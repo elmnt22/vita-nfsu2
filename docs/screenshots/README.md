@@ -1,24 +1,12 @@
-# OpenUG2 runtime gallery
+# NFSUG2_Vita screenshots
 
-These captures come from the verified runtime audit frames kept with the
-project. They are intentionally unedited: the repository is an engine
-prototype, so the images show both the recovered city scale and the current
-vehicle/lighting state.
+Captures from the Windows simulator of the Vita build (`sim/`), at the
+Vita's 3D render size (720×408). The simulator runs the same game code as
+the console; a few sim-only rendering glitches are not present on hardware.
 
 | Capture | What it shows |
 | --- | --- |
-| ![MIATA on the L4RA start line](miata-l4ra-startline.png) | MIATA on a real L4RA route with authored signage, barriers and lane materials |
-| ![MIATA city run](miata-city-run.png) | Open-world city driving under the recovered night lighting |
-| ![HUMMER on the L4RB start line](hummer-l4rb-startline.png) | HUMMER sprint start on the L4RB route |
-| ![Night open-world road](night-openworld.png) | Road, guardrail, foliage and lighting composition in the open-world bundle |
-| ![Two-car road test](ai-two-car-road-test.png) | Player and opponent vehicle test on the recovered road surface |
-| ![City plaza](showcase.png) | Plaza, fountain geometry and surrounding buildings; water animation remains work in progress |
-| ![Vehicle detail](detail_showcase.png) | Skyline body, glass, wheels and lamp presentation |
-| ![Modification menu](imgui.png) | ImGui body-shop modification controls |
-| ![Texture filtering 1x](detail_1x.png) | Road scene with 1× texture filtering |
-| ![Texture filtering 16x](detail_16x.png) | Road scene with 16× texture filtering |
-| ![Street lighting first view](lightpool_mark1_after.png) | Lighting near a parking entrance |
-| ![Street lighting second view](lightpool_mark2_after.png) | Lighting along the road and building fronts |
-| ![Sign textures](sign_texture_after.png) | Building sign, pavement and road materials |
-| ![Waterfront](water_after.png) | Current water surface, bridge and waterfront geometry |
-| ![Red shop vinyl selection](showcase-2.png) | Supra with a selected vinyl in the Red / Graphics shop |
+| ![Main menu](main_menu.png) | Front end: the original `UI_Main` strip over the 3D showroom |
+| ![Race](race.png) | Circuit race with AI opponents, original HUD, minimap and traffic |
+| ![Track select](track_select.png) | Quick Race track select with the game's own map and race info |
+| ![Car Shop](car_shop.png) | Car Specialties Shop with neon fitted and the visual rating |
