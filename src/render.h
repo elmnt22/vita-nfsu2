@@ -36,10 +36,29 @@ typedef struct {
 typedef struct {
     float pos[3];
     float uv[2];
+#ifdef __vita__
+    signed char normal[4];    /* Vita: snorm8 xyz + pad (GL_BYTE, normalized):
+                                 28 B vertices, 22% less RAM/VRAM than floats */
+#else
     float normal[3];
+#endif
     unsigned char col[4];     /* per-vertex RGBA prelight from the source stream
                                  (baked AO/lighting + terrain tint); 255=neutral */
-} BatchedVertex;              /* 36 B, interleaved */
+} BatchedVertex;              /* 28 B on the Vita, 36 B elsewhere; interleaved */
+
+#ifdef __vita__
+static inline signed char bv_snorm8(float f) {
+    float s = f * 127.0f; s += s < 0 ? -0.5f : 0.5f;
+    return (signed char)(s > 127.0f ? 127 : s < -127.0f ? -127 : (int)s);
+}
+#define BV_SET_NORMAL(o, x, y, z) do { (o)->normal[0] = bv_snorm8(x);     (o)->normal[1] = bv_snorm8(y); (o)->normal[2] = bv_snorm8(z); (o)->normal[3] = 0; } while (0)
+#define BV_NORMAL_GL_TYPE GL_BYTE
+#define BV_NORMAL_GL_NORM GL_TRUE
+#else
+#define BV_SET_NORMAL(o, x, y, z) do { (o)->normal[0] = (x); (o)->normal[1] = (y);     (o)->normal[2] = (z); } while (0)
+#define BV_NORMAL_GL_TYPE GL_FLOAT
+#define BV_NORMAL_GL_NORM GL_FALSE
+#endif
 
 typedef struct {
     GLuint vbo;               /* unified interleaved VBO */
@@ -69,7 +88,33 @@ typedef struct {
                                  per-mesh mode table was supplied -- sky/glow/
                                  vista/diagnostic batches keep their own,
                                  separate, unrelated render treatment. */
+    void *shared_buffers; /* owning GPU reference; render aliases merely borrow */
+    unsigned char reflect;    /* members carry N2Mesh.reflect: the wet-road pass */
 } N2Batch;
+#ifdef __vita__
+/* Road reflection target (worldreflect.fx): the scene mirrored about the
+   road plane, rendered small; reflective road batches add it on top. */
+int    render_refl_begin(int w, int h, const float clear_rgb[3]);
+void   render_refl_end(int screen_w, int screen_h);
+GLuint render_refl_texture(void);
+/* debug: draw `tex` into the screen rectangle (x, y from bottom-left) */
+void   render_debug_texture(GLuint tex, GpuMesh *quad, int x, int y, int w, int h,
+                            int screen_w, int screen_h);
+#define RENDER_REFL_UNIT 3   /* units 1-2 are the headlight shadow maps */
+#define RENDER_ENV_UNIT 4    /* car environment atlas (car.fx) */
+int    render_env_begin(int face, const float clear_rgb[3]);
+void   render_env_end(int screen_w, int screen_h);
+GLuint render_env_texture(void);
+/* A fixed environment atlas (w x h RGBA, rows bottom first, the 3x2 face
+   layout cubeuv() reads), e.g. the garage's FRONTEND/ENVMAPS cube; NULL
+   frees it. render_env_use_static(1) makes render_env_texture return it. */
+void   render_env_static(const unsigned char *rgba, int w, int h);
+void   render_env_use_static(int on);
+void   render_env_view(int face, const float eye[3], float *V);
+
+#endif
+void render_batch_release(N2Batch *batch);
+void render_batch_reuse_selftest(void); /* GL context required on Vita */
 
 /* the one shader program + its uniform handles */
 typedef struct {
@@ -86,7 +131,8 @@ typedef struct {
                                        batches only, M135-R) */
           uEmissiveTex,             /* >0.5: texture-backed unlit RGB/alpha
                                        (authored sky and point-light sprites) */
-          uFogColor, uFogDensity,   /* exp^2 distance fog (matches the sky) */
+          uFogColor, uFogDensity,   /* linear distance fog (world.fx FogValue) */
+          uFogK, uFogFloor,         /* start*density, minimum fog factor */
           uCamPos,  /* camera in world space */
           uEnv,     /* environment-reflection amount (cars only) */
           uUVCheck, /* 1 = show the diagnostic UV-coordinate visualization
@@ -107,7 +153,7 @@ typedef struct {
                         plastic. Dome-weighted by dot(N,V) in the shader, so a
                         curved lens is hottest where it faces the camera.
                         Zero everywhere else; the car pass clears it. */
-    GLint uHeadPos, uHeadForward, uHeadRight, uHeadUp, uHeadShape, uHeadGain, uHeadLow;
+    GLint uHeadPos, uHeadForward, uHeadRight, uHeadUp, uHeadShape, uHeadGain, uHeadLow, uHeadColor;
     GLint uHeadShadow, uHeadShadowMap[2], uHeadShadowMVP;
 } RProg;
 
@@ -152,7 +198,13 @@ void mat_lookat(const float *eye, const float *fwd, float *m);   /* up = world +
  * allowed), as supplied by mat_car and the wheel/brake hub transforms. */
 void render_model(const RProg *r,const float model[16]);
 RProg    render_program(void);          /* compile+link the shader, fetch uniforms */
+#ifdef __vita__
+void     render_world_lite_program(const RProg *main_prog);   /* Vita: cheap world FS */
+#endif
 GpuMesh *upload_scene(N2Scene *s);      /* VBO/NBO/IBO per mesh, normals computed */
+/* Re-upload one mesh's positions and normals through a row-vector matrix
+   (an opening hood / door, partanim.c); NULL puts the mesh back as loaded. */
+void render_mesh_repose(GpuMesh *g, const N2Mesh *m, const float *mat);
 void free_scene_gpu(GpuMesh *gm, int count);
 GpuMesh  make_wheel(float R, float halfW);  /* procedural tyre (see render.c) */
 GLuint   make_wheel_tex(void);          /* radial alloy-rim texture for it */
@@ -214,6 +266,56 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
 int upload_world_batches_step(WorldBatchUpload **job, int max_batches,
                           N2Batch **out, int *count, int *meshbatch);
 void upload_world_batches_cancel(WorldBatchUpload **job);
+/* Optional per-mesh normals (scene order) computed ahead of time, e.g. on a
+   worker thread; NULL entries fall back to computing them during upload. */
+void upload_world_batches_set_normals(WorldBatchUpload *job, float *const *normals);
+#ifdef __vita__
+/* Scaled 3D rendering (PS Vita): the scene renders into an offscreen colour
+   texture + depth at a fraction of the screen, then is stretched over the
+   full framebuffer before the HUD, which stays native resolution. The GPU is
+   fill-rate bound, so pixels saved are frame time saved. */
+int  render_scene_begin(int screen_w, int screen_h, float scale);   /* 1 = scaled */
+void render_scene_end(const RProg *rp, GpuMesh *quad, int screen_w, int screen_h,
+                      float fog_density);
+/* the screen flash: the next composites multiply the 3D frame by mul (rgb)
+   before the visual treatment; NULL = none */
+void render_set_flash(const float mul[3]);
+/* the speed / nitrous motion blur (0x5cc460) for the next composites:
+   strength k (0 = off) and the first pass's corner offsets o (left x, top y,
+   right x, bottom y, in texture units); and the bloom level f (0x5bc180) */
+void render_set_speedblur(float k, const float o[4]);
+void render_set_bloom_level(float f);
+/* the scene camera's depth of field for the next composites (camera +0xb4
+   centre / +0xb8 range in metres, 0 0 = off; 0x5d2850) and its letterbox
+   (camera +0xc8, 0 = none; 0x5cbdc0) */
+void render_set_dof(float centre, float range);
+void render_set_letterbox(float lb);
+/* around the main 3D pass: opaque draws write the depth of field depth to
+   the frame's alpha while on (Vita; a no-op without a depth of field) */
+void render_dof_scene(int on);
+int  render_dof_writes(void);   /* 1 while that alpha is being written */
+#endif
+/* The flat per-vertex normals batch upload uses (nverts*3 floats). */
+void render_mesh_normals(const N2Mesh *m, float *nor);
+/* A mesh already in batch vertex layout (normals included) plus its 3D
+   bounds, prepared off the render thread so batch upload only copies. */
+typedef struct { BatchedVertex *v; float bb[6]; unsigned char borrowed, hash_valid; uint64_t hash[2]; } PackedMesh;
+int  render_pack_mesh(const N2Mesh *m, PackedMesh *out);    /* 1 = ok */
+/* Apply upload_tex's 64px+ box halving ahead of time (any thread). */
+void render_prehalve_tex(N2Tex *t);
+extern int g_world_dxt;
+int render_world_dxt_enabled(void);
+/* Safe single-level upload plan; rejects unsupported dimensions/short blobs. */
+int render_dxt_base_plan(const N2Tex *t, int *w, int *h, int *offset, int *bytes);
+void render_dxt_plan_selftest(void);
+/* Borrows the array; consumes and clears each vertex buffer after copying it.
+   Cancellation leaves unconsumed entries owned by the caller. */
+void upload_world_batches_set_packed(WorldBatchUpload *job, PackedMesh *packed);
+WorldBatchUpload *upload_world_batches_prepare_cpu(const N2Scene *scene,
+    const float (*bounds)[4], const GLuint *logical_textures,
+    const unsigned char *modes, PackedMesh *packed);
+int upload_world_batches_bind_prepared(WorldBatchUpload *job, const GLuint *textures,
+    GLuint terrain_texture, const unsigned char *modes);
 /* Same merge, but for one category (N2_SKY / N2_GLOW) pulled out of the main
  * batching pass above — grouped by texture only, no spatial cell/cull grid,
  * since there are only ever a handful of skybox/neon meshes per city. Sky,
@@ -248,5 +350,36 @@ float text_width(const char *s, float px);
 
 /* dev screenshot: rgb is top-left origin, w*h*3 */
 void write_png(const char *path, int w, int h, const unsigned char *rgb);
+
+/* car.fx (oldcar.txt = the port's earlier car shader): begin binds the env
+   atlas and selects the car variant, part sets the light material of the
+   next draw (body/misc without one = paint), end goes back. */
+int    render_carfx_enabled(void);
+int    render_carfx_active(void);
+void   render_carfx_begin(const RProg *r);
+void   render_carfx_sh(const float sh[10][4]);
+void   render_carfx_part(uint32_t material, int cat);
+/* 0x48d860 (ReplaceLightMaterial) as the car renderer uses it: while set,
+   meshes with one of these light materials wear the paint material
+   (carfx_use_paint) -- painted calipers, exhaust tips and rims. n 0 clears. */
+void   render_carfx_swap(const uint32_t *materials, int n);
+int    render_carfx_swapped(uint32_t material);
+void   render_carfx_end(void);
+
+/* worldbone.fx (SPEED2.EXE IDI_WORLDBONE_FX): the pre-race scene's skinned
+   characters. Positions/normals come skinned into the world (nisdraw.c);
+   colour = 2 * tex * saturate(SH(N) * (DiffuseMin + DiffuseRange * N.E)).
+   Uniforms: uMVP, uEye, uSH0..9, uDMin, uDRange, uTex, uCut, uBlend, uDofW. */
+GLuint render_bone_program(void);
+
+/* worldnodepth.fx: the Acid particles (aciddraw.c). Attributes aPos 0,
+   aUV 1, aColor 3 (normalised bytes); uniforms uMVP, uTex. */
+/* the particle program's colour attribute (aciddraw.c) */
+#ifdef __vita__
+#define RENDER_PARTICLE_COLOR_LOC 2
+#else
+#define RENDER_PARTICLE_COLOR_LOC 3
+#endif
+GLuint render_particle_program(void);
 
 #endif

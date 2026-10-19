@@ -150,6 +150,7 @@ typedef struct {
     int   air_frames;            /* consecutive frames with no contact at all   */
     float impact;                /* |vz| at the frame contact was regained, m/s */
     float lift;                  /* penetration guard applied this frame, m     */
+    int   land_frames;           /* arcade soft landing: ticks left (launch_cap) */
 } PhysRideState;
 
 /* One frame of support, gathered by the caller from the world. ax/ay are the
@@ -161,6 +162,14 @@ typedef struct {
     int   valid[4];  /* 1 = reachable support this frame          */
     float ax[4], ay[4];
     float vz[4];     /* support-height rate along wheel XY motion, m/s; 0 at rest */
+    float downforce; /* extra downward acceleration, m/s^2 (arcade grip at speed;
+                        0 = none). Balanced by the springs, so ride height is
+                        unchanged; it only shortens flights off crests. */
+    float launch_cap; /* >0: upward speed limit, m/s, when contact is lost
+                         (arcade: crests and hard landings do not throw the
+                         car into the air); 0 = none */
+    float stick;     /* extra downward pull, m/s^2, while airborne within
+                        0.8 m of the road (launch_cap set); 0 = none */
 } PhysRideSupport;
 
 /* Static equilibrium on the given support. Solves heave, pitch and roll from
@@ -199,6 +208,30 @@ float phys_drive_step(float pos[3], float vel[2], float *heading, float *speed,
                       float throttle, float steer, int handbrake,
                       const PhysSurface *sf, const PhysVehicle *vh,
                       const PhysRideState *ride);
+
+/* Player drift state (arcade, NFSU2-style). The base model above has no yaw
+ * momentum: heading follows the steering and the tyres scrub ~14% of the side
+ * speed per tick, so no input can unsettle the car. With a PhysDrift the step
+ * can enter a slide -- brake tap (or handbrake) then throttle + steer inside
+ * PHYS_DRIFT_FEINT ticks, above PHYS_DRIFT_MIN_KMH -- and while sliding it
+ * carries extra yaw and swings the velocity toward the nose instead of
+ * scrubbing it, so the drift keeps its speed. Throttle and steer hold the
+ * angle; countersteer, lifting off or slowing down regrips. NULL = old model
+ * (AI and self-tests). */
+#define PHYS_DRIFT_FEINT    30      /* ticks after a brake release that arm entry */
+#define PHYS_DRIFT_MIN_KMH  50.0f
+typedef struct {
+    float level;     /* 0 grip .. 1 full slide                              */
+    float yaw;       /* extra yaw carried by the slide, rad/tick             */
+    float slip;      /* last slip angle, rad (signed: + = nose left of path) */
+    int   brake_t;   /* ticks since the brake / handbrake was last held      */
+    int   entered;   /* set for one step when a slide starts (1 feint, 2 hb) */
+    int   age;       /* ticks since the slide started                        */
+} PhysDrift;
+float phys_player_step(float pos[3], float vel[2], float *heading, float *speed,
+                       float throttle, float steer, int handbrake,
+                       const PhysSurface *sf, const PhysVehicle *vh,
+                       const PhysRideState *ride, PhysDrift *dr);
 
 /* Push (pos.xy) out of any wall AABB (expanded by r) it penetrates, along the
  * least-penetration axis; zero the into-wall velocity so the car slides along

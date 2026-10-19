@@ -19,6 +19,20 @@
 /* ...and eases off toward top speed so 200+ km/h stays stable (NFSU2 cars
  * corner tight at city speed, wide at full tilt) */
 #define TURN_HISPD_DROP  0.55f
+/* Player drift (PhysDrift). Steady slip angle is roughly
+ * yaw_per_tick * (1-ALIGN) / ALIGN, so at 100 km/h full lock on throttle it
+ * settles near 30 deg; half lock ~15 deg; lifting off doubles ALIGN and the
+ * car straightens as the level bleeds away. */
+#define DRIFT_STEER_MIN  0.30f    /* |steer| needed to start a slide            */
+#define DRIFT_KICK       0.012f   /* entry yaw impulse, rad/tick (~11 deg total)  */
+#define DRIFT_YAW_GAIN   0.0005f  /* steer -> carried yaw per tick              */
+#define DRIFT_YAW_DAMP   0.94f    /* carried yaw retention per tick             */
+#define DRIFT_STEER_BOOST 0.15f   /* extra steering authority while sliding     */
+#define DRIFT_ALIGN_ON   0.05f    /* velocity swing toward the nose, on throttle */
+#define DRIFT_ALIGN_OFF  0.10f    /* ...and off throttle                        */
+#define DRIFT_SCRUB      0.9985f  /* speed kept per tick while sliding          */
+#define DRIFT_MAX_SLIP   0.90f    /* rad (~52 deg); beyond this the rear grips  */
+#define DRIFT_EXIT_KMH   30.0f
 
 PhysTune g_phys_tune = { 1.0f, 1.0f, 1.0f, 220.0f };   /* stock defaults */
 
@@ -119,7 +133,10 @@ float phys_ride_reach_down(const PhysRideState *r, float dt) {
 
 float phys_ride_support_vz(const float normal[3], const float vel[2],
                           float old_heading, float heading, float ax, float ay, float dt) {
-    if (dt <= 0 || fabsf(normal[2]) < 1e-6f) return 0;
+    /* A face steeper than ~70 deg is a wall or a seam, not something a tyre
+       rolls up: its slope-derived rise rate goes to infinity as the face
+       approaches vertical and launched the car 16 m (10-08). */
+    if (dt <= 0 || fabsf(normal[2]) < 0.34f) return 0;
     float dc=cosf(heading)-cosf(old_heading), ds=sinf(heading)-sinf(old_heading);
     float dx=vel[0]+dc*ax-ds*ay, dy=vel[1]+ds*ax+dc*ay;
     return -(normal[0]*dx+normal[1]*dy)/(normal[2]*dt);
@@ -134,6 +151,12 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
     unsigned was = r->contact_mask;
     r->impact = 0.0f;
     r->lift   = 0.0f;
+    /* vertical rate of the road under the car. Every clamp below is relative
+       to it: zeroing vz on a steep descent threw the body ~8 m/s up off the
+       road (the landing trace: bump stop -> vz 0 -> 20 ticks airborne). */
+    float road_vz = 0.0f; int nroad = 0;
+    for (int k = 0; k < 4; k++) if (s->valid[k]) { road_vz += s->vz[k]; nroad++; }
+    if (nroad) road_vz /= (float)nroad;
 
     /* per-wheel compression and force. The +G preload makes zero compression
        the resting equilibrium, so a fully supported car sits exactly on its
@@ -155,7 +178,7 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
         if (c > PHYS_RIDE_BUMP) c = PHYS_RIDE_BUMP;
         r->compression[k] = c;
         /* The damper resists suspension travel, not motion along a slope. */
-        force[k] = fmaxf(0.0f,K*c - C*(wv-s->vz[k]) + PHYS_RIDE_G);
+        force[k] = fmaxf(0.0f,K*c - C*(wv-s->vz[k]) + PHYS_RIDE_G + s->downforce);
         /* A tyre may push on the road, but cannot pull the body down onto a
            crest. An unloaded wheel also supplies no steering/braking grip. */
         if(force[k]>0)mask |= 1u << k;
@@ -163,7 +186,23 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
     r->contact_mask = mask;
 
     if (!mask) {                                   /* free flight */
-        r->vz -= PHYS_RIDE_G * dt;
+        if (was && s->launch_cap > 0 && r->vz > road_vz + s->launch_cap)
+            r->vz = road_vz + s->launch_cap;
+        /* arcade road hold (launch_cap set = high speed): over a small dip,
+           with the road under every wheel less than 0.8 m below, pull down
+           harder so the car follows the road instead of floating off it */
+        float stick = 0.0f;
+        if (s->launch_cap > 0) {
+            int nvalid = 0, close = 1;
+            for (int k = 0; k < 4; k++) {
+                if (!s->valid[k]) continue;
+                nvalid++;
+                float gap = (r->z + ax[k]*r->pitch + ay[k]*r->roll) - s->z[k];
+                if (gap > 0.8f) close = 0;
+            }
+            if (nvalid >= 3 && close) stick = s->stick;
+        }
+        r->vz -= (PHYS_RIDE_G + s->downforce + stick) * dt;
         r->z  += r->vz * dt;
         /* bleed angular rates so an airborne car cannot tumble without bound */
         r->pitch_rate *= 0.98f; r->roll_rate *= 0.98f;
@@ -176,12 +215,25 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
            already resolved the frame, so landing energy was handled twice and a
            single 4.4 m/s arrival on a continuous -6% road launched the car into
            a 6-hop, 174-of-180-frame ballistic cycle (M130-R2 case 1). */
-        if (!was) r->impact = fmaxf(0.0f,-r->vz);
+        if (!was) {
+            r->impact = fmaxf(0.0f, road_vz - r->vz);
+            if (s->launch_cap > 0) r->land_frames = 20;   /* arcade soft landing */
+        }
         float fz = 0, tp = 0, tr = 0;
         for (int k = 0; k < 4; k++) { fz += force[k]; tp += ax[k]*force[k]; tr += ay[k]*force[k]; }
-        r->vz         += (fz * 0.25f - PHYS_RIDE_G) * dt;
+        r->vz         += (fz * 0.25f - PHYS_RIDE_G - s->downforce) * dt;
         r->pitch_rate += (tp / ip) * dt;
         r->roll_rate  += (tr / ir) * dt;
+        if (r->land_frames > 0) {
+            /* the first ticks after touching down at speed: the springs may
+               stop the fall but may not throw the body back up, and the pitch
+               and roll kick of the landing is damped (no bounce chain) */
+            r->land_frames--;
+            if (s->launch_cap > 0) {
+                if (r->vz > road_vz + 0.15f) r->vz = road_vz + 0.15f;
+                r->pitch_rate *= 0.5f; r->roll_rate *= 0.5f;
+            }
+        }
         r->z     += r->vz * dt;
         r->pitch += r->pitch_rate * dt;
         r->roll  += r->roll_rate  * dt;
@@ -195,12 +247,12 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
 
     /* bump stop: no wheel may end the frame compressed past its travel, so the
        body can never settle through a surface it is standing on. */
-    float pen = 0;
+    float pen = 0, pen_vz = road_vz;
     for (int k = 0; k < 4; k++) {
         if (!s->valid[k]) continue;
         float wz = r->z + ax[k]*r->pitch + ay[k]*r->roll;
         float over = (s->z[k] - wz) - PHYS_RIDE_BUMP;
-        if (over > pen) pen = over;
+        if (over > pen) { pen = over; pen_vz = s->vz[k]; }
     }
     if (pen > 0) {
         /* Bounded by the travel that produced it: one frame cannot push a valid
@@ -209,7 +261,9 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
            reachable contacts reach this loop, so an out-of-reach deck overhead
            contributes nothing. */
         if (pen > PHYS_RIDE_PEN_MAX) pen = PHYS_RIDE_PEN_MAX;
-        r->z += pen; r->lift = pen; if (r->vz < 0) r->vz = 0;
+        /* match the road's own vertical rate, never 0: on a descent a
+           zero would launch the body off the road it just landed on */
+        r->z += pen; r->lift = pen; if (r->vz < pen_vz) r->vz = pen_vz;
     }
 
     /* refresh the reported compressions after the clamp/bump-stop */
@@ -248,8 +302,16 @@ void phys_ride_body_up(const PhysRideState *ride,float heading,float up[3]) {
 
 void phys_landing_camera(float *offset,float *velocity,float impact,float dt) {
     if(dt<=0)return;
+#ifdef __vita__
+    /* One soft dip per landing. The spring was under-damped (zeta 0.44): a
+       6-7 m/s highway landing set the view wobbling for several cycles, which
+       read as the car bouncing. Smaller kick, near-critical damping. */
+    *velocity-=fminf(1.5f,fmaxf(0,impact-1.5f)*.18f);
+    *velocity+=(-324.0f * *offset-32.0f * *velocity)*dt;
+#else
     *velocity-=fminf(4.0f,fmaxf(0,impact-1.5f)*.45f);
     *velocity+=(-324.0f * *offset-16.0f * *velocity)*dt;
+#endif
     *offset+=*velocity*dt;
 }
 
@@ -312,15 +374,47 @@ PhysVehicle phys_vehicle_from_source(const N2PhysicsAttr *a,int power_level,
     return v;
 }
 
-float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
-                    float throttle, float steer, int handbrake,
-                    const PhysSurface *sf, const PhysVehicle *vh) {
+/* Entry, hold and exit of a player slide. Runs before the heading update so a
+ * feint or handbrake kick lands in this tick's yaw. */
+static void drift_pre(PhysDrift *dr, float throttle, float steer, int handbrake,
+                      float fwd, float spd) {
+    float kmh = PHYS_KMH(spd), as = fabsf(steer);
+    int braking = handbrake || (throttle < 0 && fwd > 0.01f);
+    dr->entered = 0;
+    if (braking) dr->brake_t = 0; else if (dr->brake_t < 1000) dr->brake_t++;
+    if (fwd <= 0.05f) { dr->level = 0; dr->yaw = 0; return; }
+    if (dr->level < 0.5f && kmh > PHYS_DRIFT_MIN_KMH && as > DRIFT_STEER_MIN) {
+        int feint = throttle > 0.3f && dr->brake_t > 0 && dr->brake_t <= PHYS_DRIFT_FEINT;
+        if (feint || handbrake) {
+            dr->level = 1.0f; dr->age = 0;
+            dr->yaw += copysignf(DRIFT_KICK, steer);
+            dr->entered = handbrake ? 2 : 1;
+            return;
+        }
+    }
+    if (dr->level <= 0) return;
+    dr->age++;
+    float decay = 0;
+    if (kmh < DRIFT_EXIT_KMH) decay = 0.06f;                      /* too slow    */
+    else if (throttle < 0.1f && !handbrake) decay = 0.02f;         /* lift-off    */
+    if (dr->age > 20 && fabsf(dr->slip) < 0.06f && as < 0.5f)
+        decay += 0.08f;                                            /* straightened */
+    dr->level -= decay;
+    if (dr->level < 0.02f) dr->level = 0;
+}
+
+static float car_step(float pos[3], float vel[2], float *heading, float *speed,
+                      float throttle, float steer, int handbrake,
+                      const PhysSurface *sf, const PhysVehicle *vh, PhysDrift *dr) {
     static const PhysVehicle NEUTRAL = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
     if (!sf) sf = &PHYS_SURF_ROAD;
     if (!vh) vh = &NEUTRAL;
     float top = g_phys_tune.top_kmh / 3.6f / PHYS_TICKRATE * sf->topfrac;
     float hf[2] = { cosf(*heading), sinf(*heading) };
     float fwd = vel[0]*hf[0] + vel[1]*hf[1];   /* signed forward speed */
+    if (dr) drift_pre(dr, throttle, steer, handbrake, fwd,
+                      sqrtf(vel[0]*vel[0]+vel[1]*vel[1]));
+    float dl = dr ? dr->level : 0.0f;
     if (handbrake) throttle = 0; /* hold at rest, including W/S + Space */
     if (throttle > 0) {
         /* throttle tapers as speed builds: punchy off the line, eases near top */
@@ -341,8 +435,18 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
     float dir = (vel[0]*hf[0]+vel[1]*hf[1]) < 0 ? -1.f : 1.f;  /* fwd vs reverse */
     float sfac = spd/(PHYS_MAXSPD*TURN_RAMP_FRAC); if (sfac > 1) sfac = 1;
     float hifrac = spd/PHYS_MAXSPD; if (hifrac > 1) hifrac = 1;
-    *heading += steer * PHYS_TURN * g_phys_tune.turn * sfac
+    float yaw = steer * PHYS_TURN * g_phys_tune.turn * sfac
                 * (1.0f - TURN_HISPD_DROP*hifrac) * dir * sf->steer * vh->steer;
+    if (dr) {
+        if (dl > 0) {
+            /* the slide carries its own yaw; steering feeds it (more on
+               throttle), countersteer drains it */
+            float thr = throttle > 0 ? throttle : 0;
+            dr->yaw = dr->yaw*DRIFT_YAW_DAMP + steer*dl*DRIFT_YAW_GAIN*(0.4f+0.6f*thr);
+            yaw = yaw*(1.0f + DRIFT_STEER_BOOST*dl) + dr->yaw;
+        } else dr->yaw *= 0.8f;
+    }
+    *heading += yaw;
     /* decompose velocity in the new heading frame, clamp forward, scrub side */
     float nf[2] = { cosf(*heading), sinf(*heading) }, nr[2] = { nf[1], -nf[0] };
     float vf = vel[0]*nf[0]+vel[1]*nf[1], vl = vel[0]*nr[0]+vel[1]*nr[1];
@@ -355,7 +459,19 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
        so a slide can never be amplified. */
     { float lat = sf->lat * vh->lat;
       if (lat > 0.99f) lat = 0.99f; if (lat < 0.50f) lat = 0.50f;
-      vl *= handbrake ? fminf(HANDBRAKE_GRIP,lat+0.07f) : lat; }
+      float vl_grip = vl * (handbrake ? fminf(HANDBRAKE_GRIP,lat+0.07f) : lat);
+      if (dl > 0 && vf > 0.05f) {
+          /* sliding: swing the velocity toward the nose instead of scrubbing
+             the side component, so the drift keeps its speed */
+          float a = atan2f(vl, vf), mag = hypotf(vf, vl) * DRIFT_SCRUB;
+          a *= 1.0f - (throttle > 0.1f ? DRIFT_ALIGN_ON : DRIFT_ALIGN_OFF);
+          if (a >  DRIFT_MAX_SLIP) { a =  DRIFT_MAX_SLIP; dr->yaw *= 0.5f; }
+          if (a < -DRIFT_MAX_SLIP) { a = -DRIFT_MAX_SLIP; dr->yaw *= 0.5f; }
+          float vf_d = mag*cosf(a), vl_d = mag*sinf(a);
+          vf = vf + (vf_d - vf)*dl;
+          vl = vl_grip + (vl_d - vl_grip)*dl;
+      } else vl = vl_grip;
+      if (dr) dr->slip = vf > 0.05f ? atan2f(vl, vf) : 0.0f; }
     if (handbrake) {
         /* Rear grip releases for a turn, but the brake still dissipates
            momentum. Clamp the loss so stopping cannot become reversing. */
@@ -367,6 +483,21 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
     *speed = vf;                      /* forward speed, for HUD/collision */
     pos[0] += vel[0]; pos[1] += vel[1];
     return vl < 0 ? -vl : vl;         /* drift magnitude */
+}
+
+float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
+                    float throttle, float steer, int handbrake,
+                    const PhysSurface *sf, const PhysVehicle *vh) {
+    return car_step(pos,vel,heading,speed,throttle,steer,handbrake,sf,vh,NULL);
+}
+
+float phys_player_step(float pos[3], float vel[2], float *heading, float *speed,
+                       float throttle, float steer, int handbrake,
+                       const PhysSurface *sf, const PhysVehicle *vh,
+                       const PhysRideState *ride, PhysDrift *dr) {
+    if (!ride || ride->contact_mask)
+        return car_step(pos,vel,heading,speed,throttle,steer,handbrake,sf,vh,dr);
+    return phys_drive_step(pos,vel,heading,speed,throttle,steer,handbrake,sf,vh,ride);
 }
 
 float phys_drive_step(float pos[3], float vel[2], float *heading, float *speed,
@@ -819,19 +950,22 @@ static int cw_resolve_one(int o, float *pos, float *vel, const float obst[][4],
    by raw extent; a query collects every rect near the body's start box, plus a
    margin, and visits them in ascending index. Rects outside that set cannot
    overlap until the body has been pushed by the margin; if that ever happens
-   the pass finishes with the linear scan from the current index. */
+   the pass finishes with the linear scan from the current index.
+   The index is read-only after the build: traffic steps query it from the
+   parallel-for workers while the main thread steps the player, so each query
+   collects its candidates in its own stack buffer (a full buffer falls back
+   to the linear scan, which gives the same result). */
 #define CWI_CELL 32.0f
 #define CWI_MARGIN 4.0f
+#define CWI_QCAP 2048
 static struct {
     const float (*obst)[4]; const float (*obz)[2]; int n;
     float x0, y0; int gw, gh;
     int *start, *list, *big, nbig;   /* big: rects spanning too many cells */
-    unsigned *stamp, tick;
-    int *cand, ncap;
 } g_cwi;
 
 void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int nobst) {
-    free(g_cwi.start); free(g_cwi.list); free(g_cwi.big); free(g_cwi.stamp); free(g_cwi.cand);
+    free(g_cwi.start); free(g_cwi.list); free(g_cwi.big);
     memset(&g_cwi, 0, sizeof g_cwi);
     if (!obst || nobst <= 0) return;
     float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f;
@@ -843,9 +977,7 @@ void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int no
     int gw=1+(int)((x1-x0)/CWI_CELL), gh=1+(int)((y1-y0)/CWI_CELL);
     if (gw<=0 || gh<=0 || (long)gw*gh > (1L<<22)) return;
     int *count=calloc((size_t)gw*gh+1,sizeof *count), *big=malloc((size_t)nobst*sizeof *big);
-    unsigned *stamp=calloc((size_t)nobst,sizeof *stamp);
-    int *cand=malloc((size_t)nobst*sizeof *cand);
-    if (!count||!big||!stamp||!cand) {free(count);free(big);free(stamp);free(cand);return;}
+    if (!count||!big) {free(count);free(big);return;}
     long total=0; int nbig=0;
     #define CWI_SPAN(o,cx0,cy0,cx1,cy1) int cx0=(int)((obst[o][0]-x0)/CWI_CELL), \
         cy0=(int)((obst[o][1]-y0)/CWI_CELL), cx1=(int)((obst[o][2]-x0)/CWI_CELL), \
@@ -857,7 +989,7 @@ void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int no
     }
     for (int c=0;c<gw*gh;c++) count[c+1]+=count[c];
     int *list=malloc((size_t)(total?total:1)*sizeof *list), *fill=malloc((size_t)gw*gh*sizeof *fill);
-    if (!list||!fill) {free(count);free(big);free(stamp);free(cand);free(list);free(fill);return;}
+    if (!list||!fill) {free(count);free(big);free(list);free(fill);return;}
     memcpy(fill,count,(size_t)gw*gh*sizeof *fill);
     for (int o=0;o<nobst;o++) {
         CWI_SPAN(o,cx0,cy0,cx1,cy1);
@@ -868,7 +1000,6 @@ void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int no
     free(fill);
     g_cwi.obst=obst;g_cwi.obz=obz;g_cwi.n=nobst;g_cwi.x0=x0;g_cwi.y0=y0;g_cwi.gw=gw;g_cwi.gh=gh;
     g_cwi.start=count;g_cwi.list=list;g_cwi.big=big;g_cwi.nbig=nbig;
-    g_cwi.stamp=stamp;g_cwi.cand=cand;g_cwi.ncap=nobst;
 }
 
 static int cwi_int_cmp(const void *a,const void *b){int x=*(const int*)a,y=*(const int*)b;return (x>y)-(x<y);}
@@ -887,20 +1018,21 @@ static int cw_resolve(float *pos, float *vel, const float obst[][4],
         int cx0=(int)floorf((qx0-g_cwi.x0)/CWI_CELL), cx1=(int)floorf((qx1-g_cwi.x0)/CWI_CELL);
         int cy0=(int)floorf((qy0-g_cwi.y0)/CWI_CELL), cy1=(int)floorf((qy1-g_cwi.y0)/CWI_CELL);
         if(cx0<0)cx0=0; if(cy0<0)cy0=0; if(cx1>=g_cwi.gw)cx1=g_cwi.gw-1; if(cy1>=g_cwi.gh)cy1=g_cwi.gh-1;
-        if (++g_cwi.tick == 0) { memset(g_cwi.stamp,0,(size_t)g_cwi.ncap*sizeof *g_cwi.stamp); g_cwi.tick=1; }
-        int nc = 0;
-        for (int k=0;k<g_cwi.nbig;k++) { g_cwi.stamp[g_cwi.big[k]]=g_cwi.tick; g_cwi.cand[nc++]=g_cwi.big[k]; }
-        for (int y=cy0;y<=cy1;y++) for (int x=cx0;x<=cx1;x++) {
-            int c=y*g_cwi.gw+x;
-            for (int k=g_cwi.start[c];k<g_cwi.start[c+1];k++) {
-                int o=g_cwi.list[k];
-                if (g_cwi.stamp[o]!=g_cwi.tick) { g_cwi.stamp[o]=g_cwi.tick; g_cwi.cand[nc++]=o; }
-            }
+        int cand[CWI_QCAP], nc = 0, full = g_cwi.nbig > CWI_QCAP;
+        if (!full) { memcpy(cand,g_cwi.big,(size_t)g_cwi.nbig*sizeof *cand); nc=g_cwi.nbig; }
+        for (int y=cy0;!full && y<=cy1;y++) for (int x=cx0;!full && x<=cx1;x++) {
+            int c=y*g_cwi.gw+x, k0=g_cwi.start[c], k1=g_cwi.start[c+1];
+            if (nc + (k1-k0) > CWI_QCAP) { full=1; break; }
+            memcpy(cand+nc,g_cwi.list+k0,(size_t)(k1-k0)*sizeof *cand); nc+=k1-k0;
         }
-        qsort(g_cwi.cand,(size_t)nc,sizeof *g_cwi.cand,cwi_int_cmp);
-        from = nobst;                        /* no linear tail unless pushed far */
+        if (full) nc = 0;                    /* from stays 0: plain linear scan */
+        else {
+            qsort(cand,(size_t)nc,sizeof *cand,cwi_int_cmp);
+            from = nobst;                    /* no linear tail unless pushed far */
+        }
         for (int k=0;k<nc;k++) {
-            int o=g_cwi.cand[k];
+            int o=cand[k];
+            if (k && o==cand[k-1]) continue;   /* rect binned in several cells */
             if (!cw_resolve_one(o,pos,vel,obst,obz,r,cz0,cz1,scene,src,log,maxlog,&hits,ax,ay,bx,by))
                 continue;
             hits++;
@@ -998,6 +1130,7 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max) {
     int nobst = 0;
     for (int i = 0; i < s->count && nobst < max; i++) {
+        if (s->meshes[i].world_role == 2) continue;
         int sc = s->meshes[i].scen, baked_props=embedded_prop_mesh(&s->meshes[i]);
         int prop_check = 0;
         if (sc != N2_SC_NONE) {                 /* named: decide semantically */
@@ -1012,7 +1145,10 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
         } else if (s->meshes[i].cat != N2_OTHER) continue;   /* unnamed fallback */
         if (s->meshes[i].nverts < 3) continue;
         float ox0=1e30f,oy0=1e30f,oz0=1e30f, ox1=-1e30f,oy1=-1e30f,oz1=-1e30f;
-        for (int v=0;v<s->meshes[i].nverts;v++){ float *p=s->meshes[i].verts+v*5;
+        if (s->meshes[i].world_bounds_valid) {
+            const float *b = s->meshes[i].world_bounds;
+            ox0=b[0]; oy0=b[1]; oz0=b[2]; ox1=b[3]; oy1=b[4]; oz1=b[5];
+        } else for (int v=0;v<s->meshes[i].nverts;v++){ float *p=s->meshes[i].verts+v*5;
             if(p[0]<ox0)ox0=p[0]; if(p[0]>ox1)ox1=p[0];
             if(p[1]<oy0)oy0=p[1]; if(p[1]>oy1)oy1=p[1];
             if(p[2]<oz0)oz0=p[2]; if(p[2]>oz1)oz1=p[2]; }

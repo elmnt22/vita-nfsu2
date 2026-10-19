@@ -1,17 +1,36 @@
 #include "world_instance.h"
 
+#ifdef __vita__
+#include "SDL.h"
+void vita_mark(const char *fmt, ...);
+#define VMARK(...) vita_mark(__VA_ARGS__)
+#else
+#define VMARK(...) ((void)0)
+#endif
+
 #include <limits.h>
+#include <assert.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "nfsu2.h"
 #include "world_scenery.h"
+int world_build_aborted(void);
 
 #define WINST_WORLD_LIMIT 1e8f
+static int g_world_low_detail;
+void world_instance_set_detail(int low) { g_world_low_detail = !!low; }
+static int g_winst_convert;
+void world_instance_set_convert(int on) { g_winst_convert = !!on; }
 
+/* Prototype meshes are parsed lazily. The library scan records only what the
+ * resolver and ownership passes need (identity, category flags, mesh count);
+ * the geometry is re-parsed from [begin,end) the first time a placement uses
+ * the prototype. A whole STREAM bundle's models are far larger than the
+ * handful a view-radius build actually places. */
 typedef struct {
-    N2Scene scene;
+    N2Scene scene;       /* empty until winst_proto_load */
     float matrix[16];
     uint32_t name_hash;
     uint32_t model_key;  /* authored 0x134011+0x10; display names may truncate */
@@ -21,11 +40,22 @@ typedef struct {
     /* Set by the ownership pre-pass: some record places this prototype with a
      * real transform, so it is an instanced object and not a ground chunk. */
     unsigned char instanced;
+    unsigned char loaded;
+    unsigned char any_ground;   /* some mesh is ROAD/TERRAIN */
+    unsigned char all_ground;   /* every mesh is ROAD/TERRAIN */
+    int mesh_count;             /* meshes the full parse produces (> 0) */
+    int index_count;
+    long begin, end;            /* object payload range in the bundle */
 } WInstProto;
 
 typedef struct {
     WInstProto *items;
     int count, cap;
+    const unsigned char *data;  /* bundle the ranges index; borrowed */
+    const uint32_t *keys;       /* texture keys for re-parsing; borrowed */
+    int nkeys;
+    int *model_index; /* open-addressed slots: first prototype index + 1 */
+    unsigned model_index_cap;
 } WInstLibrary;
 
 /* Kept out of the public header: the standalone regression uses this to prove
@@ -85,6 +115,11 @@ int winst_place_mesh(N2Scene *dst, const N2Mesh *src,
     }
 
     N2Mesh placed = *src;
+    placed.world_bounds_valid = 0;
+    for (int k = 0; k < 3; k++) {
+        placed.world_bounds[k] = 1e30f;
+        placed.world_bounds[k+3] = -1e30f;
+    }
     placed.authored_normals = 0; /* world placement rebuilds the vertex pool */
     placed.verts = (float *)winst_place_alloc(nverts * 5 * sizeof *placed.verts);
     placed.idx = (uint16_t *)winst_place_alloc(nidx * sizeof *placed.idx);
@@ -107,6 +142,10 @@ int winst_place_mesh(N2Scene *dst, const N2Mesh *src,
         out[2] = in[0] * matrix[2] + in[1] * matrix[6] + in[2] * matrix[10] + matrix[14];
         out[3] = in[3];
         out[4] = in[4];
+        for (int k = 0; k < 3; k++) {
+            if (out[k] < placed.world_bounds[k]) placed.world_bounds[k] = out[k];
+            if (out[k] > placed.world_bounds[k+3]) placed.world_bounds[k+3] = out[k];
+        }
         if (!isfinite(out[0]) || !isfinite(out[1]) || !isfinite(out[2]) ||
             fabsf(out[0]) > WINST_WORLD_LIMIT || fabsf(out[1]) > WINST_WORLD_LIMIT ||
             fabsf(out[2]) > WINST_WORLD_LIMIT) {
@@ -117,6 +156,7 @@ int winst_place_mesh(N2Scene *dst, const N2Mesh *src,
             return 0;
         }
     }
+    placed.world_bounds_valid = 1;
     placed.inst = 1;
     snprintf(placed.aname, sizeof placed.aname, "%.27s", asset_name ? asset_name : "");
     if (!winst_push_mesh(dst, placed)) {
@@ -151,9 +191,7 @@ static uint32_t winst_name_key(const char *name, char folded[28]) {
 static void winst_free_scene(N2Scene *scene) {
     if (!scene) return;
     for (int i = 0; i < scene->count; i++) {
-        free(scene->meshes[i].verts);
-        free(scene->meshes[i].idx);
-        free(scene->meshes[i].vcol);
+        n2_mesh_geometry_release(&scene->meshes[i]);
     }
     free(scene->meshes);
     memset(scene, 0, sizeof *scene);
@@ -161,6 +199,7 @@ static void winst_free_scene(N2Scene *scene) {
 
 static void winst_library_free(WInstLibrary *library) {
     if (!library) return;
+    free(library->model_index);
     for (int i = 0; i < library->count; i++) winst_free_scene(&library->items[i].scene);
     free(library->items);
     memset(library, 0, sizeof *library);
@@ -210,6 +249,47 @@ static const WInstProto *winst_library_find(const WInstLibrary *library,
  * alternatives, not names synthesized from A/B/Z suffixes. This is availability
  * fallback, not retail's still-undecoded distance/region LOD selection rule.
  * Name lookup is reserved for records without ANY authored key. */
+/* Preserve the resolver's first-model semantics, including duplicate keys.
+ * A neighborhood can resolve thousands of placements with three LOD keys;
+ * scanning the entire city's library per key was repeated CPU work. */
+static void winst_library_index(WInstLibrary *library) {
+    if (!library || library->model_index || library->count <= 0) return;
+    unsigned cap = 16;
+    while (cap < (unsigned)library->count * 2u) {
+        if (cap > UINT_MAX / 2u) return;
+        cap *= 2u;
+    }
+    int *slots = (int *)calloc(cap, sizeof *slots);
+    if (!slots) return; /* retain the existing linear fallback on allocation failure */
+    for (int i = 0; i < library->count; i++) {
+        uint32_t key = library->items[i].model_key;
+        if (!key) continue;
+        unsigned slot = (key * 2654435761u) & (cap - 1u);
+        while (slots[slot] && library->items[slots[slot]-1].model_key != key)
+            slot = (slot + 1u) & (cap - 1u);
+        if (!slots[slot]) slots[slot] = i + 1;
+    }
+    library->model_index = slots;
+    library->model_index_cap = cap;
+}
+
+static const WInstProto *winst_library_key(const WInstLibrary *library, uint32_t key) {
+    if (!library || !key) return NULL;
+    if (library->model_index) {
+        unsigned mask = library->model_index_cap - 1u;
+        unsigned slot = (key * 2654435761u) & mask;
+        while (library->model_index[slot]) {
+            const WInstProto *p = &library->items[library->model_index[slot]-1];
+            if (p->model_key == key) return p;
+            slot = (slot + 1u) & mask;
+        }
+        return NULL;
+    }
+    for (int i = 0; i < library->count; i++)
+        if (library->items[i].model_key == key) return &library->items[i];
+    return NULL;
+}
+
 static const WInstProto *winst_library_resolve(const WInstLibrary *library,
                                               const WInstPlacement *placement,
                                               const char *name,
@@ -219,9 +299,8 @@ static const WInstProto *winst_library_resolve(const WInstLibrary *library,
         uint32_t key = placement->model_keys[lod];
         if (!key) continue;
         keyed = 1;
-        if (library) for (int i = 0; i < library->count; i++) {
-            const WInstProto *proto = &library->items[i];
-            if (proto->model_key != key) continue;
+        const WInstProto *proto = winst_library_key(library, key);
+        if (proto) {
             if (stats) {
                 stats->keyed_models++;
                 stats->lod_fallbacks += lod != 0;
@@ -243,12 +322,9 @@ static const WInstProto *winst_library_resolve(const WInstLibrary *library,
  * prototype for a requested asset. */
 static int winst_proto_has_own_matrix(const WInstLibrary *library,
                                       const WInstProto *proto) {
-    if (!library || !proto || !proto->has_matrix || proto->scene.count <= 0)
+    if (!library || !proto || !proto->has_matrix || proto->mesh_count <= 0)
         return 0;
-    for (int mesh = 0; mesh < proto->scene.count; mesh++) {
-        int cat = proto->scene.meshes[mesh].cat;
-        if (cat != N2_ROAD && cat != N2_TERRAIN) return 0;
-    }
+    if (!proto->all_ground) return 0;
     for (int i = 0; i < library->count; i++)
         if (&library->items[i] != proto &&
             !strcmp(library->items[i].name, proto->name)) return 0;
@@ -286,9 +362,12 @@ static uint32_t winst_model_identity(const unsigned char *data, long begin,
     return key;
 }
 
+/* reload == NULL: library scan; record the prototype's metadata and discard
+ * its geometry. reload != NULL: re-parse that prototype's geometry into it. */
 static void winst_collect_model(WInstLibrary *library, const unsigned char *data,
                                 long begin, long end,
-                                const uint32_t *keys, int nkeys) {
+                                const uint32_t *keys, int nkeys,
+                                WInstProto *reload) {
     N2Scene local;
     memset(&local, 0, sizeof local);
     int cat = n2_mesh_category(data, begin, end);
@@ -383,8 +462,10 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
                         subkey ? subkey : texkey, NULL,
                         (long)sub[i].start, (long)sub[i].count,
                         (unsigned char)N2_DRAW_OPAQUE);
-            for (int j = before; j < local.count; j++)
+            for (int j = before; j < local.count; j++) {
                 local.meshes[j].mat_exact = (unsigned char)exact;
+                local.meshes[j].reflect = (sub[i].flags & N2_SUB_REFLECT) != 0;
+            }
         }
     } else {
         int exact_single_slot = nslot == 1 && slot[0] != 0;
@@ -400,12 +481,46 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
         local.meshes[i].scen = (unsigned char)scen;
         snprintf(local.meshes[i].sname, sizeof local.meshes[i].sname, "%.31s", name);
     }
-    if (local.count && winst_library_add(library, &local, name, matrix,
-                                         has_matrix, is_vista)) {
-        library->items[library->count - 1].model_key = model_key;
+    if (reload) {
+        reload->scene = local;
         return;
     }
+    int count = local.count, any_ground = 0, all_ground = 1, index_count = 0;
+    for (int i = 0; i < count; i++) {
+        int g = local.meshes[i].cat == N2_ROAD || local.meshes[i].cat == N2_TERRAIN;
+        any_ground |= g;
+        all_ground &= g;
+        index_count += local.meshes[i].nidx;
+    }
     winst_free_scene(&local);
+    N2Scene empty;
+    memset(&empty, 0, sizeof empty);
+    if (count && winst_library_add(library, &empty, name, matrix,
+                                   has_matrix, is_vista)) {
+        WInstProto *proto = &library->items[library->count - 1];
+        proto->model_key = model_key;
+        proto->mesh_count = count;
+        proto->index_count = index_count;
+        proto->any_ground = (unsigned char)any_ground;
+        proto->all_ground = (unsigned char)all_ground;
+        proto->begin = begin;
+        proto->end = end;
+    }
+}
+
+/* Parse a prototype's geometry on first use. */
+static const N2Scene *winst_proto_load(const WInstLibrary *library, WInstProto *proto) {
+    if (!proto->loaded) {
+        winst_collect_model((WInstLibrary *)library, library->data, proto->begin, proto->end,
+                            library->keys, library->nkeys, proto);
+        proto->loaded = 1;
+    }
+    return &proto->scene;
+}
+
+static void winst_proto_unload(WInstProto *proto) {
+    winst_free_scene(&proto->scene);
+    proto->loaded = 0;
 }
 
 static void winst_collect_models(WInstLibrary *library, const unsigned char *data,
@@ -419,7 +534,7 @@ static void winst_collect_models(WInstLibrary *library, const unsigned char *dat
         if ((uint64_t)size > (uint64_t)(end - payload)) return;
         long object_end = payload + (long)size;
         if (magic == 0x80134010u)
-            winst_collect_model(library, data, payload, object_end, keys, nkeys);
+            winst_collect_model(library, data, payload, object_end, keys, nkeys, NULL);
         else if (magic != 0 && (magic >> 28) == 8)
             winst_collect_models(library, data, payload, object_end, keys, nkeys);
         offset = object_end;
@@ -725,6 +840,9 @@ static int winst_bbox_in_range(const WInstPlacement *placement,
     return dx * dx + dy * dy <= radius * radius;
 }
 
+#ifdef __vita__
+static Uint64 g_visit_ticks;   /* time spent placing (vs scanning) this build */
+#endif
 static int winst_visit_section(const WInstSection *section,
                                float focus_x, float focus_y, float view_radius,
                                WInstInternalVisitFn visit, void *userdata,
@@ -737,6 +855,9 @@ static int winst_visit_section(const WInstSection *section,
             winst_reject(stats);
             continue;
         }
+        placement.record_id = record;
+        placement.region_id = section->region_id;
+        placement.record_index = i;
         if (!winst_bbox_in_range(&placement, focus_x, focus_y, view_radius)) continue;
         if (stats) stats->instances_in_range++;
         if (placement.type_index >= (unsigned)section->type_count) {
@@ -753,7 +874,14 @@ static int winst_visit_section(const WInstSection *section,
         type_name[32] = 0;
         for (int lod = 0; lod < 3; lod++)
             placement.model_keys[lod] = n2_u32(type + 0x20 + lod * 4);
+#ifdef __vita__
+        Uint64 t0 = SDL_GetPerformanceCounter();
+        int ok = !visit || visit(&placement, type_name, userdata);
+        g_visit_ticks += SDL_GetPerformanceCounter() - t0;
+        if (!ok) return 0;
+#else
         if (visit && !visit(&placement, type_name, userdata)) return 0;
+#endif
     }
     return 1;
 }
@@ -814,6 +942,55 @@ static int winst_mark_section_ids(const unsigned char *data, long begin, long en
                                            present,present_cap)) return 0;
         pos=child_end;
     }
+    return 1;
+}
+
+static unsigned char *winst_read_named(const char *root, const char *name, long *len);
+int world_instance_district_boxes(const char *track_root, const char *bundle,
+                                  float (**boxes)[4], int *count) {
+    if (!track_root || !bundle || !boxes || !count) return 0;
+    *boxes = NULL; *count = 0;
+    const char *stem = !strncmp(bundle, "STREAM", 6) ? bundle + 6 : bundle;
+    char companion[64];
+    snprintf(companion, sizeof companion, "%s", stem);
+    char *dot = strrchr(companion, '.');
+    if (dot && !strcmp(dot, ".BUN")) *dot = 0;
+    long len = 0;
+    unsigned char *data = winst_read_named(track_root, companion, &len);
+    if (!data) return 0;
+    WInstRegion *regions = NULL; int n = 0;
+    int ok = winst_parse_regions(data, len, &regions, &n) && n > 0;
+    free(data);
+    if (ok && (*boxes = (float (*)[4])malloc((size_t)n * sizeof **boxes)) != NULL) {
+        for (int i = 0; i < n; i++) memcpy((*boxes)[i], regions[i].bb, sizeof (*boxes)[i]);
+        *count = n;
+    } else ok = 0;
+    winst_free_regions(regions, n);
+    return ok;
+}
+
+int world_instance_bounds(const char *track_root, const char *bundle, float out[4]) {
+    if (!track_root || !bundle || !out) return 0;
+    const char *stem = !strncmp(bundle, "STREAM", 6) ? bundle + 6 : bundle;
+    char companion[64];
+    snprintf(companion, sizeof companion, "%s", stem);
+    char *dot = strrchr(companion, '.');
+    if (dot && !strcmp(dot, ".BUN")) *dot = 0;
+    long len = 0;
+    unsigned char *data = winst_read_named(track_root, companion, &len);
+    if (!data) return 0;
+    WInstRegion *regions = NULL; int count = 0;
+    int ok = winst_parse_regions(data, len, &regions, &count) && count > 0;
+    free(data);
+    if (!ok) { winst_free_regions(regions, count); return 0; }
+    out[0] = out[1] = 1e30f; out[2] = out[3] = -1e30f;
+    for (int i = 0; i < count; i++) {
+        if (regions[i].bb[0] < out[0]) out[0] = regions[i].bb[0];
+        if (regions[i].bb[1] < out[1]) out[1] = regions[i].bb[1];
+        if (regions[i].bb[2] > out[2]) out[2] = regions[i].bb[2];
+        if (regions[i].bb[3] > out[3]) out[3] = regions[i].bb[3];
+    }
+    winst_free_regions(regions, count);
     return 1;
 }
 
@@ -892,42 +1069,460 @@ int winst_test_collect_placements(const unsigned char *section_data,
 #endif
 
 typedef struct {
-    const WInstLibrary *library;
+    WInstLibrary *library;
     N2Scene *scene;
     N2Scene *vista;
     WInstStats *stats;
 } WInstBuildVisit;
 
-static int winst_build_visit(const WInstPlacement *placement,
+static int winst_build_visit_uncached(const WInstPlacement *placement,
                              const char *type_name, void *userdata) {
     WInstBuildVisit *build = (WInstBuildVisit *)userdata;
+#ifdef __vita__
+    if (world_build_aborted()) return 0;
+#endif
     const WInstProto *proto = winst_library_resolve(build->library, placement,
                                                     type_name, build->stats);
     if (!proto) return 1;
+    const N2Scene *meshes = winst_proto_load(build->library, (WInstProto *)proto);
+    const WInstProto *low = proto;
+    /* Only authored scenery alternatives. Ground, vistas and category mixtures
+     * stay intact. Keep the original geometry for collision separately. */
+    int compatible = !proto->any_ground && !proto->is_vista && meshes->count > 0;
+    for (int i = 0; i < meshes->count; i++)
+        compatible &= meshes->meshes[i].cat == N2_OTHER;
+    if (g_world_low_detail && compatible) {
+        for (int lod = 0; lod < 3; lod++) {
+            uint32_t key = placement->model_keys[lod];
+            if (!key) continue;
+            const WInstProto *p = winst_library_key(build->library, key);
+            if (p && !p->any_ground && !p->is_vista &&
+                p->index_count > 0 && p->index_count < low->index_count) {
+                const N2Scene *candidate = winst_proto_load(build->library, (WInstProto *)p);
+                int ok = candidate->count > 0;
+                for (int k = 0; k < candidate->count; k++)
+                    ok &= candidate->meshes[k].cat == N2_OTHER &&
+                          candidate->meshes[k].scen == meshes->meshes[0].scen;
+                if (ok) low = p;
+            }
+        }
+    }
     N2Scene *dst = proto->is_vista ? build->vista : build->scene;
-    for (int i = 0; i < proto->scene.count; i++) {
-        const N2Mesh *mesh = &proto->scene.meshes[i];
+    for (int i = 0; i < meshes->count; i++) {
+        const N2Mesh *mesh = &meshes->meshes[i];
         int ground = mesh->cat == N2_ROAD || mesh->cat == N2_TERRAIN;
         /* A chunk prototype belongs to the ground pass outright. An instanced
          * one is placed here, at its own record's matrix, like anything else:
          * leaving it to the ground pass stranded every copy on one authored
          * origin, up to 855 m from where the record puts it. */
         if (ground && !proto->instanced) continue;
-        if (!winst_place_mesh(dst, mesh, placement->matrix, type_name,
+        N2Mesh source = *mesh;
+        if (low != proto) {
+            /* Collision copy; its prelighting is kept so a build that places
+               it near the car can draw it instead of the stand-in. */
+            source.world_role = 1;
+        }
+        if (!winst_place_mesh(dst, &source, placement->matrix, type_name,
                              build->stats)) return 0;
         if (ground && build->stats) build->stats->instanced_ground_meshes++;
     }
+    if (low != proto) {
+        const N2Scene *simple = &low->scene;
+        for (int i = 0; i < simple->count; i++) {
+            N2Mesh source = simple->meshes[i];
+            source.world_role = 2;
+            if (!winst_place_mesh(dst, &source, placement->matrix, type_name, build->stats)) return 0;
+        }
+        if (build->stats) {
+            build->stats->lod_replacements++;
+            build->stats->lod_saved_indices += proto->index_count - low->index_count;
+        }
+    }
     return 1;
+}
+
+#ifdef __vita__
+/* Cache source placements inside fixed 128 m tiles. Each resident owns its
+ * mesh metadata, while the tile and residents share immutable payloads. Only
+ * the serial builder touches this table; final payload release may occur on
+ * the render thread and therefore uses atomic reference counts. */
+typedef struct WInstCachedPlacement {
+    struct WInstCachedPlacement *next;
+    const unsigned char *record;
+    int tile_x, tile_y;
+    N2Scene scene;
+    size_t bytes;
+    unsigned touched;
+    int ground;
+    long lod_replacements, lod_saved_indices;
+} WInstCachedPlacement;
+#define WINST_CACHE_SLOTS 4096
+#define WINST_CACHE_LIMIT (24u * 1024u * 1024u)
+#define WINST_GROUND_CACHE_LIMIT (8u * 1024u * 1024u)
+#define WINST_SCENERY_CACHE_LIMIT (WINST_CACHE_LIMIT-WINST_GROUND_CACHE_LIMIT)
+static WInstCachedPlacement *g_placement_cache[WINST_CACHE_SLOTS];
+static size_t g_placement_cache_bytes;
+static size_t g_ground_cache_bytes;
+static const unsigned char *g_placement_cache_bundle;
+static int g_placement_cache_detail, g_placement_cache_event;
+static long g_cpu_cache_hits, g_cpu_cache_misses;
+static long g_ground_cache_hits;
+typedef struct { WInstCachedPlacement *entry; float distance2; unsigned slot; int ground; } WInstCacheVictim;
+static WInstCacheVictim *g_cache_victims;
+static int g_cache_victim_count, g_cache_victim_next[2];
+static unsigned g_cache_epoch;
+static float g_cache_focus_x, g_cache_focus_y;
+static long g_cache_evicted;
+static long g_lod_near_kept;   /* placements drawn full near the centre (this build) */
+size_t world_instance_cache_bytes(void) { return g_placement_cache_bytes; }
+/* Drop every cached placement (payloads still used by the active resident
+   stay alive through their reference counts). Called after a build failed
+   for memory: the next build is slower without reuse, but the heap gets back
+   the cache's scattered blocks. Only while no build job runs. */
+void world_instance_cache_flush(void) {
+    long n = 0; size_t bytes = g_placement_cache_bytes;
+    for (int i = 0; i < WINST_CACHE_SLOTS; i++)
+        while (g_placement_cache[i]) {
+            WInstCachedPlacement *e = g_placement_cache[i];
+            g_placement_cache[i] = e->next;
+            winst_free_scene(&e->scene); free(e); n++;
+        }
+    g_placement_cache_bytes = g_ground_cache_bytes = 0;
+    free(g_cache_victims); g_cache_victims = NULL;
+    g_cache_victim_count = g_cache_victim_next[0] = g_cache_victim_next[1] = 0;
+    printf("placement cache flushed: %ld entries, %u KB\n", n, (unsigned)(bytes >> 10));
+}
+
+static float winst_cache_distance2(int tile_x, int tile_y) {
+    float dx=(tile_x+0.5f)*128-g_cache_focus_x;
+    float dy=(tile_y+0.5f)*128-g_cache_focus_y;
+    return dx*dx+dy*dy;
+}
+static int winst_cache_victim_cmp(const void *a, const void *b) {
+    float x=((const WInstCacheVictim *)a)->distance2;
+    float y=((const WInstCacheVictim *)b)->distance2;
+    return x>y ? -1 : x<y;
+}
+
+static size_t winst_cache_category_bytes(int ground) {
+    return ground ? g_ground_cache_bytes : g_placement_cache_bytes-g_ground_cache_bytes;
+}
+
+static int winst_cache_make_room(size_t bytes, int tile_x, int tile_y, int ground) {
+    size_t limit=ground ? WINST_GROUND_CACHE_LIMIT : WINST_SCENERY_CACHE_LIMIT;
+    if (bytes > limit) return 0;
+    float distance2=winst_cache_distance2(tile_x,tile_y);
+    while (bytes > limit-winst_cache_category_bytes(ground) &&
+           g_cache_victim_next[ground] < g_cache_victim_count) {
+        WInstCacheVictim *v=&g_cache_victims[g_cache_victim_next[ground]];
+        /* Sorted farthest first. Prefer a materially closer incoming tile;
+           do not churn tiles already reused by this build. */
+        if (v->distance2 <= distance2 + 128*128) break;
+        g_cache_victim_next[ground]++;
+        /* Other category may already have freed its entry. The snapshot's
+           category is safe to inspect without touching that payload. */
+        if (v->ground!=ground) continue;
+        WInstCachedPlacement *e=v->entry;
+        if (e->touched==g_cache_epoch) continue;
+        WInstCachedPlacement **p=&g_placement_cache[v->slot];
+        while (*p && *p!=e) p=&(*p)->next;
+        assert(*p==e);
+        *p=e->next; g_placement_cache_bytes-=e->bytes;
+        if (e->ground) g_ground_cache_bytes-=e->bytes;
+        winst_free_scene(&e->scene); free(e); g_cache_evicted++;
+    }
+    return bytes <= limit-winst_cache_category_bytes(ground);
+}
+
+static unsigned winst_cache_slot(const unsigned char *record) {
+    return ((uintptr_t)record >> 6) & (WINST_CACHE_SLOTS - 1);
+}
+
+static void winst_cache_begin(const unsigned char *bundle, int event,
+                             float x, float y, float radius) {
+    free(g_cache_victims); g_cache_victims=NULL;
+    g_cache_victim_count=g_cache_victim_next[0]=g_cache_victim_next[1]=0;
+    g_cache_focus_x=x; g_cache_focus_y=y;
+    g_cache_epoch++; g_cache_evicted=0;
+    g_lod_near_kept=0;
+    int entries=0;
+    int reset = bundle != g_placement_cache_bundle ||
+        event != g_placement_cache_event || g_world_low_detail != g_placement_cache_detail;
+    for (int i = 0; i < WINST_CACHE_SLOTS; i++) {
+        WInstCachedPlacement **p = &g_placement_cache[i];
+        while (*p) {
+            WInstCachedPlacement *e = *p;
+            float dx = (e->tile_x + 0.5f) * 128 - x;
+            float dy = (e->tile_y + 0.5f) * 128 - y;
+            if (reset || dx*dx + dy*dy > (radius+256)*(radius+256)) {
+                *p = e->next; g_placement_cache_bytes -= e->bytes;
+                if (e->ground) g_ground_cache_bytes-=e->bytes;
+                winst_free_scene(&e->scene); free(e);
+                g_cache_evicted++;
+            } else { entries++; p = &e->next; }
+        }
+    }
+    g_placement_cache_bundle = bundle; g_placement_cache_event = event;
+    g_placement_cache_detail = g_world_low_detail;
+    g_cpu_cache_hits = g_cpu_cache_misses = 0;
+    g_ground_cache_hits=0;
+    if (entries) g_cache_victims=malloc((size_t)entries*sizeof *g_cache_victims);
+    if (g_cache_victims) {
+        for (unsigned i=0; i<WINST_CACHE_SLOTS; i++)
+            for (WInstCachedPlacement *e=g_placement_cache[i]; e; e=e->next) {
+                WInstCacheVictim *v=&g_cache_victims[g_cache_victim_count++];
+                v->entry=e; v->slot=i;
+                v->ground=e->ground;
+                v->distance2=winst_cache_distance2(e->tile_x,e->tile_y);
+            }
+        qsort(g_cache_victims,(size_t)g_cache_victim_count,sizeof *g_cache_victims,
+              winst_cache_victim_cmp);
+    }
+}
+#endif
+
+
+#ifdef __vita__
+static int winst_cache_store(N2Scene *scene, int before, const unsigned char *record,
+                             int tile_x, int tile_y, int ground,
+                             long lod_replacements, long lod_saved_indices) {
+    int count = scene->count - before;
+    size_t bytes = sizeof(WInstCachedPlacement) + (size_t)count * sizeof(N2Mesh);
+    if (!record || count <= 0) return 1;
+    for (int i = before; i < scene->count; i++) {
+        N2Mesh *m = &scene->meshes[i];
+        if (!m->world_bounds_valid || m->shared_geometry) return 1;
+        if (ground ? (m->cat != N2_ROAD && m->cat != N2_TERRAIN) : m->cat != N2_OTHER) return 1;
+        /* Reserve room for persistent packed vertices as well as geometry. */
+        bytes += sizeof(N2SharedGeometry) + (size_t)m->nidx * sizeof(uint16_t) +
+            (size_t)m->nverts * ((m->authored_normals ? 8 : 5)*sizeof(float) +
+                               (m->vcol ? 4 : 0) + (m->world_role == 1 ? 0 : 28));   /* 28 B packed vertex */
+    }
+    if (!winst_cache_make_room(bytes,tile_x,tile_y,ground)) return 1;
+    WInstCachedPlacement *e = calloc(1,sizeof *e);
+    if (!e) return 1;
+    e->scene.meshes = calloc((size_t)count,sizeof(N2Mesh));
+    if (!e->scene.meshes) { free(e); return 1; }
+    for (int i = 0; i < count; i++) {
+        N2Mesh *m = &scene->meshes[before+i];
+        N2SharedGeometry *g = calloc(1,sizeof *g);
+        if (!g) { winst_free_scene(&e->scene); free(e); return 1; }
+        g->refs = 2; g->verts=m->verts; g->idx=m->idx; g->vcol=m->vcol;
+        m->shared_geometry = g;
+        e->scene.meshes[e->scene.count++] = *m;
+    }
+    e->record=record; e->bytes=bytes; e->ground=ground;
+    e->tile_x=tile_x; e->tile_y=tile_y; e->touched=g_cache_epoch;
+    e->lod_replacements=lod_replacements;
+    e->lod_saved_indices=lod_saved_indices;
+    unsigned slot=winst_cache_slot(record);
+    e->next=g_placement_cache[slot]; g_placement_cache[slot]=e;
+    g_placement_cache_bytes += bytes;
+    if (ground) g_ground_cache_bytes+=bytes;
+    return 1;
+}
+
+static int winst_cache_append_ground(WInstCachedPlacement *cached, N2Scene *dst,
+                                    float x, float y, float radius, int own_matrix,
+                                    WInstStats *stats) {
+    cached->touched=g_cache_epoch;
+    for (int k=0; k<cached->scene.count; k++) {
+        N2Mesh m=cached->scene.meshes[k]; float *bb=m.world_bounds;
+        float dx=x<bb[0]?bb[0]-x:x>bb[3]?x-bb[3]:0;
+        float dy=y<bb[1]?bb[1]-y:y>bb[4]?y-bb[4]:0;
+        if (radius>0 && dx*dx+dy*dy>radius*radius) continue;
+        __atomic_add_fetch(&m.shared_geometry->refs,1,__ATOMIC_RELAXED);
+        if (!winst_push_mesh(dst,m)) { n2_mesh_geometry_release(&m); return 0; }
+        if (stats) { stats->meshes_placed++; if (own_matrix) stats->own_matrix_meshes++; }
+        g_ground_cache_hits++;
+    }
+    return 1;
+}
+#endif
+
+#ifdef __vita__
+/* Low detail swaps scenery for its cheapest authored model -- often flat
+ * cards meant for the distance. Placements within this range of the build
+ * centre draw their full model instead (it is already placed, as the
+ * collision copy); the stand-in is dropped. The car stays well inside it
+ * between builds, and fog hides most of what lies beyond. */
+#define WINST_LOD_NEAR_M 280.0f
+
+/* Applies the near/far choice to the meshes one placement appended at
+ * [before, count). Cached entries keep both versions; only this build's
+ * copies change. */
+static void winst_lod_resolve(N2Scene *scene, int before, const float matrix[16]) {
+    int has_low = 0;
+    for (int i = before; i < scene->count; i++) has_low |= scene->meshes[i].world_role == 2;
+    if (!has_low) return;
+    float dx = matrix[12] - g_cache_focus_x, dy = matrix[13] - g_cache_focus_y;
+    int near = !g_winst_convert && dx*dx + dy*dy < WINST_LOD_NEAR_M*WINST_LOD_NEAR_M;
+    int w = before;
+    for (int i = before; i < scene->count; i++) {
+        N2Mesh m = scene->meshes[i];
+        if (near && m.world_role == 2) { n2_mesh_geometry_release(&m); continue; }
+        if (near && m.world_role == 1) m.world_role = 0;
+        /* converting: a tile decides near/far at load, and near draws this
+           copy, so its prelight must survive (dropping it drew those models
+           unshaded, too bright -- 10-09) */
+        else if (!near && !g_winst_convert && m.world_role == 1 && m.shared_geometry) m.vcol = NULL;
+        scene->meshes[w++] = m;
+    }
+    scene->count = w;
+    if (near) g_lod_near_kept++;
+}
+#endif
+
+static int winst_build_visit_inner(const WInstPlacement *placement,
+                                   const char *type_name, void *userdata);
+/* Every mesh a placement emits carries its scenery record. */
+static int winst_build_visit(const WInstPlacement *placement,
+                             const char *type_name, void *userdata) {
+    WInstBuildVisit *b = userdata;
+    int s0 = b->scene->count, v0 = b->vista->count;
+    if (!winst_build_visit_inner(placement, type_name, userdata)) return 0;
+    if (placement->region_id >= 0 && placement->region_id <= 0xFFFF &&
+        placement->record_index >= 0 && placement->record_index <= 0xFFFF) {
+        for (int i = s0; i < b->scene->count; i++) {
+            N2Mesh *m = &b->scene->meshes[i];
+            m->scen_has = 1; m->scen_region = (uint16_t)placement->region_id;
+            m->scen_index = (uint16_t)placement->record_index;
+        }
+        for (int i = v0; i < b->vista->count; i++) {
+            N2Mesh *m = &b->vista->meshes[i];
+            m->scen_has = 1; m->scen_region = (uint16_t)placement->region_id;
+            m->scen_index = (uint16_t)placement->record_index;
+        }
+    }
+    return 1;
+}
+static int winst_build_visit_inner(const WInstPlacement *placement,
+                                   const char *type_name, void *userdata) {
+#ifdef __vita__
+    WInstBuildVisit *build = userdata;
+    if (world_build_aborted()) return 0;
+    if (!g_placement_cache_bundle)
+        return winst_build_visit_uncached(placement,type_name,userdata);
+    unsigned slot = winst_cache_slot(placement->record_id);
+    if (placement->record_id) for (WInstCachedPlacement *e = g_placement_cache[slot]; e; e=e->next) {
+        if (e->ground || e->record != placement->record_id) continue;
+        e->touched=g_cache_epoch;
+        for (int i = 0; i < e->scene.count; i++) {
+            N2Mesh m = e->scene.meshes[i];
+            __atomic_add_fetch(&m.shared_geometry->refs, 1, __ATOMIC_RELAXED);
+            if (!winst_push_mesh(build->scene, m)) { n2_mesh_geometry_release(&m); return 0; }
+        }
+        build->stats->meshes_placed += e->scene.count;
+        build->stats->lod_replacements += e->lod_replacements;
+        build->stats->lod_saved_indices += e->lod_saved_indices;
+        g_cpu_cache_hits++;
+        winst_lod_resolve(build->scene, build->scene->count - e->scene.count, placement->matrix);
+        return 1;
+    }
+    int before = build->scene->count;
+    long lod_before = build->stats->lod_replacements, saved_before = build->stats->lod_saved_indices;
+    if (!winst_build_visit_uncached(placement,type_name,userdata)) return 0;
+    g_cpu_cache_misses++;
+    int stored = winst_cache_store(build->scene,before,placement->record_id,
+        (int)floorf(placement->matrix[12]/128),(int)floorf(placement->matrix[13]/128),0,
+        build->stats->lod_replacements-lod_before,build->stats->lod_saved_indices-saved_before);
+    winst_lod_resolve(build->scene, before, placement->matrix);
+    return stored;
+#else
+    return winst_build_visit_uncached(placement,type_name,userdata);
+#endif
+}
+
+void world_instance_cache_selftest(void) {
+#ifdef __vita__
+    /* Production lookup and eviction, without depending on track files. */
+    static const unsigned char identity[64] = {0};
+    winst_cache_begin(identity,0,0,0,400);
+    WInstCachedPlacement *e = calloc(1,sizeof *e);
+    assert(e);
+    e->record=identity; e->bytes=sizeof *e + sizeof(N2Mesh);
+    e->scene.meshes=calloc(1,sizeof(N2Mesh)); assert(e->scene.meshes);
+    e->scene.count=e->scene.cap=1;
+    N2Mesh *m=&e->scene.meshes[0];
+    m->verts=calloc(15,sizeof(float)); m->idx=calloc(3,sizeof(uint16_t));
+    m->nverts=m->nidx=3; m->cat=N2_OTHER;
+    m->shared_geometry=calloc(1,sizeof(N2SharedGeometry));
+    assert(m->verts && m->idx && m->shared_geometry);
+    m->shared_geometry->refs=1; m->shared_geometry->verts=m->verts;
+    m->shared_geometry->idx=m->idx;
+    unsigned slot=winst_cache_slot(identity);
+    e->next=g_placement_cache[slot]; g_placement_cache[slot]=e;
+    g_placement_cache_bytes+=e->bytes;
+    N2Scene scene={0},vista={0}; WInstStats stats={0};
+    WInstBuildVisit visit={NULL,&scene,&vista,&stats};
+    WInstPlacement placement={0}; placement.record_id=identity;
+    assert(winst_build_visit(&placement,"fixture",&visit));
+    assert(scene.count==1 && scene.meshes[0].verts==m->verts);
+    assert(m->shared_geometry->refs==2 && g_cpu_cache_hits==1);
+    /* Retiring a resident must preserve the tile's data. */
+    winst_free_scene(&scene); assert(m->shared_geometry->refs==1);
+    assert(winst_build_visit(&placement,"fixture",&visit));
+    /* Evicting a tile must preserve a resident's outstanding reference. */
+    winst_cache_begin(identity,0,4096,4096,400);
+    assert(g_placement_cache_bytes==0);
+    assert(scene.meshes[0].shared_geometry->refs==1);
+    scene.meshes[0].verts[0]=7; assert(scene.meshes[0].verts[0]==7);
+    /* Simulate a full reservation with two small actual payloads. Incoming
+       nearby data must evict the farther tile and preserve live residents. */
+    for (int i=0; i<2; i++) {
+        WInstCachedPlacement *v=calloc(1,sizeof *v); assert(v);
+        v->record=identity+i; v->tile_x=i ? 3 : 0;
+        v->bytes=WINST_SCENERY_CACHE_LIMIT/2;
+        v->scene.meshes=malloc(sizeof(N2Mesh)); assert(v->scene.meshes);
+        v->scene.count=v->scene.cap=1;
+        v->scene.meshes[0]=scene.meshes[0];
+        __atomic_add_fetch(&v->scene.meshes[0].shared_geometry->refs,1,__ATOMIC_RELAXED);
+        unsigned vs=winst_cache_slot(v->record);
+        v->next=g_placement_cache[vs]; g_placement_cache[vs]=v;
+        g_placement_cache_bytes+=v->bytes;
+    }
+    winst_cache_begin(identity,0,0,0,400);
+    assert(winst_cache_make_room(WINST_GROUND_CACHE_LIMIT,0,0,1));
+    assert(g_cache_evicted==0);
+    assert(winst_cache_make_room(1024*1024,0,0,0));
+    assert(g_cache_evicted==1 && g_placement_cache_bytes==WINST_SCENERY_CACHE_LIMIT/2);
+    assert(scene.meshes[0].shared_geometry->refs==2);
+    /* A request farther away must not displace the closer remaining tile. */
+    assert(!winst_cache_make_room(WINST_SCENERY_CACHE_LIMIT/2+1,4,0,0));
+    assert(!winst_cache_make_room(WINST_GROUND_CACHE_LIMIT+1,0,0,1));
+    winst_cache_begin(NULL,0,0,0,0);
+    assert(scene.meshes[0].shared_geometry->refs==1);
+    N2Mesh *terrain=&scene.meshes[0]; terrain->cat=N2_TERRAIN;
+    terrain->world_bounds_valid=1;
+    float ground_bounds[6]={0,0,0,2,2,0};
+    memcpy(terrain->world_bounds,ground_bounds,sizeof ground_bounds);
+    n2_mesh_bias_terrain(terrain);
+    float height=terrain->verts[2]; n2_mesh_bias_terrain(terrain);
+    assert(height==-0.05f && terrain->verts[2]==height && terrain->world_bounds[2]==height);
+    N2Mesh ground_samples[2]={*terrain,*terrain};
+    ground_samples[1].world_bounds[0]=ground_samples[1].world_bounds[1]=1000;
+    ground_samples[1].world_bounds[3]=ground_samples[1].world_bounds[4]=1002;
+    __atomic_add_fetch(&terrain->shared_geometry->refs,2,__ATOMIC_RELAXED);
+    WInstCachedPlacement ground={0}; ground.scene=(N2Scene){ground_samples,2,2};
+    N2Scene clipped={0}; WInstStats ground_stats={0};
+    assert(winst_cache_append_ground(&ground,&clipped,0,0,10,1,&ground_stats));
+    assert(clipped.count==1 && clipped.meshes[0].world_bounds[0]==0);
+    n2_mesh_bias_terrain(&clipped.meshes[0]); assert(clipped.meshes[0].verts[2]==height);
+    winst_free_scene(&clipped);
+    assert(winst_cache_append_ground(&ground,&clipped,1000,1000,10,1,&ground_stats));
+    assert(clipped.count==1 && clipped.meshes[0].world_bounds[0]==1000);
+    assert(ground_stats.meshes_placed==2 && ground_stats.own_matrix_meshes==2);
+    winst_free_scene(&clipped);
+    n2_mesh_geometry_release(&ground_samples[0]); n2_mesh_geometry_release(&ground_samples[1]);
+    assert(terrain->shared_geometry->refs==1);
+    winst_free_scene(&scene);
+#endif
 }
 
 /* winst_collect_model assigns one category to a whole object, so a prototype
  * is ground or it is not. */
 static int winst_proto_is_ground(const WInstProto *proto) {
-    for (int i = 0; i < proto->scene.count; i++) {
-        int cat = proto->scene.meshes[i].cat;
-        if (cat == N2_ROAD || cat == N2_TERRAIN) return 1;
-    }
-    return 0;
+    return proto->any_ground;
 }
 
 typedef struct {
@@ -1000,26 +1595,141 @@ static int winst_mark_instanced(const WInstPlacement *placement,
     return 1;
 }
 
+/* XY distance from (x,y) to a mesh's bounds after `matrix` (column-major,
+   as winst_place_mesh applies it). */
+static float winst_mesh_dist2(const N2Mesh *m, const float *matrix, float x, float y,
+                              float out_bb[4]) {
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (int v = 0; v < m->nverts; v++) {
+        const float *p = m->verts + v*5;
+        float wx = matrix[0]*p[0] + matrix[4]*p[1] + matrix[8]*p[2] + matrix[12];
+        float wy = matrix[1]*p[0] + matrix[5]*p[1] + matrix[9]*p[2] + matrix[13];
+        if (wx < x0) x0 = wx; if (wx > x1) x1 = wx;
+        if (wy < y0) y0 = wy; if (wy > y1) y1 = wy;
+    }
+    out_bb[0] = x0; out_bb[1] = y0; out_bb[2] = x1; out_bb[3] = y1;
+    if (x0 > x1) return 1e30f;
+    float dx = x < x0 ? x0 - x : x > x1 ? x - x1 : 0.0f;
+    float dy = y < y0 ? y0 - y : y > y1 ? y - y1 : 0.0f;
+    return dx*dx + dy*dy;
+}
+
+#ifdef __vita__
+/* The pinned bundle never changes, so neither does the library order: the
+   placed ground bounds of prototype i are remembered across builds and far
+   prototypes are skipped without being parsed. Builds run one at a time. */
+static float (*g_ground_bb)[4];   /* x0 y0 x1 y1; x0 > x1 = not measured */
+static int g_ground_bb_n;
+static signed char *own_memo; static const void *own_memo_items; static int own_memo_n;
+#endif
+
 static int winst_place_ground_prototypes(const WInstLibrary *library,
                                          N2Scene *scene, N2Scene *vista,
-                                         WInstStats *stats) {
+                                         WInstStats *stats,
+                                         float focus_x, float focus_y, float radius) {
     static const float identity[16] = {
         1, 0, 0, 0, 0, 1, 0, 0,
         0, 0, 1, 0, 0, 0, 0, 1,
     };
     if (!library || !scene || !vista) return 0;
+#ifdef __vita__
+    if (g_ground_bb_n != library->count) {
+        free(g_ground_bb);
+        g_ground_bb = (float (*)[4])malloc((size_t)library->count * sizeof *g_ground_bb);
+        g_ground_bb_n = g_ground_bb ? library->count : 0;
+        for (int i = 0; i < g_ground_bb_n; i++) { g_ground_bb[i][0] = 1.0f; g_ground_bb[i][2] = 0.0f; }
+    }
+#endif
     for (int i = 0; i < library->count; i++) {
-        const WInstProto *proto = &library->items[i];
-        if (proto->instanced) continue;
+        WInstProto *proto = (WInstProto *)&library->items[i];
+        if (proto->instanced || !proto->any_ground) continue;
+#ifdef __vita__
+        /* before anything costly: winst_proto_has_own_matrix scans every
+           prototype name, which over the whole library was seconds a build */
+        float *gb = g_ground_bb && !proto->is_vista && radius > 0.0f ? g_ground_bb[i] : NULL;
+        if (gb && gb[0] <= gb[2]) {
+            float dx = focus_x < gb[0] ? gb[0]-focus_x : focus_x > gb[2] ? focus_x-gb[2] : 0.0f;
+            float dy = focus_y < gb[1] ? gb[1]-focus_y : focus_y > gb[3] ? focus_y-gb[3] : 0.0f;
+            if (dx*dx + dy*dy > radius*radius) continue;   /* wholly out of range */
+        }
+#endif
+#ifdef __vita__
+        /* Position independent, and a scan of every prototype name per call
+           (~1300 ground prototypes x 10698 names a build): remember it for
+           the cached library. */
+        if (own_memo_items != (const void *)library->items || own_memo_n != library->count) {
+            free(own_memo);
+            own_memo = (signed char *)malloc((size_t)(library->count ? library->count : 1));
+            if (own_memo) memset(own_memo, -1, (size_t)(library->count ? library->count : 1));
+            own_memo_items = library->items; own_memo_n = own_memo ? library->count : 0;
+        }
+        int own_matrix;
+        if (own_memo && i < own_memo_n) {
+            if (own_memo[i] < 0) own_memo[i] = (signed char)winst_proto_has_own_matrix(library, proto);
+            own_matrix = own_memo[i];
+        } else own_matrix = winst_proto_has_own_matrix(library, proto);
+#else
         int own_matrix = winst_proto_has_own_matrix(library, proto);
+#endif
         const float *matrix = own_matrix ? proto->matrix : identity;
         N2Scene *dst = proto->is_vista ? vista : scene;
-        for (int mesh = 0; mesh < proto->scene.count; mesh++) {
-            const N2Mesh *source = &proto->scene.meshes[mesh];
-            if (source->cat != N2_ROAD && source->cat != N2_TERRAIN) continue;
-            if (!winst_place_mesh(dst, source, matrix, proto->name, stats)) return 0;
-            if (own_matrix && stats) stats->own_matrix_meshes++;
+#ifdef __vita__
+        const unsigned char *cache_key=library->data+proto->begin;
+        WInstCachedPlacement *cached=NULL;
+        if (g_placement_cache_bundle && dst==scene)
+            for (WInstCachedPlacement *e=g_placement_cache[winst_cache_slot(cache_key)]; e; e=e->next)
+                if (e->ground && e->record==cache_key) { cached=e; break; }
+        if (cached) {
+            if (!winst_cache_append_ground(cached,dst,focus_x,focus_y,radius,own_matrix,stats))
+                return 0;
+            continue;
         }
+        int ground_before=dst->count, ground_total=0;
+#endif
+        /* Placed exactly once: parse, copy into the scene, release. */
+        const N2Scene *meshes = winst_proto_load(library, proto);
+        int ok = 1;
+        for (int mesh = 0; mesh < meshes->count && ok; mesh++) {
+            const N2Mesh *source = &meshes->meshes[mesh];
+            if (source->cat != N2_ROAD && source->cat != N2_TERRAIN) continue;
+#ifdef __vita__
+            ground_total++;
+            /* Only this resident's ground: the whole city's terrain in every
+               resident is what kept two residents from fitting in memory. */
+            if (dst == scene && radius > 0.0f) {
+                float mb[4];
+                float d2 = winst_mesh_dist2(source, matrix, focus_x, focus_y, mb);
+                if (gb && mb[0] <= mb[2]) {          /* grow the remembered bounds */
+                    if (gb[0] > gb[2]) { memcpy(gb, mb, sizeof mb); }
+                    else { if (mb[0] < gb[0]) gb[0] = mb[0]; if (mb[1] < gb[1]) gb[1] = mb[1];
+                           if (mb[2] > gb[2]) gb[2] = mb[2]; if (mb[3] > gb[3]) gb[3] = mb[3]; }
+                }
+                if (d2 > radius * radius) continue;
+            }
+#endif
+            if (!winst_place_mesh(dst, source, matrix, proto->name, stats)) ok = 0;
+            else if (own_matrix && stats) stats->own_matrix_meshes++;
+        }
+#ifdef __vita__
+        /* Admit only complete prototype ground sets; a clipped set cannot
+           stand in for this prototype when the next focus moves. */
+        if (ok && g_placement_cache_bundle && dst==scene && ground_total>0 &&
+            dst->count-ground_before==ground_total) {
+            float mn[2]={1e30f,1e30f},mx[2]={-1e30f,-1e30f};
+            for (int k=ground_before; k<dst->count; k++) {
+                N2Mesh *m=&dst->meshes[k]; n2_mesh_bias_terrain(m);
+                for (int c=0; c<2; c++) {
+                    if (m->world_bounds[c]<mn[c]) mn[c]=m->world_bounds[c];
+                    if (m->world_bounds[c+3]>mx[c]) mx[c]=m->world_bounds[c+3];
+                }
+            }
+            winst_cache_store(dst,ground_before,cache_key,
+                (int)floorf((mn[0]+mx[0])*0.5f/128),
+                (int)floorf((mn[1]+mx[1])*0.5f/128),1,0,0);
+        }
+#endif
+        winst_proto_unload(proto);
+        if (!ok) return 0;
     }
     return 1;
 }
@@ -1052,15 +1762,72 @@ static int winst_has_suffix(const char *text, const char *suffix) {
     return n >= s && !strcmp(text + n - s, suffix);
 }
 
+/* Bundles the caller already holds in memory (world.c keeps every region's
+ * STREAM*.BUN resident for this whole build). Borrowing them instead of
+ * re-reading avoids a second ~113 MB copy of the same file, which is the
+ * difference between fitting and not fitting on low-memory targets. */
+#define WINST_MAX_LENT 8
+static struct { char name[64]; const unsigned char *data; long len; } winst_lent[WINST_MAX_LENT];
+static int winst_nlent;
+
+void world_instance_lend_bundle(const char *name, const unsigned char *data, long len) {
+    if (!name) { winst_nlent = 0; return; }
+    if (!data || len <= 0 || winst_nlent >= WINST_MAX_LENT) return;
+    snprintf(winst_lent[winst_nlent].name, sizeof winst_lent[0].name, "%s", name);
+    winst_lent[winst_nlent].data = data;
+    winst_lent[winst_nlent].len = len;
+    winst_nlent++;
+}
+
+static const unsigned char *winst_borrow(const char *name, long *len) {
+    for (int i = 0; i < winst_nlent; i++) {
+        size_t n = strlen(winst_lent[i].name);
+        if (!strncmp(name, winst_lent[i].name, n) && (!name[n] || !strcmp(name + n, ".BUN"))) {
+            *len = winst_lent[i].len;
+            return winst_lent[i].data;
+        }
+    }
+    return NULL;
+}
+
 static unsigned char *winst_read_named(const char *root, const char *name,
                                        long *len) {
     char path[1024];
     snprintf(path, sizeof path, "%s/%s%s", root, name,
              winst_has_suffix(name, ".BUN") ? "" : ".BUN");
+#ifdef __vita__
+    /* The region companion (e.g. L4RA.BUN, ~420 KB) was read from the card
+       twice per streaming build. Keep the last two small files; callers own
+       and free the copy they get. Builds run one at a time on the worker. */
+    static struct { char path[256]; unsigned char *data; long len; } keep[2];
+    static int keep_next;
+    for (int i = 0; i < 2; i++)
+        if (keep[i].data && !strcmp(keep[i].path, path)) {
+            unsigned char *copy = (unsigned char *)malloc((size_t)keep[i].len);
+            if (!copy) break;
+            memcpy(copy, keep[i].data, (size_t)keep[i].len);
+            if (len) *len = keep[i].len;
+            return copy;
+        }
+    long got = 0;
+    unsigned char *data = n2_read_file(path, &got);
+    if (len) *len = got;
+    if (data && got > 0 && got <= 2 * 1024 * 1024 && strlen(path) < sizeof keep[0].path) {
+        int k = keep_next; keep_next ^= 1;
+        free(keep[k].data);
+        keep[k].data = (unsigned char *)malloc((size_t)got);
+        if (keep[k].data) {
+            memcpy(keep[k].data, data, (size_t)got); keep[k].len = got;
+            snprintf(keep[k].path, sizeof keep[k].path, "%s", path);
+        }
+    }
+    return data;
+#else
     return n2_read_file(path, len);
+#endif
 }
 
-static int winst_prepare_combined(const N2Scene *dst, const N2Scene *add,
+static int winst_prepare_combined(const N2Scene *dst, N2Scene *add,
                                   N2Mesh **combined, int *count) {
     if (!dst || !add || !combined || !count || dst->count < 0 || add->count < 0 ||
         dst->count > INT_MAX - add->count) return 0;
@@ -1068,6 +1835,28 @@ static int winst_prepare_combined(const N2Scene *dst, const N2Scene *add,
     *combined = NULL;
     if (!*count) return 1;
     if ((size_t)*count > SIZE_MAX / sizeof **combined) return 0;
+    /* Merge inside the freshly built array (it doubled while growing, so it
+       usually has room already) instead of asking for a second block of the
+       same size: on a long-running, fragmented heap that second 2+ MB block
+       is what failed, every build, until the car ran off the loaded area. */
+    if (add->meshes && add->count) {
+        N2Mesh *room = add->meshes;
+        if (add->cap < *count)
+            room = (N2Mesh *)realloc(add->meshes, (size_t)*count * sizeof **combined);
+        if (room) {
+            if (dst->count) {
+                memmove(room + dst->count, room, (size_t)add->count * sizeof *room);
+                memcpy(room, dst->meshes, (size_t)dst->count * sizeof *room);
+            }
+            if (add->cap > *count) {   /* hand back the doubling slack */
+                N2Mesh *fit = (N2Mesh *)realloc(room, (size_t)*count * sizeof *room);
+                if (fit) room = fit;
+            }
+            add->meshes = NULL; add->count = add->cap = 0;   /* now owned by *combined */
+            *combined = room;
+            return 1;
+        }
+    }
     *combined = (N2Mesh *)malloc((size_t)*count * sizeof **combined);
     if (!*combined) return 0;
     if (dst->count)
@@ -1127,6 +1916,29 @@ static int winst_check_scenery(const unsigned char *data,long begin,long end,
     return 1;
 }
 
+#ifdef __vita__
+/* The prototype library indexes the pinned bundle, which never changes, so it
+   is built once and reused by every resident build (builds run one at a
+   time). Per-build state -- parsed prototype geometry -- is released at the
+   end of each build; the index and its texture keys stay. */
+static WInstLibrary g_lib;
+static uint32_t *g_lib_keys;
+static const unsigned char *g_lib_data;
+static int g_lib_owned;   /* ownership flags already marked in g_lib */
+/* World tiles in use: the prototype library (built by a conversion) is never
+   needed again and points into the full bundle about to be stripped. */
+void world_instance_library_release(void) {
+    for (int i = 0; i < g_lib.count; i++)
+        if (g_lib.items[i].loaded) winst_proto_unload(&g_lib.items[i]);
+    winst_library_free(&g_lib);
+    free(g_lib_keys); g_lib_keys = NULL; g_lib_data = NULL; g_lib_owned = 0;
+    /* keyed by library size / item pointer: stale once another bundle's
+       library takes the same shape or address */
+    free(g_ground_bb); g_ground_bb = NULL; g_ground_bb_n = 0;
+    free(own_memo); own_memo = NULL; own_memo_items = NULL; own_memo_n = 0;
+}
+#endif
+
 int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
                          const char *track_root,
                          const char *const *bundles, int bundle_count,
@@ -1136,8 +1948,11 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     WInstStats local_stats;
     WInstRegion *regions = NULL;
     int region_count = 0, region_cap = 0;
-    unsigned char *selected = NULL, *bundle_data = NULL;
+    unsigned char *selected = NULL;
+    const unsigned char *bundle_data = NULL;
     long bundle_len = 0;
+    int bundle_borrowed = 0;
+    uint32_t *keys = NULL;
     WInstLibrary library;
     N2Scene built_scene, built_vista;
     WGSelection scenery = {0};
@@ -1184,13 +1999,29 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
                                          view_radius, selected, 65536, &home_index);
     local_stats.regions_total = region_count;
     local_stats.regions_selected = nselected;
+    if (home_index < 0 && g_winst_convert && nselected > 0) {
+        /* converting: a cell centre over water still owns the land at its
+           edges; borrow the nearest selected district as home */
+        float bd = 1e30f;
+        for (int i = 0; i < region_count; i++) {
+            int id = regions[i].id;
+            if (id < 0 || id >= 65536 || !selected[id]) continue;
+            float dx = focus_x < regions[i].bb[0] ? regions[i].bb[0] - focus_x
+                     : focus_x > regions[i].bb[2] ? focus_x - regions[i].bb[2] : 0.0f;
+            float dy = focus_y < regions[i].bb[1] ? regions[i].bb[1] - focus_y
+                     : focus_y > regions[i].bb[3] ? focus_y - regions[i].bb[3] : 0.0f;
+            if (dx*dx + dy*dy < bd) { bd = dx*dx + dy*dy; home_index = i; }
+        }
+    }
     if (home_index < 0 || home_index >= region_count) goto cleanup;
     local_stats.home_region = regions[home_index].id;
+    VMARK("    regions: %d read, %d selected", region_count, nselected);
 
     for (int i = 0; i < bundle_count && !bundle_data; i++) {
         long candidate_len = 0;
-        unsigned char *candidate = winst_read_named(track_root, bundles[i],
-                                                     &candidate_len);
+        const unsigned char *candidate = winst_borrow(bundles[i], &candidate_len);
+        int borrowed = candidate != NULL;
+        if (!candidate) candidate = winst_read_named(track_root, bundles[i], &candidate_len);
         if (!candidate) continue;
         WInstWalk find;
         memset(&find, 0, sizeof find);
@@ -1199,12 +2030,14 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
         if (walked && find.found_region) {
             bundle_data = candidate;
             bundle_len = candidate_len;
+            bundle_borrowed = borrowed;
             snprintf(local_stats.bundle, sizeof local_stats.bundle, "%s", bundles[i]);
-        } else free(candidate);
+        } else if (!borrowed) free((void *)candidate);
     }
     /* The home section is the atomic gate: destination scenes are untouched
      * until a complete temporary assembly has been built and committed. */
     if (!bundle_data) goto cleanup;
+    VMARK("    home section found");
 
     /* A requested event id the bundle does not author is degraded to the
      * unfiltered scene. That is an authoring fact, not a corrupt table, so it
@@ -1229,7 +2062,14 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     }
     local_stats.scenery_effective = effective_event;
 
-    uint32_t *keys = (uint32_t *)malloc(16384 * sizeof *keys);
+#ifdef __vita__
+    int lib_cached = g_lib.items && g_lib_data == bundle_data;
+    if (lib_cached) {
+        library = g_lib;
+        VMARK("    library reused: %d prototypes", library.count);
+    } else {
+#endif
+    keys = (uint32_t *)malloc(16384 * sizeof *keys);
     if (!keys) goto cleanup;
     N2Tpk tpk = n2_tpk_open(bundle_data, bundle_len);
     int nkeys = n2_tpk_keys(bundle_data, tpk, keys, 16384);
@@ -1255,11 +2095,44 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
             }
         }
     }
+    if (nkeys < 16384) {
+        long ads_len = 0;
+        unsigned char *ads = n2_read_global_ads(track_root, &ads_len);
+        if (ads) {
+            N2Tpk ads_tpk = n2_tpk_open(ads, ads_len);
+            nkeys += n2_tpk_keys(ads, ads_tpk, keys + nkeys, 16384 - nkeys);
+            free(ads_tpk.blk); free(ads);
+        }
+    }
+    /* Prototype geometry is re-parsed on first use, so the library keeps
+     * borrowing the bundle and the key set until the build is done. */
+    library.data = bundle_data;
+    library.keys = keys;
+    library.nkeys = nkeys;
+    VMARK("    library scan start");
     winst_collect_models(&library, bundle_data, 0, bundle_len, keys, nkeys);
-    free(keys);
+    winst_library_index(&library);
+    VMARK("    library scan done: %d prototypes", library.count);
+    VMARK("    model lookup: %u slots (%u KB)", library.model_index_cap,
+          (unsigned)(library.model_index_cap * sizeof(int) / 1024));
+#ifdef __vita__
+    free(tpk.blk);
+    g_lib = library; g_lib_keys = keys; g_lib_data = bundle_data;
+    keys = NULL;          /* owned by the cache now */
+    lib_cached = 1;
+    }
+#endif
 
     WInstOwnership owner;
     WInstWalk ownership;
+#ifdef __vita__
+    /* The ownership pass is position independent (whole bundle, unfiltered)
+       and only sets flags in the library, which is cached: do it once. */
+    if (!lib_cached) g_lib_owned = 0;
+    if (g_lib_owned) {
+        VMARK("    ownership reused");
+    } else {
+#endif
     if (!winst_ownership_open(&owner, &library)) goto cleanup;
     memset(&ownership, 0, sizeof ownership);
     ownership.find_region = -1;
@@ -1269,9 +2142,29 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     int owned = winst_walk_sections(bundle_data, 0, bundle_len, &ownership);
     free(owner.ground_keys);
     if (!owned) goto cleanup;
+#ifdef __vita__
+    g_lib_owned = 1;
+    }
+    if (world_build_aborted()) goto cleanup;
+#endif
 
+    VMARK("    ownership done; ground placement start");
+#ifdef __vita__
+    winst_cache_begin(bundle_borrowed ? bundle_data : NULL, effective_event,
+                      focus_x, focus_y, view_radius);
+#endif
+    /* margin: ground just past the resident edge still catches a car the
+       swap was late for */
     if (!winst_place_ground_prototypes(&library, &built_scene, &built_vista,
-                                       &local_stats)) goto cleanup;
+                                       &local_stats, focus_x, focus_y,
+                                       view_radius + 60.0f)) goto cleanup;
+    VMARK("    ground placed: %d meshes", built_scene.count);
+#ifdef __vita__
+    VMARK("    CPU tiles: %ld ground meshes reused",g_ground_cache_hits);
+#endif
+#ifdef __vita__
+    if (world_build_aborted()) goto cleanup;
+#endif
 
     WInstBuildVisit visit = { &library, &built_scene, &built_vista, &local_stats };
     WInstWalk collect;
@@ -1287,8 +2180,41 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
     collect.userdata = &visit;
     collect.stats = &local_stats;
     collect.scenery = effective_event ? &scenery : NULL;
+#ifdef __vita__
+    g_visit_ticks = 0;
+    Uint64 walk_t0 = SDL_GetPerformanceCounter();
+#endif
     if (!winst_walk_sections(bundle_data, 0, bundle_len, &collect) ||
         !collect.found_region) goto cleanup;
+    VMARK("    objects placed: %d meshes", built_scene.count);
+#ifdef __vita__
+    {   double f = (double)SDL_GetPerformanceFrequency(), all = (double)(SDL_GetPerformanceCounter() - walk_t0);
+        VMARK("    objects: %ld records scanned, %ld in range; scan %.0f ms, placing %.0f ms",
+              local_stats.instances_seen, local_stats.instances_in_range,
+              (all - (double)g_visit_ticks) * 1000.0 / f, (double)g_visit_ticks * 1000.0 / f); }
+#endif
+#ifdef __vita__
+    VMARK("    CPU tiles: %ld placements reused, %ld built, %u KB cache reserved",
+          g_cpu_cache_hits, g_cpu_cache_misses, (unsigned)(g_placement_cache_bytes/1024));
+    VMARK("    CPU tiles: %ld distant placements evicted", g_cache_evicted);
+    VMARK("    CPU cache split: ground %u / 8192 KB, scenery %u / 16384 KB",
+          (unsigned)(g_ground_cache_bytes/1024),
+          (unsigned)((g_placement_cache_bytes-g_ground_cache_bytes)/1024));
+#endif
+    long render_indices = 0, collision_meshes = 0;
+    for (int i = 0; i < built_scene.count; i++) {
+        if (built_scene.meshes[i].world_role == 1) collision_meshes++;
+        else render_indices += built_scene.meshes[i].nidx;
+    }
+#ifdef __vita__
+    VMARK("    detail %s: %ld replacements (%ld drawn full within %.0f m), %ld triangles saved, %ld render triangles, %ld collision-only meshes",
+          g_world_low_detail ? "low" : "full", local_stats.lod_replacements, g_lod_near_kept,
+          WINST_LOD_NEAR_M, local_stats.lod_saved_indices / 3, render_indices / 3, collision_meshes);
+#else
+    VMARK("    detail %s: %ld replacements, %ld triangles saved, %ld render triangles, %ld collision-only meshes",
+          g_world_low_detail ? "low" : "full", local_stats.lod_replacements,
+          local_stats.lod_saved_indices / 3, render_indices / 3, collision_meshes);
+#endif
     if (!winst_commit_scenes(scene, vista, &built_scene, &built_vista)) goto cleanup;
     ok = 1;
 
@@ -1298,8 +2224,17 @@ cleanup:
         winst_free_scene(&built_scene);
         winst_free_scene(&built_vista);
     }
+#ifdef __vita__
+    if (g_lib.items && library.items == g_lib.items) {
+        for (int i = 0; i < library.count; i++)
+            if (library.items[i].loaded) winst_proto_unload(&library.items[i]);
+        g_lib = library;
+        memset(&library, 0, sizeof library);
+    }
+#endif
     winst_library_free(&library);
-    free(bundle_data);
+    free(keys);
+    if (!bundle_borrowed) free((void *)bundle_data);
     free(selected);
     winst_free_regions(regions, region_count);
     if (stats) *stats = local_stats;

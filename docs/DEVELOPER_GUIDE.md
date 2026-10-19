@@ -1448,13 +1448,25 @@ and NOS sprites, `GLOBAL/InGameRace.bun` the tachometer arc, and
 `GLOBAL/HUD_CustomTextures_ALL.bin` the dial faces (`TACH_FILL_CUSTOM_00..10`;
 the per-style `HUD_CustomTextures_00..10.bin` files hold no TPK records).
 
+The standard cluster draws a separate 0–9 thousands-of-RPM scale with digital
+speed and a gear readout. `TACH_NOS_ALPHA` contains an **N2O** legend and is
+used only for the nitrous decoration, never as the RPM scale. The RPM needle
+uses a fixed 9000 RPM full scale rather than remapping each car's redline to
+the end of the scale. This drawn cluster is a fidelity approximation; its
+numerals are not recovered retail font assets.
+
+`HudState.map_cars` supplies live traffic and rival positions. The minimap
+draws yellow traffic dots and orange rival dots over roads and race routes,
+independently of world-render visibility, and clips them within the panel.
+It does not invent shop or event markers where gameplay data is unavailable.
+
 Two things are measured at load rather than assumed:
 
-* **Dial geometry.** The needle pivot is a least-squares circle fit over
+* **Nitrous art geometry.** The retained art diagnostic is a least-squares circle fit over
   `TACH_NOS_ALPHA`'s opaque texels, with the sweep taken from the largest
   angular gap. The shipped arc is centred at (0.373, 0.054) of the art width
   with radius 0.303 and sweeps 181°→29° — it is neither a semicircle nor
-  centred on the art, so assuming either puts the needle outside the dial.
+  centred on the art. This fit no longer drives the RPM needle.
 * **Art usability.** A record can decode to garbage; `ARROW_MARKERA` does.
   `hud_art_run_fraction` measures horizontal colour coherence — every usable
   sprite scores 0.719–0.996, that record scores 0.192 — and anything under

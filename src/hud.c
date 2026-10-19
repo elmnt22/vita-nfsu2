@@ -1,12 +1,15 @@
 /* hud.c — in-game player HUD. See hud.h for the honesty contract.
  *
- * Everything is drawn as transformed unit quads through the existing shader,
- * exactly like the menu overlay already does; the HUD adds no GL objects
- * beyond its textures and no shader of its own. All state it touches is saved
+ * The layout is the game's own: HUD_SingleRace.fng, read from the retail
+ * bundles through feng.c, with its art and bitmap fonts. Everything is drawn
+ * through the existing shader as transformed quads (sprites) or one small
+ * dynamic quad batch (glyphs, the N2O sector); the HUD adds no shader. All state it touches is saved
  * and restored, so it cannot leak blending/depth/uniforms into the world pass
  * or the developer UI.
  */
 #include "hud.h"
+#include "feng.h"
+#include "options.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,68 +85,231 @@ void hud_place(float aspect, float anchor_x, float anchor_y,
 
 /* --------------------------------------------------------------- resources */
 
-/* One art slot. `key` is the TPK record hash; `tex` is 0 when it did not load,
- * which every draw site must tolerate. */
-typedef struct HudArc HudArc;
-typedef struct { const char *name; uint32_t key; GLuint tex; int w, h;
-                 unsigned char rejected; struct {
-                     int ok; float cx, cy, r, a0, a1;
-                 } arc; } HudArt;
+/* The HUD is EA's own single-player layout, HUD_SingleRace.fng, read from the
+ * game's bundles at start-up (see feng.h): every sprite, string, size, colour
+ * and position below comes from that package, and code only drives what the
+ * game drives -- needle angles, the N2O level, readout text and the live map.
+ * Only the objects named here are drawn: the package also carries mode
+ * screens (drag/drift readouts, getaway meter, dyno stats, online status,
+ * standings, race timer) that this engine has no system behind.
+ * Hashes are FEng object name hashes as tools/fng_dump.py lists them. */
+#define FE_TACH_GROUP    0x5164d4eau
+#define FE_TURBO_GROUP   0xc5d551b7u
+#define FE_TURBO_NEEDLE  0x6d5ece44u
+#define FE_RPM_NEEDLE    0xf0250dacu
+#define FE_SPEED         0xc1d5ff50u
+#define FE_GEAR          0xb84589beu
+#define FE_SPEED_UNITS   0xc3383b63u   /* the tach's "KM/H" (0x4c68d0: MPH 0x8569ab44 / KM/H 0x8569a25f) */
+#define FE_SHIFT         0x25cf2f74u
+#define FE_NOS_TRACK     0x11495cd6u   /* Tach_NOS_Alpha: the N2O scale */
+#define FE_NOS_BACKING   0x11461255u
+#define FE_NOS_FILL      0x39e180c4u   /* Tach_NOS: the level, additive */
+#define FE_MAP_MASK      0x40cdc515u   /* the dark disc = panel body */
+#define FE_MAP_BORDER    0x382d2fc9u   /* group: ring quadrant x4 */
+#define FE_MAP_SLOT      0x90fe80f3u   /* Track4000_map: where the live map goes */
+#define FE_MAP_NORTH     0xf2a54430u
+#define FE_MAP_PLAYER    0xeb24e169u
+#define FE_MAP_GPS       0x4f649313u
+#define FE_MAP_GATE      0x7af1ca63u
+#define FE_RACE_CORNER   0x411301e3u
+#define FE_POS_GROUP     0xe8434eb4u
+#define FE_POS_NUM       0x9c183bf8u
+#define FE_POS_SUFFIX    0x44f24239u
+#define FE_POS_OF        0x3bbd6268u
+#define FE_LAP_GROUP     0x70f90bd4u
+#define FE_LAP_LABEL     0x8b7e6ea1u
+#define FE_LAP_NUM       0x57f0e3a5u
+#define FE_LAP_OF        0xf2685238u
+#define FE_LAP_BOX       0xa86c3b9bu   /* HUD_Drift's 3rdperson_BoxLaps, top level */
+#define FE_BANK_GROUP    0x3f8644cau
+#define FE_BANK_VALUE    0x1930b057u
+#define FE_SMS           0x4b9b8f5au
+#define FE_WRONG_WAY     0xc82fa200u   /* icon_Wrongway: hidden until code shows it */
+#define FE_COUNTDOWN     0x2da220aau   /* the countdown string (widget 0x4f7340 / 0x4ab5b0) */
 
-enum {
-    ART_BACKING, ART_TACH_BACK, ART_TACH_ARC, ART_TACH_FILL,
-    ART_NOS_BAR, ART_NOS_OVERLAY,
-    ART_MAP_MASK, ART_MAP_BORDER, ART_MAP_BACK, ART_MAP_CAR, ART_MAP_NORTH,
-    ART_MAP_GPS, ART_MAP_START, ART_MAP_SAFEHOUSE, ART_MAP_CIRCUIT,
-    ART_ARROW, ART_CINGULAR_LOGO, ART_CINGULAR_SLOGAN,
-    ART_ENGAGE_BACKING, ART_ENGAGE_PHONE, ART_ENGAGE_CINGULAR,
-    ART_COUNT
-};
+#define HUD_PACKAGE      "HUD_SingleRace.fng"
+#define HUD_ARROW_KEY    0x985c190cu   /* ARROW_MARKERA (InGameCommon) */
 
-/* Arc geometry MEASURED from the shipped TACH_NOS_ALPHA art at load time,
- * in art-normalised coordinates (0..1 across the record, y up from its
- * bottom edge). Guessing that the arc is a semicircle centred on the art's
- * bottom-centre puts the needle pivot visibly outside the dial: the shipped
- * arc is neither centred nor a half-turn. */
+/* Visibility gates: a drawn object shows only while its gate is open. */
+enum { G_ALWAYS, G_TURBO, G_NOS, G_RACE, G_POS, G_LAPS, G_BANK, G_SMS, G_COUNT };
+/* Objects whose drawing code overrides the authored state. */
+enum { R_NONE, R_RPM_NEEDLE, R_TURBO_NEEDLE, R_SPEED, R_GEAR, R_SHIFT,
+       R_NOS_FILL, R_MAP_SLOT, R_MAP_NORTH, R_POS_NUM, R_POS_SUFFIX, R_POS_OF,
+       R_LAP_LABEL, R_LAP_NUM, R_LAP_OF, R_BANK_VALUE, R_COUNTDOWN, R_UNITS,
+       R_ANIM };   /* drift HUD: a ported widget's object, drawn from its FEng state */
+
+/* Measured dial geometry: the rev scale is the shipped 3rdperson_10500lines
+ * art, whose "0" sits straight below the hub and whose numerals advance
+ * 22.5 degrees clockwise per 1000 rpm ("8" straight up); the needle art
+ * points down at angle 0. Checked by rendering the needle at 0/4000/8000 rpm
+ * over the shipped dial with tools/fng_dump.py. */
+#define RPM_DEG_PER_1000  22.5f
+#define RPM_SCALE_MAX     10500.0f
+/* the turbo needle reads "0" at its authored 123 degrees (upper left); -1
+   (full vacuum, "-30") is the red zone at lower left, +1 ("30") the red zone
+   at upper right. Checked by rendering the needle at 0..240 degrees over the
+   shipped 3rdperson_Turbolines dial with tools/fng_dump.py. */
+#define BOOST_DEG_ZERO    123.0f
+#define BOOST_DEG_SPAN    97.0f
+
+#define HUD_NFONT 4
+#define HUD_QMAX  64          /* quads per batch: one string or one N2O sector */
+
+/* Arc geometry MEASURED from the shipped Tach_NOS_Alpha art at load time, in
+ * art-normalised coordinates (fractions of the art's WIDTH, y up from its
+ * bottom edge). Drives the N2O level sector when a tank model exists. */
 struct HudArc {
     int   ok;
-    float cx, cy, r;      /* fitted circle, fractions of the art's WIDTH */
+    float cx, cy, r;      /* fitted circle */
     float a0, a1;         /* sweep start/end in radians, a0 = the low end */
 };
 
+typedef struct { GLuint tex; int w, h; unsigned char additive; } HudTex;
+typedef struct { GLuint tex; int aw, ah, ok; FengFont f; } HudFont;
+
 struct Hud {
-    HudArt art[ART_COUNT];
-    int    preview;
-    char   missing[512];
+    FengPackage *pk;                   /* NULL: package missing, arrow only */
+    HudTex  rt[FENG_MAX_RES];          /* per package resource */
+    HudFont font[HUD_NFONT];
+    signed char font_of[FENG_MAX_RES]; /* resource -> font slot, -1 none */
+    short   draw[FENG_MAX_OBJ];        /* drawn objects, far to near */
+    int     ndraw;
+    unsigned char role[FENG_MAX_OBJ], gate[FENG_MAX_OBJ];
+    unsigned char tach[FENG_MAX_OBJ];   /* in the tach group (the Gauges option) */
+    int     o_player, o_gps, o_gate, o_track, o_wrong;
+    struct HudArc nos_arc;
+    GLuint  arrow_tex;
+    int     preview;
+    char    missing[512];
+    char    dataroot[512];             /* for the string table (lap box label) */
     /* smoothed display state: a needle that snaps looks broken, and a dial fed
        straight from a 60 Hz sample jitters on every gear change. */
-    float  needle_rpm, needle_speed, nos_glow, arrow_angle;
-    int    arrow_primed;
+    float   needle_rpm, needle_speed, nos_glow, arrow_angle;
+    int     arrow_primed;
+    /* street map: luminance texture over [map_x0, map_x0+map_ext] etc. and a
+       circular fan whose texture coordinates are rewritten every frame */
+    GLuint  map_tex;
+    float   map_x0, map_y0, map_ext;
+    /* the event's TRACKMAP (0x4ca840) and the indicator objects 0x4db900
+       hands out: AIRACERINDICATOR_0..7, STARTLINEINDICATOR_0, the first
+       PLAYERCARINDICATOR in the package */
+    GLuint  tm_tex;
+    int     tm_event;
+    float   tm_x0, tm_y0, tm_size, tm_zoom;
+    int     o_aiind[8], o_startind, o_playerind;
+    GLuint  fan_vbo, fan_nbo, fan_ibo;
+    GLuint  qb_vbo, qb_nbo, qb_ibo;    /* dynamic quads: glyphs, N2O sector */
+    struct HudDriftW *dw;              /* drift HUD: scripts + widget state */
 };
 
-/* Source containers, tried in order. Every key is looked up in each until one
-   answers, so a record moving between the shipped packs is not fatal. */
-static const char *HUD_PACKS[] = {
-    "GLOBAL/InGameCommon.bun",
-    "GLOBAL/InGameRace.bun",
-    "GLOBAL/HUD_CustomTextures_ALL.bin",
+/* The drift HUD (HUD_Drift.fng; HUD object 0x4f8bf0). The package's FEng
+ * scripts run (feng_anim_*), and the objects of the widgets ported so far are
+ * drawn from that live state with the strings the widgets write:
+ *   0x4f6c00 / 0x4da590  drift angle, too slow / losing multiplier, the drift
+ *                        title comments, and the running drift's points and
+ *                        title (its popup node at +0x20, filled by 0x4c88e0);
+ *   0x4f7ad0 / 0x4da900 -> 0x4c85d0  total, multiplier, points to the next
+ *                        multiplier, best drift; 0x4ab780 the popup.
+ * Objects of widgets not ported yet (leaderboard, lap timer, split time,
+ * hurry, countdown, race-over message) are not drawn. */
+struct HudDriftW {
+    FengAnim anim;
+    short res_ov[FENG_MAX_OBJ];   /* a screen's code-set image: resource + 1 (0x50c990) */
+    /* strings the widgets set, each its own length (English.bin runs to
+       931 characters; a fixed 48 cut the post-race dialog's question) */
+    char   *txt[FENG_MAX_OBJ];
+    unsigned short txtcap[FENG_MAX_OBJ];
+    unsigned char has_txt[FENG_MAX_OBJ];
+    unsigned char wl[FENG_MAX_OBJ];      /* a ported widget's object */
+    unsigned char *lang; uint32_t *sh; const char **st; int nstr;   /* English.bin */
+    int turbo;
+    /* 0x4f6c00 */
+    int o_slow, o_wwc, o_comment, o_angle, o_angle_deg, o_back1, o_back3, o_point, o_title;
+    struct { int cont; float pts; int chain, time; uint32_t label; int fade, state, failed; } node;
+    int node_on;                        /* +0x40 */
+    int comment_on, comment_t;          /* +0x95, +0x98 */
+    /* 0x4f7ad0 */
+    int o_back03, o_total, o_total_title, o_box01, o_next_ind, o_mult, o_next_pts,
+        o_best_back, o_best_text, o_best;
+    uint32_t c60, c64, c68;             /* +0x60 +0x64 +0x68 colours */
+    float f70;                          /* +0x70 blink scale */
+    int t74, b78, lvl7c, b79;
+    int screen;                         /* a full-screen package: no edge pinning (2: left edge, PC_Loading) */
+    /* 0x4f7170 / 0x4c7f00: RaceOverMessage (+0x20), RaceOverBacking (+0x24),
+       the feature on (0x4c6690), its scripts started (+0x28) */
+    int o_ro_msg, o_ro_back, ro_on, ro_started;
+    /* an IconScroller strip on a screen (hud_screen_strip) */
+    GLuint strip_tex[16]; unsigned char strip_add[16], strip_lock[16];
+    int strip_n, strip_sel, strip_master, strip_ms;
+    float strip_scroll, strip_pulse;
+    /* 0x4f6420 / 0x4aafc0: WrongWayImage (+0x20), WrongWay_CountDown (+0x24),
+       faded in (+0x28) */
+    int o_ww, o_wwc2, ww_in;
+    /* 0x4f5c40: CurrentLapTime (+0x2c), Lap_Time_Title / Text (+0x34 / +0x38);
+       +0x54 / +0x58 / +0x5c / +0x64 / +0x65 */
+    int o_lt, o_ltt, o_ltx, lt54, lt58, lt5c, lt64, lt65;
+    /* 0x4f6030: SplitTimeText (+0x20); +0x28 shown, +0x2c since */
+    int o_sp, sp28, sp2c;
+    /* 0x4f6130: rows 1..4 LBData / LeaderText / LBTextBacking / LBBacking;
+       +0x1bc the view's start, +0x1c0 the names view */
+    int o_lbd[4], o_lbt[4], o_lbtb[4], o_lbb[4], lb1bc, lb1c0;
+    /* the drag HUD (HUD_Drag.fng): 0x4f6500 / 0x4c7090 the drag tach --
+       RPM_fill, 3rdPersonTachRPMNumbers (+0x2c), RPM_Redline (+0x28),
+       3rdPersonNeedle (+0x20), 3rdPersonGear (+0x70), ShiftMessage (+0x74),
+       3rdPersonSpeedUnits (+0x78), 3rdPersonSpeed (+0x7c),
+       Drag_Position_Backing_03, Shift_light (+0x30) */
+    int drag, drag_on;                  /* drag_on: the features' state (0x4c6690), -1 unset */
+    int o_rpmfill, o_rpmnum, o_redline, o_needle, o_gear, o_shmsg, o_units, o_speed, o_pb03, o_shlight;
+    int g80, g84;                       /* +0x80 last frame's gear, +0x84 this frame's */
+    unsigned char f88, f89, f8a, f8b, f8c, f8d, f8e, fa4;   /* message / blink latches; +0xa4 no scale art */
+    uint32_t c98, c9c;                  /* the gear's and the needle's authored colours */
+    HudTex ov_num, ov_red;              /* the rev scale and redline art by the engine (0x5ed9b0) */
+    /* 0x4f69e0 / 0x4c7aa0: HEAT_Bar (+0x20) */
+    int o_heat;
+    /* 0x4f6a90 / 0x4c7b20: NOS_Line (+0x20), NOS_GameBreaker (+0x24), NOS_Fill */
+    int o_nosline, o_nosgb, o_nosfill;
+    /* 0x4f5a70 / 0x4c6b80: 3rdperson_Turbofill / _Turbolines / _TurboDial (+0x28) / _TurboRed_1 / _2 */
+    int o_tb[5];
+    /* 0x4f4ac0 / 0x4ebb10: RacePositionNumber (+0x28), RacePositionNth (+0x2c),
+       NumberRacers (+0x30), RaceTime (+0x38), PositionBacking (+0x3c),
+       Drag_Position_Backing_01 / _02; +0x4c the last lap event, +0x50 the time shown */
+    int o_pnum, o_pnth, o_pof, o_ptime, o_pback, o_pb01, o_pb02, p4c, p50;
 };
-enum { HUD_NPACK = (int)(sizeof HUD_PACKS / sizeof HUD_PACKS[0]) };
 
-static void hud_art_define(Hud *h, int slot, const char *name, uint32_t key) {
-    h->art[slot].name = name; h->art[slot].key = key; h->art[slot].tex = 0;
+#define MAP_FAN 48            /* rim vertices of the clipped street map */
+#define MAP_TEX 2048          /* street texture size (luminance, 4 MB) */
+
+/* The minimap panel in FEng units: the Track4000_map slot's centre and half
+ * size, and the screen edge it is pinned to. hud_init copies them from the
+ * loaded package; these defaults ARE those numbers, so hud_map_pick agrees
+ * with the draw even before (or without) a load. */
+static float g_map_fx = -223.0f, g_map_fy = 142.0f, g_map_half = 64.0f;
+static int   g_map_pin = -1;
+
+/* Widescreen: FEng lays the HUD out on 640x480. Everything keeps its 4:3
+ * size (one FEng unit = 1/480 of the screen height) and hangs off the edge
+ * its top-level group sits nearest, so the minimap stays bottom-left and the
+ * cluster bottom-right at 16:9 instead of drifting inward or stretching. */
+static int hud_pin_of(float ax) { return ax < -106.0f ? -1 : ax > 106.0f ? 1 : 0; }
+/* a whole screen's pin: centred 4:3, or the left edge (screen 2) */
+#define screen_pin(w) ((w)->screen == 2 ? -1 : 0)
+
+static void fe_ndc(float asp, int pin, float fx, float fy, float *nx, float *ny) {
+    *nx = (float)pin + (fx - (float)pin * 320.0f) / (240.0f * asp);
+    *ny = -fy / 240.0f;
 }
 
 /* Least-squares circle through the arc's opaque texels (Kasa fit), plus the
  * angular sweep taken from the largest empty gap around that circle. Both come
- * from the art, so the needle pivots where the dial actually pivots. */
-static void hud_measure_arc(const N2Tex *t, struct HudArc *out) {
+ * from the art, so the level follows the scale the art actually draws. */
+static void hud_measure_arc(const FengImage *t, struct HudArc *out) {
     out->ok = 0;
-    if (!t->alpha || t->w < 8 || t->h < 8) return;
+    if (!t->rgba || t->w < 8 || t->h < 8) return;
+    #define ARC_A(x, y) (t->rgba[(((long)(y) * t->w) + (x)) * 4 + 3])
     double Sxx=0,Sxy=0,Syy=0,Sx=0,Sy=0,Sxz=0,Syz=0,Sz=0; long n=0;
     for (int y = 0; y < t->h; y++)
         for (int x = 0; x < t->w; x++) {
-            if (t->alpha[(long)y * t->w + x] < 160) continue;
+            if (ARC_A(x, y) < 160) continue;
             /* normalise by WIDTH on both axes so the fit stays circular, and
                flip y so it runs up from the art's bottom edge */
             double px = (x + 0.5) / (double)t->w;
@@ -184,13 +350,14 @@ static void hud_measure_arc(const N2Tex *t, struct HudArc *out) {
     unsigned char bin[360]; memset(bin, 0, sizeof bin);
     for (int y = 0; y < t->h; y++)
         for (int x = 0; x < t->w; x++) {
-            if (t->alpha[(long)y * t->w + x] < 160) continue;
+            if (ARC_A(x, y) < 160) continue;
             double px = (x + 0.5) / (double)t->w;
             double py = (t->h - 0.5 - y) / (double)t->w;
             double a = atan2(py - cy, px - cx) * 180.0 / M_PI;
             if (a < 0) a += 360.0;
             int b = (int)a; if (b >= 0 && b < 360) bin[b] = 1;
         }
+    #undef ARC_A
     int best_len = 0, best_start = -1, run = 0, run_start = 0;
     for (int i = 0; i < 720; i++) {          /* two turns: handles the wrap */
         int b = i % 360;
@@ -203,20 +370,24 @@ static void hud_measure_arc(const N2Tex *t, struct HudArc *out) {
     double gap_end = (best_start + best_len) % 360;      /* arc CCW start */
     double gap_start = best_start;                       /* arc CCW end   */
     double a1 = gap_end, a0 = gap_start;
-    while (a0 < a1) a0 += 360.0;                 /* a0 (zero RPM) is CW-first */
+    while (a0 < a1) a0 += 360.0;                 /* a0 (empty) is CW-first */
     out->cx = (float)cx; out->cy = (float)cy; out->r = (float)r;
     out->a0 = (float)(a0 * M_PI / 180.0);
     out->a1 = (float)(a1 * M_PI / 180.0);
     out->ok = 1;
 }
 
-/* Upload one decoded record with HUD-appropriate sampling. Clamping matters:
-   these are sprites on a transparent field, and REPEAT bleeds the opposite
-   edge into the border of every rotated element. */
-static GLuint hud_upload(const N2Tex *t) {
-    GLuint id = upload_tpk_texture_to_gpu(t);
+/* Upload one decoded RGBA image with HUD-appropriate sampling. Clamping
+   matters: these are sprites on a transparent field, and REPEAT bleeds the
+   opposite edge into the border of every rotated element. */
+static GLuint hud_upload(const FengImage *t) {
+    GLuint id = 0;
+    glGenTextures(1, &id);
     if (!id) return 0;
     glBindTexture(GL_TEXTURE_2D, id);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t->w, t->h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, t->rgba);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -224,100 +395,761 @@ static GLuint hud_upload(const N2Tex *t) {
     return id;
 }
 
-Hud *hud_init(const char *dataroot) {
+static void hud_note_missing(Hud *h, const char *what) {
+    size_t used = strlen(h->missing);
+    snprintf(h->missing + used, sizeof h->missing - used, "%s%s",
+             used ? " " : "", what);
+}
+
+/* Which objects are drawn, behind which gate, with which override. */
+static void hud_classify(Hud *h) {
+    const FengPackage *p = h->pk;
+    int tach = feng_find(p, FE_TACH_GROUP), turbo = feng_find(p, FE_TURBO_GROUP);
+    int mask = feng_find(p, FE_MAP_MASK), border = feng_find(p, FE_MAP_BORDER);
+    int slot = feng_find(p, FE_MAP_SLOT), north = feng_find(p, FE_MAP_NORTH);
+    int corner = feng_find(p, FE_RACE_CORNER), pos = feng_find(p, FE_POS_GROUP);
+    int laps = feng_find(p, FE_LAP_GROUP), bank = feng_find(p, FE_BANK_GROUP);
+    int sms = feng_find(p, FE_SMS);
+    static const struct { uint32_t hash; unsigned char role; } roles[] = {
+        { FE_RPM_NEEDLE, R_RPM_NEEDLE }, { FE_TURBO_NEEDLE, R_TURBO_NEEDLE },
+        { FE_SPEED, R_SPEED }, { FE_GEAR, R_GEAR }, { FE_SHIFT, R_SHIFT },
+        { FE_NOS_FILL, R_NOS_FILL }, { FE_MAP_SLOT, R_MAP_SLOT },
+        { FE_MAP_NORTH, R_MAP_NORTH }, { FE_POS_NUM, R_POS_NUM },
+        { FE_POS_SUFFIX, R_POS_SUFFIX }, { FE_POS_OF, R_POS_OF },
+        { FE_LAP_LABEL, R_LAP_LABEL }, { FE_LAP_NUM, R_LAP_NUM },
+        { FE_LAP_OF, R_LAP_OF }, { FE_BANK_VALUE, R_BANK_VALUE }, { FE_SPEED_UNITS, R_UNITS },
+    };
+    h->ndraw = 0;
+    for (int i = 0; i < p->nobj; i++) {
+        const FengObj *o = &p->obj[i];
+        h->role[i] = R_NONE; h->gate[i] = G_ALWAYS;
+        h->tach[i] = tach >= 0 && feng_inside(p, i, tach);
+        int in = (tach >= 0 && feng_inside(p, i, tach)) || i == mask || i == slot ||
+                 (border >= 0 && feng_inside(p, i, border)) || i == north ||
+                 i == corner || (pos >= 0 && feng_inside(p, i, pos)) ||
+                 (laps >= 0 && feng_inside(p, i, laps)) ||
+                 (bank >= 0 && feng_inside(p, i, bank)) || i == sms;
+        /* HUD_Drift keeps the lap readout at top level, not in a group */
+        int lap_obj = laps < 0 && (o->hash == FE_LAP_LABEL || o->hash == FE_LAP_NUM ||
+                                   o->hash == FE_LAP_OF || o->hash == FE_LAP_BOX);
+        if (lap_obj) in = 1;
+        if (o->hash == FE_COUNTDOWN && o->type == FENG_STRING && !(h->dw && h->dw->screen)) {
+            h->role[i] = R_COUNTDOWN;   /* HUD_SingleRace and HUD_Drift both have it */
+            int k = h->ndraw++;
+            while (k > 0 && p->obj[h->draw[k - 1]].az < o->az) { h->draw[k] = h->draw[k - 1]; k--; }
+            h->draw[k] = (short)i;
+            continue;
+        }
+        if (h->dw && h->dw->wl[i] && o->type != FENG_GROUP) {
+            h->role[i] = R_ANIM;
+            int k = h->ndraw++;
+            /* ties: an earlier object is in front (Chyron_FE: the ring (0) over
+               the logo (5) over the bar pieces (6..8), all at z 100) */
+            while (k > 0 && p->obj[h->draw[k - 1]].az <= o->az) { h->draw[k] = h->draw[k - 1]; k--; }
+            h->draw[k] = (short)i;
+            continue;
+        }
+        if (!in || o->type == FENG_GROUP) continue;
+        for (size_t r = 0; r < sizeof roles / sizeof roles[0]; r++)
+            if (o->hash == roles[r].hash) h->role[i] = roles[r].role;
+        /* a placeholder the game reveals by script stays hidden unless code
+           drives it */
+        if (o->rgba[3] <= 0.0f && h->role[i] == R_NONE) continue;
+        if (turbo >= 0 && feng_inside(p, i, turbo)) h->gate[i] = G_TURBO;
+        else if (o->hash == FE_NOS_TRACK || o->hash == FE_NOS_BACKING ||
+                 o->hash == FE_NOS_FILL) h->gate[i] = G_NOS;
+        else if (i == corner) h->gate[i] = G_RACE;
+        else if (pos >= 0 && feng_inside(p, i, pos)) h->gate[i] = G_POS;
+        else if ((laps >= 0 && feng_inside(p, i, laps)) || lap_obj) h->gate[i] = G_LAPS;
+        else if (bank >= 0 && feng_inside(p, i, bank)) h->gate[i] = G_BANK;
+        else if (i == sms) h->gate[i] = G_SMS;
+        /* painter's order: farthest (largest z) first, authored order on ties */
+        int k = h->ndraw++;
+        while (k > 0 && p->obj[h->draw[k - 1]].az < o->az) { h->draw[k] = h->draw[k - 1]; k--; }
+        h->draw[k] = (short)i;
+    }
+    h->o_player = feng_find(p, FE_MAP_PLAYER);
+    h->o_gps = feng_find(p, FE_MAP_GPS);
+    h->o_gate = feng_find(p, FE_MAP_GATE);
+    h->o_wrong = feng_find(p, FE_WRONG_WAY);
+    for (int k = 0; k < 8; k++) {
+        char nm[32]; snprintf(nm, sizeof nm, "AIRACERINDICATOR_%d", k);
+        h->o_aiind[k] = feng_find(p, feng_hash_upper(nm));
+    }
+    h->o_startind = feng_find(p, feng_hash_upper("STARTLINEINDICATOR_0"));
+    h->o_playerind = -1;
+    for (int k = 0; k < 8 && h->o_playerind < 0; k++) {
+        char nm[32]; snprintf(nm, sizeof nm, "PLAYERCARINDICATOR_%d", k);
+        h->o_playerind = feng_find(p, feng_hash_upper(nm));
+    }
+    h->o_track = feng_find(p, FE_NOS_TRACK);
+    if (slot >= 0) {
+        const FengObj *o = &p->obj[slot];
+        g_map_fx = o->ax; g_map_fy = o->ay;
+        g_map_half = 0.5f * fabsf(o->size[0]);
+        g_map_pin = hud_pin_of(p->obj[o->root].ax);
+    }
+}
+
+/* Every texture the drawn objects name, from the packs that ship them. The
+   tach face, needle and rev scale are the player-selectable gauge style:
+   HUD_CustomTextures_NN.bin names them <NAME>_CUSTOM_NN (style 00 here). */
+static const char *HUD_PACKS[] = {
+    "GLOBAL/InGameRace.bun",
+    "GLOBAL/InGameCommon.bun",
+    "GLOBAL/HUD_CustomTextures_%02d.bin",   /* the gauge style */
+};
+static int g_hud_style;                   /* HUDINDEX, 0 = STOCK */
+static unsigned g_hud_col[3];             /* backing, dial, needle: 0x01RRGGBB, 0 = white */
+int hud_custom(int style, const unsigned col[3]) {
+    if (style < 0 || style > 10) style = 0;
+    int changed = style != g_hud_style || memcmp(col, g_hud_col, sizeof g_hud_col);
+    g_hud_style = style; memcpy(g_hud_col, col, sizeof g_hud_col);
+    return changed;
+}
+/* 0x4f5254: the tach objects painted with the gauge colours (0x51d860 =
+   FEObject SetColor, so the colour replaces the authored one): backing
+   (slot 0xa4) tach_fill + 3rdperson_Turbofill, dial (0xa6)
+   3rdPersonTachRPMNumbers + 3rdperson_Turbolines, needle (0xa5)
+   3rdPersonNeedle + 3rdperson_TurboDial. No colour part = white. */
+static void hud_paint_gauges(FengPackage *p) {
+    static const char *const nm[6] = { "tach_fill", "3rdperson_Turbofill", "3rdPersonTachRPMNumbers",
+                                       "3rdperson_Turbolines", "3rdPersonNeedle", "3rdperson_TurboDial" };
+    int n = 0;
+    for (int k = 0; k < 6; k++) {
+        int o = feng_find(p, feng_hash_upper(nm[k]));
+        if (o < 0) continue;
+        unsigned c = g_hud_col[k / 2];
+        int r = c ? (int)(c >> 16 & 0xff) : 255, g = c ? (int)(c >> 8 & 0xff) : 255, b = c ? (int)(c & 0xff) : 255;
+        p->obj[o].rgba[0] = (float)r / 255.0f; p->obj[o].rgba[1] = (float)g / 255.0f; p->obj[o].rgba[2] = (float)b / 255.0f;
+        p->obj[o].rgba[3] = 1.0f;
+        p->obj[o].data[0] = b; p->obj[o].data[1] = g; p->obj[o].data[2] = r; p->obj[o].data[3] = 255;
+        n++;
+    }
+    if (g_hud_style || g_hud_col[0] || g_hud_col[1] || g_hud_col[2])
+        printf("player HUD: custom gauges style %02d, %d objects painted\n", g_hud_style, n);
+}
+enum { HUD_NPACK = (int)(sizeof HUD_PACKS / sizeof HUD_PACKS[0]) };
+
+/* a bundle, unpacked when it is JDLZ (FRONTEND/FrontB.lzc) */
+static unsigned char *hud_read_bundle(const char *path, long *len) {
+    unsigned char *d = n2_read_file(path, len);
+    if (!d || *len < 16 || memcmp(d, "JDLZ", 4)) return d;
+    long ul = (long)n2_u32(d + 8);
+    unsigned char *u = (unsigned char *)malloc((size_t)ul);
+    if (u) ul = n2_jdlz(d, (int)*len, u, (int)ul);
+    free(d);
+    if (!u || ul <= 0) { free(u); *len = 0; return NULL; }
+    *len = ul;
+    return u;
+}
+
+static void hud_load_art(Hud *h, const char *dataroot, const char *own) {
+    const FengPackage *p = h->pk;
+    unsigned char need[FENG_MAX_RES]; memset(need, 0, sizeof need);
+    for (int k = 0; k < h->ndraw; k++) {
+        const FengObj *o = &p->obj[h->draw[k]];
+        if (o->type != FENG_STRING && h->role[h->draw[k]] != R_MAP_SLOT &&
+            o->res >= 0 && o->res < p->nres) need[o->res] = 1;
+    }
+    int extra[14] = { h->o_player, h->o_gps, h->o_gate, h->o_wrong, h->o_startind, h->o_playerind,
+                      h->o_aiind[0], h->o_aiind[1], h->o_aiind[2], h->o_aiind[3],
+                      h->o_aiind[4], h->o_aiind[5], h->o_aiind[6], h->o_aiind[7] };
+    for (int e = 0; e < 14; e++)
+        if (extra[e] >= 0 && p->obj[extra[e]].res >= 0 && p->obj[extra[e]].res < p->nres)
+            need[p->obj[extra[e]].res] = 1;
+    /* keys: [2r] plain name, [2r+1] custom gauge name, last = the nav arrow */
+    uint32_t keys[FENG_MAX_RES * 2 + 1];
+    FengImage img[FENG_MAX_RES * 2 + 1];
+    memset(img, 0, sizeof img);
+    for (int r = 0; r < p->nres; r++) {
+        char custom[64];
+        const char *nm = p->res[r].name;
+        int n = 0;
+        while (nm[n] && nm[n] != '.' && n < 40) { custom[n] = nm[n]; n++; }
+        snprintf(custom + n, sizeof custom - (size_t)n, "_CUSTOM_%02d", g_hud_style);
+        keys[2*r]   = need[r] && p->res[r].type == 1 ? feng_tex_key(nm) : 0;
+        keys[2*r+1] = need[r] && p->res[r].type == 1 ? feng_tex_key(custom) : 0;
+    }
+    int nk = p->nres * 2;
+    keys[nk++] = HUD_ARROW_KEY;
+    /* -1: the package's own bundle; HUD_NPACK: a screen's menu art (GLOBALB) */
+    int last = h->dw && h->dw->screen ? HUD_NPACK + 1 : HUD_NPACK;
+    for (int f = own ? -1 : 0; f < last; f++) {
+        char path[1024], pack[64];
+        pack[0] = 0;
+        if (f >= 0 && f < HUD_NPACK) snprintf(pack, sizeof pack, HUD_PACKS[f], g_hud_style);
+        snprintf(path, sizeof path, "%s/%s", dataroot, f < 0 ? own : f == HUD_NPACK
+                 ? "GLOBAL/GLOBALB.BUN" : pack);
+        if (feng_tpk_load_file(path, keys, nk, img) >= 0) continue;   /* only the wanted images' bytes */
+        long len = 0;
+        unsigned char *d = hud_read_bundle(path, &len);
+        if (!d) continue;
+        feng_tpk_load(d, len, keys, nk, img);
+        free(d);
+    }
+    for (int r = 0; r < p->nres; r++) {
+        if (!need[r]) continue;
+        FengImage *im = img[2*r].rgba ? &img[2*r] : &img[2*r+1];
+        if (!im->rgba) { hud_note_missing(h, p->res[r].name); continue; }
+        h->rt[r].tex = hud_upload(im);
+        h->rt[r].w = im->w; h->rt[r].h = im->h;
+        h->rt[r].additive = im->blend == 6;
+        if (h->o_track >= 0 && p->obj[h->o_track].res == r)
+            hud_measure_arc(im, &h->nos_arc);
+    }
+    /* The arrow record can decode to garbage -- ARROW_MARKERA in InGameCommon
+       does exactly that. HUD art is flat-shaded, so a noise test on it is
+       reliable; a rejected arrow falls back to the drawn chevron. */
+    FengImage *ar = &img[nk - 1];
+    if (ar->rgba) {
+        long n = (long)ar->w * ar->h;
+        unsigned char *rgb = (unsigned char *)malloc((size_t)n * 3);
+        if (rgb) {
+            for (long i = 0; i < n; i++) memcpy(rgb + i*3, ar->rgba + i*4, 3);
+            if (hud_art_run_fraction(rgb, ar->w, ar->h) >= HUD_ART_RUN_MIN)
+                h->arrow_tex = hud_upload(ar);
+            free(rgb);
+        }
+    }
+    for (int i = 0; i < nk; i++) feng_image_free(&img[i]);
+}
+
+/* Fonts the drawn strings use: glyph tables from LANGUAGES/English.bin,
+   atlases from LANGUAGES/LanguageTextures.bin. */
+static void hud_load_fonts(Hud *h, const char *dataroot) {
+    const FengPackage *p = h->pk;
+    memset(h->font_of, -1, sizeof h->font_of);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/LANGUAGES/English.bin", dataroot);
+    long len = 0;
+    unsigned char *lang = n2_read_file(path, &len);
+    /* the front end's ConduitMdITC_TT21i is in GLOBAL/GLOBALA.BUN (FNTF + its
+       own atlas TPK), not in the language file */
+    long glen = 0;
+    snprintf(path, sizeof path, "%s/GLOBAL/GLOBALA.BUN", dataroot);
+    unsigned char *globa = h->dw && h->dw->screen ? n2_read_file(path, &glen) : NULL;
+    int nf = 0;
+    for (int k = 0; k < h->ndraw && (lang || globa); k++) {
+        const FengObj *o = &p->obj[h->draw[k]];
+        if (o->type != FENG_STRING || o->res < 0 || o->res >= p->nres) continue;
+        /* one resource row per font, so the row is the identity */
+        if (h->font_of[o->res] >= 0 || nf >= HUD_NFONT) continue;
+        if ((lang && feng_load_font(lang, len, p->res[o->res].name, &h->font[nf].f)) ||
+            (globa && feng_load_font(globa, glen, p->res[o->res].name, &h->font[nf].f)))
+            h->font_of[o->res] = (signed char)nf++;
+        else hud_note_missing(h, p->res[o->res].name);
+    }
+    free(lang);
+    if (!nf) { free(globa); return; }
+    snprintf(path, sizeof path, "%s/LANGUAGES/LanguageTextures.bin", dataroot);
+    uint32_t keys[HUD_NFONT]; FengImage img[HUD_NFONT];
+    memset(img, 0, sizeof img);
+    for (int f = 0; f < nf; f++) keys[f] = h->font[f].f.atlas_key;
+    if (feng_tpk_load_file(path, keys, nf, img) < 0) {
+        unsigned char *d = n2_read_file(path, &len);
+        if (!d) { hud_note_missing(h, "LanguageTextures.bin"); free(globa); return; }
+        feng_tpk_load(d, len, keys, nf, img);
+        free(d);
+    }
+    if (globa) { feng_tpk_load(globa, glen, keys, nf, img); free(globa); }
+    for (int f = 0; f < nf; f++) {
+        if (img[f].rgba) {
+            h->font[f].tex = hud_upload(&img[f]);
+            h->font[f].aw = img[f].w; h->font[f].ah = img[f].h;
+            h->font[f].ok = h->font[f].tex != 0;
+        } else hud_note_missing(h, h->font[f].f.name);
+        feng_image_free(&img[f]);
+    }
+}
+
+static void drift_init(Hud *h, const char *dataroot, int turbo);
+static void drift_mark(Hud *h, int turbo);
+static void drag_mark(Hud *h);
+static void drag_init(Hud *h, const char *dataroot, float redline, float maxrpm);
+static const char *dw_str(const struct HudDriftW *w, uint32_t hash);
+static void dw_load_strings(struct HudDriftW *w, const char *dataroot);
+static void dw_text(struct HudDriftW *w, int o, const char *s);
+static void dw_label(struct HudDriftW *w, int o, uint32_t hash);
+static int dw_obj(Hud *h, const char *name);
+/* the race over widget's objects (0x4f7170) are run by their FEng scripts */
+static void ro_mark(Hud *h) {
+    static const char *const names[] = { "RaceOverMessage", "RaceOverBacking",
+                                         "WrongWayImage", "WrongWay_CountDown",
+                                         "CurrentLapTime", "Lap_Time_Title", "Lap_Time_Text",
+                                         "SplitTimeText" };
+    for (size_t k = 0; k < sizeof names / sizeof names[0]; k++) {
+        int o = dw_obj(h, names[k]);
+        if (o >= 0) h->dw->wl[o] = 1;
+    }
+    for (int r = 1; r <= 4; r++) {                       /* the leaderboard's rows */
+        static const char *const f[4] = { "LBData_%d", "LeaderText_%d", "LBTextBacking_%d", "LBBacking_%d" };
+        for (int q = 0; q < 4; q++) {
+            char nm[32]; snprintf(nm, sizeof nm, f[q], r);
+            int o = dw_obj(h, nm);
+            if (o >= 0) h->dw->wl[o] = 1;
+        }
+    }
+}
+/* 0x4f7170: the objects found, hidden until the feature is on (0x4c6690(0, 0)) */
+static void ro_init(Hud *h) {
+    struct HudDriftW *w = h->dw;
+    w->o_ro_msg = dw_obj(h, "RaceOverMessage");
+    w->o_ro_back = dw_obj(h, "RaceOverBacking");
+    if (w->o_ro_msg >= 0) feng_anim_hide(&w->anim, w->o_ro_msg, 1);
+    if (w->o_ro_back >= 0) feng_anim_hide(&w->anim, w->o_ro_back, 1);
+    w->ro_on = 0; w->ro_started = 0;
+    w->o_ww = dw_obj(h, "WrongWayImage");
+    w->o_wwc2 = dw_obj(h, "WrongWay_CountDown");
+    w->ww_in = 0;
+    w->o_lt = dw_obj(h, "CurrentLapTime");
+    w->o_ltt = dw_obj(h, "Lap_Time_Title");
+    w->o_ltx = dw_obj(h, "Lap_Time_Text");
+    w->lt54 = w->lt58 = w->lt5c = w->lt64 = w->lt65 = 0;
+    w->o_sp = dw_obj(h, "SplitTimeText");
+    if (w->o_sp >= 0) feng_anim_hide(&w->anim, w->o_sp, 1);
+    w->sp28 = 0; w->sp2c = 0;
+    for (int r = 0; r < 4; r++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "LBData_%d", r + 1); w->o_lbd[r] = dw_obj(h, nm);
+        snprintf(nm, sizeof nm, "LeaderText_%d", r + 1); w->o_lbt[r] = dw_obj(h, nm);
+        snprintf(nm, sizeof nm, "LBTextBacking_%d", r + 1); w->o_lbtb[r] = dw_obj(h, nm);
+        snprintf(nm, sizeof nm, "LBBacking_%d", r + 1); w->o_lbb[r] = dw_obj(h, nm);
+    }
+    w->lb1bc = 0; w->lb1c0 = 0;
+}
+
+/* drift: 0 the plain HUD, 1 HUD_Drift, 2 a whole screen, 3 HUD_SingleRace,
+   4 HUD_Drag (redline / maxrpm for its rev scale) */
+static Hud *hud_init_pkg2(const char *dataroot, const char *const *pkg_from, int nfrom,
+                          const char *package, int drift, int turbo, float redline, float maxrpm);
+static Hud *hud_init_pkg(const char *dataroot, const char *const *pkg_from, int nfrom,
+                         const char *package, int drift, int turbo) {
+    return hud_init_pkg2(dataroot, pkg_from, nfrom, package, drift, turbo, 0.0f, 0.0f);
+}
+static Hud *hud_init_pkg2(const char *dataroot, const char *const *pkg_from, int nfrom,
+                          const char *package, int drift, int turbo, float redline, float maxrpm) {
     Hud *h = (Hud *)calloc(1, sizeof *h);
     if (!h) return NULL;
     if (!dataroot) dataroot = ".";
+    snprintf(h->dataroot, sizeof h->dataroot, "%s", dataroot);
+    memset(h->font_of, -1, sizeof h->font_of);
 
-    hud_art_define(h, ART_BACKING,        "SS_HUDBACKING",           0xe3af0cd4u);
-    hud_art_define(h, ART_TACH_BACK,      "TACH_NOS_BACKING",        0xa9e53dbcu);
-    hud_art_define(h, ART_TACH_ARC,       "TACH_NOS_ALPHA",          0x04575433u);
-    hud_art_define(h, ART_TACH_FILL,      "TACH_FILL_CUSTOM_00",     0x4738197eu);
-    hud_art_define(h, ART_NOS_BAR,        "SS_NOS",                  0x7ab54f94u);
-    hud_art_define(h, ART_NOS_OVERLAY,    "SS_NOS_OVERLAY",          0x59d6e695u);
-    hud_art_define(h, ART_MAP_MASK,       "MINIMAP_MASK",            0x40cdc515u);
-    hud_art_define(h, ART_MAP_BORDER,     "MINIMAP_BORDER",          0x92a75587u);
-    hud_art_define(h, ART_MAP_BACK,       "MAPBACK",                 0xd86eb8ceu);
-    hud_art_define(h, ART_MAP_CAR,        "MINIMAP_ICON_CAR",        0xada85247u);
-    hud_art_define(h, ART_MAP_NORTH,      "MINIMAP_NORTH_INDICATOR", 0xf2a54430u);
-    hud_art_define(h, ART_MAP_GPS,        "MINIMAP_GPS_SELECTOR",    0xe2848973u);
-    hud_art_define(h, ART_MAP_START,      "MINIMAP_ICON_START_LINE", 0x059b3ec6u);
-    hud_art_define(h, ART_MAP_SAFEHOUSE,  "MINIMAP_ICON_SAFE_HOUSE", 0x2cfd5273u);
-    hud_art_define(h, ART_MAP_CIRCUIT,    "MINIMAP_ICON_CIRCUIT",    0x25559384u);
-    hud_art_define(h, ART_ARROW,          "ARROW_MARKERA",           0x985c190cu);
-    hud_art_define(h, ART_CINGULAR_LOGO,  "HUD_CINGULAR_LOGO",       0x67a76a24u);
-    hud_art_define(h, ART_CINGULAR_SLOGAN,"HUD_CINGULAR_SLOGAN",     0xff4c9fb7u);
-    hud_art_define(h, ART_ENGAGE_BACKING, "ENGAGE_BACKING",          0x99f665f4u);
-    hud_art_define(h, ART_ENGAGE_PHONE,   "ENGAGE_PHONE_ICON",       0x6fff0767u);
-    hud_art_define(h, ART_ENGAGE_CINGULAR,"ENGAGE_CINGULAR_ICON",    0xea570722u);
-
-    for (int p = 0; p < HUD_NPACK; p++) {
+    h->pk = (FengPackage *)malloc(sizeof *h->pk);
+    int loaded = 0;
+    for (int f = 0; f < nfrom && h->pk && !loaded; f++) {
         char path[1024];
-        snprintf(path, sizeof path, "%s/%s", dataroot, HUD_PACKS[p]);
+        snprintf(path, sizeof path, "%s/%s", dataroot, pkg_from[f]);
         long len = 0;
-        unsigned char *d = n2_read_file(path, &len);
+        unsigned char *d = hud_read_bundle(path, &len);
         if (!d) continue;
-        N2Tpk tpk = n2_tpk_open(d, len);
-        for (int a = 0; a < ART_COUNT; a++) {
-            if (h->art[a].tex) continue;             /* an earlier pack had it */
-            N2Tex t;
-            if (!n2_tpk_decode(d, len, tpk, h->art[a].key, &t)) continue;
-            /* A record can decode to garbage -- ARROW_MARKERA in InGameCommon
-               does exactly that. Shipping it would put a block of coloured
-               noise at the top of the screen and call it a navigation arrow.
-               n2_tex_noise is tuned for world textures and is deliberately
-               conservative (it must not throw away sign faces again), and this
-               noise is too dark to trip it; UI art needs its own, measured
-               test. The element then falls back to a plainly non-retail
-               drawing and is named in hud_missing(). */
-            if (hud_art_run_fraction(t.rgb, t.w, t.h) < HUD_ART_RUN_MIN) {
-                free(t.rgb); free(t.alpha); free(t.dxt);
-                h->art[a].rejected = 1;
-                continue;
-            }
-            h->art[a].tex = hud_upload(&t);
-            h->art[a].w = t.w; h->art[a].h = t.h;
-            /* Every dial's geometry comes from its own art: the shipped
-               records put the circle CENTRE OUTSIDE the texture (the drag
-               tach's is 1.34 widths to the right), so nothing can be placed
-               by eye. */
-            { struct HudArc fit = {0}; hud_measure_arc(&t, &fit);
-              h->art[a].arc.ok = fit.ok; h->art[a].arc.cx = fit.cx;
-              h->art[a].arc.cy = fit.cy; h->art[a].arc.r  = fit.r;
-              h->art[a].arc.a0 = fit.a0; h->art[a].arc.a1 = fit.a1; }
-            free(t.rgb); free(t.alpha); free(t.dxt);
-        }
+        loaded = feng_load_package(d, len, package, h->pk);
         free(d);
     }
-    for (int a = 0; a < ART_COUNT; a++)
-        if (!h->art[a].tex) {
-            size_t used = strlen(h->missing);
-            snprintf(h->missing + used, sizeof h->missing - used,
-                     "%s%s%s", used ? " " : "", h->art[a].name,
-                     h->art[a].rejected ? "(decodes to noise)" : "(absent)");
+    if (loaded && drift != 2) hud_paint_gauges(h->pk);   /* the race HUDs */
+    if (loaded && drift) {
+        h->dw = (struct HudDriftW *)calloc(1, sizeof *h->dw);
+        if (h->dw && drift == 1) drift_mark(h, turbo);
+        if (h->dw && drift == 4) drag_mark(h);
+        if (h->dw && (drift == 1 || drift == 3 || drift == 4)) ro_mark(h);   /* the race HUDs */
+        if (h->dw && drift == 2) {          /* a whole screen: every object, centred 4:3 */
+            memset(h->dw->wl, 1, sizeof h->dw->wl);
+            h->dw->screen = 1;
         }
-    {   static const int dials[1] = { ART_TACH_ARC };
-        for (int i = 0; i < 1; i++) {
-            const HudArt *a = &h->art[dials[i]];
-            if (a->arc.ok)
-                printf("player HUD: %-22s centre (%.3f, %.3f)w r %.3fw "
-                       "sweep %.0f..%.0f deg\n", a->name, a->arc.cx, a->arc.cy,
-                       a->arc.r, a->arc.a0 * 180.0f / (float)M_PI,
-                       a->arc.a1 * 180.0f / (float)M_PI);
-            else printf("player HUD: %-22s no usable arc fit\n", a->name);
+    }
+    if (!loaded) {
+        free(h->pk); h->pk = NULL;
+        hud_note_missing(h, package);
+        printf("player HUD: %s not found -- only the navigation arrow draws\n", package);
+    } else {
+        hud_classify(h);
+        hud_load_art(h, dataroot, drift ? pkg_from[0] : NULL);
+        hud_load_fonts(h, dataroot);
+        if (h->dw && drift == 1) drift_init(h, dataroot, turbo);
+        if (h->dw && drift == 3) {
+            feng_anim_init(&h->dw->anim, h->pk);
+            dw_load_strings(h->dw, dataroot);
         }
+        if (h->dw && drift == 4) drag_init(h, dataroot, redline, maxrpm);
+        if (h->dw && (drift == 1 || drift == 3 || drift == 4)) ro_init(h);
+        if (h->dw && drift == 2) {
+            feng_anim_init(&h->dw->anim, h->pk);
+            dw_load_strings(h->dw, dataroot);
+        }
+        printf("player HUD: %s, %d objects, %d drawn; minimap at (%.0f,%.0f) r %.0f pin %d\n",
+               h->pk->name, h->pk->nobj, h->ndraw, (double)g_map_fx, (double)g_map_fy,
+               (double)g_map_half, g_map_pin);
+        if (h->nos_arc.ok)
+            printf("player HUD: N2O arc centre (%.3f, %.3f)w r %.3fw sweep %.0f..%.0f deg\n",
+                   h->nos_arc.cx, h->nos_arc.cy, h->nos_arc.r,
+                   h->nos_arc.a0 * 180.0f / (float)M_PI, h->nos_arc.a1 * 180.0f / (float)M_PI);
+    }
+
+    /* dynamic quad batch: positions/UVs per draw, fixed normals and indices */
+    {
+        float nrm[HUD_QMAX * 4 * 3];
+        unsigned short idx[HUD_QMAX * 6];
+        for (int i = 0; i < HUD_QMAX * 4; i++) { nrm[i*3] = 0; nrm[i*3+1] = 0; nrm[i*3+2] = 1; }
+        for (int q = 0; q < HUD_QMAX; q++) {
+            unsigned short b = (unsigned short)(q * 4);
+            idx[q*6] = b; idx[q*6+1] = b + 1; idx[q*6+2] = b + 2;
+            idx[q*6+3] = b; idx[q*6+4] = b + 2; idx[q*6+5] = b + 3;
+        }
+        glGenBuffers(1, &h->qb_vbo);
+        glGenBuffers(1, &h->qb_nbo);
+        glGenBuffers(1, &h->qb_ibo);
+        glBindBuffer(GL_ARRAY_BUFFER, h->qb_nbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof nrm, nrm, GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, h->qb_ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, h->qb_vbo);
+        glBufferData(GL_ARRAY_BUFFER, HUD_QMAX * 4 * 5 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
     }
     h->needle_rpm = h->needle_speed = 0.0f;
     return h;
 }
 
+/* a race HUD kept across races (the original builds its HUD per race):
+   the race-over / wrong way / lap time / split / leaderboard widgets start
+   clean, else the lap widget's last-lap stamp from the previous race
+   (later than the new race clock) keeps "BEST LAP TIME" up all lap 1 */
+void hud_race_reset(Hud *h) {
+    if (h && h->pk && h->dw && !h->dw->screen) ro_init(h);
+}
+
+Hud *hud_init(const char *dataroot) {
+    static const char *const from[] = { "GLOBAL/InGameRace.bun", "GLOBAL/InGameFreeRoam.bun" };
+    return hud_init_pkg(dataroot, from, 2, HUD_PACKAGE, 3, 0);
+}
+
+Hud *hud_init_short(const char *dataroot) {
+    static const char *const from[] = { "GLOBAL/InGameRace.bun" };
+    return hud_init_pkg(dataroot, from, 1, "HUD_Short_Track.fng", 3, 0);
+}
+
+Hud *hud_init_drift(const char *dataroot, int turbo) {
+    static const char *const from[] = { "GLOBAL/InGameDrift.bun" };
+    return hud_init_pkg(dataroot, from, 1, "HUD_Drift.fng", 1, turbo);
+}
+
+Hud *hud_init_drag(const char *dataroot, float redline, float maxrpm) {
+    static const char *const from[] = { "GLOBAL/InGameDrag.bun" };
+    return hud_init_pkg2(dataroot, from, 1, "HUD_Drag.fng", 4, 0, redline, maxrpm);
+}
+
+Hud *hud_init_screen(const char *dataroot, const char *bundle, const char *package) {
+    const char *from[1] = { bundle };
+    Hud *h = hud_init_pkg(dataroot, from, 1, package, 2, 0);
+    /* PC_Loading: "LOADING", its gradient and circles are one strip on the
+       left edge, as the front end pins it (shop.c PK_LOADING) */
+    if (h && h->dw && !strcmp(package, "PC_Loading.fng")) h->dw->screen = 2;
+    return h;
+}
+
+static int screen_obj(const Hud *h, const char *name) {
+    return h && h->pk && h->dw ? feng_find(h->pk, feng_hash_upper(name)) : -1;
+}
+void hud_screen_text(Hud *h, const char *name, const char *text) {
+    int o = screen_obj(h, name);
+    if (o >= 0) dw_text(h->dw, o, text);
+}
+void hud_screen_label(Hud *h, const char *name, uint32_t label) {
+    int o = screen_obj(h, name);
+    if (o >= 0) dw_label(h->dw, o, label);
+}
+void hud_screen_text_h(Hud *h, uint32_t obj, const char *text) {
+    int o = h && h->pk && h->dw ? feng_find(h->pk, obj) : -1;
+    if (o >= 0) dw_text(h->dw, o, text);
+}
+void hud_screen_label_h(Hud *h, uint32_t obj, uint32_t label) {
+    int o = h && h->pk && h->dw ? feng_find(h->pk, obj) : -1;
+    if (o >= 0) dw_label(h->dw, o, label);
+}
+void hud_screen_script_h(Hud *h, uint32_t obj, const char *script) {
+    int o = h && h->pk && h->dw ? feng_find(h->pk, obj) : -1;
+    if (o >= 0) feng_anim_set(&h->dw->anim, o, feng_hash_upper(script), 1);
+}
+void hud_screen_hide_h(Hud *h, uint32_t obj, int hide) {
+    int o = h && h->pk && h->dw ? feng_find(h->pk, obj) : -1;
+    if (o >= 0) feng_anim_hide(&h->dw->anim, o, hide);
+}
+const char *hud_screen_string(const Hud *h, uint32_t label) {
+    return h && h->dw ? dw_str(h->dw, label) : "";
+}
+void hud_screen_script(Hud *h, const char *name, const char *script) {
+    int o = screen_obj(h, name);
+    if (o >= 0) feng_anim_set(&h->dw->anim, o, feng_hash_upper(script), 1);
+}
+void hud_screen_script_all(Hud *h, const char *script) {
+    if (!h || !h->dw) return;
+    uint32_t hs = feng_hash_upper(script);
+    for (int i = 0; i < h->pk->nobj; i++) feng_anim_set(&h->dw->anim, i, hs, 1);
+}
+void hud_screen_hide(Hud *h, const char *name, int hide) {
+    int o = screen_obj(h, name);
+    if (o >= 0) feng_anim_hide(&h->dw->anim, o, hide);
+}
+int hud_screen_box(const Hud *h, const char *name, float *x, float *y, float *w, float *ht) {
+    int o = screen_obj(h, name);
+    if (o < 0) return 0;
+    const int32_t *d = h->pk->obj[o].data;
+    float v[4]; memcpy(&v[0], &d[7], 4); memcpy(&v[1], &d[8], 4); memcpy(&v[2], &d[14], 4); memcpy(&v[3], &d[15], 4);
+    *x = v[0]; *y = v[1]; *w = v[2]; *ht = v[3];
+    return 1;
+}
+void hud_screen_pos(Hud *h, const char *name, float x, float y) {
+    int o = screen_obj(h, name);
+    if (o >= 0) feng_anim_pos(&h->dw->anim, o, x, y);
+}
+void hud_screen_size(Hud *h, const char *name, float w, float ht) {
+    int o = screen_obj(h, name);
+    if (o >= 0) feng_anim_size(&h->dw->anim, o, w, ht);
+}
+int hud_screen_res(Hud *h, const char *name, const char *resname) {
+    int o = screen_obj(h, name);
+    if (o < 0) return 0;
+    for (int r = 0; r < h->pk->nres; r++)
+        if (!strcmp(h->pk->res[r].name, resname)) { h->dw->res_ov[o] = (short)(r + 1); return 1; }
+    return 0;
+}
+void hud_screen_pos_reset(Hud *h, const char *name) {
+    int o = screen_obj(h, name);
+    if (o < 0) return;
+    float x, y; memcpy(&x, &h->pk->obj[o].data[7], 4); memcpy(&y, &h->pk->obj[o].data[8], 4);
+    feng_anim_pos(&h->dw->anim, o, x, y);
+}
+int hud_screen_strip(Hud *h, const char *dataroot, const char *bundle, const uint32_t *keys, int n) {
+    if (!h || !h->dw || !h->pk || n <= 0) return 0;
+    struct HudDriftW *w = h->dw;
+    if (n > 16) n = 16;
+    for (int i = 0; i < w->strip_n; i++)
+        if (w->strip_tex[i]) glDeleteTextures(1, &w->strip_tex[i]);
+    memset(w->strip_tex, 0, sizeof w->strip_tex);
+    w->strip_master = feng_find(h->pk, feng_hash_upper("OPTION_MASTER"));
+    w->strip_n = n; w->strip_sel = 0; w->strip_scroll = 0.0f; w->strip_pulse = 0.0f; w->strip_ms = 0;
+    memset(w->strip_lock, 0, sizeof w->strip_lock);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s", dataroot ? dataroot : ".", bundle);
+    FengImage img[16]; memset(img, 0, sizeof img);
+    if (feng_tpk_load_file(path, keys, n, img) < 0) {
+        long len = 0;
+        unsigned char *d = n2_read_file(path, &len);
+        if (!d) return 0;
+        feng_tpk_load(d, len, keys, n, img);
+        free(d);
+    }
+    int got = 0;
+    for (int i = 0; i < n; i++) {
+        if (!img[i].rgba) continue;
+        w->strip_tex[i] = hud_upload(&img[i]);
+        w->strip_add[i] = img[i].blend == 6;
+        feng_image_free(&img[i]);
+        got++;
+    }
+    return got;
+}
+/* an option that can't be picked: drawn at the locked alpha (0x51fd60, 150) */
+void hud_screen_strip_lock(Hud *h, int i, int lock) {
+    if (h && h->dw && i >= 0 && i < 16) h->dw->strip_lock[i] = (unsigned char)(lock != 0);
+}
+void hud_screen_strip_select(Hud *h, int sel) {
+    if (!h || !h->dw || sel < 0 || sel >= h->dw->strip_n || sel == h->dw->strip_sel) return;
+    h->dw->strip_sel = sel;
+    h->dw->strip_pulse = 0.0f;
+}
+/* the strip's easing per 1/60 s frame: scroll 0.3 of the way to the
+   selection ([+0xb4]), pulse phase += 0.03 over 0..2 */
+static void strip_tick(struct HudDriftW *w, int dt_ms) {
+    w->strip_ms += dt_ms;
+    for (; w->strip_ms >= 17; w->strip_ms -= 17) {
+        float target = (float)w->strip_sel;
+        w->strip_scroll += (target - w->strip_scroll) * 0.3f;
+        if (fabsf(target - w->strip_scroll) < 0.001f) w->strip_scroll = target;
+        w->strip_pulse += 0.03f;
+        if (w->strip_pulse > 2.0f) w->strip_pulse = 0.0f;
+    }
+}
+void hud_screen_draw(Hud *h, const RProg *rp, GpuMesh *quad, int width, int height, int dt_ms) {
+    if (!h || !h->dw) return;
+    feng_anim_tick(&h->dw->anim, dt_ms);
+    if (h->dw->strip_n) strip_tick(h->dw, dt_ms);
+    HudState s; memset(&s, 0, sizeof s);
+    hud_draw(h, rp, quad, &s, width, height);
+}
+
 void hud_free(Hud **hp) {
     if (!hp || !*hp) return;
     Hud *h = *hp;
-    for (int a = 0; a < ART_COUNT; a++)
-        if (h->art[a].tex) glDeleteTextures(1, &h->art[a].tex);
+    for (int r = 0; r < FENG_MAX_RES; r++)
+        if (h->rt[r].tex) glDeleteTextures(1, &h->rt[r].tex);
+    for (int f = 0; f < HUD_NFONT; f++)
+        if (h->font[f].tex) glDeleteTextures(1, &h->font[f].tex);
+    if (h->arrow_tex) glDeleteTextures(1, &h->arrow_tex);
+    if (h->map_tex) glDeleteTextures(1, &h->map_tex);
+    if (h->tm_tex) glDeleteTextures(1, &h->tm_tex);
+    if (h->fan_vbo) glDeleteBuffers(1, &h->fan_vbo);
+    if (h->fan_nbo) glDeleteBuffers(1, &h->fan_nbo);
+    if (h->fan_ibo) glDeleteBuffers(1, &h->fan_ibo);
+    if (h->qb_vbo) glDeleteBuffers(1, &h->qb_vbo);
+    if (h->qb_nbo) glDeleteBuffers(1, &h->qb_nbo);
+    if (h->qb_ibo) glDeleteBuffers(1, &h->qb_ibo);
+    if (h->dw) {
+        for (int i = 0; i < h->dw->strip_n; i++)
+            if (h->dw->strip_tex[i]) glDeleteTextures(1, &h->dw->strip_tex[i]);
+        if (h->dw->ov_num.tex) glDeleteTextures(1, &h->dw->ov_num.tex);
+        if (h->dw->ov_red.tex) glDeleteTextures(1, &h->dw->ov_red.tex);
+        for (int i = 0; i < FENG_MAX_OBJ; i++) free(h->dw->txt[i]);
+        free(h->dw->lang); free(h->dw->sh); free((void *)h->dw->st); free(h->dw);
+    }
+    feng_free_package(h->pk);
+    free(h->pk);
     free(h);
     *hp = NULL;
+}
+
+/* One capsule (thick segment) into an 8-bit image: value = max(existing,
+   shade), with a one-pixel soft edge. Coordinates in pixels. */
+static void map_capsule(unsigned char *img, int size, float ax, float ay,
+                        float bx, float by, float r, float shade) {
+    int x0 = (int)floorf((ax < bx ? ax : bx) - r - 1), x1 = (int)ceilf((ax > bx ? ax : bx) + r + 1);
+    int y0 = (int)floorf((ay < by ? ay : by) - r - 1), y1 = (int)ceilf((ay > by ? ay : by) + r + 1);
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 >= size) x1 = size - 1; if (y1 >= size) y1 = size - 1;
+    float ex = bx - ax, ey = by - ay, l2 = ex*ex + ey*ey;
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) {
+            float px = x + 0.5f - ax, py = y + 0.5f - ay;
+            float t = l2 > 1e-6f ? (px*ex + py*ey) / l2 : 0.0f;
+            if (t < 0) t = 0; else if (t > 1) t = 1;
+            float dx = px - t*ex, dy = py - t*ey;
+            float d = sqrtf(dx*dx + dy*dy) - r;          /* <0 inside */
+            float cover = d <= -0.5f ? 1.0f : d >= 0.5f ? 0.0f : 0.5f - d;
+            if (cover <= 0.0f) continue;
+            unsigned char *p = &img[(size_t)y*size + x];
+            float v = *p + (shade - *p) * cover;
+            if (v > *p) *p = (unsigned char)v;
+        }
+}
+
+void hud_map_build(Hud *h, const float *xy, const int *next,
+                   const float *half_width, int n) {
+    if (!h || !xy || !next || n < 2) return;
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (int i = 0; i < n; i++) {
+        if (xy[i*2] < x0) x0 = xy[i*2]; if (xy[i*2] > x1) x1 = xy[i*2];
+        if (xy[i*2+1] < y0) y0 = xy[i*2+1]; if (xy[i*2+1] > y1) y1 = xy[i*2+1];
+    }
+    float ext = (x1 - x0 > y1 - y0 ? x1 - x0 : y1 - y0) + 200.0f;
+    if (!(ext > 0.0f) || ext > 100000.0f) return;
+    x0 -= 100.0f; y0 -= 100.0f;
+    unsigned char *img = (unsigned char *)malloc((size_t)MAP_TEX * MAP_TEX);
+    if (!img) return;
+    memset(img, 40, (size_t)MAP_TEX * MAP_TEX);              /* dark blocks */
+    float s = MAP_TEX / ext;                                   /* px per metre */
+    /* two passes: a darker kerb outline under every road, then the roads */
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < n; i++) {
+            int j = next[i];
+            if (j < 0 || j >= n) continue;
+            float hw = half_width ? 0.5f*(half_width[i] + half_width[j]) : 5.0f;
+            if (!(hw > 0.5f)) hw = 5.0f;
+            if (hw > 30.0f) hw = 30.0f;
+            float r = hw * s;
+            if (r < 1.2f) r = 1.2f;                            /* keep alleys visible */
+            float shade = hw >= 9.0f ? 235.0f : 150.0f + hw * 8.0f;   /* wide = bright */
+            float ax = (xy[i*2]-x0)*s, ay = (xy[i*2+1]-y0)*s;
+            float bx = (xy[j*2]-x0)*s, by = (xy[j*2+1]-y0)*s;
+            if ((ax-bx)*(ax-bx) + (ay-by)*(ay-by) > 400.0f*s*400.0f*s) continue;  /* route jump */
+            if (pass == 0) map_capsule(img, MAP_TEX, ax, ay, bx, by, r + 1.0f, 70.0f);
+            else           map_capsule(img, MAP_TEX, ax, ay, bx, by, r, shade);
+        }
+    glGenTextures(1, &h->map_tex);
+    glBindTexture(GL_TEXTURE_2D, h->map_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, MAP_TEX, MAP_TEX, 0,
+                 GL_LUMINANCE, GL_UNSIGNED_BYTE, img);
+    free(img);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    h->map_x0 = x0; h->map_y0 = y0; h->map_ext = ext;
+
+    /* the fan: centre + MAP_FAN rim vertices; positions/UVs filled per frame */
+    float nrm[(MAP_FAN + 1) * 3];
+    for (int i = 0; i <= MAP_FAN; i++) { nrm[i*3] = 0; nrm[i*3+1] = 0; nrm[i*3+2] = 1; }
+    unsigned short idx[MAP_FAN * 3];
+    for (int i = 0; i < MAP_FAN; i++) {
+        idx[i*3] = 0; idx[i*3+1] = (unsigned short)(1 + i);
+        idx[i*3+2] = (unsigned short)(1 + (i + 1) % MAP_FAN);
+    }
+    glGenBuffers(1, &h->fan_vbo);
+    glGenBuffers(1, &h->fan_nbo);
+    glGenBuffers(1, &h->fan_ibo);
+    glBindBuffer(GL_ARRAY_BUFFER, h->fan_nbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof nrm, nrm, GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, h->fan_ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, h->fan_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (MAP_FAN + 1) * 5 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    printf("minimap: street map %dx%d over %.0f m (%.1f m/px) from %d road nodes\n",
+           MAP_TEX, MAP_TEX, (double)ext, (double)(ext / MAP_TEX), n);
+}
+
+/* the fan's buffers (centre + MAP_FAN rim vertices, filled per frame) */
+static void hud_map_fan(Hud *h) {
+    if (h->fan_vbo) return;
+    float nrm[(MAP_FAN + 1) * 3];
+    for (int i = 0; i <= MAP_FAN; i++) { nrm[i*3] = 0; nrm[i*3+1] = 0; nrm[i*3+2] = 1; }
+    unsigned short idx[MAP_FAN * 3];
+    for (int i = 0; i < MAP_FAN; i++) {
+        idx[i*3] = 0; idx[i*3+1] = (unsigned short)(1 + i);
+        idx[i*3+2] = (unsigned short)(1 + (i + 1) % MAP_FAN);
+    }
+    glGenBuffers(1, &h->fan_vbo);
+    glGenBuffers(1, &h->fan_nbo);
+    glGenBuffers(1, &h->fan_ibo);
+    glBindBuffer(GL_ARRAY_BUFFER, h->fan_nbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof nrm, nrm, GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, h->fan_ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, h->fan_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (MAP_FAN + 1) * 5 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+}
+int hud_set_trackmap(Hud *h, const char *dataroot, int event,
+                     float x0, float y0, float size, float zoom) {
+    if (!h || !(size > 0) || !(zoom > 0)) return 0;
+    h->tm_x0 = x0; h->tm_y0 = y0; h->tm_size = size; h->tm_zoom = zoom;
+    if (event == h->tm_event && h->tm_tex) return 1;
+    char path[1024], name[32];
+    snprintf(path, sizeof path, "%s/TRACKS/TRACKMAP%d.BIN", dataroot ? dataroot : ".", event);
+    snprintf(name, sizeof name, "TRACKMAP%d", event);
+    long len = 0;
+    unsigned char *d = n2_read_file(path, &len);
+    if (!d) { printf("minimap: %s missing\n", path); return 0; }
+    uint32_t key = 0xffffffffu;                                  /* bin hash of the name */
+    for (const char *c = name; *c; c++) key = key * 33u + (unsigned char)*c;
+    FengImage img; memset(&img, 0, sizeof img);
+    int ok = feng_tpk_load(d, len, &key, 1, &img) && img.rgba;
+    free(d);
+    if (!ok) { printf("minimap: %s holds no %s\n", path, name); return 0; }
+    /* its alpha is 0 throughout: Track4000_map draws it by colour alone */
+    for (int i = 0; i < img.w * img.h; i++) img.rgba[i * 4 + 3] = 255;
+    if (!h->tm_tex) glGenTextures(1, &h->tm_tex);
+    glBindTexture(GL_TEXTURE_2D, h->tm_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.w, img.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.rgba);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    feng_image_free(&img);
+    hud_map_fan(h);
+    h->tm_event = event;
+    printf("minimap: %s, %.0f m from (%.0f, %.0f), zoom %.2f\n", name, (double)size, (double)x0, (double)y0, (double)zoom);
+    return 1;
 }
 
 void hud_set_preview(Hud *h, int on) { if (h) h->preview = on ? 1 : 0; }
@@ -393,125 +1225,267 @@ static void hud_label(const HudDC *dc, const char *s, float cx, float cy,
               cx - (float)strlen(s) * 2.0f * px, cy + 2.5f * py, px, py);
 }
 
-/* --------------------------------------------------------- gauge cluster */
+/* ------------------------------------------------------------ FEng drawing */
 
-/* Cluster size, in HUD units (1 unit = half the screen height). The arc art
- * is 2:1, and everything else is derived from its MEASURED circle. */
-#define TACH_W   0.84f
-#define TACH_H   0.42f
-
-
-/* Sweep an angle across a measured arc. frac 0 = a0 end, 1 = a1 end. */
-static float hud_arc_angle(const HudArt *a, float frac, float fb0, float fb1) {
-    if (frac < 0.0f) frac = 0.0f;
-    if (frac > 1.0f) frac = 1.0f;
-    float a0 = a->arc.ok ? a->arc.a0 : fb0 * (float)M_PI / 180.0f;
-    float a1 = a->arc.ok ? a->arc.a1 : fb1 * (float)M_PI / 180.0f;
-    return a0 + frac * (a1 - a0);
+/* Draw object i's own art centred on FEng point (fx, fy), turned `angle`
+ * radians clockwise about its authored pivot, tinted rgba. */
+static void fe_sprite_at(Hud *h, const HudDC *dc, int i, float fx, float fy,
+                         float angle, const float *rgba) {
+    const FengObj *o = &h->pk->obj[i];
+    if (o->res < 0 || o->res >= h->pk->nres || !h->rt[o->res].tex) return;
+    const HudTex *t = &h->rt[o->res];
+    /* rotate about centre + pivot: centre' = P + R(angle) * (centre - P) */
+    float px = o->pivot[0], py = o->pivot[1], c = cosf(angle), s = sinf(angle);
+    float cx = fx + px + (-px * c + py * s), cy = fy + py + (-px * s - py * c);
+    float nx, ny;
+    fe_ndc(dc->asp, hud_pin_of(h->pk->obj[o->root].ax), cx, cy, &nx, &ny);
+    if (t->additive) glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    /* FEng turns clockwise on a y-down screen; hud_xform is CCW, y-up */
+    hud_blit(dc, t->tex, fabsf(o->size[0]) / 240.0f, fabsf(o->size[1]) / 240.0f,
+             nx, ny, -angle, rgba[0], rgba[1], rgba[2], rgba[3]);
+    if (t->additive) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
+static void fe_sprite(Hud *h, const HudDC *dc, int i) {
+    const FengObj *o = &h->pk->obj[i];
+    fe_sprite_at(h, dc, i, o->ax, o->ay, o->aangle, o->rgba);
+}
 
-static void hud_draw_cluster(Hud *h, const HudDC *dc, const HudState *s) {
-    /* Standard third-person cluster. The rev arc is the anchor; the N2O bar
-       hangs below it and disappears entirely when no nitrous is fitted, so
-       removing it leaves everything else exactly where it was.
+/* Object i's art at an NDC point (minimap markers), unrotated. */
+static void fe_sprite_ndc(Hud *h, const HudDC *dc, int i, float nx, float ny,
+                          const float *rgba) {
+    if (i < 0) return;
+    const FengObj *o = &h->pk->obj[i];
+    if (o->res < 0 || o->res >= h->pk->nres || !h->rt[o->res].tex) return;
+    hud_blit(dc, h->rt[o->res].tex, fabsf(o->size[0]) / 240.0f,
+             fabsf(o->size[1]) / 240.0f, nx, ny, 0.0f,
+             rgba[0], rgba[1], rgba[2], rgba[3]);
+}
 
-       There is deliberately NO boost dial here. The only turbo art in the game
-       is DRAG_TURBO_* inside GLOBAL/InGameDrag.bun, which belongs to the drag
-       HUD and is out of scope for this one; and no turbo system exists to
-       drive it either. Both reasons point the same way, so the gauge is
-       absent rather than dead. */
-    float cx, cy;
-    hud_place(dc->asp, 1.0f, -1.0f, -0.52f, 0.56f, &cx, &cy);
-    const HudArt *arc = &h->art[ART_TACH_ARC];
-    float pivx = cx, pivy = cy - TACH_H * 0.5f, arc_r = TACH_W * 0.42f;
-    if (arc->arc.ok) {
-        pivx = cx + (arc->arc.cx - 0.5f) * TACH_W / dc->asp;
-        pivy = cy - TACH_H * 0.5f + arc->arc.cy * TACH_W;
-        arc_r = arc->arc.r * TACH_W;
+/* Draw `nq` quads from the batch (x,y,z,u,v per vertex, NDC) with one texture. */
+static void hud_batch(Hud *h, const HudDC *dc, GLuint tex, const float *v, int nq,
+                      const float *rgba) {
+    if (nq <= 0 || !tex) return;
+    glBindBuffer(GL_ARRAY_BUFFER, h->qb_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(nq * 4 * 5 * sizeof(float)), v, GL_DYNAMIC_DRAW);
+    static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    glUniformMatrix4fv(dc->rp->uMVP, 1, GL_FALSE, ident);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1f(dc->rp->uUseTex, 1.0f);
+    glUniform1f(dc->rp->uEmissiveTex, 1.0f);
+    glUniform1f(dc->rp->uUnlit, 0.0f);
+    glUniform3f(dc->rp->uColor, rgba[0], rgba[1], rgba[2]);
+    glUniform1f(dc->rp->uAlpha, rgba[3]);
+    GpuMesh m; memset(&m, 0, sizeof m);
+    m.vbo = h->qb_vbo; m.nbo = h->qb_nbo; m.ibo = h->qb_ibo; m.nidx = nq * 6;
+    draw_gpumesh(&m);
+}
+
+static void put_vert(float *v, float x, float y, float u, float t) {
+    v[0] = x; v[1] = y; v[2] = 0.0f; v[3] = u; v[4] = t;
+}
+
+/* The console FNGs' button prompts: a text object whose string is the token
+ * $JOY_EVENT_FENG_<button>$ drew the pad button's glyph from the console's
+ * button font. The PC build has no such font (it hides the prompts and puts
+ * up the mouse bar UI_PC_Help_Bar instead), so the Vita draws its own
+ * PlayStation glyphs, one line of the object's font high. The buttons are
+ * the ones main.c binds to the pad events: FENG_SELECT = PAD_ACCEPT (Cross),
+ * FENG_CANCEL = PAD_BACK (Circle), FENG_BUTTON1 = Triangle, FENG_BUTTON0 =
+ * Square. */
+enum { BTN_CROSS, BTN_CIRCLE, BTN_TRIANGLE, BTN_SQUARE, BTN_N };
+static GLuint g_btn_tex[BTN_N];
+static int btn_of_token(const char *t) {
+    static const struct { const char *tok; int b; } k[] = {
+        { "$JOY_EVENT_FENG_SELECT$", BTN_CROSS }, { "$JOY_EVENT_FENG_CANCEL$", BTN_CIRCLE },
+        { "$JOY_EVENT_FENG_BUTTON1$", BTN_TRIANGLE }, { "$JOY_EVENT_FENG_BUTTON0$", BTN_SQUARE } };
+    for (size_t n = 0; n < sizeof k / sizeof k[0]; n++) if (!strcmp(t, k[n].tok)) return k[n].b;
+    return -1;
+}
+static float seg_dist(float px, float py, float ax, float ay, float bx, float by) {
+    float dx = bx - ax, dy = by - ay;
+    float t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
+    t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+    float ex = px - ax - t * dx, ey = py - ay - t * dy;
+    return sqrtf(ex * ex + ey * ey);
+}
+static GLuint btn_tex(int b) {
+    if (g_btn_tex[b]) return g_btn_tex[b];
+    enum { S = 64 };
+    static const unsigned char col[BTN_N][3] = {
+        { 124, 178, 232 }, { 255, 102, 102 }, { 64, 226, 160 }, { 255, 105, 248 } };
+    unsigned char *img = malloc(S * S * 4);
+    if (!img) return 0;
+    const float c = 0.5f * S, rd = 30.0f, st = 2.6f;   /* disc radius, half stroke */
+    const float tr = 13.0f;                            /* triangle circumradius */
+    float tx[3], ty[3];
+    for (int k = 0; k < 3; k++) {
+        float a = -1.5707963f + (float)k * 2.0943951f;
+        tx[k] = c + tr * cosf(a); ty[k] = c + 2.0f + tr * sinf(a);
     }
-
-    hud_blit(dc, h->art[ART_TACH_FILL].tex, arc_r * 1.70f, arc_r * 1.70f,
-             pivx, pivy, 0.0f, 1.0f, 1.0f, 1.0f, 0.28f);
-    hud_blit(dc, h->art[ART_TACH_BACK].tex, TACH_W, TACH_H, cx, cy,
-             0.0f, 1.0f, 1.0f, 1.0f, 0.85f);
-
-    float frac = 0.0f;
-    if (s->have_rpm && s->rpm_redline > 1.0f) frac = s->rpm / s->rpm_redline;
-    if (frac < 0.0f) frac = 0.0f;
-    if (frac > 1.0f) frac = 1.0f;
-    h->needle_rpm += (frac - h->needle_rpm) * 0.35f;
-    const int SEG = 48;
-    for (int i = 0; i < SEG; i++) {
-        float f0 = (float)i / SEG;
-        if (f0 > h->needle_rpm) break;
-        float a = hud_arc_angle(arc, f0, 181.0f, 29.0f), rr = arc_r * 0.80f;
-        int hot = f0 > 0.82f;
-        hud_blit(dc, 0, arc_r * 0.10f, arc_r * 0.10f,
-                 pivx + cosf(a) * rr / dc->asp, pivy + sinf(a) * rr, a,
-                 hot ? 1.0f : 0.35f, hot ? 0.18f : 0.82f, hot ? 0.12f : 1.0f, 0.90f);
-    }
-    hud_blit(dc, arc->tex, TACH_W, TACH_H, cx, cy, 0.0f, 1.0f, 1.0f, 1.0f, 0.95f);
-
-    /* needle: no needle sprite ships in the non-drag packs, so this one is
-       drawn. It is the only part of the dial that is not retail art. */
-    {   float a = hud_arc_angle(arc, h->needle_rpm, 181.0f, 29.0f);
-        float len = arc_r * 0.86f;
-        hud_blit(dc, 0, len, arc_r * 0.048f,
-                 pivx + cosf(a) * len * 0.5f / dc->asp,
-                 pivy + sinf(a) * len * 0.5f, a, 0.95f, 0.16f, 0.12f, 0.95f);
-        hud_blit(dc, 0, arc_r * 0.15f, arc_r * 0.15f, pivx, pivy, 0.0f,
-                 0.10f, 0.10f, 0.12f, 0.95f);
-    }
-
-    char buf[64];
-    float kmh = s->speed_kmh < 0.0f ? -s->speed_kmh : s->speed_kmh;
-    h->needle_speed += (kmh - h->needle_speed) * 0.40f;
-    snprintf(buf, sizeof buf, "%d", (int)(h->needle_speed + 0.5f));
-    hud_label(dc, buf, pivx, pivy + arc_r * 0.52f, 0.072f, 0.85f, 0.95f, 1.0f, 1.0f);
-    hud_label(dc, "KMH", pivx, pivy + arc_r * 0.22f, 0.026f, 0.55f, 0.70f, 0.80f, 1.0f);
-    if (s->have_rpm) {
-        if (s->gear < 0)       snprintf(buf, sizeof buf, "R");
-        else if (s->gear == 0) snprintf(buf, sizeof buf, "N");
-        else                   snprintf(buf, sizeof buf, "%d", s->gear);
-        hud_label(dc, buf, pivx + arc_r * 0.62f, pivy + arc_r * 0.20f, 0.070f,
-                  1.0f, 0.55f, 0.12f, 1.0f);
-    }
-
-    /* ---- N2O bar: present only when nitrous is FITTED ---- */
-    if (hud_shows_nos(s)) {
-        float bx, by;
-        hud_place(dc->asp, 1.0f, -1.0f, -0.52f, 0.235f, &bx, &by);
-        hud_blit(dc, h->art[ART_NOS_BAR].tex, 0.62f, 0.078f, bx, by,
-                 0.0f, 0.35f, 0.38f, 0.45f, 0.85f);
-        float fill = s->have_nitro_tank ? s->nitro_tank
-                                        : (s->nitro_active ? 1.0f : 0.0f);
-        if (fill < 0.0f) fill = 0.0f;
-        if (fill > 1.0f) fill = 1.0f;
-        h->nos_glow += ((s->nitro_active ? 1.0f : 0.0f) - h->nos_glow) * 0.25f;
-        if (fill > 0.001f) {
-            float w = 0.60f * fill;
-            hud_blit(dc, h->art[ART_NOS_OVERLAY].tex, w, 0.064f,
-                     bx - (0.60f - w) * 0.5f, by, 0.0f,
-                     0.35f + 0.6f * h->nos_glow, 0.75f + 0.25f * h->nos_glow,
-                     1.0f, 0.55f + 0.45f * h->nos_glow);
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++) {
+            float px = x + 0.5f, py = y + 0.5f, dx = px - c, dy = py - c;
+            float r = sqrtf(dx * dx + dy * dy), d;
+            if (b == BTN_CROSS)
+                d = fminf(seg_dist(px, py, c - 11, c - 11, c + 11, c + 11),
+                          seg_dist(px, py, c - 11, c + 11, c + 11, c - 11));
+            else if (b == BTN_CIRCLE) d = fabsf(r - 12.0f);
+            else if (b == BTN_TRIANGLE)
+                d = fminf(seg_dist(px, py, tx[0], ty[0], tx[1], ty[1]),
+                          fminf(seg_dist(px, py, tx[1], ty[1], tx[2], ty[2]),
+                                seg_dist(px, py, tx[2], ty[2], tx[0], ty[0])));
+            else d = fabsf(fmaxf(fabsf(dx), fabsf(dy)) - 10.5f);
+            float sym = fminf(fmaxf(st + 0.5f - d, 0.0f), 1.0f);
+            float disc = fminf(fmaxf(rd + 0.5f - r, 0.0f), 1.0f);
+            float ring = fminf(fmaxf(1.5f - fabsf(r - (rd - 1.5f)), 0.0f), 1.0f);
+            float g = 28.0f + 120.0f * ring;               /* dark face, light rim */
+            unsigned char *p = img + (y * S + x) * 4;
+            for (int k = 0; k < 3; k++) p[k] = (unsigned char)(g + (col[b][k] - g) * sym);
+            p[3] = (unsigned char)(255.0f * disc);
         }
-        if (!s->have_nitro_tank)
-            hud_label(dc, s->nitro_active ? "NOS ON" : "NOS", bx, by,
-                      0.030f, 0.60f, 0.78f, 0.90f, 0.90f);
+    FengImage im; memset(&im, 0, sizeof im);
+    im.w = S; im.h = S; im.rgba = img;
+    g_btn_tex[b] = hud_upload(&im);
+    free(img);
+    return g_btn_tex[b];
+}
+/* the glyph a line high, placed as the object's justification places text */
+static void fe_button_at(Hud *h, const HudDC *dc, int i, int b, float lineh,
+                         float x, float y, const float *rgba) {
+    const FengObj *o = &h->pk->obj[i];
+    GLuint tex = btn_tex(b);
+    if (!tex) return;
+    float s = lineh;
+    if (o->just & FENG_JUST_HCENTER) x -= 0.5f * s;
+    else if (o->just & FENG_JUST_RIGHT) x -= s;
+    if (o->just & FENG_JUST_VCENTER) y -= 0.5f * s;
+    else if (o->just & FENG_JUST_BOTTOM) y -= s;
+    int pin = h->dw && h->dw->screen ? screen_pin(h->dw) : hud_pin_of(h->pk->obj[o->root].ax);
+    float ax, ay, bx, by, v[20];
+    fe_ndc(dc->asp, pin, x, y, &ax, &ay);
+    fe_ndc(dc->asp, pin, x + s, y + s, &bx, &by);
+    put_vert(v,      ax, ay, 0.0f, 0.0f);
+    put_vert(v + 5,  bx, ay, 1.0f, 0.0f);
+    put_vert(v + 10, bx, by, 1.0f, 1.0f);
+    put_vert(v + 15, ax, by, 0.0f, 1.0f);
+    const float white[4] = { 1.0f, 1.0f, 1.0f, rgba[3] };
+    hud_batch(h, dc, tex, v, 1, white);
+}
+
+/* An FEng string in the game's own bitmap font, anchored and justified as
+ * authored (Sj), at the object's scale. */
+static void fe_text_at(Hud *h, const HudDC *dc, int i, const char *txt,
+                       float x, float y, float sc, const float *rgba) {
+    const FengObj *o = &h->pk->obj[i];
+    if (!txt || !*txt || o->res < 0 || o->res >= h->pk->nres) return;
+    int fi = h->font_of[o->res];
+    if (fi < 0 || !h->font[fi].ok) return;
+    const HudFont *F = &h->font[fi];
+    if (*txt == '$') {
+        int b = btn_of_token(txt);
+        if (b >= 0) { fe_button_at(h, dc, i, b, (float)F->f.line * sc, x, y, rgba); return; }
     }
+    /* 0x51c110: '\n' and '^' start a line, (leading Sl + the font's line)
+       apart; each line justified on its own, the block centred / bottomed
+       as a whole (the height: 0x50bf40 for left/top text, else lines x
+       (leading + line)) */
+    int nl = 1;
+    for (const char *c = txt; *c; c++) if (*c == '\n' || *c == '^') nl++;
+    float lh = ((float)o->lead + (float)F->f.line) * sc;
+    float hgt = (o->just & 5) ? lh * (float)nl : lh * (float)(nl - 1) + (float)F->f.line * sc;
+    if (o->just & FENG_JUST_VCENTER) y -= 0.5f * hgt;
+    else if (o->just & FENG_JUST_BOTTOM) y -= hgt;
+    float xl = x;
+    int pin = h->dw && h->dw->screen ? screen_pin(h->dw) : hud_pin_of(h->pk->obj[o->root].ax), nq = 0;
+    float v[HUD_QMAX * 4 * 5];
+    int line_start = 1;
+    for (const char *c = txt; *c && nq < HUD_QMAX; c++) {
+        if (line_start) {
+            char ln[256]; int n = 0;
+            for (const char *e = c; *e && *e != '\n' && *e != '^' && n < 255; e++) ln[n++] = *e;
+            ln[n] = 0;
+            float w = feng_text_width(&F->f, ln) * sc;
+            x = xl;
+            if (o->just & FENG_JUST_HCENTER) x -= 0.5f * w;
+            else if (o->just & FENG_JUST_RIGHT) x -= w;
+            line_start = 0;
+        }
+        if (*c == '\n' || *c == '^') { y += lh; line_start = 1; continue; }
+        const FengGlyph *g = &F->f.g[(unsigned char)*c];
+        if (!g->ok) continue;
+        if (g->w && g->h) {
+            float x0 = x + g->xo * sc, y0 = y + g->yo * sc;
+            float x1 = x0 + g->w * sc, y1 = y0 + g->h * sc;
+            float ax, ay, bx, by;
+            fe_ndc(dc->asp, pin, x0, y0, &ax, &ay);
+            fe_ndc(dc->asp, pin, x1, y1, &bx, &by);
+            float u0 = (float)g->u / F->aw, v0 = (float)g->v / F->ah;
+            float u1 = (float)(g->u + g->w) / F->aw, v1 = (float)(g->v + g->h) / F->ah;
+            float *q = v + nq * 20;
+            put_vert(q,      ax, ay, u0, v0);
+            put_vert(q + 5,  bx, ay, u1, v0);
+            put_vert(q + 10, bx, by, u1, v1);
+            put_vert(q + 15, ax, by, u0, v1);
+            nq++;
+        }
+        x += g->adv * sc;
+    }
+    hud_batch(h, dc, F->tex, v, nq, rgba);
+}
+
+static void fe_text(Hud *h, const HudDC *dc, int i, const char *txt,
+                    const float *rgba) {
+    const FengObj *o = &h->pk->obj[i];
+    fe_text_at(h, dc, i, txt, o->ax, o->ay, o->size[0], rgba);
+}
+
+/* The N2O level: Tach_NOS drawn only inside the sector from the scale's empty
+ * end to `fill`, about the arc centre measured from Tach_NOS_Alpha. Outside
+ * the art the clamped edge texel is black, which adds nothing. */
+static void fe_nos_sector(Hud *h, const HudDC *dc, int i, float fill,
+                          const float *rgba) {
+    const FengObj *o = &h->pk->obj[i];
+    const struct HudArc *arc = &h->nos_arc;
+    if (!arc->ok || o->res < 0 || !h->rt[o->res].tex) return;
+    float sw = fabsf(o->size[0]), sh = fabsf(o->size[1]);
+    float left = o->ax - 0.5f * sw, top = o->ay - 0.5f * sh;
+    float cx = left + arc->cx * sw, cy = top + sh - arc->cy * sw;
+    float R = arc->r * sw * 1.35f;
+    float a_end = arc->a0 + (arc->a1 - arc->a0) * fill;
+    int pin = hud_pin_of(h->pk->obj[o->root].ax);
+    const int K = 32;
+    float v[32 * 20], cnx, cny;
+    fe_ndc(dc->asp, pin, cx, cy, &cnx, &cny);
+    for (int k = 0; k < K; k++) {
+        float t0 = arc->a0 + (a_end - arc->a0) * (float)k / K;
+        float t1 = arc->a0 + (a_end - arc->a0) * (float)(k + 1) / K;
+        float p0x = cx + cosf(t0) * R, p0y = cy - sinf(t0) * R;   /* art y-up */
+        float p1x = cx + cosf(t1) * R, p1y = cy - sinf(t1) * R;
+        float n0x, n0y, n1x, n1y;
+        fe_ndc(dc->asp, pin, p0x, p0y, &n0x, &n0y);
+        fe_ndc(dc->asp, pin, p1x, p1y, &n1x, &n1y);
+        float *q = v + k * 20;
+        put_vert(q,      cnx, cny, (cx - left) / sw, (cy - top) / sh);
+        put_vert(q + 5,  n0x, n0y, (p0x - left) / sw, (p0y - top) / sh);
+        put_vert(q + 10, n1x, n1y, (p1x - left) / sw, (p1y - top) / sh);
+        put_vert(q + 15, n1x, n1y, (p1x - left) / sw, (p1y - top) / sh);
+    }
+    if (h->rt[o->res].additive) glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    hud_batch(h, dc, h->rt[o->res].tex, v, K, rgba);
+    if (h->rt[o->res].additive) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
 /* ---------------------------------------------------------------- minimap */
 
-#define MAP_R     0.30f    /* panel radius, HUD units */
 #define MAP_VIEW  260.0f   /* world metres from centre to panel edge */
 
 /* One definition of where the panel sits, shared by the draw and the pick so
    they can never drift apart. */
 static void hud_map_center(float asp, float *cx, float *cy) {
-    hud_place(asp, -1.0f, -1.0f, 0.38f, 0.38f, cx, cy);
+    fe_ndc(asp, g_map_pin, g_map_fx, g_map_fy, cx, cy);
 }
+static float hud_map_r(void) { return g_map_half / 240.0f; }
 
 static float hud_map_rot(const HudState *s) {
     return (float)M_PI * 0.5f - s->car_heading;
@@ -521,10 +1495,10 @@ int hud_map_pick(float ndc_x, float ndc_y,
                  int width, int height, const HudState *s,
                  float *wx, float *wy) {
     if (!s || !wx || !wy || width <= 0 || height <= 0) return 0;
-    float asp = (float)width / (float)height, cx, cy;
+    float asp = (float)width / (float)height, cx, cy, mr = hud_map_r();
     hud_map_center(asp, &cx, &cy);
     /* NDC -> normalised panel coordinates (the exact inverse of the draw) */
-    float mx = (ndc_x - cx) * asp / MAP_R, my = (ndc_y - cy) / MAP_R;
+    float mx = (ndc_x - cx) * asp / mr, my = (ndc_y - cy) / mr;
     if (mx * mx + my * my > 1.0f) return 0;          /* outside the round panel */
     float rot = hud_map_rot(s), c = cosf(-rot), sn = sinf(-rot);
     float dx = mx * c - my * sn, dy = mx * sn + my * c;
@@ -533,44 +1507,130 @@ int hud_map_pick(float ndc_x, float ndc_y,
     return 1;
 }
 
-static void hud_draw_minimap(Hud *h, const HudDC *dc, const HudState *s) {
-    float cx, cy;
+/* 0x4ca840's indicators over the TRACKMAP: each one's offset from the car
+ * in window units (0.5 = the panel's half width), turned with the map,
+ * hidden from 1.0 out, held at the rim from 0.55 (0x78e08c) -- the start
+ * line's (flag 1) hidden there instead -- and turned by its heading less
+ * the car's. The player's at the centre; the GPS target in free roam. */
+static void hud_map_icon(Hud *h, const HudDC *dc, int o, float wx, float wy, float wh, int flag1,
+                         const HudState *s, float cx, float cy, float mr, float view, float rot) {
+    if (o < 0) return;
+    float mx, my;
+    hud_map_project(wx, wy, s->car_x, s->car_y, view, rot, &mx, &my);
+    float d = 0.5f * sqrtf(mx * mx + my * my);                      /* window units */
+    if (!(d < 1.0f)) return;                                        /* 0x78e090 */
+    if (0.55f < d) {
+        if (flag1) return;
+        mx *= 0.55f / d; my *= 0.55f / d;
+    }
+    const FengObj *ob = &h->pk->obj[o];
+    if (ob->res < 0 || ob->res >= h->pk->nres || !h->rt[ob->res].tex) return;
+    hud_blit(dc, h->rt[ob->res].tex, fabsf(ob->size[0]) / 240.0f, fabsf(ob->size[1]) / 240.0f,
+             cx + mx * mr / dc->asp, cy + my * mr, wh - s->car_heading,
+             ob->rgba[0], ob->rgba[1], ob->rgba[2], ob->rgba[3]);
+}
+static void hud_draw_map_icons(Hud *h, const HudDC *dc, const HudState *s,
+                               float cx, float cy, float mr, float view, float rot) {
+    if (s->map_start)                                               /* 0x4ec950: type 1, flag 1 */
+        hud_map_icon(h, dc, h->o_startind, s->map_start_x, s->map_start_y,
+                     s->map_start_deg * (float)M_PI / 180.0f, 1, s, cx, cy, mr, view, rot);
+    int n = 0;
+    if (s->map_cars) for (int i = 0; i < s->map_car_n && n < 8; i++) {   /* type 3: the AI racers */
+        const HudMapCar *m = &s->map_cars[i];
+        if (!m->rival) continue;
+        hud_map_icon(h, dc, h->o_aiind[n++], m->x, m->y, m->heading, 0, s, cx, cy, mr, view, rot);
+    }
+    if (!s->racing && s->nav_active && h->o_gps >= 0) {
+        float px, py, mx, my;
+        hud_map_project(s->nav_target_x, s->nav_target_y, s->car_x, s->car_y, view, rot, &mx, &my);
+        float l = sqrtf(mx * mx + my * my);
+        if (l > 0.88f) { mx *= 0.88f / l; my *= 0.88f / l; }
+        px = cx + mx * mr / dc->asp; py = cy + my * mr;
+        fe_sprite_ndc(h, dc, h->o_gps, px, py, h->pk->obj[h->o_gps].rgba);
+    }
+    if (h->o_playerind >= 0) {                                      /* type 4: at the centre */
+        const FengObj *ob = &h->pk->obj[h->o_playerind];
+        if (ob->res >= 0 && ob->res < h->pk->nres && h->rt[ob->res].tex)
+            hud_blit(dc, h->rt[ob->res].tex, fabsf(ob->size[0]) / 240.0f, fabsf(ob->size[1]) / 240.0f,
+                     cx, cy, 0.0f, ob->rgba[0], ob->rgba[1], ob->rgba[2], ob->rgba[3]);
+    }
+}
+
+/* Everything that lives INSIDE the panel, drawn at the Track4000_map slot's
+ * place in the draw order (the mask disc below it, north arrow above). */
+static void hud_draw_map(Hud *h, const HudDC *dc, const HudState *s) {
+    float cx, cy, mr = hud_map_r();
     hud_map_center(dc->asp, &cx, &cy);
 
     /* Heading-up, like the original: the world rotates so the car's forward
        axis points at the top of the panel. World heading 0 = +X, and "up" on
        the panel is +Y, hence the quarter-turn offset. */
     float rot = hud_map_rot(s);
-    const float view = s->map_radius_m > 1.0f ? s->map_radius_m : MAP_VIEW;
-
-    /* MINIMAP_MASK is a filled disc, not a vignette: it IS the panel body, so
-       it goes underneath and no square backing is needed (one would show its
-       corners outside the ring). MAPBACK is a flat tint tile, laid inside. */
-    hud_blit(dc, h->art[ART_MAP_BACK].tex, MAP_R * 1.40f, MAP_R * 1.40f,
-             cx, cy, 0.0f, 1.0f, 1.0f, 1.0f, 0.55f);
-    hud_blit(dc, h->art[ART_MAP_MASK].tex, MAP_R * 2.0f, MAP_R * 2.0f,
-             cx, cy, 0.0f, 0.06f, 0.08f, 0.11f, 0.82f);
+    /* the event's TRACKMAP: a 0.3 / zoom window across the panel (0x4ca840) */
+    const int tm = h->tm_tex != 0;
+    const float view = tm ? 0.5f * (0.3f / h->tm_zoom) * h->tm_size
+                          : s->map_radius_m > 1.0f ? s->map_radius_m : MAP_VIEW;
+    const float k = mr / 0.30f;      /* marker sizes were tuned on a 0.30 panel */
 
     /* Everything inside the panel is projected through the same measured
-       transform: world metres -> normalised panel -> NDC. No per-district
-       constants; MAP_VIEW is a zoom level, not a fitted offset. */
+       transform: world metres -> normalised panel -> NDC. */
     #define MAP_PT(wx, wy, outx, outy, inside) do {                         \
         float _mx, _my;                                                     \
         hud_map_project((wx), (wy), s->car_x, s->car_y, view, rot,          \
                         &_mx, &_my);                                        \
         (inside) = (_mx*_mx + _my*_my) < 0.92f * 0.92f;                     \
-        (outx) = cx + _mx * MAP_R / dc->asp;                                \
-        (outy) = cy + _my * MAP_R;                                          \
+        (outx) = cx + _mx * mr / dc->asp;                                   \
+        (outy) = cy + _my * mr;                                             \
     } while (0)
 
-    /* free-roam road network: dots, cheap and cullable */
-    if (!s->racing && s->nav_xy && s->nav_n > 0) {
+    /* street map: one textured fan clipped to the panel. Each rim vertex
+       samples the world point under it (inverse of MAP_PT), so the map turns
+       and scrolls exactly like the overlays drawn on top of it. */
+    if (h->map_tex || tm) {
+        const float RIM = 0.92f;
+        float v[(MAP_FAN + 1) * 5];
+        float rc = cosf(-rot), rs = sinf(-rot);
+        for (int i = 0; i <= MAP_FAN; i++) {
+            float mx = 0.0f, my = 0.0f;
+            if (i) { float a = (float)(i - 1) * 2.0f * (float)M_PI / MAP_FAN;
+                     mx = cosf(a) * RIM; my = sinf(a) * RIM; }
+            float wx = s->car_x + (mx*rc - my*rs) * view;
+            float wy = s->car_y + (mx*rs + my*rc) * view;
+            v[i*5]   = cx + mx * mr / dc->asp;
+            v[i*5+1] = cy + my * mr;
+            v[i*5+2] = 0.0f;
+            if (tm) {                                   /* top-left origin, y down */
+                v[i*5+3] = (wx - h->tm_x0) / h->tm_size;
+                v[i*5+4] = (h->tm_y0 - wy) / h->tm_size;
+            } else {
+                v[i*5+3] = (wx - h->map_x0) / h->map_ext;
+                v[i*5+4] = (wy - h->map_y0) / h->map_ext;
+            }
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, h->fan_vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_DYNAMIC_DRAW);
+        static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        glUniformMatrix4fv(dc->rp->uMVP, 1, GL_FALSE, ident);
+        glBindTexture(GL_TEXTURE_2D, tm ? h->tm_tex : h->map_tex);
+        glUniform1f(dc->rp->uUseTex, 1.0f);
+        glUniform1f(dc->rp->uEmissiveTex, 1.0f);
+        glUniform1f(dc->rp->uUnlit, 0.0f);
+        glUniform3f(dc->rp->uColor, 1.0f, 1.0f, 1.0f);
+        glUniform1f(dc->rp->uAlpha, tm ? 1.0f : 0.92f);   /* Track4000_map: rgba 255 */
+        GpuMesh fan; memset(&fan, 0, sizeof fan);
+        fan.vbo = h->fan_vbo; fan.nbo = h->fan_nbo; fan.ibo = h->fan_ibo;
+        fan.nidx = MAP_FAN * 3;
+        draw_gpumesh(&fan);
+    }
+    if (tm) { hud_draw_map_icons(h, dc, s, cx, cy, mr, view, rot); return; }
+    /* free-roam road network: dots, cheap and cullable (no street map only) */
+    if (!h->map_tex && !s->racing && s->nav_xy && s->nav_n > 0) {
         int drawn = 0;
         for (int i = 0; i < s->nav_n && drawn < 900; i++) {
             float px, py; int in;
             MAP_PT(s->nav_xy[i*2], s->nav_xy[i*2+1], px, py, in);
             if (!in) continue;
-            hud_blit(dc, 0, 0.012f, 0.012f, px, py, 0.0f,
+            hud_blit(dc, 0, 0.012f * k, 0.012f * k, px, py, 0.0f,
                      0.40f, 0.46f, 0.55f, 0.85f);
             drawn++;
         }
@@ -578,15 +1638,24 @@ static void hud_draw_minimap(Hud *h, const HudDC *dc, const HudState *s) {
     /* race route: an ordered polyline, so draw real segments. A circuit's
        last gate joins back to its first, which is why route_loop exists --
        otherwise the lap has a visible gap across the start line. */
-    if (s->route_xy && s->route_n > 1) {
+    /* the road-following racing line when there is one, else the gates */
+    const float *rxy = s->route_line && s->route_line_n > 1 ? s->route_line : s->route_xy;
+    int rn = s->route_line && s->route_line_n > 1 ? s->route_line_n : s->route_n;
+    if (rxy && rn > 1) {
         const float RIM = 0.92f;
-        int segs = s->route_loop ? s->route_n : s->route_n - 1;
+        int segs = s->route_loop ? rn : rn - 1;
         for (int i = 0; i < segs; i++) {
-            int j = (i + 1) % s->route_n;
+            int j = (i + 1) % rn;
+            /* a racing line can hold more than one run (branches): never
+               join two points that are not neighbours on the road */
+            if (rxy == s->route_line) {
+                float gx = rxy[j*2] - rxy[i*2], gy = rxy[j*2+1] - rxy[i*2+1];
+                if (gx*gx + gy*gy > 80.0f*80.0f) continue;
+            }
             float p0x, p0y, p1x, p1y;
-            hud_map_project(s->route_xy[i*2], s->route_xy[i*2+1],
+            hud_map_project(rxy[i*2], rxy[i*2+1],
                             s->car_x, s->car_y, view, rot, &p0x, &p0y);
-            hud_map_project(s->route_xy[j*2], s->route_xy[j*2+1],
+            hud_map_project(rxy[j*2], rxy[j*2+1],
                             s->car_x, s->car_y, view, rot, &p1x, &p1y);
             /* CLIP, do not cull: a leg longer than the window has BOTH ends
                outside while still crossing it, and dropping those is what
@@ -605,57 +1674,1133 @@ static void hud_draw_minimap(Hud *h, const HudDC *dc, const HudState *s) {
             if (t1 <= t0) continue;                     /* outside [0,1] */
             float c0x = p0x + ex*t0, c0y = p0y + ey*t0;
             float c1x = p0x + ex*t1, c1y = p0y + ey*t1;
-            float ax = cx + c0x * MAP_R / dc->asp, ay = cy + c0y * MAP_R;
-            float bx = cx + c1x * MAP_R / dc->asp, by = cy + c1y * MAP_R;
+            float ax = cx + c0x * mr / dc->asp, ay = cy + c0y * mr;
+            float bx = cx + c1x * mr / dc->asp, by = cy + c1y * mr;
             float dx = (bx - ax) * dc->asp, dy = by - ay;
             float len = sqrtf(dx*dx + dy*dy);
             if (len < 1e-5f) continue;
-            hud_blit(dc, 0, len, 0.020f, (ax+bx)*0.5f, (ay+by)*0.5f,
+            hud_blit(dc, 0, len, 0.020f * k, (ax+bx)*0.5f, (ay+by)*0.5f,
                      atan2f(dy, dx), 0.30f, 0.80f, 1.0f, 0.95f);
         }
     }
     /* the armed gate: the one checkpoint that actually counts next */
-    if (s->route_xy && s->route_next >= 0 && s->route_next < s->route_n) {
+    if (s->route_xy && s->route_next >= 0 && s->route_next < s->route_n && h->o_gate >= 0) {
         float px, py; int in;
         MAP_PT(s->route_xy[s->route_next*2], s->route_xy[s->route_next*2+1],
                px, py, in);
-        if (in) hud_blit(dc, h->art[ART_MAP_START].tex, 0.060f, 0.060f,
-                         px, py, 0.0f, 1.0f, 0.92f, 0.35f, 1.0f);
+        if (in) fe_sprite_ndc(h, dc, h->o_gate, px, py, h->pk->obj[h->o_gate].rgba);
     }
     /* destination marker, only while guidance is live */
-    if (s->nav_active) {
+    if (s->nav_active && h->o_gps >= 0) {
         float px, py; int in;
         MAP_PT(s->nav_target_x, s->nav_target_y, px, py, in);
         if (!in) {   /* clamp to the rim so the player still gets a bearing */
             float dx = px - cx, dy = py - cy;
             float l = sqrtf(dx*dx*dc->asp*dc->asp + dy*dy);
-            if (l > 1e-5f) { px = cx + dx / l * MAP_R * 0.88f;
-                             py = cy + dy / l * MAP_R * 0.88f; }
+            if (l > 1e-5f) { px = cx + dx / l * mr * 0.88f;
+                             py = cy + dy / l * mr * 0.88f; }
         }
-        hud_blit(dc, h->art[ART_MAP_GPS].tex, 0.075f, 0.075f, px, py, 0.0f,
-                 1.0f, 1.0f, 1.0f, 0.95f);
+        fe_sprite_ndc(h, dc, h->o_gps, px, py, h->pk->obj[h->o_gps].rgba);
+    }
+    /* Vehicle dots remain visible over the street texture and race route.
+       Cull using the whole dot radius so markers cannot bleed over the rim. */
+    if (s->map_cars) for (int i = 0; i < s->map_car_n; i++) {
+        const HudMapCar *m = &s->map_cars[i];
+        float px, py; int in;
+        MAP_PT(m->x, m->y, px, py, in);
+        float dx = (px-cx)*dc->asp/mr, dy = (py-cy)/mr;
+        if (!in || dx*dx+dy*dy > 0.85f*0.85f) continue;
+        /* A small disc built from crossed rectangles, with a dark outline. */
+        hud_blit(dc, 0, 0.027f * k, 0.027f * k, px, py, 0.0f, 0.04f, 0.04f, 0.04f, 1.0f);
+        for (int q = 0; q < 2; q++)
+            hud_blit(dc, 0, (q ? 0.014f : 0.021f) * k, (q ? 0.021f : 0.014f) * k,
+                     px, py, 0.0f, 1.0f, m->rival ? 0.42f : 0.88f,
+                     m->rival ? 0.12f : 0.24f, 1.0f);
     }
     #undef MAP_PT
+    /* the player's icon never rotates: the map turns under it */
+    if (h->o_player >= 0)
+        fe_sprite_ndc(h, dc, h->o_player, cx, cy, h->pk->obj[h->o_player].rgba);
+}
 
-    /* MINIMAP_BORDER holds ONE QUADRANT of the ring, with the ring's centre at
-       the art's bottom-right corner. The retail ring is that quadrant drawn
-       four times, each rotated a further 90 degrees about the panel centre. */
-    for (int k = 0; k < 4; k++) {
-        float th = -(float)k * (float)M_PI * 0.5f;
-        float bx = -MAP_R * 0.5f, by = MAP_R * 0.5f;
-        float c = cosf(th), sn = sinf(th);
-        float ox = bx * c - by * sn, oy = bx * sn + by * c;
-        hud_blit(dc, h->art[ART_MAP_BORDER].tex, MAP_R, MAP_R,
-                 cx + ox / dc->asp, cy + oy, th, 1.0f, 1.0f, 1.0f, 0.90f);
+/* ------------------------------------------------------- the FEng screen */
+
+/* ------------------------------------------------------------- drift HUD */
+
+/* the objects of the ported widgets, by name (FEHashUpper) */
+static int dw_obj(Hud *h, const char *name) {
+    return feng_find(h->pk, feng_hash_upper(name));
+}
+
+static void drift_mark(Hud *h, int turbo) {
+    struct HudDriftW *w = h->dw;
+    /* 0x4f6c00's list: SlowMessage, WrongWay_CountDown, Comment_DATA, the
+       angle readout and the turbo / no-turbo backing; the popup's two
+       strings are fetched (hidden) but not listed. 0x4f7ad0's list: the
+       total, the multiplier box, and in a drift race the best drift. */
+    static const char *const names[] = {
+        "SlowMessage", "WrongWay_CountDown", "Comment_DATA", "Angle_Indicator_DATA",
+        "Angle_degrees", "Drift_Angle_Backing1", "Drift_Angle_Backing3",
+        "SP_Drift_Point", "SP_Drift_Title",
+        "Style_Point_Backing_03", "SP_DRIFT_TOTAL", "Style_TotalDrift_Title",
+        "CurrentSpeed_Trap_Backing_01", "NextSpeeed_Trap_Indicator", "drift_multiplier_text",
+        "SpeedTrap_Speed_DATA", "BestDriftBacking", "BestLapTimeText", "BestDrift",
+    };
+    for (size_t k = 0; k < sizeof names / sizeof names[0]; k++) {
+        int o = dw_obj(h, names[k]);
+        if (o >= 0) w->wl[o] = 1;
     }
-    /* the car icon never rotates: the map turns under it */
-    hud_blit(dc, h->art[ART_MAP_CAR].tex, 0.070f, 0.070f, cx, cy, 0.0f,
-             1.0f, 1.0f, 1.0f, 1.0f);
-    /* north sits on the rim in the direction world north currently points */
-    hud_blit(dc, h->art[ART_MAP_NORTH].tex, 0.072f, 0.036f,
-             cx + cosf(rot + (float)M_PI * 0.5f) * MAP_R * 0.84f / dc->asp,
-             cy + sinf(rot + (float)M_PI * 0.5f) * MAP_R * 0.84f,
-             0.0f, 1.0f, 1.0f, 1.0f, 0.85f);
+    w->turbo = turbo;
+}
+
+static const char *dw_str(const struct HudDriftW *w, uint32_t hash) {
+    for (int i = 0; i < w->nstr; i++) if (w->sh[i] == hash) return w->st[i];
+    const char *p = options_port_str(hash);   /* the port's own option labels */
+    return p ? p : "";
+}
+
+/* LANGUAGES/English.bin chunk 0x39000: the string table (0x4ffa80) */
+static void str_load(const char *dataroot, unsigned char **plang, uint32_t **psh,
+                     const char ***pst, int *pn) {
+    char path[1024];
+    long len = 0;
+    snprintf(path, sizeof path, "%s/LANGUAGES/English.bin", dataroot);
+    unsigned char *lang = *plang = n2_read_file(path, &len);
+    if (!lang) return;
+    for (long o = 0; o + 8 <= len; ) {
+        uint32_t id = n2_u32(lang + o), sz = n2_u32(lang + o + 4);
+        long p = o + 8;
+        if (p + (long)sz > len) break;
+        if (id == 0x00039000u && sz >= 16) {
+            uint32_t n = n2_u32(lang + p + 4), toff = n2_u32(lang + p + 8);
+            uint32_t soff = n2_u32(lang + p + 12);
+            if ((long)toff + (long)n * 8 > (long)sz || n >= 20000) return;
+            uint32_t *sh = *psh = (uint32_t *)malloc(n * sizeof *sh);
+            const char **st = *pst = (const char **)malloc(n * sizeof *st);
+            if (!sh || !st) return;
+            for (uint32_t i = 0; i < n; i++) {
+                sh[i] = n2_u32(lang + p + toff + i * 8);
+                uint32_t so = n2_u32(lang + p + toff + i * 8 + 4);
+                st[i] = (long)soff + (long)so < (long)sz ? (const char *)lang + p + soff + so : "";
+            }
+            *pn = (int)n;
+            return;
+        }
+        o = p + sz;
+    }
+}
+static void dw_load_strings(struct HudDriftW *w, const char *dataroot) {
+    str_load(dataroot, &w->lang, &w->sh, &w->st, &w->nstr);
+}
+/* the plain race HUD's own copy (its lap box label) */
+static struct { unsigned char *lang; uint32_t *sh; const char **st; int nstr, tried; } g_hstr;
+static const char *hud_str(const char *dataroot, uint32_t hash) {
+    if (!g_hstr.tried && dataroot) { g_hstr.tried = 1; str_load(dataroot, &g_hstr.lang, &g_hstr.sh, &g_hstr.st, &g_hstr.nstr); }
+    for (int i = 0; i < g_hstr.nstr; i++) if (g_hstr.sh[i] == hash) return g_hstr.st[i];
+    return "";
+}
+
+static void dw_text(struct HudDriftW *w, int o, const char *s) {
+    if (o < 0) return;
+    if (!s) s = "";
+    if (s == w->txt[o]) { w->has_txt[o] = 1; return; }
+    size_t n = strlen(s);
+    if (n >= 0xffff) n = 0xfffe;
+    if (n + 1 > w->txtcap[o]) {
+        size_t cap = (n + 16) & ~(size_t)15;
+        char *t = (char *)realloc(w->txt[o], cap);
+        if (!t) return;
+        w->txt[o] = t; w->txtcap[o] = (unsigned short)cap;
+    }
+    memcpy(w->txt[o], s, n); w->txt[o][n] = 0;
+    w->has_txt[o] = 1;
+}
+/* 0x50c900: a string by its label hash */
+static void dw_label(struct HudDriftW *w, int o, uint32_t hash) { dw_text(w, o, dw_str(w, hash)); }
+
+/* bPrintf "%$d" (0x43e950, flag '$' 0x2000): digits grouped by 3 with the
+   locale's ',' (0x7eb3f0: '.', ',', 3) */
+static void dw_num(char *out, int cap, int v) {
+    char d[16]; int n = 0;
+    unsigned u = v < 0 ? (unsigned)-(long)v : (unsigned)v;
+    do { d[n++] = (char)('0' + u % 10); u /= 10; } while (u && n < 15);
+    int k = 0;
+    if (v < 0 && k < cap - 1) out[k++] = '-';
+    for (int i = n - 1; i >= 0 && k < cap - 1; i--) {
+        out[k++] = d[i];
+        if (i && i % 3 == 0 && k < cap - 1) out[k++] = ',';
+    }
+    out[k] = 0;
+}
+
+void hud_num(char *out, int cap, int v) { dw_num(out, cap, v); }
+
+static int dw_ftol(float f) { return (int)f; }   /* 0x75bed4 truncates */
+
+static void dw_show(struct HudDriftW *w, int o, int show) { if (o >= 0) feng_anim_hide(&w->anim, o, !show); }
+
+/* the widget constructors (0x4f6c00, 0x4f7ad0) */
+static void drift_init(Hud *h, const char *dataroot, int turbo) {
+    struct HudDriftW *w = h->dw;
+    feng_anim_init(&w->anim, h->pk);
+    dw_load_strings(w, dataroot);
+    w->o_slow = dw_obj(h, "SlowMessage");
+    w->o_wwc = dw_obj(h, "WrongWay_CountDown");
+    w->o_comment = dw_obj(h, "Comment_DATA");
+    w->o_angle = dw_obj(h, "Angle_Indicator_DATA");
+    w->o_angle_deg = dw_obj(h, "Angle_degrees");
+    w->o_back1 = dw_obj(h, "Drift_Angle_Backing1");
+    w->o_back3 = dw_obj(h, "Drift_Angle_Backing3");
+    w->o_point = dw_obj(h, "SP_Drift_Point");
+    w->o_title = dw_obj(h, "SP_Drift_Title");
+    w->o_back03 = dw_obj(h, "Style_Point_Backing_03");
+    w->o_total = dw_obj(h, "SP_DRIFT_TOTAL");
+    w->o_total_title = dw_obj(h, "Style_TotalDrift_Title");
+    w->o_box01 = dw_obj(h, "CurrentSpeed_Trap_Backing_01");
+    w->o_next_ind = dw_obj(h, "NextSpeeed_Trap_Indicator");
+    w->o_mult = dw_obj(h, "drift_multiplier_text");
+    w->o_next_pts = dw_obj(h, "SpeedTrap_Speed_DATA");
+    w->o_best_back = dw_obj(h, "BestDriftBacking");
+    w->o_best_text = dw_obj(h, "BestLapTimeText");
+    w->o_best = dw_obj(h, "BestDrift");
+    /* 0x4f6c00 */
+    dw_label(w, w->o_slow, 0xb8387a0bu);                  /* "Too Slow!" */
+    dw_show(w, w->o_point, 0);
+    dw_show(w, w->o_title, 0);
+    uint32_t sc = feng_hash_upper(turbo ? "Turbo" : "NoTurbo");
+    feng_anim_set(&w->anim, w->o_angle, sc, 1);
+    feng_anim_set(&w->anim, w->o_angle_deg, sc, 1);
+    /* only the backing the widget lists is shown with it */
+    dw_show(w, turbo ? w->o_back3 : w->o_back1, 0);
+    /* 0x4f7ad0 */
+    w->c60 = 0xffcaf48au; w->c64 = 0xffcaf48au; w->c68 = 0xffcf3030u;
+    w->f70 = 0.05f; w->t74 = 0; w->b78 = 0; w->b79 = 1; w->lvl7c = 0;
+    { char b[16]; snprintf(b, sizeof b, "X%d", 0); dw_text(w, w->o_mult, b); }
+    printf("drift HUD: %s, %d scripts, %d tracks; %d strings; %s backing\n", h->pk->name,
+           h->pk->nscr, h->pk->ntrk, w->nstr, turbo ? "turbo" : "no-turbo");
+}
+
+/* 0x4ab780: the running drift's points (pt) and title (ti) */
+static void dw_popup(struct HudDriftW *w, int ti, int pt, int clock) {
+    int nx = w->node.label != 0xa46aaea8u;                /* not "DRIFT" */
+    int pts = dw_ftol(nx && w->node.chain ? w->node.pts / (float)w->node.chain : w->node.pts);
+    char b[48], n1[24], n2[24];
+    dw_num(n1, sizeof n1, pts); dw_num(n2, sizeof n2, w->node.chain);
+    if (!w->node.failed && !(w->node.pts < 0.0f)) {
+        if (!nx) {                                         /* drift race, DRIFT */
+            feng_anim_color(&w->anim, pt, w->c64); feng_anim_color(&w->anim, ti, w->c64);
+            dw_text(w, pt, n1);
+        } else {
+            feng_anim_color(&w->anim, pt, w->c60); feng_anim_color(&w->anim, ti, w->c60);
+            if (w->node.chain > 1) snprintf(b, sizeof b, "+%sx%s", n1, n2);
+            else snprintf(b, sizeof b, "+%s", n1);
+            dw_text(w, pt, b);
+        }
+    } else {
+        feng_anim_color(&w->anim, pt, w->c68); feng_anim_color(&w->anim, ti, w->c68);
+        if (w->node.chain > 1 && nx) snprintf(b, sizeof b, "%sx%s", n1, n2);
+        else snprintf(b, sizeof b, "%s", n1);
+        dw_text(w, pt, b);
+    }
+    dw_label(w, ti, w->node.label);
+    const uint32_t ANIMATE = feng_hash_upper("animate"), FADEOUT = feng_hash_upper("fadeout");
+    if (pt >= 0 && w->node.fade != 1 && !feng_anim_running(&w->anim, pt, FADEOUT)) {
+        feng_anim_set(&w->anim, pt, ANIMATE, 1);
+        dw_show(w, pt, w->b79);
+    }
+    if (w->node.fade != 1 && !feng_anim_running(&w->anim, ti, FADEOUT)) {
+        feng_anim_set(&w->anim, ti, ANIMATE, 1);
+        dw_show(w, ti, 1);
+    }
+    if (w->node.fade && (w->node.state == 3 || (!w->node.cont && w->node.state != 5))) {
+        feng_anim_set(&w->anim, ti, FADEOUT, 1);
+        if (w->b79)
+            feng_anim_set(&w->anim, pt, feng_hash_upper(w->node.pts < 0.0f ? "fadeoutCrash" : "fadeout"), 1);
+        w->node.state = 5;
+    }
+    if (w->node.time == 0 || w->node.time == 0x7fffffff) { w->node.fade = 1; w->node.time = clock; }
+}
+
+/* one frame of the drift widgets, in the retail order: the car's style
+   tick (title 0x4ac120, popup copy 0x4c88e0), then 0x4da590 and 0x4da900 */
+static void drift_update(Hud *h, const HudDrift *d) {
+    struct HudDriftW *w = h->dw;
+    const int now = d->clock;
+    char b[48];
+    if (d->title) {                                        /* 0x4ac120 */
+        w->comment_on = 1; w->comment_t = now;
+        dw_label(w, w->o_comment, d->title);
+        dw_show(w, w->o_comment, 1);
+    }
+    if (d->m0_shown) {                                     /* 0x4c88e0, moment 0 in a drift race */
+        float keep = w->node.pts;
+        w->node.cont = d->m0_cont;
+        w->node.pts = d->m0_cur;
+        w->node.chain = dw_ftol(d->m0_mult + 0.5f);
+        w->node.label = d->m0_label;
+        w->node.time = 0; w->node.fade = 0;
+        w->node.failed = d->m0_state == 4;
+        w->node.state = d->m0_state;
+        w->node_on = 1;
+        if (d->m0_state == 4) { w->node.pts = keep; dw_show(w, w->o_comment, 0); }
+    }
+    /* 0x4da590 */
+    float a = d->slip_deg;                                 /* 0x4ab390 */
+    if (d->gear == 0 || d->fwd_speed < 0.0f) a = 0.0f;
+    a = fabsf(a);
+    if (a > 90.0f) a = 90.0f;
+    snprintf(b, sizeof b, "%d", dw_ftol(a));
+    dw_text(w, w->o_angle, b);
+    if (d->losing_mult) {                                  /* 0x4ab420 */
+        dw_show(w, w->o_slow, 1);
+        if (!feng_anim_running(&w->anim, w->o_slow, feng_hash_upper("LosingMult")))
+            feng_anim_set(&w->anim, w->o_slow, feng_hash_upper("LosingMult"), 1);
+    } else if (d->too_slow) {
+        dw_show(w, w->o_slow, 1);
+        if (!feng_anim_running(&w->anim, w->o_slow, feng_hash_upper("TooSlowToGain")))
+            feng_anim_set(&w->anim, w->o_slow, feng_hash_upper("TooSlowToGain"), 1);
+    } else dw_show(w, w->o_slow, 0);
+    w->c64 = d->wheelf > 1.0f || d->prox > 1.0f ? 0xffff8020u : 0xffcaf48au;   /* 0x4c7ea0 */
+    dw_show(w, w->o_wwc, 0);                               /* 0x4ab2b0: no countdown running */
+    if (!w->comment_on || (float)(now - w->comment_t) * 0.00025f > 2.0f)   /* 0x4ab340 */
+        dw_show(w, w->o_comment, 0);
+    /* 0x4da900 -> 0x4c85d0 */
+    dw_num(b, sizeof b, dw_ftol(d->m0_best));
+    dw_text(w, w->o_best, b);
+    dw_show(w, w->o_title, 0);
+    dw_show(w, w->o_point, 0);
+    if (w->node_on) {
+        dw_show(w, w->o_title, 1);
+        dw_show(w, w->o_point, 1);
+        dw_popup(w, w->o_title, w->o_point, now);
+        if (!w->node.failed) { w->node_on = 0; w->node.time = 0; }
+        else if ((float)(now - w->node.time) * 0.00025f > 1.0f) {
+            w->node_on = 0; w->node.time = 0;
+            dw_show(w, w->o_title, 0);
+            dw_show(w, w->o_point, 0);
+        }
+    }
+    const uint32_t HL = feng_hash_upper("Highlight");
+    if (d->m0_state == 3) {
+        dw_num(b, sizeof b, dw_ftol(d->m0_banked));
+        dw_text(w, w->o_total, b);
+        feng_anim_set(&w->anim, w->o_total, HL, 1);
+        feng_anim_set(&w->anim, w->o_total_title, HL, 1);
+    }
+    int next = d->next, cur = dw_ftol(d->m0_cur), lvl = d->level;
+    char n1[24];
+    if (w->lvl7c < lvl) feng_anim_set(&w->anim, w->o_mult, HL, 1);
+    dw_num(n1, sizeof n1, lvl);
+    snprintf(b, sizeof b, "X%s", n1);
+    dw_text(w, w->o_mult, b);
+    w->lvl7c = lvl;
+    if (next < 1) {
+        dw_text(w, w->o_next_pts, "----");
+        dw_label(w, w->o_next_ind, 0xcc62c8beu);           /* "MAX" */
+        feng_anim_color(&w->anim, w->o_next_pts, 0xffaa8000u);
+        return;
+    }
+    dw_num(b, sizeof b, next);
+    dw_text(w, w->o_next_pts, b);
+    snprintf(b, sizeof b, dw_str(w, 0xe03ef7a4u), lvl + 1);   /* "Gain %dX with:" */
+    dw_text(w, w->o_next_ind, b);
+    if (next <= cur) { feng_anim_color(&w->anim, w->o_next_pts, 0xffaa8000u); return; }
+    float per = 0.5f;
+    if (cur > 0) { per = (float)next / (float)cur * w->f70; if (per > 0.5f) per = 0.5f; }
+    if (per < (float)(now - w->t74) * 0.00025f) {
+        w->b78 = !w->b78; w->t74 = now;
+        feng_anim_color(&w->anim, w->o_next_pts, w->b78 ? 0xffcaf48au : 0xffaa8000u);
+    }
+}
+
+/* ------------------------------------------------------------- drag HUD */
+
+/* the objects the drag HUD's widgets list (their constructors look them up
+   by name; the ones HUD_Drag lacks are skipped): 0x4f6500, 0x4f69e0,
+   0x4f6a90, 0x4f5a70, 0x4f4ac0 (PositionBacking is a group) */
+static const char *const DRAG_TACH[] = {
+    "RPM_fill", "3rdPersonTachRPMNumbers", "RPM_Redline", "3rdPersonNeedle", "3rdPersonGear",
+    "ShiftMessage", "3rdPersonSpeedUnits", "3rdPersonSpeed", "Drag_Position_Backing_03", "Shift_light" };
+static const char *const DRAG_NOS[] = { "NOS_Line", "NOS_GameBreaker", "NOS_Fill" };
+static const char *const DRAG_TURBO[] = { "3rdperson_Turbofill", "3rdperson_Turbolines",
+    "3rdperson_TurboDial", "3rdperson_TurboRed_1", "3rdperson_TurboRed_2" };
+static const char *const DRAG_POS[] = { "RacePositionNumber", "RacePositionNth", "NumberRacers",
+    "RaceTime", "PositionBacking", "Drag_Position_Backing_01", "Drag_Position_Backing_02" };
+#define DRAG_N(a) ((int)(sizeof a / sizeof a[0]))
+
+static void drag_mark_list(Hud *h, const char *const *names, int n) {
+    for (int k = 0; k < n; k++) {
+        int o = dw_obj(h, names[k]);
+        if (o >= 0) h->dw->wl[o] = 1;
+        if (o >= 0 && h->pk->obj[o].type == FENG_GROUP)        /* PositionBacking's art */
+            for (int i = 0; i < h->pk->nobj; i++) if (feng_inside(h->pk, i, o)) h->dw->wl[i] = 1;
+    }
+}
+static void drag_mark(Hud *h) {
+    drag_mark_list(h, DRAG_TACH, DRAG_N(DRAG_TACH));
+    drag_mark_list(h, DRAG_NOS, DRAG_N(DRAG_NOS));
+    drag_mark_list(h, DRAG_TURBO, DRAG_N(DRAG_TURBO));
+    drag_mark_list(h, DRAG_POS, DRAG_N(DRAG_POS));
+    int o = dw_obj(h, "HEAT_Bar");
+    if (o >= 0) h->dw->wl[o] = 1;
+}
+/* 0x4c6690: a widget's listed objects shown / hidden with its feature */
+static void drag_show_list(Hud *h, const char *const *names, int n, int show) {
+    for (int k = 0; k < n; k++) dw_show(h->dw, dw_obj(h, names[k]), show);
+}
+
+static uint32_t drag_argb(const FengObj *o) {                /* 0x50ccc0 -> 0x5054d0 */
+    uint32_t c = 0;
+    for (int k = 0; k < 4; k++) {
+        int v = (int)(o->rgba[k == 0 ? 3 : k - 1] * 255.0f + 0.5f);
+        c = c << 8 | (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+    return c;
+}
+
+/* 0x60fe10: the tach's rev scale class by the engine's redline / limiter */
+static int drag_tach_class(float red, float max) {
+    if (9000.0f <= max && 8500.0f <= red) return 9000.0f <= red ? 0 : 1;
+    if (max < 8000.0f || red < 7500.0f) {
+        if (max < 7000.0f || red < 6500.0f) return red < 6000.0f ? 7 : 6;
+        return red < 7000.0f ? 5 : 4;
+    }
+    return red < 8000.0f ? 3 : 2;
+}
+
+static void drag_init(Hud *h, const char *dataroot, float redline, float maxrpm) {
+    struct HudDriftW *w = h->dw;
+    w->drag = 1;
+    feng_anim_init(&w->anim, h->pk);
+    dw_load_strings(w, dataroot);
+    w->o_rpmfill = dw_obj(h, "RPM_fill");
+    w->o_rpmnum = dw_obj(h, "3rdPersonTachRPMNumbers");
+    w->o_redline = dw_obj(h, "RPM_Redline");
+    w->o_needle = dw_obj(h, "3rdPersonNeedle");
+    w->o_gear = dw_obj(h, "3rdPersonGear");
+    w->o_shmsg = dw_obj(h, "ShiftMessage");
+    w->o_units = dw_obj(h, "3rdPersonSpeedUnits");
+    w->o_speed = dw_obj(h, "3rdPersonSpeed");
+    w->o_pb03 = dw_obj(h, "Drag_Position_Backing_03");
+    w->o_shlight = dw_obj(h, "Shift_light");
+    w->o_heat = dw_obj(h, "HEAT_Bar");
+    w->o_nosline = dw_obj(h, "NOS_Line");
+    w->o_nosgb = dw_obj(h, "NOS_GameBreaker");
+    w->o_nosfill = dw_obj(h, "NOS_Fill");
+    for (int k = 0; k < 5; k++) w->o_tb[k] = dw_obj(h, DRAG_TURBO[k]);
+    w->o_pnum = dw_obj(h, "RacePositionNumber");
+    w->o_pnth = dw_obj(h, "RacePositionNth");
+    w->o_pof = dw_obj(h, "NumberRacers");
+    w->o_ptime = dw_obj(h, "RaceTime");
+    w->o_pback = dw_obj(h, "PositionBacking");
+    w->o_pb01 = dw_obj(h, "Drag_Position_Backing_01");
+    w->o_pb02 = dw_obj(h, "Drag_Position_Backing_02");
+    /* 0x4f6500 -> 0x5ed9b0 (one human in a drag race): DRAG_RPM_<n>_LINES
+       on the rev scale (missing: it and the redline stay hidden, +0xa4) and
+       DRAG_RPM_REDLINES_<r> on the redline */
+    static const char *const LINES[8] = { "10000", "10000", "9000", "9000", "8000", "8000", "7000", "7000" };
+    static const int RED[8] = { 9000, 8500, 8000, 7500, 7000, 6500, 6000, 5500 };
+    int cls = drag_tach_class(redline, maxrpm);
+    char nl[48], nr[48], path[1024];
+    snprintf(nl, sizeof nl, "DRAG_RPM_%s_LINES", LINES[cls]);
+    snprintf(nr, sizeof nr, "DRAG_RPM_REDLINES_%d", RED[cls]);
+    uint32_t keys[2] = { feng_tex_key(nl), feng_tex_key(nr) };
+    FengImage img[2]; memset(img, 0, sizeof img);
+    snprintf(path, sizeof path, "%s/GLOBAL/InGameDrag.bun", dataroot);
+    long len = 0;
+    unsigned char *d = n2_read_file(path, &len);
+    if (d) { feng_tpk_load(d, len, keys, 2, img); free(d); }
+    if (img[0].rgba) { w->ov_num.tex = hud_upload(&img[0]); w->ov_num.w = img[0].w; w->ov_num.h = img[0].h;
+                       w->ov_num.additive = img[0].blend == 6; }
+    else w->fa4 = 1;
+    if (img[1].rgba) { w->ov_red.tex = hud_upload(&img[1]); w->ov_red.w = img[1].w; w->ov_red.h = img[1].h;
+                       w->ov_red.additive = img[1].blend == 6; }
+    feng_image_free(&img[0]); feng_image_free(&img[1]);
+    w->g84 = 1; w->g80 = 1;
+    w->f88 = w->f89 = w->f8a = w->f8b = w->f8c = w->f8d = w->f8e = 0;
+    w->c98 = w->o_gear >= 0 ? drag_argb(&h->pk->obj[w->o_gear]) : 0xffffffffu;
+    w->c9c = w->o_needle >= 0 ? drag_argb(&h->pk->obj[w->o_needle]) : 0xffffffffu;
+    w->p4c = w->p50 = 0;
+    /* every widget starts with its feature off (0x4c6690(0, 0)) */
+    drag_show_list(h, DRAG_TACH, DRAG_N(DRAG_TACH), 0);
+    drag_show_list(h, DRAG_NOS, DRAG_N(DRAG_NOS), 0);
+    drag_show_list(h, DRAG_TURBO, DRAG_N(DRAG_TURBO), 0);
+    drag_show_list(h, DRAG_POS, DRAG_N(DRAG_POS), 0);
+    dw_show(w, w->o_heat, 0);
+    dw_show(w, dw_obj(h, "WrongWay_CountDown"), 0);     /* 0x4ab2b0: offline, no countdown */
+    w->drag_on = -1;                                    /* the features' state, set on the first frame */
+    printf("drag HUD: %s, %d scripts; rev scale %s / %s (class %d, redline %.0f, limiter %.0f)%s\n",
+           h->pk->name, h->pk->nscr, nl, nr, cls, (double)redline, (double)maxrpm,
+           w->fa4 ? " -- scale art missing" : "");
+}
+
+/* 0x4a9d60: v over (lo, hi) mapped onto (a, b), clamped */
+static float drag_map(float lo, float hi, float a, float b, float v) {
+    if (lo < v && v < hi) return (b - a) * ((v - lo) / (hi - lo)) + a;
+    if (!(v < lo) && hi <= v) return b;
+    return a;
+}
+/* 0x4c66f0: a bottom-anchored vertical fill -- the art's v0 (data +0x48)
+   from the value, the height (1 - v0) x the texture's, the centre moved so
+   the bottom edge stays */
+static void drag_fill(Hud *h, int o, float v, float hi, float a, float b) {
+    struct HudDriftW *w = h->dw;
+    if (o < 0) return;
+    const FengObj *ob = &h->pk->obj[o];
+    if (ob->res < 0 || ob->res >= h->pk->nres || h->rt[ob->res].h <= 0) return;
+    float th = (float)h->rt[ob->res].h, k = 1.0f / th;
+    float f = drag_map(0.0f, hi, (th - a) * k, b * k, v);
+    int32_t *d = w->anim.data[o];
+    float ox, oy, sx, oh, nh = (1.0f - f) * th;
+    memcpy(&ox, &d[7], 4); memcpy(&oy, &d[8], 4); memcpy(&sx, &d[14], 4); memcpy(&oh, &d[15], 4);
+    memcpy(&d[18], &f, 4);
+    feng_anim_size(&w->anim, o, sx, nh);
+    feng_anim_pos(&w->anim, o, ox, (oh - nh) * 0.5f + oy);
+}
+
+/* 0x4ffaa0: the place's ordinal suffix label */
+static uint32_t drag_nth(int n) {
+    static const uint32_t T[10] = { 0x7447c0e3u, 0xbc4ce12fu, 0x63eb6a03u, 0xbd498562u, 0x46573b3fu,
+                                    0xbc4cae38u, 0xbd383957u, 0xe2ab0284u, 0x438da7c0u, 0xbcdd9448u };
+    if (n < 0) n = 0;
+    return n == 10 ? 0xbcdd9448u : T[n % 10];
+}
+
+static void drag_msg(struct HudDriftW *w, uint32_t label) {
+    const uint32_t ZOOMIN = feng_hash_upper("ZoomIn");
+    dw_label(w, w->o_shmsg, label);
+    feng_anim_set(&w->anim, w->o_shmsg, ZOOMIN, 1);
+    dw_show(w, w->o_shmsg, 1);
+}
+/* the message's zoom ran out: hidden, the latch released (player +0x58 is
+   never 6 / 7 here) */
+static void drag_msg_done(struct HudDriftW *w, unsigned char *latch) {
+    if (feng_anim_running(&w->anim, w->o_shmsg, feng_hash_upper("ZoomIn"))) return;
+    *latch = 0;
+    dw_show(w, w->o_shmsg, 0);
+}
+
+/* 0x4c7090, one human: the drag tach */
+static void drag_tach(Hud *h, const HudState *s, const HudDrag *g, int on) {
+    struct HudDriftW *w = h->dw;
+    w->g84 = g->gear;
+    if (!g->shifting) w->f8c = 0;
+    else if (!w->f8c) w->f8c = 1;                       /* +0x90 = drivetrain +0x6c (unread) */
+    const float rpm = g->rpm;
+    if (on) {
+        char b[24];
+        /* speed: car +0x430 x 2.237 mph (0x78426c) or x 3.6 km/h (0x7904fc) */
+        dw_label(w, w->o_units, g->mph ? 0x8569ab44u : 0x8569a25fu);
+        snprintf(b, sizeof b, "%3d", dw_ftol(g->speed * (g->mph ? 2.237f : 3.6f)));
+        dw_text(w, w->o_speed, b);
+        /* 0x4ab210: rpm / the limiter over the car's sweep, wrapped to (-360, 360] */
+        float f = g->maxrpm > 0.0f ? rpm / g->maxrpm : 0.0f;
+        f = f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f;
+        float a0 = g->ang0, span = a0 < g->ang1 ? g->ang1 - a0 : 360.0f - a0 + g->ang1;
+        float ang = a0 + span * f;
+        if (360.0f < ang) ang -= 360.0f;
+        if (ang < -360.0f) ang += 360.0f;
+        feng_anim_rot(&w->anim, w->o_needle, ang);
+        /* the redline blinks while over it after an over-revved shift */
+        const float gr = g->grade;
+        if (!(gr < 0.0f) || w->f8b || rpm <= g->redline) {
+            if (w->f8d) { feng_anim_set(&w->anim, w->o_redline, feng_hash_upper("Init"), 1); w->f8d = 0; w->f8e = 0; }
+        } else {
+            if (!w->f8e) w->f8e = 1;                    /* +0x94 = the clock (unread) */
+            if (!w->f8d) { feng_anim_set(&w->anim, w->o_redline, feng_hash_upper("Blink"), 1); w->f8d = 1; }
+        }
+        /* the gear "%c" (table 0x7f66a4). Its colour (orange 0xffff8000 while
+           car +0x448 == 0) needs car +0x448, not decoded: authored colour. */
+        if (w->o_gear >= 0) {
+            static const char GC[10] = { 'A', 'R', 'N', '1', '2', '3', '4', '5', '6', '7' };
+            int gi = w->g84 + 1;
+            snprintf(b, sizeof b, "%c", gi >= 0 && gi < 10 ? GC[gi] : 'X');
+            dw_text(w, w->o_gear, b);
+            feng_anim_color(&w->anim, w->o_gear, w->c98);
+        }
+        /* the shift messages (ShiftMessage, ZoomIn) */
+        if (gr <= 0.0f || 1.0f < gr) {
+            if (w->f88) drag_msg_done(w, &w->f88);
+        } else if (w->f88) drag_msg_done(w, &w->f88);
+        else if (g->gear != w->g80) {
+            drag_msg(w, 0.5f < gr ? 0x0598b065u : 0x27d2dd45u);   /* "Perfect Shift!" / "Good Shift!" */
+            w->f88 = 1;
+        }
+        if (g->cut) {                                   /* a shift with the clutch out (+0x60 3) */
+            if (w->f89) drag_msg_done(w, &w->f89);
+            else { drag_msg(w, 0x75941dc1u); w->f89 = 1; }   /* "Missed Shift!" */
+        } else if (w->f89) drag_msg_done(w, &w->f89);
+        if (g->race_state != 4 || w->g84 <= w->g80 || w->g80 == 0 || w->f88 || w->f89) {
+            if (w->f8a) drag_msg_done(w, &w->f8a);      /* 0x4c76ff */
+            if (w->f8b) drag_msg_done(w, &w->f8b);
+        } else if (!(gr != 0.0f || w->f8a)) { drag_msg(w, 0x2303d76cu); w->f8a = 1; }   /* "Short Shift!" */
+        else if (gr < 0.0f && !w->f8b) { drag_msg(w, 0x27d75cd8u); w->f8b = 1; }        /* "Over Rev!" */
+        /* the shift light and the needle's colour: gear +0x80's shift
+           window (0x7fbf60 x drivetrain +0xe4, at least 500 rpm) below its
+           shift point, the shift's grade so far (0x594f20, unrounded) */
+        int pg = w->g80 < 0 ? 0 : w->g80 > 9 ? 9 : w->g80;
+        float q = g->phys ? g->q[pg] : 0.0f, win = g->win[pg];
+        float ww = 500.0f <= win ? win : 500.0f, start = g->up[pg] - ww;
+        if ((q != 0.0f || !(rpm < start)) && !g->shifting) {
+            if (q != -1.0f) {
+                if (q <= 0.5f) {
+                    if (g->gear != 0) {
+                        float cur[4] = { (float)(w->c9c >> 24), (float)(w->c9c >> 16 & 0xff),
+                                         (float)(w->c9c >> 8 & 0xff), (float)(w->c9c & 0xff) };
+                        static const float TGT[4] = { 255.0f, 0.0f, 128.0f, 192.0f };
+                        if (!feng_anim_running(&w->anim, w->o_shlight, feng_hash_upper("PulseBlue")))
+                            feng_anim_set(&w->anim, w->o_shlight, feng_hash_upper("PulseBlue"), 1);
+                        float t = (rpm - start) / (ww * 0.5f);              /* 0x4ab0b0 */
+                        uint32_t c = 0;
+                        for (int k = 0; k < 4; k++) {
+                            float v = (TGT[k] - cur[k]) * t + cur[k];
+                            v = v > 0.0f ? (v < 255.0f ? v : 255.0f) : 0.0f;
+                            c = c << 8 | (uint32_t)(int)v;                    /* 0x4a9e30 */
+                        }
+                        feng_anim_color(&w->anim, w->o_needle, c);
+                    }
+                } else {
+                    feng_anim_color(&w->anim, w->o_needle, 0xff00ff00u);
+                    if (!feng_anim_running(&w->anim, w->o_shlight, feng_hash_upper("PulseGreen")))
+                        feng_anim_set(&w->anim, w->o_shlight, feng_hash_upper("PulseGreen"), 1);
+                }
+            } else {
+                feng_anim_color(&w->anim, w->o_needle, 0xff800000u);
+                if (!feng_anim_running(&w->anim, w->o_shlight, feng_hash_upper("PulseRed")))
+                    feng_anim_set(&w->anim, w->o_shlight, feng_hash_upper("PulseRed"), 1);
+            }
+            dw_show(w, w->o_shlight, 1);
+        } else {
+            dw_show(w, w->o_shlight, 0);
+            feng_anim_color(&w->anim, w->o_needle, w->c9c);
+        }
+    }
+    w->g80 = w->g84;
+    if (w->fa4) { dw_show(w, w->o_rpmnum, 0); dw_show(w, w->o_redline, 0); }
+    (void)s;
+}
+
+/* one frame of the drag HUD's widgets: the features on while the race runs
+   (0x4c6690), then 0x4c7090, 0x4c7aa0, 0x4c7b20, 0x4c6b80, 0x4ebb10 */
+static void drag_update(Hud *h, const HudState *s, const HudDrag *g) {
+    struct HudDriftW *w = h->dw;
+    int on = s->racing && !s->race_over;
+    int nos_on = on && g->nos;
+    int st = on | nos_on << 1;
+    if (st != w->drag_on) {
+        drag_show_list(h, DRAG_TACH, DRAG_N(DRAG_TACH), on);
+        drag_show_list(h, DRAG_TURBO, DRAG_N(DRAG_TURBO), on);
+        drag_show_list(h, DRAG_POS, DRAG_N(DRAG_POS), on);
+        drag_show_list(h, DRAG_NOS, DRAG_N(DRAG_NOS), nos_on);
+        dw_show(w, w->o_heat, on);
+        w->drag_on = st;
+    }
+    drag_tach(h, s, g, on);
+    if (on) {
+        /* 0x4c7aa0: the heat 0..1 (0x5eccd0) */
+        float ht = g->heat <= 0.0f ? 0.0f : g->heat > 1.0f ? 1.0f : g->heat;
+        drag_fill(h, w->o_heat, ht, 1.0f, 105.0f, 5.0f);
+        /* 0x4c6b80: the turbo dial, 96..158 degrees in a drag race */
+        for (int k = 0; k < 5; k++) dw_show(w, w->o_tb[k], g->turbo);
+        float b = g->boost, a = (96.0f - 158.0f) * (b + 1.0f) * 0.5f + 158.0f;   /* 0x4aa160 */
+        if (360.0f < a) a -= 360.0f;
+        if (a < 0.0f) a = 360.0f - a;
+        feng_anim_rot(&w->anim, w->o_tb[2], a);
+        /* 0x4ebb10: place "%d", its suffix, "/%d" the field; the race clock,
+           held 3 s after a lap event */
+        char t[24];
+        snprintf(t, sizeof t, "%d", s->position);
+        dw_text(w, w->o_pnum, t);
+        dw_label(w, w->o_pnth, drag_nth(s->position));
+        snprintf(t, sizeof t, "/%d", s->cars);
+        dw_text(w, w->o_pof, t);
+        if (s->lap_new) w->p4c = s->rt_now;
+        if (3.0f <= (float)(s->rt_now - w->p4c) * 0.00025f) w->p50 = s->rt_now;
+        hud_time_fmt(t, w->p50, 0);
+        dw_text(w, w->o_ptime, t);
+    }
+    if (nos_on) {                                       /* 0x4c7b20, a drag race: 45 / -9 */
+        float v = g->nos_v;
+        if (v <= 0.0f) { dw_show(w, w->o_nosline, 0); dw_show(w, w->o_nosgb, 0); }
+        else if (1.0f < v) {
+            dw_show(w, w->o_nosline, 1); dw_show(w, w->o_nosgb, 1);
+            drag_fill(h, w->o_nosline, 1.0f, 1.0f, 45.0f, -9.0f);
+            drag_fill(h, w->o_nosgb, v - 1.0f, 1.0f, 45.0f, -9.0f);
+        } else {
+            dw_show(w, w->o_nosline, 1); dw_show(w, w->o_nosgb, 0);
+            drag_fill(h, w->o_nosline, v, 1.0f, 45.0f, -9.0f);
+        }
+    }
+}
+
+/* a ported widget's object, from its live FEng state */
+static void fe_anim_draw(Hud *h, const HudDC *dc, int i) {
+    struct HudDriftW *w = h->dw;
+    const FengObj *o = &h->pk->obj[i];
+    FengPlace pl;
+    feng_anim_place(&w->anim, i, &pl);
+    if (pl.hidden || pl.rgba[3] <= 0.0f) return;
+    if (o->type == FENG_STRING) {
+        fe_text_at(h, dc, i, w->has_txt[i] ? w->txt[i] : o->text, pl.x, pl.y, pl.sx, pl.rgba);
+        return;
+    }
+    int res = w->res_ov[i] ? w->res_ov[i] - 1 : o->res;
+    if (res < 0 || res >= h->pk->nres) return;
+    /* White16x16.bmp ships only in GLOBALB.BUN: a white texel times the
+       colour is the flat colour, which the untextured quad draws exactly */
+    static const HudTex white = { 0, 16, 16, 0 };
+    const HudTex *t = &h->rt[res];
+    /* 0x50c990: the drag tach's rev scale / redline art set by the engine */
+    if (w->drag && i == w->o_rpmnum && w->ov_num.tex) t = &w->ov_num;
+    if (w->drag && i == w->o_redline && w->ov_red.tex) t = &w->ov_red;
+    if (!t->tex) {
+        if (strncmp(h->pk->res[res].name, "White16x16", 10)) return;
+        t = &white;
+    }
+    int pin = w->screen ? screen_pin(w) : hud_pin_of(h->pk->obj[o->root].ax);
+    /* a whole screen's full-screen art (PC_Loading's backdrop) covers the
+       width as the front end draws it (shop.c to_ndc cover), instead of a
+       4:3 picture between black bars */
+    if (w->screen && fabsf(o->size[0]) >= 600.0f && fabsf(o->size[1]) >= 440.0f && dc->asp > 4.0f / 3.0f) {
+        float k = dc->asp * 0.75f;
+        pl.x *= k; pl.y *= k; pl.sx *= k; pl.sy *= k;
+        pin = 0;
+    }
+    if (t->additive) glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    /* the image's uv rectangle (object data words 17..20) when a widget
+       crops it (the drag HUD's fill bars, 0x4c66f0) */
+    const int32_t *d = w->anim.data[i];
+    float uv[4];
+    for (int k = 0; k < 4; k++) memcpy(&uv[k], &d[17 + k], 4);
+    if (w->drag && t->tex && (uv[0] != 0.0f || uv[1] != 0.0f || uv[2] != 1.0f || uv[3] != 1.0f)) {
+        float hw = 0.5f * fabsf(pl.sx), hh = 0.5f * fabsf(pl.sy), c = cosf(pl.angle), s = sinf(pl.angle);
+        static const float cx[4] = { -1, 1, 1, -1 }, cy[4] = { -1, -1, 1, 1 };
+        float v[20];
+        for (int k = 0; k < 4; k++) {
+            float lx = cx[k] * hw, ly = cy[k] * hh, nx, ny;
+            fe_ndc(dc->asp, pin, pl.x + lx * c - ly * s, pl.y + lx * s + ly * c, &nx, &ny);
+            put_vert(v + k * 5, nx, ny, cx[k] < 0 ? uv[0] : uv[2], cy[k] < 0 ? uv[1] : uv[3]);
+        }
+        hud_batch(h, dc, t->tex, v, 1, pl.rgba);
+    } else {
+        float nx, ny;
+        fe_ndc(dc->asp, pin, pl.x, pl.y, &nx, &ny);
+        hud_blit(dc, t->tex, fabsf(pl.sx) / 240.0f, fabsf(pl.sy) / 240.0f, nx, ny, -pl.angle,
+                 pl.rgba[0], pl.rgba[1], pl.rgba[2], pl.rgba[3]);
+    }
+    if (t->additive) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+/* 0x577240 -> 0x576d30 (English, no flags): a time in 1/4000 s as
+   "M:SS.CC" (minutes under 10 with a leading space), "SS.CC" (" S.CC"),
+   "0.CC", or "Hh:MM:SS" from an hour */
+/* 0x577240 -> 0x576d30 (English): flags 1 negative (set for t < 0), 2 a
+   '+' when positive, 4 zero templates (the same digits), 8 keep the last
+   digit when a sign shifts the string right. A sign replaces the leading
+   space of a one-digit first field, else the string moves right by one
+   and (without 8) loses its last digit. 0 and 0x7fffffff read as 0. */
+void hud_time_fmt(char *b, int t, int flags) {
+    if (t == 0x7fffffff) t = 0;
+    if (t < 0) { t = -t; flags |= 1; }
+    int sec = t / 4000, h = sec / 3600, m = sec % 3600 / 60, ss = sec % 60;
+    int cs = (t % 4000 * 1000 / 4000) / 10, first;
+    if (h) {
+        strcpy(b, (flags & 4) ? "00h:00:00" : "--h:--:--");
+        b[1] = (char)('0' + h % 10); b[0] = h < 10 ? ' ' : (char)('0' + h / 10 % 10);
+        b[5] = (char)('0' + m % 10); b[4] = (char)('0' + m / 10 % 10);
+        b[8] = (char)('0' + ss % 10); b[7] = (char)('0' + ss / 10 % 10);
+        first = h;
+    } else if (m) {
+        strcpy(b, (flags & 4) ? "00:00.00" : "--:--.--");
+        b[1] = (char)('0' + m % 10); b[0] = m < 10 ? ' ' : (char)('0' + m / 10 % 10);
+        b[4] = (char)('0' + ss % 10); b[3] = (char)('0' + ss / 10 % 10);
+        b[7] = (char)('0' + cs % 10); b[6] = (char)('0' + cs / 10 % 10);
+        first = m;
+    } else if (ss) {
+        strcpy(b, (flags & 4) ? "00.00" : "--.--");
+        b[1] = (char)('0' + ss % 10); b[0] = ss < 10 ? ' ' : (char)('0' + ss / 10 % 10);
+        b[4] = (char)('0' + cs % 10); b[3] = (char)('0' + cs / 10 % 10);
+        first = ss;
+    } else {
+        strcpy(b, (flags & 4) ? "0.00" : "0.--");
+        b[3] = (char)('0' + cs % 10); b[2] = (char)('0' + cs / 10 % 10);
+        first = 10;                                      /* always shifts when signed */
+    }
+    if (!(flags & 3)) return;
+    if (first >= 10) {
+        char c[16]; strcpy(c, b);
+        if (!(flags & 8)) c[strlen(c) - 1] = 0;
+        strcpy(b + 1, c);
+    }
+    b[0] = (flags & 1) ? '-' : '+';
+}
+void hud_time_str(char *b, int t) { hud_time_fmt(b, t, 0); }
+/* 0x4ab4b0: the label of the player's place -- the last of the field
+   "You were last!", else the table 0x7f66b4 by place */
+static uint32_t ro_place_label(const HudState *s) {
+    static const uint32_t T[7] = { 0x37083607u, 0xe815bc6du, 0xc9a64efbu, 0x443fab5au,
+                                   0xac122037u, 0x4342d430u, 0xeac720d3u };
+    if (s->ro_racers == s->ro_place) return 0xeac720d3u;
+    return s->ro_place >= 0 && s->ro_place < 7 ? T[s->ro_place] : 0x37083607u;
+}
+/* the race over widget 0x4c7f00, every frame: its objects shown while the
+   feature is on (0x4c6690); RaceOverMessage's script 0x657a31f6 started
+   once (with RaceOverBacking's, 0x36819d93 in a drag race), then the text
+   by the player's race entry state */
+static void ro_update(Hud *h, const HudState *s) {
+    struct HudDriftW *w = h->dw;
+    if (w->o_ro_msg < 0) return;
+    int on = s->race_over != 0;
+    if (on != w->ro_on) {
+        feng_anim_hide(&w->anim, w->o_ro_msg, !on);
+        if (w->o_ro_back >= 0) feng_anim_hide(&w->anim, w->o_ro_back, !on);
+        w->ro_on = on;
+    }
+    if (!on) return;
+    if (!feng_anim_running(&w->anim, w->o_ro_msg, 0x657a31f6u) && !w->ro_started) {
+        feng_anim_set(&w->anim, w->o_ro_msg, 0x657a31f6u, 1);
+        if (w->o_ro_back >= 0) feng_anim_set(&w->anim, w->o_ro_back, s->ro_drag ? 0x36819d93u : 0x657a31f6u, 1);
+        w->ro_started = 1;
+    }
+    char t[16], b[160], n[24];
+    hud_time_str(t, s->ro_time);
+    switch (s->ro_state) {
+    case 1:
+        if (s->ro_score_race) {
+            dw_num(n, sizeof n, s->ro_score);
+            if (s->ro_alone) snprintf(b, sizeof b, "%s %s", dw_str(w, 0x13640de9u), n);
+            else snprintf(b, sizeof b, "%s\n%s %s", dw_str(w, ro_place_label(s)), dw_str(w, 0x13640de9u), n);
+        } else if (s->ro_alone) snprintf(b, sizeof b, "%s %s", dw_str(w, 0xc2878ebcu), t);
+        else snprintf(b, sizeof b, "%s\n%s %s", dw_str(w, ro_place_label(s)), dw_str(w, 0xc2878ebcu), t);
+        dw_text(w, w->o_ro_msg, b);
+        break;
+    case 3: dw_label(w, w->o_ro_msg, 0x1b59940cu); break;   /* knocked out */
+    case 0xb: dw_label(w, w->o_ro_msg, 0x668c7453u); break; /* time's up */
+    case 8: dw_label(w, w->o_ro_msg, 0x7449d26du); break;   /* blown engine */
+    case 9: dw_label(w, w->o_ro_msg, 0x4ba0d22fu); break;   /* totaled */
+    case 10: break;
+    /* 6 / 7 (outrun / drag modes) and 0xc (online) come with those modes */
+    default: dw_label(w, w->o_ro_msg, 0xa074449fu); break;
+    }
+}
+
+/* the wrong way widget 0x4aafc0 (feature 0x4000, on in a race): offline the
+   countdown stays hidden; WrongWayImage fades in (FadeIn) once the player is
+   going the wrong way (player +0x248) and out (FadeOut) once not */
+static void ww_update(Hud *h, const HudState *s) {
+    struct HudDriftW *w = h->dw;
+    if (w->o_ww < 0) return;
+    int on = s->racing && !s->race_over;                 /* 0x4c6690 */
+    feng_anim_hide(&w->anim, w->o_ww, !on);
+    if (w->o_wwc2 >= 0) feng_anim_hide(&w->anim, w->o_wwc2, 1);
+    if (!on) return;
+    if (s->wrong_way) {
+        if (!w->ww_in) { w->ww_in = 1; feng_anim_set(&w->anim, w->o_ww, feng_hash_upper("FadeIn"), 1); }
+    } else if (w->ww_in && !feng_anim_running(&w->anim, w->o_ww, feng_hash_upper("FadeOut"))) {
+        feng_anim_set(&w->anim, w->o_ww, feng_hash_upper("FadeOut"), 1);
+        w->ww_in = 0;
+    }
+}
+
+/* the lap widget's time part (0x4aa1b0): at a new lap the lap's time
+   holds for 3 s (then the running lap again) and Lap_Time_Title / Text
+   show it 2 s ("BEST LAP TIME" when it is the best and not the first);
+   no lap yet: "--:--.--" */
+static void lt_update(Hud *h, const HudState *s) {
+    struct HudDriftW *w = h->dw;
+    if (w->o_lt < 0) return;
+    int on = s->rt_on && s->racing && !s->race_over;      /* 0x4c6690: the widget's objects */
+    feng_anim_hide(&w->anim, w->o_lt, !on);
+    if (!on) {
+        if (w->o_ltt >= 0) feng_anim_hide(&w->anim, w->o_ltt, 1);
+        if (w->o_ltx >= 0) feng_anim_hide(&w->anim, w->o_ltx, 1);
+        return;
+    }
+    char b[24];
+    if (s->lap_start != 0 && s->lap_start != 0x7fffffff) {
+        if (s->lap_new) {
+            w->lt54 = s->rt_now; w->lt58 = s->lap_last; w->lt5c = s->rt_now;
+            w->lt64 = !(s->lap_best < w->lt58 || !w->lt65);
+            w->lt65 = 1;
+        }
+        if (3.0f < (float)(s->rt_now - w->lt54) * 0.00025f) w->lt58 = s->rt_now - s->lap_start;
+        hud_time_fmt(b, w->lt58, 4);
+        dw_text(w, w->o_lt, b);
+        int show = w->lt65 && (float)(s->rt_now - w->lt5c) * 0.00025f < 2.0f;   /* 0x7844c0; only after a lap */
+        if (w->o_ltt >= 0) feng_anim_hide(&w->anim, w->o_ltt, !show);
+        if (w->o_ltx >= 0) feng_anim_hide(&w->anim, w->o_ltx, !show);
+        if (show) {
+            if (w->o_ltx >= 0) dw_text(w, w->o_ltx, b);
+            if (w->o_ltt >= 0) dw_label(w, w->o_ltt, w->lt64 ? 0xa8247197u : 0xfc1b498au);
+        }
+    } else {
+        dw_label(w, w->o_lt, 0x61c9b7a2u);                                 /* "--:--.--" */
+        /* no lap yet: the package's placeholders ("LAPY TIMER" / "TIME") stay hidden */
+        if (w->o_ltt >= 0) feng_anim_hide(&w->anim, w->o_ltt, 1);
+        if (w->o_ltx >= 0) feng_anim_hide(&w->anim, w->o_ltx, 1);
+    }
+}
+/* the split time (0x4da090 -> 0x4c6cb0 / 0x4aa740): at a new lap or
+   checkpoint the gap to the leader (to the second when leading), signed,
+   zooming in green when ahead or level, red behind; gone 3 s after */
+static void sp_update(Hud *h, const HudState *s) {
+    struct HudDriftW *w = h->dw;
+    if (w->o_sp < 0) return;
+    int on = s->split_on && s->racing && !s->race_over;
+    if (!on) { feng_anim_hide(&w->anim, w->o_sp, 1); w->sp28 = 0; return; }
+    if (!s->split_new) {
+        if (3.0f < (float)(s->rt_now - w->sp2c) * 0.00025f) { feng_anim_hide(&w->anim, w->o_sp, 1); w->sp28 = 0; }
+        return;
+    }
+    if (s->lb_n < 2 || s->split_gap == 0) return;
+    char b[24];
+    hud_time_fmt(b, s->split_gap, 2);
+    dw_text(w, w->o_sp, b);
+    if (!w->sp28) {
+        w->sp2c = s->rt_now;
+        feng_anim_set(&w->anim, w->o_sp, feng_hash_upper(s->split_gap <= 0 ? "ZoominGreen" : "ZoominRed"), 1);
+        feng_anim_hide(&w->anim, w->o_sp, 0);
+        w->sp28 = 1;
+    }
+}
+/* the leaderboard (one human, 0x4da190): 4 rows -- the leader, the cars
+   just ahead, the player, the cars behind (0x4aaed0); for 10 s the others'
+   gaps to the player ("+%s", 0x577240 flags 10) and 2 s everyone's names
+   (0x4aa890); "%d :" positions; the player's row SetPlayerColor, the
+   others Init; rows past the field hidden */
+static void lb_update(Hud *h, const HudState *s) {
+    struct HudDriftW *w = h->dw;
+    if (w->o_lbd[0] < 0) return;
+    int on = s->lb_on && s->racing && !s->race_over && s->rt_on;
+    for (int r = 0; r < 4; r++) {
+        int o4[4] = { w->o_lbd[r], w->o_lbt[r], w->o_lbtb[r], w->o_lbb[r] };
+        for (int q = 0; q < 4; q++) if (o4[q] >= 0) feng_anim_hide(&w->anim, o4[q], !on);
+    }
+    if (!on) return;
+    int n = s->lb_n < 8 ? s->lb_n : 8, me = 0;
+    for (int k = 0; k < n; k++) if (s->lb[k].me) me = k;
+    int row[4] = { 0, 0, 0, 0 }, before[7], after[7], nb = 0, na = 0, slots = 4 - 1;
+    int pos = me + 1, i8 = pos - 2, i5 = pos;
+    for (int it = 0; it < n && slots > 0; it++) {
+        if (0 < i8 && 1 < slots) { before[nb++] = i8--; slots--; }
+        if (i5 < n && 0 < slots) { after[na++] = i5++; slots--; }
+    }
+    int r = 1;
+    for (int k = nb - 1; k >= 0; k--) row[r++] = before[k];
+    if (me != 0) row[r++] = me;
+    for (int k = 0; k < na; k++) row[r++] = after[k];
+    int names = w->lb1c0;                                /* the view: drawn before a flip shows */
+    if (!w->lb1c0) {
+        if (10.0f < (float)(s->rt_now - w->lb1bc) * 0.00025f) { w->lb1bc = s->rt_now; w->lb1c0 = 1; }   /* 0x784560 */
+    } else if (2.0f < (float)(s->rt_now - w->lb1bc) * 0.00025f) { w->lb1bc = s->rt_now; w->lb1c0 = 0; }
+    for (int q = 0; q < 4 && q < n; q++) {
+        int k = row[q];
+        char b[32];
+        if (k == me) {
+            if (w->o_lbb[q] >= 0) feng_anim_set(&w->anim, w->o_lbb[q], feng_hash_upper("SetPlayerColor"), 1);
+            feng_anim_set(&w->anim, w->o_lbd[q], feng_hash_upper("SetPlayerColor"), 1);
+            dw_text(w, w->o_lbd[q], s->lb[k].name);
+        } else {
+            if (w->o_lbb[q] >= 0) feng_anim_set(&w->anim, w->o_lbb[q], feng_hash_upper("Init"), 1);
+            feng_anim_set(&w->anim, w->o_lbd[q], feng_hash_upper("Init"), 1);
+            if (names) dw_text(w, w->o_lbd[q], s->lb[k].name);
+            else { hud_time_fmt(b, s->lb[k].gap, 10); dw_text(w, w->o_lbd[q], b); }
+        }
+        snprintf(b, sizeof b, "%d :", k + 1);
+        if (w->o_lbt[q] >= 0) dw_text(w, w->o_lbt[q], b);
+    }
+    for (int q = n; q < 4; q++) {                        /* past the field */
+        if (w->o_lbd[q] >= 0) feng_anim_hide(&w->anim, w->o_lbd[q], 1);
+        if (w->o_lbt[q] >= 0) feng_anim_hide(&w->anim, w->o_lbt[q], 1);
+    }
+}
+
+static const char *ordinal_suffix(int n) {
+    int t = n % 100;
+    if (t >= 11 && t <= 13) return "th";
+    switch (n % 10) { case 1: return "st"; case 2: return "nd"; case 3: return "rd"; }
+    return "th";
+}
+
+/* Every drawn object of HUD_SingleRace, far to near, with the live values the
+   game itself would write into the dynamic ones. */
+static void strip_draw(Hud *h, const HudDC *dc) {
+    struct HudDriftW *w = h->dw;
+    float cx = 0.0f, cy = -150.0f, sw = 118.0f, sh = 59.0f;
+    if (w->strip_master >= 0) {
+        const FengObj *m = &h->pk->obj[w->strip_master];
+        cx = m->ax; cy = m->ay; sw = fabsf(m->size[0]); sh = fabsf(m->size[1]);
+    }
+    float step = sw + 40.0f;
+    for (int i = 0; i < w->strip_n; i++) {
+        if (!w->strip_tex[i]) continue;
+        float x = cx + ((float)i - w->strip_scroll) * step;
+        float k = 0.8f;
+        if (i == w->strip_sel) {   /* 0x538760: alpha ramp -> scale 0.97..1.0 */
+            float tri = w->strip_pulse < 1.0f ? w->strip_pulse : 2.0f - w->strip_pulse;
+            float a = tri * 255.0f * 1.1f + 127.5f; if (a > 255.0f) a = 255.0f;
+            k = 0.97f + a * 0.000117647f;
+        }
+        if (fabsf(x) + 0.5f * sw * k > 282.0f) continue;   /* outside the strip box */
+        float nx, ny;
+        fe_ndc(dc->asp, 0, x, cy, &nx, &ny);
+        if (w->strip_add[i]) glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        hud_blit(dc, w->strip_tex[i], sw * k / 240.0f, sh * k / 240.0f, nx, ny, 0.0f, 1.0f, 1.0f, 1.0f,
+                 w->strip_lock[i] ? 150.0f / 255.0f : 1.0f);
+        if (w->strip_add[i]) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+}
+static void hud_draw_screen(Hud *h, const HudDC *dc, const HudState *s) {
+    const FengPackage *p = h->pk;
+    unsigned char gate_on[G_COUNT];
+    gate_on[G_ALWAYS] = 1;
+    gate_on[G_TURBO]  = s->have_turbo ? 1 : 0;   /* unfitted = removed */
+    gate_on[G_NOS]    = (unsigned char)hud_shows_nos(s);
+    gate_on[G_RACE]   = s->racing ? 1 : 0;
+    gate_on[G_POS]    = s->racing && s->cars > 1 && s->position > 0;
+    gate_on[G_LAPS]   = s->racing ? 1 : 0;
+    gate_on[G_BANK]   = (unsigned char)hud_shows_money(s);
+    gate_on[G_SMS]    = !s->racing && s->message_waiting;
+
+    float rpm = s->have_rpm ? s->rpm : 0.0f;
+    if (rpm < 0.0f) rpm = 0.0f;
+    if (rpm > RPM_SCALE_MAX) rpm = RPM_SCALE_MAX;
+    h->needle_rpm += (rpm - h->needle_rpm) * 0.35f;
+    float kmh = fabsf(s->speed_kmh);
+    h->needle_speed += (kmh - h->needle_speed) * 0.40f;
+    h->nos_glow += ((s->nitro_active ? 1.0f : 0.0f) - h->nos_glow) * 0.25f;
+    float rot = hud_map_rot(s);
+    char buf[32];
+
+    int strip_done = !(h->dw && h->dw->strip_n);
+    for (int k = 0; k < h->ndraw; k++) {
+        int i = h->draw[k];
+        const FengObj *o = &p->obj[i];
+        if (!strip_done && (h->dw->strip_master < 0 || o->az < p->obj[h->dw->strip_master].az)) {
+            strip_draw(h, dc);              /* the icons sit at OPTION_MASTER's depth */
+            strip_done = 1;
+        }
+        if (!gate_on[h->gate[i]]) continue;
+        if (h->tach[i] && s->no_gauges) continue;
+        if ((h->gate[i] == G_POS && s->no_pos) || (h->gate[i] == G_LAPS && s->no_laps)) continue;
+        /* the race over mask (0x600090): only that widget and the
+           countdown's (hi 0x20000) keep their objects */
+        if (s->race_over && h->role[i] != R_COUNTDOWN &&
+            !(h->dw && (i == h->dw->o_ro_msg || i == h->dw->o_ro_back))) continue;
+        if (h->dw && i == h->dw->o_ww && !(s->racing && !s->race_over)) continue;
+        switch (h->role[i]) {
+        case R_RPM_NEEDLE:
+            if (s->have_rpm)
+                fe_sprite_at(h, dc, i, o->ax, o->ay,
+                             h->needle_rpm / 1000.0f * RPM_DEG_PER_1000 * (float)M_PI / 180.0f,
+                             o->rgba);
+            break;
+        case R_TURBO_NEEDLE: {
+            float b = s->have_boost ? s->boost : 0.0f;
+            if (b < -1.0f) b = -1.0f;
+            if (b > 1.0f) b = 1.0f;
+            fe_sprite_at(h, dc, i, o->ax, o->ay,
+                         (BOOST_DEG_ZERO + b * BOOST_DEG_SPAN) * (float)M_PI / 180.0f, o->rgba);
+            break; }
+        case R_SPEED:   /* 0x4c68d0: m/s x 2.237 mph or x 3.6 km/h */
+            snprintf(buf, sizeof buf, "%d", (int)(h->needle_speed * (s->kmh ? 1.0f : 2.237f / 3.6f) + 0.5f));
+            fe_text(h, dc, i, buf, o->rgba);
+            break;
+        case R_UNITS:
+            fe_text(h, dc, i, hud_str(h->dataroot, s->kmh ? 0x8569a25fu : 0x8569ab44u), o->rgba);
+            break;
+        case R_GEAR:
+            if (!s->have_rpm) break;
+            if (s->gear < 0) snprintf(buf, sizeof buf, "R");
+            else if (!s->gear) snprintf(buf, sizeof buf, "N");
+            else snprintf(buf, sizeof buf, "%d", s->gear);
+            fe_text(h, dc, i, buf, o->rgba);
+            break;
+        case R_SHIFT:
+            if (s->have_rpm && s->gear > 0 && s->rpm_redline > 0.0f &&
+                s->rpm >= s->rpm_redline * 0.93f)
+                fe_sprite(h, dc, i);
+            break;
+        case R_NOS_FILL: {
+            /* no tank model: a fitted system reads full; boosting brightens */
+            float fill = s->have_nitro_tank ? s->nitro_tank : 1.0f;
+            if (fill < 0.0f) fill = 0.0f;
+            if (fill > 1.0f) fill = 1.0f;
+            float c[4];
+            for (int q = 0; q < 4; q++) c[q] = o->rgba[q] + (1.0f - o->rgba[q]) * h->nos_glow;
+            if (fill >= 0.999f) fe_sprite_at(h, dc, i, o->ax, o->ay, o->aangle, c);
+            else if (fill > 0.001f) fe_nos_sector(h, dc, i, fill, c);
+            break; }
+        case R_MAP_SLOT:
+            hud_draw_map(h, dc, s);
+            break;
+        case R_MAP_NORTH:
+            /* turns about its authored pivot (the panel centre) to where
+               world north currently lies */
+            fe_sprite_at(h, dc, i, o->ax, o->ay, -rot, o->rgba);
+            break;
+        case R_POS_NUM:
+            snprintf(buf, sizeof buf, "%d", s->position);
+            fe_text(h, dc, i, buf, o->rgba);
+            break;
+        case R_POS_SUFFIX: {   /* 0x4ffaa0: 10 "th", else the table 0x7f70d8 by n % 10 */
+            static const uint32_t T[10] = { 0x7447c0e3u, 0xbc4ce12fu, 0x63eb6a03u, 0xbd498562u, 0x46573b3fu,
+                                            0xbc4cae38u, 0xbd383957u, 0xe2ab0284u, 0x438da7c0u, 0xbcdd9448u };
+            int n = s->position < 0 ? 0 : s->position;
+            const char *t = hud_str(h->dataroot, n == 10 ? 0xbcdd9448u : T[n % 10]);
+            fe_text(h, dc, i, t[0] ? t : hud_str(h->dataroot, 0xc01a6f63u), o->rgba);
+            break; }
+        case R_POS_OF:
+            snprintf(buf, sizeof buf, "/%d", s->cars);
+            fe_text(h, dc, i, buf, o->rgba);
+            break;
+        /* the lap box as the game's lap widget writes it (0x4aa1b0, English
+           layout): laps = LapNumber "%2d" + NumberLaps "/%2d"; progress =
+           LapText "Completed", NumberLaps "%3d%%", LapNumber hidden; no box
+           data (free roam, no race manager) = nothing drawn */
+        case R_LAP_LABEL:
+            if (s->lapbox == HUD_LAPBOX_LAPS) fe_text(h, dc, i, o->text, o->rgba);
+            else if (s->lapbox == HUD_LAPBOX_PERCENT)
+                fe_text(h, dc, i, hud_str(h->dataroot, 0xb1ee4ca9u), o->rgba);
+            break;
+        case R_LAP_NUM:
+            if (s->lapbox != HUD_LAPBOX_LAPS) break;
+            snprintf(buf, sizeof buf, "%2d", s->lapbox_num);
+            fe_text(h, dc, i, buf, o->rgba);
+            break;
+        case R_LAP_OF:
+            if (s->lapbox == HUD_LAPBOX_LAPS) snprintf(buf, sizeof buf, "/%2d", s->lapbox_of);
+            else if (s->lapbox == HUD_LAPBOX_PERCENT) snprintf(buf, sizeof buf, "%3d%%", s->lapbox_pct);
+            else break;
+            fe_text(h, dc, i, buf, o->rgba);
+            break;
+        case R_BANK_VALUE:
+            snprintf(buf, sizeof buf, "%ld", s->money);
+            fe_text(h, dc, i, buf, o->rgba);
+            break;
+        case R_COUNTDOWN: {
+            /* 0x4ab5b0: hidden at stage 0; "GO!" (label 0x535) or "%d";
+               alpha ftol(255 cos(ftol(frac 5898240) / 360 in 16-bit
+               angle units)), scale 2 frac + 1 about its own position */
+            if (s->countdown <= 0) break;
+            const char *t = buf;
+            if (s->countdown == 4) t = hud_str(h->dataroot, 0x535u);
+            else snprintf(buf, sizeof buf, "%d", s->countdown);
+            float f = s->countdown_frac;
+            int ang = (int)(f * 5898240.0f) / 360;                  /* 0x790a70 */
+            float c[4] = { o->rgba[0], o->rgba[1], o->rgba[2], 0 };
+            c[3] = (float)(int)(cosf((float)(unsigned short)ang * (6.28318531f / 65536.0f)) * 255.0f) / 255.0f;
+            fe_text_at(h, dc, i, t, o->ax, o->ay, 2.0f * f + 1.0f, c);   /* 0x78e070 */
+            break; }
+        case R_ANIM:
+            if (h->dw) fe_anim_draw(h, dc, i);
+            break;
+        default:
+            if (o->type == FENG_STRING) fe_text(h, dc, i, o->text, o->rgba);
+            else fe_sprite(h, dc, i);
+            break;
+        }
+    }
 }
 
 /* ------------------------------------------------------- navigation arrow */
@@ -681,9 +2826,9 @@ static void hud_draw_nav_arrow(Hud *h, const HudDC *dc, const HudState *s) {
        CCW-positive, so the arrow angle passes straight through: negating it
        here points the arrow at the mirror image of every turn. */
     float rot = h->arrow_angle;
-    if (h->art[ART_ARROW].tex) {
+    if (h->arrow_tex) {
         /* the sprite points up at rot 0; a right turn must lean right */
-        hud_blit(dc, h->art[ART_ARROW].tex, 0.13f, 0.26f, ax, ay, rot,
+        hud_blit(dc, h->arrow_tex, 0.13f, 0.26f, ax, ay, rot,
                  0.30f, 0.62f, 1.0f, 0.95f);
     } else {
         /* No usable arrow art ships in these packs, so this chevron is drawn,
@@ -714,52 +2859,6 @@ static void hud_draw_nav_arrow(Hud *h, const HudDC *dc, const HudState *s) {
             snprintf(buf, sizeof buf, "%d M", (int)(s->nav_dist_m + 0.5f));
         hud_label(dc, buf, ax, ay - 0.175f, 0.040f, 0.55f, 0.80f, 1.0f, 0.95f);
     }
-}
-
-/* ------------------------------------------------- race / money / message */
-
-static void hud_draw_status(const HudDC *dc, const HudState *s) {
-    char buf[96];
-    float x, y;
-    hud_place(dc->asp, 1.0f, 1.0f, -0.34f, -0.16f, &x, &y);
-
-    if (s->racing) {
-        /* money is hidden during a race, per the original */
-        if (s->cars > 1) {
-            snprintf(buf, sizeof buf, "POS %d/%d", s->position, s->cars);
-            hud_label(dc, buf, x, y, 0.070f, 1.0f, 0.95f, 0.80f, 1.0f);
-        }
-        hud_status_text(s, buf, sizeof buf);
-        if (buf[0])
-            hud_label(dc, buf, x, y - 0.095f, 0.052f, 0.85f, 0.92f, 1.0f, 1.0f);
-    } else if (hud_shows_money(s)) {
-        snprintf(buf, sizeof buf, "%ld", s->money);
-        hud_label(dc, "BANK", x, y, 0.040f, 0.60f, 0.72f, 0.85f, 1.0f);
-        hud_label(dc, buf, x, y - 0.085f, 0.065f, 1.0f, 0.92f, 0.55f, 1.0f);
-    } else {
-        /* No career/economy system exists yet. Name the gap instead of
-           printing a number that looks like a balance. */
-        hud_label(dc, "BANK", x, y, 0.040f, 0.60f, 0.72f, 0.85f, 0.9f);
-        hud_label(dc, "N/A",  x, y - 0.085f, 0.055f, 0.45f, 0.50f, 0.55f, 0.9f);
-    }
-}
-
-static void hud_draw_message(Hud *h, const HudDC *dc, const HudState *s) {
-    if (s->racing) return;          /* free roam only, as in the original */
-    float x, y;
-    hud_place(dc->asp, -1.0f, 1.0f, 0.30f, -0.13f, &x, &y);
-    hud_blit(dc, h->art[ART_ENGAGE_BACKING].tex, 0.46f, 0.20f, x, y, 0.0f,
-             1.0f, 1.0f, 1.0f, 0.80f);
-    hud_blit(dc, h->art[ART_CINGULAR_LOGO].tex, 0.26f, 0.13f, x, y + 0.025f,
-             0.0f, 1.0f, 1.0f, 1.0f, 0.95f);
-    hud_blit(dc, h->art[ART_CINGULAR_SLOGAN].tex, 0.24f, 0.06f, x, y - 0.055f,
-             0.0f, 1.0f, 1.0f, 1.0f, 0.85f);
-    /* The phone icon means "you have a message". Nothing in the engine can
-       produce one yet, so it is drawn only if something really sets the flag —
-       never on a timer to make the screenshot look busier. */
-    if (s->message_waiting)
-        hud_blit(dc, h->art[ART_ENGAGE_PHONE].tex, 0.075f, 0.075f,
-                 x + 0.19f, y + 0.06f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f);
 }
 
 /* ------------------------------------------------------------------ frame */
@@ -809,11 +2908,23 @@ void hud_draw(Hud *h, const RProg *rp, GpuMesh *quad,
     glUniform1f(rp->uVista, 0.0f);
     glUniform3f(rp->uEmissive, 0.0f, 0.0f, 0.0f);
 
-    hud_draw_minimap(h, &dc, &s);
-    hud_draw_cluster(h, &dc, &s);
-    hud_draw_status(&dc, &s);
-    if (!s.racing) hud_draw_message(h, &dc, &s);
-    hud_draw_nav_arrow(h, &dc, &s);
+    #ifdef __vita__
+    vita_lap(10);
+    #endif
+    if (h->pk && h->dw && !h->dw->screen) { ro_update(h, &s); ww_update(h, &s); lt_update(h, &s); sp_update(h, &s); lb_update(h, &s); }
+    if (h->pk && h->dw && h->dw->drag && s.drag) drag_update(h, &s, s.drag);
+    if (h->pk && h->dw && s.drift) {
+        drift_update(h, s.drift);
+        feng_anim_tick(&h->dw->anim, s.drift->dt_ms);
+    } else if (h->pk && h->dw && !h->dw->screen) feng_anim_tick(&h->dw->anim, s.dt_ms);
+    if (h->pk) hud_draw_screen(h, &dc, &s);
+    #ifdef __vita__
+    vita_lap(11);
+    #endif
+    if (!s.race_over) hud_draw_nav_arrow(h, &dc, &s);
+    #ifdef __vita__
+    vita_lap(15);
+    #endif
 
     if (h->preview) {
         float px, py;
@@ -829,6 +2940,157 @@ void hud_draw(Hud *h, const RProg *rp, GpuMesh *quad,
     glUniform1f(rp->uAlpha, 1.0f);
     glUniform1f(rp->uTextureAlpha, 0.0f);
     glUniform1f(rp->uFogDensity, fog_density);
+    glUniform3f(rp->uColor, 1.0f, 1.0f, 1.0f);
+    glDepthMask(depth_mask);
+    if (depth_on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (blend_on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    glBlendFunc((GLenum)blend_src, (GLenum)blend_dst);
+}
+
+/* ------------------------------------------------------------ garage menu */
+
+/* The tallest loaded HUD font (the game's own), or -1. */
+static int hud_menu_font(const Hud *h) {
+    int best = -1;
+    for (int f = 0; f < HUD_NFONT; f++)
+        if (h->font[f].ok && (best < 0 || h->font[f].f.line > h->font[best].f.line))
+            best = f;
+    return best;
+}
+
+/* `txt` in font `fi` at FEng point (fx, fy) (640x480 units, screen centre
+ * origin, y down), `scale` x the font's size; just 0 left, 1 centre, 2 right.
+ * Falls back to the procedural label font when no game font loaded. */
+static void hud_menu_text(Hud *h, const HudDC *dc, int fi, const char *txt,
+                          float fx, float fy, float scale, int just, const float *rgba) {
+    if (!txt || !*txt) return;
+    if (fi < 0) {
+        float nx, ny; fe_ndc(dc->asp, 0, fx, fy, &nx, &ny);
+        hud_label(dc, txt, nx, ny, 24.0f * scale / 240.0f, rgba[0], rgba[1], rgba[2], rgba[3]);
+        return;
+    }
+    const HudFont *F = &h->font[fi];
+    float w = feng_text_width(&F->f, txt) * scale;
+    float x = just == 1 ? fx - 0.5f * w : just == 2 ? fx - w : fx;
+    float y = fy - 0.5f * (float)F->f.line * scale;
+    int nq = 0;
+    float v[HUD_QMAX * 4 * 5];
+    for (const char *c = txt; *c && nq < HUD_QMAX; c++) {
+        const FengGlyph *g = &F->f.g[(unsigned char)*c];
+        if (!g->ok) continue;
+        if (g->w && g->h) {
+            float x0 = x + g->xo * scale, y0 = y + g->yo * scale;
+            float x1 = x0 + g->w * scale, y1 = y0 + g->h * scale;
+            float ax, ay, bx, by;
+            fe_ndc(dc->asp, 0, x0, y0, &ax, &ay);
+            fe_ndc(dc->asp, 0, x1, y1, &bx, &by);
+            float u0 = (float)g->u / F->aw, v0 = (float)g->v / F->ah;
+            float u1 = (float)(g->u + g->w) / F->aw, v1 = (float)(g->v + g->h) / F->ah;
+            float *q = v + nq * 20;
+            put_vert(q,      ax, ay, u0, v0);
+            put_vert(q + 5,  bx, ay, u1, v0);
+            put_vert(q + 10, bx, by, u1, v1);
+            put_vert(q + 15, ax, by, u0, v1);
+            nq++;
+        }
+        x += g->adv * scale;
+    }
+    hud_batch(h, dc, F->tex, v, nq, rgba);
+}
+
+/* A flat rectangle, FEng centre (fx, fy) and size (w, h). */
+static void hud_menu_rect(const HudDC *dc, float fx, float fy, float w, float h,
+                          float r, float g, float b, float a) {
+    float nx, ny; fe_ndc(dc->asp, 0, fx, fy, &nx, &ny);
+    hud_blit(dc, 0, w / 240.0f, h / 240.0f, nx, ny, 0.0f, r, g, b, a);
+}
+
+void hud_draw_menu(Hud *h, const RProg *rp, GpuMesh *quad, const HudMenu *m,
+                   int width, int height) {
+    if (!h || !rp || !quad || !m || width <= 0 || height <= 0) return;
+    HudDC dc; dc.rp = rp; dc.quad = quad; dc.asp = (float)width / (float)height;
+
+    GLboolean depth_on = glIsEnabled(GL_DEPTH_TEST), blend_on = glIsEnabled(GL_BLEND);
+    GLint blend_src = GL_SRC_ALPHA, blend_dst = GL_ONE_MINUS_SRC_ALPHA;
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &blend_src);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &blend_dst);
+    GLboolean depth_mask = GL_TRUE; glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+    GLfloat fog_density = 0.0f; glGetUniformfv(rp->prog, rp->uFogDensity, &fog_density);
+    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUniform1f(rp->uVColor, 0.0f); glUniform1f(rp->uFogDensity, 0.0f);
+    glUniform1f(rp->uDecal, 0.0f); glUniform1f(rp->uAlphaTest, 0.0f);
+    glUniform1f(rp->uTextureAlpha, 1.0f); glUniform1f(rp->uVista, 0.0f);
+    glUniform3f(rp->uEmissive, 0.0f, 0.0f, 0.0f);
+
+    int fi = hud_menu_font(h);
+    static const float white[4] = {0.95f, 0.95f, 0.97f, 1.0f};
+    static const float dim[4]   = {0.60f, 0.64f, 0.72f, 1.0f};
+    static const float gold[4]  = {1.00f, 0.80f, 0.20f, 1.0f};
+    static const float blue[4]  = {0.45f, 0.75f, 1.00f, 1.0f};
+
+    /* title band across the top, rows in the lower third (the car shows above) */
+    hud_menu_rect(&dc, 0.0f, -200.0f, 2000.0f, 56.0f, 0.02f, 0.03f, 0.06f, 0.70f);
+    hud_menu_text(h, &dc, fi, m->title, 0.0f, -200.0f, 1.25f, 1, gold);
+
+    const float row_h = 30.0f, top = 240.0f - 40.0f - row_h * (float)(m->rows + (m->status ? 1 : 0));
+    float panel_h = row_h * (float)(m->rows + (m->status ? 1 : 0)) + 16.0f;
+    hud_menu_rect(&dc, 0.0f, top + 0.5f * panel_h - 0.5f * row_h - 8.0f, 460.0f, panel_h,
+                  0.02f, 0.03f, 0.06f, 0.72f);
+    for (int i = 0; i < m->rows && i < HUD_MENU_ROWS; i++) {
+        float y = top + row_h * (float)i;
+        int s = i == m->sel;
+        if (s) hud_menu_rect(&dc, 0.0f, y, 452.0f, row_h - 4.0f, 0.10f, 0.28f, 0.55f, 0.85f);
+        if (m->value[i]) {
+            hud_menu_text(h, &dc, fi, m->label[i], -210.0f, y, 0.85f, 0, s ? white : dim);
+            char buf[96];
+            snprintf(buf, sizeof buf, s ? "<  %s  >" : "%s", m->value[i]);
+            hud_menu_text(h, &dc, fi, buf, 210.0f, y, 0.85f, 2, s ? gold : white);
+        } else {
+            hud_menu_text(h, &dc, fi, m->label[i], 0.0f, y, 0.95f, 1, s ? gold : white);
+        }
+    }
+    if (m->status)
+        hud_menu_text(h, &dc, fi, m->status, 0.0f, top + row_h * (float)m->rows, 0.7f, 1, blue);
+    if (m->hint) {
+        hud_menu_rect(&dc, 0.0f, 225.0f, 2000.0f, 26.0f, 0.0f, 0.0f, 0.0f, 0.55f);
+        hud_menu_text(h, &dc, fi, m->hint, 0.0f, 225.0f, 0.6f, 1, dim);
+    }
+
+    glUniform1f(rp->uUseTex, 0.0f); glUniform1f(rp->uUnlit, 0.0f);
+    glUniform1f(rp->uEmissiveTex, 0.0f); glUniform1f(rp->uAlpha, 1.0f);
+    glUniform1f(rp->uTextureAlpha, 0.0f); glUniform1f(rp->uFogDensity, fog_density);
+    glUniform3f(rp->uColor, 1.0f, 1.0f, 1.0f);
+    glDepthMask(depth_mask);
+    if (depth_on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (blend_on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    glBlendFunc((GLenum)blend_src, (GLenum)blend_dst);
+}
+
+void hud_draw_banner(Hud *h, const RProg *rp, GpuMesh *quad, const char *text,
+                     const char *sub, int width, int height) {
+    if (!h || !rp || !quad || !text || width <= 0 || height <= 0) return;
+    HudDC dc; dc.rp = rp; dc.quad = quad; dc.asp = (float)width / (float)height;
+    GLboolean depth_on = glIsEnabled(GL_DEPTH_TEST), blend_on = glIsEnabled(GL_BLEND);
+    GLint blend_src = GL_SRC_ALPHA, blend_dst = GL_ONE_MINUS_SRC_ALPHA;
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &blend_src);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &blend_dst);
+    GLboolean depth_mask = GL_TRUE; glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+    GLfloat fog_density = 0.0f; glGetUniformfv(rp->prog, rp->uFogDensity, &fog_density);
+    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUniform1f(rp->uVColor, 0.0f); glUniform1f(rp->uFogDensity, 0.0f);
+    glUniform1f(rp->uDecal, 0.0f); glUniform1f(rp->uAlphaTest, 0.0f);
+    glUniform1f(rp->uTextureAlpha, 1.0f); glUniform1f(rp->uVista, 0.0f);
+    glUniform3f(rp->uEmissive, 0.0f, 0.0f, 0.0f);
+    static const float gold[4] = {1.00f, 0.80f, 0.20f, 1.0f};
+    static const float white[4] = {0.95f, 0.95f, 0.97f, 1.0f};
+    int fi = hud_menu_font(h);
+    hud_menu_text(h, &dc, fi, text, 0.0f, -60.0f, 2.6f, 1, gold);
+    if (sub) hud_menu_text(h, &dc, fi, sub, 0.0f, -10.0f, 0.9f, 1, white);
+    glUniform1f(rp->uUseTex, 0.0f); glUniform1f(rp->uUnlit, 0.0f);
+    glUniform1f(rp->uEmissiveTex, 0.0f); glUniform1f(rp->uAlpha, 1.0f);
+    glUniform1f(rp->uTextureAlpha, 0.0f); glUniform1f(rp->uFogDensity, fog_density);
     glUniform3f(rp->uColor, 1.0f, 1.0f, 1.0f);
     glDepthMask(depth_mask);
     if (depth_on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);

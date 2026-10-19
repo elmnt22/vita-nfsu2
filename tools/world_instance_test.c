@@ -21,6 +21,8 @@
 #define winst_decode_placement winst_decode_placement_test_copy
 #define winst_place_mesh winst_place_mesh_test_copy
 #define world_instance_build world_instance_build_test_copy
+#define world_instance_set_detail world_instance_set_detail_test_copy
+#define world_instance_cache_selftest world_instance_cache_selftest_test_copy
 #define world_instance_build_for_event world_instance_build_for_event_test_copy
 #define winst_test_collect_placements winst_test_collect_placements_test_copy
 #define winst_test_placement_live_allocations winst_test_placement_live_allocations_test_copy
@@ -30,6 +32,8 @@
 #undef winst_test_placement_live_allocations
 #undef winst_test_collect_placements
 #undef world_instance_build
+#undef world_instance_set_detail
+#undef world_instance_cache_selftest
 #undef world_instance_build_for_event
 #undef winst_place_mesh
 #undef winst_decode_placement
@@ -237,6 +241,12 @@ static void test_decoded_asymmetric_placement(void) {
     memset(&stats, 0, sizeof stats);
     assert(winst_place_mesh(&dst, &src, placement.matrix, "XO_ASYMMETRIC", &stats) == 1);
     assert(dst.count == 1);
+    assert(dst.meshes[0].world_bounds_valid);
+    float measured_bounds[6]; n2_mesh_bbox(&dst.meshes[0], measured_bounds);
+    for (int k = 0; k < 3; k++) {
+        assert(near(measured_bounds[2*k], dst.meshes[0].world_bounds[k]));
+        assert(near(measured_bounds[2*k+1], dst.meshes[0].world_bounds[k+3]));
+    }
     assert(close3(dst.meshes[0].verts + 0, 100.0f, -25.0f, 7.5f));
     assert(close3(dst.meshes[0].verts + 5, 104.0f, -23.0f, 7.5f));
     assert(close3(dst.meshes[0].verts + 10, 103.5f, -22.0f, 7.5f));
@@ -523,7 +533,7 @@ static void test_ground_stage_eligibility_and_failure(void) {
     memset(&scene, 0, sizeof scene);
     memset(&vista, 0, sizeof vista);
     memset(&stats, 0, sizeof stats);
-    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats) == 1);
+    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats, 0, 0, 0) == 1);
     assert(scene.count == 1 && near(scene.meshes[0].verts[0], 7.0f));
     assert(stats.own_matrix_meshes == 1);
     free_scene(&scene);
@@ -533,7 +543,7 @@ static void test_ground_stage_eligibility_and_failure(void) {
     memset(&scene, 0, sizeof scene);
     memset(&vista, 0, sizeof vista);
     memset(&stats, 0, sizeof stats);
-    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats) == 1);
+    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats, 0, 0, 0) == 1);
     assert(scene.count == 2);
     assert(near(scene.meshes[0].verts[0], 0.0f));
     assert(near(scene.meshes[1].verts[0], 0.0f));
@@ -547,7 +557,7 @@ static void test_ground_stage_eligibility_and_failure(void) {
     memset(&scene, 0, sizeof scene);
     memset(&vista, 0, sizeof vista);
     memset(&stats, 0, sizeof stats);
-    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats) == 1);
+    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats, 0, 0, 0) == 1);
     assert(scene.count == 1 && near(scene.meshes[0].verts[0], 0.0f));
     assert(stats.own_matrix_meshes == 0);
     free_scene(&scene);
@@ -557,7 +567,7 @@ static void test_ground_stage_eligibility_and_failure(void) {
     memset(&scene, 0, sizeof scene);
     memset(&vista, 0, sizeof vista);
     memset(&stats, 0, sizeof stats);
-    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats) == 0);
+    assert(winst_place_ground_prototypes(&library, &scene, &vista, &stats, 0, 0, 0) == 0);
     assert(scene.count == 0 && vista.count == 0);
     assert(stats.rejected_meshes == 1);
     verts[0] = 0.0f;
@@ -1134,7 +1144,8 @@ static void test_private_prototype_paths(void) {
     used = add_leaf(model, used, 0x00134b01ul, verts, sizeof verts);
     used = add_leaf(model, used, 0x00134b03ul, idx, sizeof idx);
     memset(&library, 0, sizeof library);
-    winst_collect_model(&library, model, 0, used, NULL, 0);
+    winst_collect_model(&library, model, 0, used, NULL, 0, NULL);
+    library.data = model; winst_proto_load(&library, &library.items[0]);
     assert(library.count == 1 && library.items[0].scene.count == 1);
     assert(library.items[0].scene.meshes[0].nidx == 3);
     assert(library.items[0].scene.meshes[0].texkey == 0x1234u);
@@ -1165,7 +1176,8 @@ static void test_private_prototype_paths(void) {
         sn = add_leaf(sky, sn, 0x00134b01ul, sv, sizeof sv);
         sn = add_leaf(sky, sn, 0x00134b03ul, si, sizeof si);
         memset(&library, 0, sizeof library);
-        winst_collect_model(&library, sky, 0, sn, NULL, 0);
+        winst_collect_model(&library, sky, 0, sn, NULL, 0, NULL);
+        library.data = sky; winst_proto_load(&library, &library.items[0]);
         assert(library.count == 1 && library.items[0].scene.count == 2);
         assert(library.items[0].scene.meshes[0].texkey == 0x2414a01eu);
         assert(library.items[0].scene.meshes[1].texkey == 0x5fb8bcd1u);
@@ -1379,16 +1391,21 @@ static void test_ground_sheet_separates_water_from_backdrops(void) {
 
 static long make_common_tpk(unsigned char *buf, size_t cap,
                             uint32_t slot0, uint32_t slot1) {
-    const long record_size = 0x7c, header_size = 2 * record_size;
+    const long record_size = 0x7c, table = 8 + 8 + 124 + 8;
+    const long header_size = 8 + 124 + 8 + 2 * record_size;
     const long pixel_chunk = 8 + header_size;
     const long used = pixel_chunk + 9;
     assert(cap >= (size_t)used);
     memset(buf, 0, cap);
     put_u32(buf, 0xb3310000ul); put_u32(buf + 4, (unsigned long)header_size);
-    memcpy(buf + 8, "COMMON_SLOT_ZERO", 17);
-    put_u32(buf + 8 + 0x18, slot0);
-    memcpy(buf + 8 + record_size, "COMMON_SLOT_ONE", 16);
-    put_u32(buf + 8 + record_size + 0x18, slot1);
+    put_u32(buf + 8, 0x33310001u); put_u32(buf + 12, 124);
+    memcpy(buf + 20, "GLOBALTEXTURESNA", 15); /* must never be inventoried */
+    put_u32(buf + table - 8, 0x33310004u);
+    put_u32(buf + table - 4, 2 * record_size);
+    memcpy(buf + table + 12, "COMMON_SLOT_ZERO", 17);
+    put_u32(buf + table + 12 + 0x18, slot0);
+    memcpy(buf + table + record_size + 12, "COMMON_SLOT_ONE", 16);
+    put_u32(buf + table + record_size + 12 + 0x18, slot1);
     put_u32(buf + pixel_chunk, 0x33320002ul);
     return used;
 }
@@ -1436,11 +1453,109 @@ static void test_common_key_submesh_resolution(void) {
     assert(scene.meshes[1].mat_exact == 1 && scene.meshes[1].texkey == slot1);
     free_scene(&scene); free_scene(&vista);
 
-    remove(common_path); remove(companion_path); remove(stream_path);
+    /* The same exact ranges must survive when their only inventory source
+       is the optional advertisement pack (the Best Buy failure). */
+    remove(common_path);
+    const char *ad_path = "build/world_instance_common_fixture/GLOBAL/GlobalTexturesNA.bin";
+    const char *row_path = "build/world_instance_common_fixture/GLOBAL/GlobalTexturesROW.bin";
+    for (int row = 0; row < 2; row++) {
+        const char *path = row ? row_path : ad_path;
+        assert(write_fixture_file(path, common, common_len));
+        assert(world_instance_build(&scene, &vista, tracks, bundles, 1,
+                                    0, 0, 5, NULL, 0, &stats) == 1);
+        assert(scene.count == 2 && vista.count == 0);
+        assert(scene.meshes[0].mat_exact == 1 && scene.meshes[0].texkey == slot0);
+        assert(scene.meshes[1].mat_exact == 1 && scene.meshes[1].texkey == slot1);
+        free_scene(&scene); free_scene(&vista);
+        remove(path);
+    }
+    remove(companion_path); remove(stream_path);
     rmdir(global); rmdir(tracks); rmdir(base);
 }
 
+static void test_authored_low_detail(void) {
+    unsigned char colours[12] = {255,128,64,255,255,128,64,255,255,128,64,255};
+    float verts[] = {0,0,0,0,0, 4,0,0,1,0, 0,4,0,0,1};
+    uint16_t indices[] = {0,1,2,0,1,2};
+    N2Mesh models[2] = {{0}};
+    WInstProto protos[2] = {{0}};
+    for (int i = 0; i < 2; i++) {
+        models[i].verts = verts; models[i].idx = indices;
+        models[i].vcol = colours;
+        models[i].nverts = 3; models[i].nidx = i ? 3 : 6;
+        models[i].cat = N2_OTHER; models[i].scen = N2_SC_BUILDING;
+        protos[i].scene.meshes = &models[i]; protos[i].scene.count = 1;
+        protos[i].loaded = 1; protos[i].model_key = i + 1;
+        protos[i].index_count = models[i].nidx;
+    }
+    WInstLibrary library = {0}; library.items = protos; library.count = 2;
+    WInstPlacement placement = {0};
+    placement.model_keys[0] = 1; placement.model_keys[1] = 2;
+    placement.matrix[0] = placement.matrix[5] = placement.matrix[10] = placement.matrix[15] = 1;
+    N2Scene scene = {0}, vista = {0}; WInstStats stats = {0};
+    WInstBuildVisit visit = {&library, &scene, &vista, &stats};
+    world_instance_set_detail_test_copy(1);
+    assert(winst_build_visit(&placement, "XB_TEST", &visit));
+    assert(scene.count == 2 && scene.meshes[0].world_role == 1 && scene.meshes[1].world_role == 2);
+    assert(scene.meshes[0].nidx == 6 && scene.meshes[1].nidx == 3);
+    assert(!scene.meshes[0].vcol && scene.meshes[1].vcol);
+    assert(!memcmp(scene.meshes[1].vcol, colours, sizeof colours));
+    for (int i = 0; i < scene.count; i++) {
+        float measured[6]; n2_mesh_bbox(&scene.meshes[i], measured);
+        assert(scene.meshes[i].world_bounds_valid);
+        for (int k = 0; k < 3; k++) {
+            assert(near(measured[2*k], scene.meshes[i].world_bounds[k]));
+            assert(near(measured[2*k+1], scene.meshes[i].world_bounds[k+3]));
+        }
+    }
+    float obstacles_a[2][4], obstacles_b[2][4], z_a[2][2], z_b[2][2];
+    int src_a[2], src_b[2];
+    int count_a = phys_collect_walls(&scene, obstacles_a, src_a, z_a, 2);
+    for (int i = 0; i < scene.count; i++) scene.meshes[i].world_bounds_valid = 0;
+    int count_b = phys_collect_walls(&scene, obstacles_b, src_b, z_b, 2);
+    assert(count_a == count_b && count_a > 0);
+    assert(!memcmp(obstacles_a, obstacles_b, count_a * sizeof obstacles_a[0]));
+    assert(!memcmp(z_a, z_b, count_a * sizeof z_a[0]));
+    assert(!memcmp(src_a, src_b, count_a * sizeof src_a[0]));
+    assert(stats.lod_replacements == 1 && stats.lod_saved_indices == 3);
+    assert(!n2_mesh_same_content(&scene.meshes[0], &scene.meshes[1]));
+    winst_free_scene(&scene);
+    world_instance_set_detail_test_copy(0);
+    assert(winst_build_visit(&placement, "XB_TEST", &visit));
+    assert(scene.count == 1 && scene.meshes[0].world_role == 0 && scene.meshes[0].nidx == 6);
+    winst_free_scene(&scene);
+    world_instance_set_detail_test_copy(1);
+    protos[1].any_ground = 1;
+    assert(winst_build_visit(&placement, "XB_TEST", &visit));
+    assert(scene.count == 1 && scene.meshes[0].world_role == 0);
+    winst_free_scene(&scene);
+    world_instance_set_detail_test_copy(0);
+}
+
+static void test_model_key_index(void) {
+    WInstProto protos[5] = {{0}};
+    /* 1 and 17 collide in a 16-slot table; duplicate 1 must retain the first. */
+    uint32_t keys[] = {1, 17, 1, 0, 0xffffffffu};
+    for (int i = 0; i < 5; i++) protos[i].model_key = keys[i];
+    WInstLibrary library = {0}; library.items = protos; library.count = 5;
+    assert(winst_library_key(&library, 1) == &protos[0]);
+    winst_library_index(&library);
+    assert(library.model_index && library.model_index_cap == 16);
+    assert(winst_library_key(&library, 1) == &protos[0]);
+    assert(winst_library_key(&library, 17) == &protos[1]);
+    assert(winst_library_key(&library, 0xffffffffu) == &protos[4]);
+    assert(!winst_library_key(&library, 0) && !winst_library_key(&library, 33));
+    WInstPlacement placement = {0}; WInstStats stats = {0};
+    placement.model_keys[0] = 33; placement.model_keys[1] = 17;
+    assert(winst_library_resolve(&library, &placement, "XB_UNUSED", &stats) == &protos[1]);
+    assert(stats.keyed_models == 1 && stats.lod_fallbacks == 1);
+    free(library.model_index);
+}
+
 int main(void) {
+    assert(n2_tpk_inventory_selftest());
+    test_model_key_index();
+    test_authored_low_detail();
     test_scenery_event_assembly();
     test_selection_never_hides_ground();
     test_ground_prototype_follows_its_instance_transform();

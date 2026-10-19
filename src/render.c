@@ -5,9 +5,11 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <assert.h>
 #include <zlib.h>   /* screenshot PNG (dev only) */
 
 #include "render.h"
+#include "carfx.h"
 
 #if defined(__APPLE__) && !defined(N2_GLES)
 #define glGenFramebuffers glGenFramebuffersEXT
@@ -27,6 +29,12 @@
 #else
 #  define GLSL_HEADER "#version 120\n#define lowp\n#define mediump\n#define highp\n"
 #endif
+/* Depth of field (render_set_dof): with it on, the original draws every
+   opaque world / car / character mesh a second time with the effect's depth
+   pass (world.fx: alpha = saturate(viewZ * FocalRange), FocalRange 1/1024).
+   Here the colour pass writes that alpha itself while uDofW is 1 (the Vita
+   shim sets it per draw: opaque draws of the main 3D pass only). */
+#define DOF_ALPHA(a) "mix(" a ",clamp(vDepth*0.0009765625,0.0,1.0),uDofW)"
 
 /* World glows use world coordinates, never the preceding car/smoke matrix.
    Additive fog fades to black so sprite rectangles cannot add fog colour. */
@@ -104,6 +112,9 @@ int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
         float d2 = dx*dx + dy*dy + dz*dz;
         if (d2 > maxd2) continue;
         float d = sqrtf(d2); if (d < 0.5f) d = 0.5f;
+        /* outside a 60-degree cone round the view axis (wider than the
+           diagonal half-FOV) plus the largest sprite: off screen */
+        if (dx*ld[0] + dy*ld[1] + dz*ld[2] < 0.5f*d - 8.0f*halo) continue;
         /* r_in (10 m on the shipped records) is the light's influence radius,
            NOT a sprite size. Drawing the quad that large buries it in its own
            lamp post and intersects the ground and nearby walls, and the depth
@@ -165,6 +176,69 @@ static const char *VS =
     "  vPos=(uModel*vec4(aPos,1.0)).xyz; vColor=aColor;\n"
     "  gl_Position=uMVP*vec4(aPos,1.0); vDepth=gl_Position.w; }\n";
 
+/* car.fx (SPEED2.EXE, decoded 10-09; carfx.c builds the inputs). Lighting is
+   per vertex like the original vs_1_1: D = SH(N), S = SH(R) with R the
+   reflected view vector, both from the 10-term quadratic form; oD0/oD1 are
+   colour interpolators, so they saturate. World space here (the game works
+   in view space; same result). */
+#define CARFX_UNIFORMS \
+    "uniform vec4 uSH0, uSH1, uSH2, uSH3, uSH4, uSH5, uSH6, uSH7, uSH8, uSH9;\n" \
+    "uniform vec4 uCDiffMin, uCDiffRange; uniform vec3 uCSpecMin, uCSpecRange, uCPow;\n"
+static const char *VS_CAR =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
+    "uniform mat4 uMVP; uniform mat4 uModel; uniform vec3 uCamPos; uniform float uFlipN;\n"
+    CARFX_UNIFORMS
+    "varying vec2 vUV; varying float vDepth; varying vec4 vColor;\n"
+    "varying vec4 vD; varying vec4 vS; varying vec4 vR;\n"
+    "vec4 sh(vec3 n){ return uSH0+uSH1*(n.x*n.x)+uSH2*(n.y*n.y)+uSH3*(n.z*n.z)+uSH4*(n.x*n.y)\n"
+    "  +uSH5*(n.x*n.z)+uSH6*(n.y*n.z)+uSH7*n.x+uSH8*n.y+uSH9*n.z; }\n"
+    "void main(){\n"
+    "  vec3 P=(uModel*vec4(aPos,1.0)).xyz; vec3 N=normalize((uModel*vec4(aNor,0.0)).xyz);\n"
+    "  if(uFlipN>0.5) N=-N;\n"
+    "  vec3 V=normalize(uCamPos-P); float ndv=max(dot(N,V),0.01);\n"
+    "  vec4 D=sh(N); vec3 R=2.0*ndv*N-V; vec4 S=sh(R);\n"
+    "  vec4 dl=uCDiffMin+uCDiffRange*ndv;\n"
+    "  vD=clamp(vec4(D.rgb*dl.rgb,dl.a)*0.5,0.0,1.0);\n"
+    "  float sp=pow(ndv,uCPow.x);\n"
+    "  vS.rgb=clamp(S.rgb*pow(clamp(S.w,0.0,1.0),uCPow.x)*(uCSpecMin+uCSpecRange*sp)*0.5,0.0,1.0);\n"
+    "  vS.a=pow(ndv,uCPow.y);\n"
+    "  vR=vec4(R,ndv); vUV=aUV; vColor=aColor;\n"
+    "  gl_Position=uMVP*vec4(aPos,1.0); vDepth=gl_Position.w; }\n";
+/* ps_1_1: r0 = 2*env*(EnvMin + EnvRange*oD1.w) + oD1.rgb; r1 = 2*tex*oD0;
+   out = r1 + 2*r0*r1.w, alpha r1.w. The cube is a 3x2 atlas of 64 px faces
+   (render_env_*): +X -X +Y / -Y +Z -Z. */
+static const char *FS_CAR_HEAD =
+    GLSL_HEADER
+    "varying vec2 vUV; varying float vDepth; varying vec4 vColor;\n"
+    "varying vec4 vD; varying vec4 vS; varying vec4 vR;\n"
+    "uniform sampler2D uTex; uniform sampler2D uEnvTex;\n"
+    "uniform float uUseTex, uDecal, uAlpha, uVColor, uFogDensity, uFogK, uFogFloor, uTextureAlpha, uRimTint;\n"
+    "uniform float uDofW;\n"
+    "uniform vec3 uColor, uFogColor, uEmissive, uCEnvMin, uCEnvRange;\n"
+    "vec2 cubeuv(vec3 r){\n"
+    "  vec3 a=abs(r); vec2 uv; float fcol; float frow;\n"
+    "  if(a.x>=a.y && a.x>=a.z){ uv=vec2(r.x>0.0?-r.y:r.y, r.z)/a.x; fcol=r.x>0.0?0.0:1.0; frow=0.0; }\n"
+    "  else if(a.y>=a.z){ uv=vec2(r.y>0.0?r.x:-r.x, r.z)/a.y; fcol=r.y>0.0?2.0:0.0; frow=r.y>0.0?0.0:1.0; }\n"
+    "  else { uv=vec2(r.z>0.0?-r.x:r.x, r.y)/a.z; fcol=r.z>0.0?1.0:2.0; frow=1.0; }\n"
+    "  uv=uv*(0.5*62.0/64.0)+0.5;\n"
+    "  return vec2((fcol+uv.x)*(1.0/3.0),(frow+uv.y)*0.5); }\n"
+    "void main(){\n"
+    "  float fd=vDepth*uFogDensity; float fog=clamp(1.0-fd+uFogK,uFogFloor,1.0);\n"
+    "  vec4 t=texture2D(uTex,vUV);\n";
+static const char *FS_CAR_TAIL =
+    "  vec4 tex=uUseTex>0.5?(uDecal>0.5?vec4(mix(uColor,t.rgb,t.a),1.0):t):vec4(uColor,1.0);\n"
+    "  if(uVColor>1.5) tex.rgb*=vColor.rgb;\n"
+    "  if(uRimTint>0.001){ float l=dot(t.rgb,vec3(0.299,0.587,0.114)); tex.rgb=mix(tex.rgb,uColor*(0.25+1.5*l),uRimTint); }\n"
+    "  vec3 env=texture2D(uEnvTex,cubeuv(vR.xyz)).rgb;\n"
+    "  vec3 r0=clamp(2.0*env*(uCEnvMin+uCEnvRange*vS.a)+vS.rgb,0.0,1.0);\n"
+    "  vec4 r1=clamp(2.0*tex*vD,0.0,1.0);\n"
+    "  vec3 c=clamp(r1.rgb+2.0*r0*r1.a,0.0,1.0);\n"
+    /* a textured lamp glows where its art is bright (the bulbs), not over the whole housing */
+    "  if(dot(uEmissive,uEmissive)>0.0) c+=uEmissive*(0.55+0.45*vR.w)*(uUseTex>0.5?clamp(2.0*dot(t.rgb,vec3(0.299,0.587,0.114)),0.0,1.0):1.0);\n"
+    "  float a=uTextureAlpha>0.5?r1.a*uAlpha:uAlpha;\n"
+    "  gl_FragColor=vec4(mix(uFogColor,c,fog)," DOF_ALPHA("a") ");\n}\n";
+
 static const char *FS =
     GLSL_HEADER
     "varying vec2 vUV; varying vec3 vN; varying float vDepth; varying vec3 vPos;\n"
@@ -173,7 +247,7 @@ static const char *FS =
     "uniform float uVColor;\n"   /* 0 off, 1 world MODULATE2X, 2 car diffuse */
     "uniform float uUseTex; uniform vec3 uColor; uniform float uUnlit; uniform float uAlpha; uniform float uSoft; uniform float uSpec; uniform float uDecal;\n"
     "uniform float uAmbient; uniform float uDiffuse; uniform vec3 uLight;\n"
-    "uniform vec3 uFogColor; uniform float uFogDensity;\n"
+    "uniform vec3 uFogColor; uniform float uFogDensity, uFogK, uFogFloor;\n"
     "uniform vec3 uCamPos; uniform float uEnv; uniform float uUVCheck;\n"
     "uniform float uGloss; uniform float uFlipN;\n"
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
@@ -188,23 +262,35 @@ static const char *FS =
     "uniform float uEmissiveTex;\n" /* authored texture-backed unlit pass */
     "uniform float uFresnel;\n"   /* >0.5: glass -- fresnel drives alpha + reflection */
     "uniform float uClearcoat;\n" /* >0: second tight specular lobe over the base coat */
+    "uniform float uDofW;\n"      /* 1: alpha = depth of field depth (DOF_ALPHA) */
+    /* car.fx inputs: declared and touched here only so the main program
+       owns their locations (the variant system maps names through it) */
+    "uniform float uCarFx;\n"
+    CARFX_UNIFORMS
+    "uniform vec3 uCEnvMin, uCEnvRange;\n"
     "uniform vec4 uHeadPos[2];\n"
     "uniform vec3 uHeadForward, uHeadRight, uHeadUp;\n"
     "uniform vec4 uHeadShape;\n" /* horizontal/vertical spread, downward slope, range */
     "uniform float uHeadGain, uHeadLow;\n"
+    "uniform vec3 uHeadColor;\n"   /* the bulb: HEADLIGHTCOLOR */
     "uniform float uHeadShadow;\n"
     "uniform sampler2D uHeadShadowMap0, uHeadShadowMap1;\n"
     "uniform mat4 uHeadShadowMVP[2];\n"
     "float headVisibility(int h,vec3 position,vec3 normal,float along){\n"
     "  if(uHeadShadow<0.5)return 1.0;\n"
     "  float offset=0.005+along*max(uHeadShape.x,uHeadShape.y)*2.0/512.0;\n"
-    "  vec4 clip=uHeadShadowMVP[h]*vec4(position+normal*offset,1.0);\n"
+    /* Constant indices only: Cg fragment programs (PS Vita) cannot index a
+       uniform array with a variable, so the lamp is selected with ?: instead. */
+    "  mat4 shadowMVP=h==0?uHeadShadowMVP[0]:uHeadShadowMVP[1];\n"
+    "  vec4 clip=shadowMVP*vec4(position+normal*offset,1.0);\n"
     "  vec2 uv=clip.xy/clip.w*0.5+0.5;\n"
     "  if(clip.w<=0.0 || uv.x<0.0 || uv.x>1.0 || uv.y<0.0 || uv.y>1.0)return 1.0;\n"
     "  float depth=(clip.w-0.025-0.001*along)/uHeadShape.w;\n"
     "  float visibility=0.0;\n"
-    "  for(int x=0;x<2;x++)for(int y=0;y<2;y++){\n"
-    "    vec2 at=uv+(vec2(float(x),float(y))-0.5)/512.0;\n"
+    /* Distinct names: vitaGL's GLSL->Cg translator confuses scalars called
+       x/y here with the luma `y` in main() and rejects the shader. */
+    "  for(int tapX=0;tapX<2;tapX++)for(int tapY=0;tapY<2;tapY++){\n"
+    "    vec2 at=uv+(vec2(float(tapX),float(tapY))-0.5)/512.0;\n"
     "    vec2 depthRG=h==0?texture2D(uHeadShadowMap0,at).rg:texture2D(uHeadShadowMap1,at).rg;\n"
     "    visibility+=step(depth,dot(depthRG,vec2(1.0,1.0/255.0)))*0.25;\n"
     "  }\n"
@@ -224,7 +310,12 @@ static const char *FS =
     "    float grid=smoothstep(0.0,0.04,min(g.x,g.y));\n"
     "    gl_FragColor=vec4(vec3(vUV.x,vUV.y,0.2)*mix(0.35,1.0,grid),1.0); return;\n"
     "  }\n"
-    "  float fog = clamp(exp(-pow(vDepth*uFogDensity, 2.0)), 0.0, 1.0);\n"
+    "  if(uCarFx>1.5){ gl_FragColor=uSH0+uSH1+uSH2+uSH3+uSH4+uSH5+uSH6+uSH7+uSH8+uSH9+uCDiffMin+uCDiffRange\n"
+    "    +vec4(uCSpecMin+uCSpecRange+uCPow+uCEnvMin+uCEnvRange,0.0); return; }\n"
+    /* world.fx linear fog: clamp((250 - viewZ) / (250 - start), floor, 1), with
+       uFogDensity = 1/(250-start) and uFogK = start*uFogDensity; density 0 = none */
+    "  float fd = vDepth*uFogDensity;\n"
+    "  float fog = clamp(1.0 - fd + uFogK, uFogFloor, 1.0);\n"
     /* M132-R2 vista path. The backdrops are authored as cut-out sheets: their
        DXT1 blocks carry one-bit transparency (up to 57.7% of texels fully
        clear) and their DXT3 blocks carry real gradients, all of which the
@@ -287,8 +378,8 @@ static const char *FS =
        Luminance drives the shade, uColor picks the metal, so a gold OEM sheet
        becomes any painted colour (silver by default) with spokes/shadows
        intact. uRimTint 0 = raw OEM texture, 1 = fully painted. */
-    "  if(uRimTint>0.001){ float y=dot(t.rgb, vec3(0.299,0.587,0.114));\n"
-    "    base = mix(base, uColor*(0.25+1.5*y), uRimTint); }\n"
+    "  if(uRimTint>0.001){ float luma=dot(t.rgb, vec3(0.299,0.587,0.114));\n"
+    "    base = mix(base, uColor*(0.25+1.5*luma), uRimTint); }\n"
     /* cheap view-angle cavity darkening (cars only, uSpec>0 — the world
        batches always set uSpec=0): panel gaps/creases have no texture data
        to show them (verified: body meshes carry no diffuse map at all), so
@@ -321,9 +412,10 @@ static const char *FS =
     "  else if(uVColor>0.001) lit *= clamp(vColor.rgb*2.0, 0.0, 1.6);\n"
     /* Surface lighting and per-lamp world-geometry shadows. */
     "  if(uHeadGain>0.0) for(int h=0;h<2;h++){\n"
-    "    vec3 ray=vPos-uHeadPos[h].xyz; float dist=length(ray);\n"
+    "    vec4 headPos=h==0?uHeadPos[0]:uHeadPos[1];\n"   /* constant indices, see headVisibility */
+    "    vec3 ray=vPos-headPos.xyz; float dist=length(ray);\n"
     "    float along=dot(ray,uHeadForward);\n"
-    "    if(uHeadPos[h].w>0.5 && along>0.05 && dist<uHeadShape.w){\n"
+    "    if(headPos.w>0.5 && along>0.05 && dist<uHeadShape.w){\n"
     "      float lateral=dot(ray,uHeadRight)/along;\n"
     "      float elevation=dot(ray,uHeadUp)/along;\n"
     "      vec2 cone=vec2(lateral/uHeadShape.x,(elevation+uHeadShape.z)/uHeadShape.y);\n"
@@ -331,7 +423,7 @@ static const char *FS =
     "      float cutoff=mix(1.0,1.0-smoothstep(-0.018,-0.008,elevation),uHeadLow);\n"
     "      float reach=1.0-smoothstep(uHeadShape.w*0.65,uHeadShape.w,dist);\n"
     "      float lambert=max(dot(N,-ray/max(dist,0.001)),0.0);\n"
-    "      if(edge*cutoff*lambert>0.0)lit+=base*vec3(1.0,0.94,0.82)*edge*cutoff*reach*lambert*uHeadGain*5.0*headVisibility(h,vPos,N,along)/(1.0+dist*dist/350.0);\n"
+    "      if(edge*cutoff*lambert>0.0)lit+=base*uHeadColor*edge*cutoff*reach*lambert*uHeadGain*5.0*headVisibility(h,vPos,N,along)/(1.0+dist*dist/350.0);\n"
     "    }\n"
     "  }\n"
     /* environment reflection (cars only, uEnv>0): a procedural night-city
@@ -364,7 +456,7 @@ static const char *FS =
        curved lens is hottest where its surface faces the camera and falls off
        toward the rim, which is the difference between a lens and a sticker.
        The 0.55 floor keeps the lamp clearly lit all over. */
-    "  if(dot(uEmissive,uEmissive)>0.0) lit += uEmissive*(0.55+0.45*clamp(dot(N,V),0.0,1.0));\n"
+    "  if(dot(uEmissive,uEmissive)>0.0) lit += uEmissive*(0.55+0.45*clamp(dot(N,V),0.0,1.0))*(uUseTex>0.5?clamp(2.0*dot(t.rgb,vec3(0.299,0.587,0.114)),0.0,1.0):1.0);\n"
     "  float outA = uTextureAlpha>0.5 ? t.a*uAlpha : uAlpha;\n"
     /* Glass (uFresnel, the car glass pass only). A flat per-pass alpha is what
        made the cabin read as a still pool: every window sat at one constant
@@ -372,7 +464,7 @@ static const char *FS =
        than a pane. Real glass is nearly clear head-on and a mirror at grazing
        incidence, so alpha rides the same fresnel term the reflection does. */
     "  if(uFresnel>0.5) outA = clamp(mix(uAlpha, 1.0, fres), 0.0, 1.0);\n"
-    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), outA);\n"
+    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), " DOF_ALPHA("outA") ");\n"
     "}\n";
 
 /* ---- tiny 4x4 matrix (column-major) ---- */
@@ -464,14 +556,90 @@ void write_png(const char *path, int w, int h, const unsigned char *rgb) {
     free(raw); free(comp);
 }
 
+#ifdef __vita__
+static int g_shader_failed;
+#endif
 static GLuint compile(GLenum type, const char *src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, NULL); glCompileShader(s);
     GLint ok; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) { char log[512]; glGetShaderInfoLog(s, 512, NULL, log);
-        fprintf(stderr, "shader: %s\n", log); }
+        fprintf(stderr, "shader: %s\n", log);
+#ifdef __vita__
+        /* vitaGL dereferences a failed shader inside glLinkProgram and takes
+           the process down. Record it and link a flat magenta stand-in so the
+           failure is visible on screen and every other shader still loads. */
+        vita_shader_failed(type, src, log);
+        g_shader_failed = 1;
+        glDeleteShader(s);
+        static const char *fallback_vs = GLSL_HEADER
+            "attribute vec3 aPos;uniform mat4 uMVP;"
+            "void main(){gl_Position=uMVP*vec4(aPos,1.0);}";
+        static const char *fallback_fs = GLSL_HEADER
+            "void main(){gl_FragColor=vec4(1.0,0.0,1.0,1.0);}";
+        s = glCreateShader(type);
+        const char *fb = type == GL_VERTEX_SHADER ? fallback_vs : fallback_fs;
+        glShaderSource(s, 1, &fb, NULL); glCompileShader(s);
+#endif
+    }
     return s;
 }
+
+#ifdef __vita__
+/* Linked-program cache. vitaShaRK compiles GLSL on the device (the ten shader
+   variants alone took 8.3 s), so a linked program is saved with
+   glGetProgramBinary under a hash of its sources and restored with
+   glProgramBinary on later boots. The binary carries the attribute bindings.
+   Editing a shader changes the hash, so stale entries are simply never read. */
+#include <sys/stat.h>
+#define PROG_CACHE_MAX (256 * 1024)
+static GLuint program_cached(const char *vs, const char *fs) {
+    uint32_t h = 2166136261u;
+    for (const char *s = vs; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+    h = (h ^ 0xff) * 16777619u;
+    for (const char *s = fs; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+    /* binaries are per vitaGL build: the patched one gets its own names */
+    extern int vgl_ug2_build __attribute__((weak));
+    char path[96];
+    snprintf(path, sizeof path, "ux0:data/OpenUG2/cache/prog_%s%08x.bin",
+             &vgl_ug2_build ? "u_" : "", (unsigned)h);
+    GLuint p = glCreateProgram();
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+        void *buf = len > 0 && len <= PROG_CACHE_MAX ? malloc((size_t)len) : NULL;
+        int got = buf && fread(buf, 1, (size_t)len, f) == (size_t)len;
+        fclose(f);
+        if (got) {
+            glProgramBinary(p, 0, buf, (GLsizei)len);
+            free(buf);
+            GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+            if (ok) return p;
+            printf("shader cache: %s unusable, recompiling\n", path);
+            glDeleteProgram(p); p = glCreateProgram();
+        } else free(buf);
+    }
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    glBindAttribLocation(p, 0, "aPos");
+    glBindAttribLocation(p, 1, "aUV");
+    glBindAttribLocation(p, 2, "aNor");
+    glBindAttribLocation(p, 3, "aColor");
+    glLinkProgram(p);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok || g_shader_failed) return p;   /* never cache a magenta stand-in */
+    void *buf = malloc(PROG_CACHE_MAX);
+    GLsizei len = 0; GLenum fmt = 0;
+    if (buf) glGetProgramBinary(p, PROG_CACHE_MAX, &len, &fmt, buf);
+    mkdir("ux0:data/OpenUG2/cache", 0777);   /* usually exists already */
+    if (buf && len > 0 && len <= PROG_CACHE_MAX && (f = fopen(path, "wb"))) {
+        fwrite(buf, 1, (size_t)len, f);
+        fclose(f);
+    }
+    free(buf);
+    return p;
+}
+#endif
 
 /* Colour maps plus a depth renderbuffer work without depth-texture extensions.
  * ponytail: fixed 512px world-only maps; add vehicle casters when their renderer
@@ -486,13 +654,13 @@ void free_headlight_shadows(HeadlightShadows *s) {
 static int headlight_shadow_init(HeadlightShadows *s) {
     const char *vs=GLSL_HEADER
         "attribute vec3 aPos;attribute vec2 aUV;uniform mat4 uMVP;"
-        "varying vec2 uv;varying float distance;"
-        "void main(){uv=aUV;gl_Position=uMVP*vec4(aPos,1.0);distance=gl_Position.w;}";
+        "varying vec2 uv;varying float vShadowDist;"
+        "void main(){uv=aUV;gl_Position=uMVP*vec4(aPos,1.0);vShadowDist=gl_Position.w;}";
     const char *fs=GLSL_HEADER
         "uniform sampler2D uTex;uniform float uCutout,uRange;"
-        "varying vec2 uv;varying float distance;"
+        "varying vec2 uv;varying float vShadowDist;"
         "void main(){if(uCutout>0.5 && texture2D(uTex,uv).a<0.5)discard;"
-        "vec2 enc=fract(clamp(distance/uRange,0.0,0.99999)*vec2(1.0,255.0));"
+        "vec2 enc=fract(clamp(vShadowDist/uRange,0.0,0.99999)*vec2(1.0,255.0));"
         "enc.x-=enc.y/255.0;gl_FragColor=vec4(enc,0.0,1.0);}";
     GLuint v=compile(GL_VERTEX_SHADER,vs),f=compile(GL_FRAGMENT_SHADER,fs);
     s->program=glCreateProgram();glAttachShader(s->program,v);glAttachShader(s->program,f);
@@ -653,16 +821,345 @@ void render_model(const RProg *r,const float model[16]) {
     glUniformMatrix4fv(r->uModel,1,GL_FALSE,model?model:identity);
 }
 
+#ifdef __vita__
+/* PS Vita world pass: the main FS above carries car paint, glass, lamps,
+   headlight shadows and reflections, all of which the GXM compiler keeps in
+   one fragment program. The world only needs texture x prelight x sun, fog
+   and alpha test, so it is drawn with this program under the main program's
+   uniform locations (vita_alias_program in vita/sdl_vita.c). */
+static const char *FS_WORLD_LITE =
+    GLSL_HEADER
+    "varying vec2 vUV; varying vec3 vN; varying float vDepth; varying vec4 vColor;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform float uVColor, uUseTex, uUnlit, uAlpha, uAlphaTest, uTextureAlpha, uEmissiveTex;\n"
+    "uniform float uAmbient, uDiffuse, uFogDensity, uFogK, uFogFloor, uDofW;\n"
+    "uniform vec3 uColor, uLight, uFogColor;\n"
+    "void main(){\n"
+    "  float fd=vDepth*uFogDensity; float fog=clamp(1.0-fd+uFogK,uFogFloor,1.0);\n"
+    "  if(uUnlit>0.5){ gl_FragColor=vec4(mix(uFogColor,uColor,fog),uAlpha); return; }\n"
+    "  vec4 t=texture2D(uTex,vUV);\n"
+    "  if(uEmissiveTex>0.5){ float ea=t.a*uAlpha; if(ea<0.02) discard;\n"
+    "    gl_FragColor=vec4(mix(uFogColor,t.rgb*uColor,fog)," DOF_ALPHA("ea") "); return; }\n"
+    "  if(uAlphaTest>0.5 && t.a<0.5) discard;\n"
+    "  vec3 base=uUseTex>0.5?t.rgb:uColor;\n"
+    "  vec3 lit;\n"
+    "  if(uVColor>1.5) lit=base*vColor.rgb;\n"
+    "  else if(uVColor>0.001) lit=clamp(base*vColor.rgb*2.0,0.0,1.0);\n"   /* world.fx: 2*tex*vcol */
+    "  else { float nl=max(dot(normalize(vN),normalize(uLight)),0.0); lit=base*(uAmbient+uDiffuse*nl)*1.35; }\n"
+    "  float outA=uTextureAlpha>0.5?t.a*uAlpha:uAlpha;\n"
+    "  gl_FragColor=vec4(mix(uFogColor,lit,fog)," DOF_ALPHA("outA") ");\n"
+    "}\n";
+
+/* FS_WORLD_LITE for opaque and blended world draws (variant key 18): no
+   discard anywhere, so the GPU keeps hidden-surface removal for them. The
+   unlit and emissive paths stay on FS_WORLD_LITE (vu_select). */
+static const char *FS_WORLD_LITE_OPAQUE =
+    GLSL_HEADER
+    "varying vec2 vUV; varying vec3 vN; varying float vDepth; varying vec4 vColor;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform float uVColor, uUseTex, uAlpha, uTextureAlpha;\n"
+    "uniform float uAmbient, uDiffuse, uFogDensity, uFogK, uFogFloor, uDofW;\n"
+    "uniform vec3 uColor, uLight, uFogColor;\n"
+    "void main(){\n"
+    "  float fd=vDepth*uFogDensity; float fog=clamp(1.0-fd+uFogK,uFogFloor,1.0);\n"
+    "  vec4 t=texture2D(uTex,vUV);\n"
+    "  vec3 base=uUseTex>0.5?t.rgb:uColor;\n"
+    "  vec3 lit;\n"
+    "  if(uVColor>1.5) lit=base*vColor.rgb;\n"
+    "  else if(uVColor>0.001) lit=clamp(base*vColor.rgb*2.0,0.0,1.0);\n"   /* world.fx: 2*tex*vcol */
+    "  else { float nl=max(dot(normalize(vN),normalize(uLight)),0.0); lit=base*(uAmbient+uDiffuse*nl)*1.35; }\n"
+    "  float outA=uTextureAlpha>0.5?t.a*uAlpha:uAlpha;\n"
+    "  gl_FragColor=vec4(mix(uFogColor,lit,fog)," DOF_ALPHA("outA") ");\n"
+    "}\n";
+
+/* World cutout pass (variant key 19): foliage, fences, rails. A discarding
+   program gets no hidden-surface removal, so every covered pixel of every
+   cutout layer is shaded; the GPU probe put this pass at ~5 ms of a ~16 ms
+   city frame. Light and vertex colour go per vertex (the uniform branches
+   and both normalizes leave the pixel), leaving the pixel a texture fetch,
+   the alpha test and fog. World normals are flat per face, so the result
+   matches FS_WORLD_LITE. */
+static const char *VS_WORLD_LITE =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
+    "uniform mat4 uMVP; uniform mat4 uModel;\n"
+    "uniform float uVColor, uAmbient, uDiffuse; uniform vec3 uLight;\n"
+    "varying vec2 vUV; varying float vDepth; varying vec3 vLit;\n"
+    "void main(){ vUV=aUV;\n"
+    "  vec3 N=normalize((uModel*vec4(aNor,0.0)).xyz);\n"
+    "  float nl=max(dot(N,normalize(uLight)),0.0);\n"
+    "  vec3 l=vec3((uAmbient+uDiffuse*nl)*1.35);\n"
+    "  if(uVColor>1.5) l=aColor.rgb;\n"
+    "  else if(uVColor>0.001) l=aColor.rgb*2.0;\n"   /* world.fx: 2*tex*vcol, saturated per pixel */
+    "  vLit=l; gl_Position=uMVP*vec4(aPos,1.0); vDepth=gl_Position.w; }\n";
+static const char *FS_WORLD_LITE_CUTOUT =
+    GLSL_HEADER
+    "varying vec2 vUV; varying float vDepth; varying vec3 vLit;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform float uUseTex, uAlpha, uFogDensity, uFogK, uFogFloor, uDofW;\n"
+    "uniform vec3 uColor, uFogColor;\n"
+    "void main(){\n"
+    "  vec4 t=texture2D(uTex,vUV);\n"
+    "  if(t.a<0.5) discard;\n"
+    "  float fd=vDepth*uFogDensity; float fog=clamp(1.0-fd+uFogK,uFogFloor,1.0);\n"
+    "  vec3 base=mix(uColor,t.rgb,uUseTex);\n"
+    "  gl_FragColor=vec4(mix(uFogColor,clamp(base*vLit,0.0,1.0),fog)," DOF_ALPHA("uAlpha") ");\n"
+    "}\n";
+
+/* Wet-road variant (key 20) = worldreflect.fx from SPEED2.EXE:
+     r0 = tex * vcol;  out = 2*r0 + ReflectedTex * r0.a
+   with ReflectedTex sampled projectively at the pixel's own screen spot.
+   Here the lit/prelit colour is FS_WORLD_LITE_OPAQUE's, and the reflection
+   is added before fog as the original's per-vertex fog then blends both. */
+static const char *VS_WORLD_REFL =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
+    "uniform mat4 uMVP; uniform mat4 uModel; varying vec2 vUV; varying vec3 vN; varying float vDepth;\n"
+    "varying vec4 vColor; varying vec3 vRefl;\n"
+    "void main(){ vUV=aUV; vN=(uModel*vec4(aNor,0.0)).xyz; vColor=aColor;\n"
+    "  gl_Position=uMVP*vec4(aPos,1.0); vDepth=gl_Position.w;\n"
+    "  vRefl=vec3(gl_Position.x+gl_Position.w, gl_Position.y+gl_Position.w, 2.0*gl_Position.w); }\n";
+static const char *FS_WORLD_LITE_REFLECT =
+    GLSL_HEADER
+    "varying vec2 vUV; varying vec3 vN; varying float vDepth; varying vec4 vColor; varying vec3 vRefl;\n"
+    "uniform sampler2D uTex; uniform sampler2D uReflTex;\n"
+    "uniform float uVColor, uUseTex, uAlpha, uTextureAlpha;\n"
+    "uniform float uAmbient, uDiffuse, uFogDensity, uFogK, uFogFloor, uDofW;\n"
+    "uniform vec3 uColor, uLight, uFogColor;\n"
+    "void main(){\n"
+    "  float fd=vDepth*uFogDensity; float fog=clamp(1.0-fd+uFogK,uFogFloor,1.0);\n"
+    "  vec4 t=texture2D(uTex,vUV);\n"
+    "  vec3 base=uUseTex>0.5?t.rgb:uColor;\n"
+    "  float wet=(uUseTex>0.5?t.a:1.0)*vColor.a;\n"
+    "  vec3 lit=clamp(base*vColor.rgb*2.0+texture2DProj(uReflTex,vRefl).rgb*wet,0.0,1.0);\n"
+    "  float outA=uTextureAlpha>0.5?t.a*uAlpha:uAlpha;\n"
+    "  gl_FragColor=vec4(mix(uFogColor,lit,fog)," DOF_ALPHA("outA") ");\n"
+    "}\n";
+
+/* Sky dome (variant key 23): FS_WORLD_LITE's emissive path without its
+   discard. The dome is drawn opaque first and buildings cover most of it
+   downtown; with no discard in the program the GPU's hidden-surface removal
+   skips every covered dome pixel instead of shading the whole screen. */
+static const char *FS_SKY_OPAQUE =
+    GLSL_HEADER
+    "varying vec2 vUV; varying float vDepth;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform float uAlpha, uFogDensity, uFogK, uFogFloor, uDofW;\n"
+    "uniform vec3 uColor, uFogColor;\n"
+    "void main(){\n"
+    "  float fd=vDepth*uFogDensity; float fog=clamp(1.0-fd+uFogK,uFogFloor,1.0);\n"
+    "  vec4 t=texture2D(uTex,vUV);\n"
+    "  gl_FragColor=vec4(mix(uFogColor,t.rgb*uColor,fog)," DOF_ALPHA("t.a*uAlpha") ");\n"
+    "}\n";
+
+/* world.fx fast path (variant key 24): the textured, prelit case that nearly
+   every opaque and blended world draw takes (uUseTex 1, uVColor in (0,1.5]),
+   sat(2*tex*vcol), with no uniform branches left in the pixel. Fog goes per
+   vertex like the original's (linear in depth, so the interpolated value is
+   the per-pixel one wherever the clamp is not active); uTextureAlpha is 0 or
+   1, so the alpha select becomes a mix. */
+static const char *VS_WORLD_FAST =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; attribute vec4 aColor;\n"
+    "uniform mat4 uMVP; uniform float uFogDensity, uFogK, uFogFloor;\n"
+    "varying vec2 vUV; varying vec3 vCol; varying vec2 vFog;\n"
+    "void main(){ vUV=aUV; vCol=aColor.rgb*2.0;\n"
+    "  gl_Position=uMVP*vec4(aPos,1.0);\n"
+    "  vFog=vec2(clamp(1.0-gl_Position.w*uFogDensity+uFogK,uFogFloor,1.0),\n"
+    "            clamp(gl_Position.w*0.0009765625,0.0,1.0)); }\n";   /* y: DOF depth */
+static const char *FS_WORLD_FAST =
+    GLSL_HEADER
+    "varying vec2 vUV; varying vec3 vCol; varying vec2 vFog;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform float uAlpha, uTextureAlpha, uDofW;\n"
+    "uniform vec3 uFogColor;\n"
+    "void main(){\n"
+    "  vec4 t=texture2D(uTex,vUV);\n"
+    "  vec3 lit=clamp(t.rgb*vCol,0.0,1.0);\n"
+    "  gl_FragColor=vec4(mix(uFogColor,lit,vFog.x),mix(uAlpha*mix(1.0,t.a,uTextureAlpha),vFog.y,uDofW));\n"
+    "}\n";
+
+/* Specialised variants of the main fragment program (PS Vita). The main FS
+   steers every path (paint, glass, lamps, sprites, HUD) with uniforms, and
+   the GXM compiler pays for all of it per pixel: the player car alone cost
+   ~15 ms of GPU more than under the lite program. Each variant keeps one
+   path with its features fixed at compile time and the same results:
+     key 0-7  lit; bit 1 specular (crease, phong, clear coat, rim),
+              bit 2 environment reflection, bit 4 glass fresnel
+     key 10-17 the same with the alpha-test discard (only those can
+              discard: a discard in the program costs every draw HSR)
+     key 8    textured unlit (uEmissiveTex)
+     key 9    flat unlit (uUnlit; shadows, halos, HUD fills)
+   pow() with constant exponents becomes multiplies. The UV checker and
+   vista paths stay on the main program. sdl_vita.c picks the variant per
+   draw from the cached uniform values (vu_select). */
+static const char *const g_variant_names[] = {
+    "uMVP", "uModel", "uTex", "uVColor", "uUseTex", "uColor", "uUnlit", "uAlpha", "uSoft",
+    "uSpec", "uDecal", "uAmbient", "uDiffuse", "uLight", "uFogColor", "uFogDensity",
+    "uCamPos", "uEnv", "uUVCheck", "uGloss", "uFlipN", "uRimTint", "uEmissive", "uVista",
+    "uAlphaTest", "uTextureAlpha", "uEmissiveTex", "uFresnel", "uClearcoat", "uFogK", "uFogFloor",
+    "uCarFx", "uSH0", "uSH1", "uSH2", "uSH3", "uSH4", "uSH5", "uSH6", "uSH7", "uSH8", "uSH9",
+    "uCDiffMin", "uCDiffRange", "uCSpecMin", "uCSpecRange", "uCPow", "uCEnvMin", "uCEnvRange",
+    "uDofW" };
+
+static void variant_fs(int key, char *s, size_t cap) {
+    int cut = key >= 10 && key < 18, bits = cut ? key - 10 : key;
+    int spec = bits < 8 && (bits & 1), env = bits < 8 && (bits & 2), fres = bits < 8 && (bits & 4);
+    size_t n = 0;
+#define VADD(str) do { size_t l_ = strlen(str); if (n + l_ < cap) { memcpy(s + n, str, l_); n += l_; } } while (0)
+    VADD(GLSL_HEADER);
+    VADD("varying vec2 vUV; varying vec3 vN; varying float vDepth; varying vec3 vPos; varying vec4 vColor;\n"
+         "uniform sampler2D uTex;\n"
+         "uniform float uVColor, uUseTex, uUnlit, uAlpha, uSoft, uSpec, uDecal, uAmbient, uDiffuse;\n"
+         "uniform float uFogDensity, uFogK, uFogFloor, uEnv, uGloss, uFlipN, uRimTint, uAlphaTest, uTextureAlpha;\n"
+         "uniform float uFresnel, uClearcoat, uDofW;\n"
+         "uniform vec3 uColor, uLight, uFogColor, uCamPos, uEmissive;\n"
+         "void main(){\n"
+         "  float fd=vDepth*uFogDensity; float fog=clamp(1.0-fd+uFogK,uFogFloor,1.0);\n");
+    if (key == 8) {
+        VADD("  vec4 t=texture2D(uTex,vUV);\n"
+             "  float a=t.a*uAlpha; if(a<0.02) discard;\n"
+             "  gl_FragColor=vec4(mix(uFogColor,t.rgb*uColor,fog)," DOF_ALPHA("a") ");\n}\n");
+    } else if (key == 9) {
+        VADD("  float a=uAlpha;\n"
+             "  if(uSoft>0.5){\n"
+             "    if(uSoft>1.5){ float d=length(max(abs(vUV-vec2(0.5))-vec2(0.4),vec2(0.0))); a*=1.0-smoothstep(0.02,0.1,d); }\n"
+             "    else { float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); } a*=a; }\n"
+             "  gl_FragColor=vec4(mix(uFogColor,uColor,fog),a);\n}\n");
+    } else {
+        VADD("  vec3 L=normalize(uLight); vec3 N=normalize(vN);\n"
+             "  if(uFlipN>0.5) N=-N;\n"
+             "  vec3 V=normalize(uCamPos-vPos);\n");
+        if (fres) VADD("  if(dot(N,V)<0.0) N=-N;\n");
+        VADD("  float nl=max(dot(N,L),0.0);\n"
+             "  float d=uAmbient+uDiffuse*nl;\n");
+        if (spec) VADD("  if(uSpec>0.001) d=uAmbient*0.35+uDiffuse*0.80*nl;\n");
+        VADD("  vec4 t=texture2D(uTex,vUV);\n");
+        if (cut) VADD("  if(t.a<0.5) discard;\n");
+        VADD("  vec3 base=uUseTex>0.5?(uDecal>0.5?mix(uColor,t.rgb,t.a):t.rgb):uColor;\n"
+             "  if(uRimTint>0.001){ float luma=dot(t.rgb,vec3(0.299,0.587,0.114));\n"
+             "    base=mix(base,uColor*(0.25+1.5*luma),uRimTint); }\n"
+             "  float ndv=clamp(dot(N,V),0.0,1.0); float e1=1.0-ndv; float e3=e1*e1*e1;\n");
+        if (spec) VADD("  if(uSpec>0.001) base*=mix(1.0,0.78,e3*e3);\n"
+                       "  float rl=max(dot(reflect(-L,N),V),0.0);\n"
+                       "  float sp=pow(rl,uGloss)*uSpec;\n"
+                       "  float r2=rl*rl; float r4=r2*r2; float r8=r4*r4; float r16=r8*r8; float r32=r16*r16;\n"
+                       "  float r128=r32*r32; r128*=r128;\n"
+                       "  sp+=r128*r32*uClearcoat;\n"
+                       "  float q=1.0-abs(N.z); float rim=q*q*q*uSpec*0.4;\n"
+                       "  vec3 lit=base*d*1.35+sp+rim;\n");
+        else VADD("  vec3 lit=base*d*1.35;\n");
+        VADD("  if(uVColor>1.5) lit*=vColor.rgb;\n"
+             "  else if(uVColor>0.001) lit*=clamp(vColor.rgb*2.0,0.0,1.6);\n");
+        if (env || fres) VADD("  float fres=0.35+0.65*e3;\n");
+        if (env) VADD("  vec3 R=reflect(-V,N);\n"
+                      "  float up=clamp(R.z*0.5+0.5,0.0,1.0); float h=1.0-abs(R.z); h*=h;\n"
+                      "  vec3 env=mix(vec3(0.03,0.03,0.05),vec3(0.10,0.14,0.24),up)+vec3(0.85,0.66,0.42)*(h*h);\n"
+                      "  lit+=env*(uEnv*fres);\n");
+        VADD("  if(dot(uEmissive,uEmissive)>0.0) lit+=uEmissive*(0.55+0.45*ndv);\n"
+             "  float outA=uTextureAlpha>0.5?t.a*uAlpha:uAlpha;\n");
+        if (fres) VADD("  outA=clamp(mix(uAlpha,1.0,fres),0.0,1.0);\n");
+        VADD("  gl_FragColor=vec4(mix(uFogColor,lit,fog)," DOF_ALPHA("outA") ");\n}\n");
+    }
+#undef VADD
+    s[n < cap ? n : cap - 1] = 0;
+}
+
+static void render_main_variants(void) {
+    Uint64 t0 = SDL_GetPerformanceCounter();
+    int made = 0;
+    for (int key = 0; key < 25; key++) {
+        static char fs[4096];
+        if (key == 23 || key == 24) {   /* sky dome, world.fx fast path */
+            GLuint p = key == 23 ? program_cached(VS, FS_SKY_OPAQUE)
+                                 : program_cached(VS_WORLD_FAST, FS_WORLD_FAST);
+            GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+            if (!ok) { printf("shader variant %d: link failed, stays on the main program\n", key); continue; }
+            vita_add_variant(p, key, g_variant_names, (int)(sizeof g_variant_names / sizeof *g_variant_names));
+            made++;
+            continue;
+        }
+        if (key >= 21)   /* car.fx; 22 keeps the alpha-test discard (cut-out rims) */
+            snprintf(fs, sizeof fs, "%s%s%s", FS_CAR_HEAD,
+                     key == 22 ? "  if(t.a<0.5) discard;\n" : "", FS_CAR_TAIL);
+        else if (key == 18) snprintf(fs, sizeof fs, "%s", FS_WORLD_LITE_OPAQUE);
+        else if (key == 19) snprintf(fs, sizeof fs, "%s", FS_WORLD_LITE_CUTOUT);
+        else if (key == 20) snprintf(fs, sizeof fs, "%s", FS_WORLD_LITE_REFLECT);
+        else variant_fs(key, fs, sizeof fs);
+        GLuint p = program_cached(key >= 21 ? VS_CAR : key == 19 ? VS_WORLD_LITE
+                                  : key == 20 ? VS_WORLD_REFL : VS, fs);
+        if (key >= 21) {   /* the env atlas' sampler unit, set once */
+            GLint cur = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &cur);
+            glUseProgram(p);
+            glUniform1i(glGetUniformLocation(p, "uEnvTex"), RENDER_ENV_UNIT);
+            glUniform1i(glGetUniformLocation(p, "uTex"), 0);
+            glUseProgram((GLuint)cur);
+        }
+        if (key == 20) {   /* the reflection's own sampler unit, set once */
+            GLint cur = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &cur);
+            glUseProgram(p);
+            glUniform1i(glGetUniformLocation(p, "uReflTex"), RENDER_REFL_UNIT);
+            glUniform1i(glGetUniformLocation(p, "uTex"), 0);
+            glUseProgram((GLuint)cur);
+        }
+        GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        if (!ok) { printf("shader variant %d: link failed, stays on the main program\n", key); continue; }
+        vita_add_variant(p, key, g_variant_names, (int)(sizeof g_variant_names / sizeof *g_variant_names));
+        made++;
+    }
+    printf("shader variants: %d of 25 built in %.0f ms\n", made,
+           (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)SDL_GetPerformanceFrequency());
+}
+
+void render_world_lite_program(const RProg *main_prog) {
+    static const char *const names[] = {
+        "uMVP", "uModel", "uUseTex", "uColor", "uUnlit", "uAlpha", "uAlphaTest",
+        "uTextureAlpha", "uFogColor", "uFogDensity", "uAmbient", "uDiffuse",
+        "uLight", "uVColor", "uEmissiveTex" };
+    GLuint p = program_cached(VS, FS_WORLD_LITE);
+    /* the full name list: names the lite program lacks are dropped while it runs */
+    (void)names;
+    vita_alias_program(main_prog->prog, p, g_variant_names,
+                       (int)(sizeof g_variant_names / sizeof *g_variant_names));
+    render_main_variants();
+    glUseProgram(main_prog->prog);
+}
+#endif
+
 RProg render_program(void) {
     RProg r;
+#ifndef __vita__
     r.prog = glCreateProgram();
     glAttachShader(r.prog, compile(GL_VERTEX_SHADER, VS));
+#endif
+#ifdef __vita__
+    Uint64 prog_t0 = SDL_GetPerformanceCounter();
+    {   /* cut "float headVisibility(" .. "void main(){" and the beam loop
+           "  if(uHeadGain>0.0)" .. "  float fres =" out of FS */
+        static char fs_vita[16384];
+        const char *a0 = strstr(FS, "float headVisibility("), *a1 = strstr(FS, "void main(){");
+        const char *b0 = strstr(FS, "  if(uHeadGain>0.0)"), *b1 = strstr(FS, "  float fres =");
+        if (a0 && a1 && b0 && b1 && a0 < a1 && a1 < b0 && b0 < b1 &&
+            strlen(FS) < sizeof fs_vita) {
+            size_t n = 0;
+            memcpy(fs_vita + n, FS, (size_t)(a0 - FS)); n += (size_t)(a0 - FS);
+            memcpy(fs_vita + n, a1, (size_t)(b0 - a1)); n += (size_t)(b0 - a1);
+            strcpy(fs_vita + n, b1);
+            r.prog = program_cached(VS, fs_vita);
+        } else
+            r.prog = program_cached(VS, FS);
+    }
+    printf("main shader program ready in %.0f ms\n",
+           (double)(SDL_GetPerformanceCounter() - prog_t0) * 1000.0 / (double)SDL_GetPerformanceFrequency());
+#else
     glAttachShader(r.prog, compile(GL_FRAGMENT_SHADER, FS));
     glBindAttribLocation(r.prog, 0, "aPos");
     glBindAttribLocation(r.prog, 1, "aUV");
     glBindAttribLocation(r.prog, 2, "aNor");
     glBindAttribLocation(r.prog, 3, "aColor");
-    glLinkProgram(r.prog); glUseProgram(r.prog);
+    glLinkProgram(r.prog);
+#endif
+    glUseProgram(r.prog);
     r.uMVP     = glGetUniformLocation(r.prog, "uMVP");
     r.uModel   = glGetUniformLocation(r.prog, "uModel");
     render_model(&r,NULL);
@@ -679,6 +1176,8 @@ RProg render_program(void) {
     r.uEmissiveTex = glGetUniformLocation(r.prog, "uEmissiveTex");
     r.uFogColor   = glGetUniformLocation(r.prog, "uFogColor");
     r.uFogDensity = glGetUniformLocation(r.prog, "uFogDensity");
+    r.uFogK = glGetUniformLocation(r.prog, "uFogK");
+    r.uFogFloor = glGetUniformLocation(r.prog, "uFogFloor");
     r.uCamPos = glGetUniformLocation(r.prog, "uCamPos");
     r.uEnv    = glGetUniformLocation(r.prog, "uEnv");
     r.uUVCheck = glGetUniformLocation(r.prog, "uUVCheck");
@@ -699,6 +1198,7 @@ RProg render_program(void) {
     r.uHeadShape = glGetUniformLocation(r.prog, "uHeadShape");
     r.uHeadGain = glGetUniformLocation(r.prog, "uHeadGain");
     r.uHeadLow = glGetUniformLocation(r.prog, "uHeadLow");
+    r.uHeadColor = glGetUniformLocation(r.prog, "uHeadColor");
     r.uHeadShadow = glGetUniformLocation(r.prog, "uHeadShadow");
     r.uHeadShadowMap[0] = glGetUniformLocation(r.prog, "uHeadShadowMap0");
     r.uHeadShadowMap[1] = glGetUniformLocation(r.prog, "uHeadShadowMap1");
@@ -710,6 +1210,7 @@ RProg render_program(void) {
     glUniform1f(r.uDecal, 0.0f); glUniform1f(r.uRimTint, 0.0f);
     glUniform3f(r.uEmissive, 0.0f, 0.0f, 0.0f);
     glUniform3f(r.uFogColor, 0.06f, 0.07f, 0.11f); glUniform1f(r.uFogDensity, 0.0f);
+    glUniform1f(r.uFogK, 0.0f); glUniform1f(r.uFogFloor, 0.0f);
     glUniform3f(r.uCamPos, 0, 0, 0); glUniform1f(r.uEnv, 0.0f);
     glUniform1f(r.uUVCheck, 0.0f);
     glUniform1f(r.uGloss, 20.0f);
@@ -761,6 +1262,7 @@ GpuMesh *upload_scene(N2Scene *s) {
     if (!gm) return NULL;
     for (int i = 0; i < s->count; i++) {
         N2Mesh *m = &s->meshes[i];
+        if (m->world_role == 1) continue;
         N2Mesh rounded={0};
         if (n2_round_wheel_tyre(m,&rounded)) m=&rounded;
         float *nor = (float *)calloc(m->nverts * 3, sizeof(float));
@@ -789,13 +1291,48 @@ GpuMesh *upload_scene(N2Scene *s) {
     return gm;
 }
 
+void render_mesh_repose(GpuMesh *g, const N2Mesh *m, const float *M) {
+    if (!g || !m || !g->vbo || !g->nbo || m->nverts <= 0 || !m->verts) return;
+    float *nor = (float *)calloc((size_t)m->nverts * 3, sizeof(float));
+    float *pos = M ? (float *)malloc((size_t)m->nverts * 5 * sizeof(float)) : NULL;
+    if (!nor || (M && !pos)) { free(nor); free(pos); return; }
+    mesh_normals(m, nor);
+    if (M) {
+        for (int v = 0; v < m->nverts; v++) {
+            const float *p = m->verts + 5 * v; float *o = pos + 5 * v, *n = nor + 3 * v;
+            float x = p[0], y = p[1], z = p[2], nx = n[0], ny = n[1], nz = n[2];
+            o[0] = x * M[0] + y * M[4] + z * M[8] + M[12];
+            o[1] = x * M[1] + y * M[5] + z * M[9] + M[13];
+            o[2] = x * M[2] + y * M[6] + z * M[10] + M[14];
+            o[3] = p[3]; o[4] = p[4];
+            n[0] = nx * M[0] + ny * M[4] + nz * M[8];
+            n[1] = nx * M[1] + ny * M[5] + nz * M[9];
+            n[2] = nx * M[2] + ny * M[6] + nz * M[10];
+        }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)m->nverts * 5 * sizeof(float), M ? pos : m->verts);
+    glBindBuffer(GL_ARRAY_BUFFER, g->nbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)m->nverts * 3 * sizeof(float), nor);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    free(nor); free(pos);
+}
+
 /* ---- static-world batching ---- */
 
-typedef struct { uint64_t key; int idx; unsigned char group; } BSortEnt;
+typedef struct { uint64_t key; int idx, cell_x, cell_y; unsigned char group; } BSortEnt;
+/* Material provenance + reflective road: never mixed in one batch. The worker
+   plan and its GL-thread check must agree on this exactly. */
+static unsigned char batch_group(const N2Mesh *m, int mode) {
+    return (unsigned char)(n2_world_batch_material_group(m, mode) | (m->reflect ? 0x80 : 0));
+}
 static int bsort_cmp(const void *a, const void *b) {
     const BSortEnt *aa = (const BSortEnt *)a, *bb = (const BSortEnt *)b;
+    if (aa->cell_y != bb->cell_y) return aa->cell_y < bb->cell_y ? -1 : 1;
+    if (aa->cell_x != bb->cell_x) return aa->cell_x < bb->cell_x ? -1 : 1;
     if (aa->key != bb->key) return aa->key < bb->key ? -1 : 1;
-    return aa->group < bb->group ? -1 : aa->group > bb->group ? 1 : 0;
+    if (aa->group != bb->group) return aa->group < bb->group ? -1 : 1;
+    return aa->idx < bb->idx ? -1 : aa->idx > bb->idx ? 1 : 0;
 }
 static int btex_cmp(const void *a, const void *b) {   /* final texture order */
     GLuint ta = ((const N2Batch *)a)->tex, tb = ((const N2Batch *)b)->tex;
@@ -805,6 +1342,85 @@ static int btex_cmp(const void *a, const void *b) {   /* final texture order */
 #define BATCH_CELL     256.0f   /* grid cell edge, metres */
 #define BATCH_MAXVERTS 65535    /* u16 indices (GLES2: no u32 without ext) */
 
+#ifdef __vita__
+/* GL-thread only. Cache owns no extra reference: the last resident release
+ * removes the entry and frees its buffers. Unchanged tile/material runs share
+ * GPU storage even while old and new CPU scenes coexist. */
+typedef struct SharedBatchBuffers {
+    struct SharedBatchBuffers *next;
+    uint64_t hash[2];
+    GLuint vbo, ibo;
+    int refs, nv, ni;
+} SharedBatchBuffers;
+#define SHARED_BATCH_SLOTS 4096
+static SharedBatchBuffers *g_shared_batches[SHARED_BATCH_SLOTS];
+static int g_batch_reuse;
+static long g_batch_reused, g_batch_reused_bytes;
+
+static void batch_payload_hash(const void *data, size_t bytes, uint64_t hash[2]) {
+    const unsigned char *p = data;
+    while (bytes >= 4) {
+        uint32_t word; memcpy(&word, p, sizeof word);
+        hash[0] = (hash[0] ^ word) * UINT64_C(1099511628211);
+        hash[1] ^= (uint64_t)word + UINT64_C(0x9e3779b97f4a7c15) + (hash[1] << 6) + (hash[1] >> 2);
+        p += 4; bytes -= 4;
+    }
+    for (size_t i = 0; i < bytes; i++) {
+        hash[0] = (hash[0] ^ p[i]) * UINT64_C(1099511628211);
+        hash[1] ^= (uint64_t)p[i] + UINT64_C(0x9e3779b97f4a7c15) + (hash[1] << 6) + (hash[1] >> 2);
+    }
+}
+
+static void batch_fingerprint(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
+                              const PackedMesh *packed, const BatchedVertex *vertices,
+                              uint64_t hash[2]) {
+    hash[0]=UINT64_C(14695981039346656037); hash[1]=UINT64_C(0x6a09e667f3bcc909);
+    int vo=0;
+    for (int k=i0; k<i1; k++) {
+        int idx=ent[k].idx; const N2Mesh *m=&s->meshes[idx];
+        uint64_t piece[2]={UINT64_C(14695981039346656037),UINT64_C(0x6a09e667f3bcc909)};
+        if (packed && packed[idx].hash_valid) memcpy(piece,packed[idx].hash,sizeof piece);
+        else {
+            batch_payload_hash(vertices+vo,(size_t)m->nverts*sizeof *vertices,piece);
+            batch_payload_hash(m->idx,(size_t)m->nidx*sizeof *m->idx,piece);
+        }
+        /* Mesh boundaries and lengths define index offsets and payload order. */
+        batch_payload_hash(&m->nverts,sizeof m->nverts,hash);
+        batch_payload_hash(&m->nidx,sizeof m->nidx,hash);
+        batch_payload_hash(piece,sizeof piece,hash);
+        vo+=m->nverts;
+    }
+}
+
+static SharedBatchBuffers *batch_buffers_find(const uint64_t hash[2], int nv, int ni) {
+    for (SharedBatchBuffers *p = g_shared_batches[hash[0] & (SHARED_BATCH_SLOTS-1)]; p; p = p->next)
+        if (p->hash[0] == hash[0] && p->hash[1] == hash[1] && p->nv == nv && p->ni == ni) return p;
+    return NULL;
+}
+#endif
+
+void render_batch_release(N2Batch *b) {
+    if (!b) return;
+#ifdef __vita__
+    SharedBatchBuffers *p = b->shared_buffers;
+    if (p) {
+        assert(p->refs > 0);
+        if (--p->refs == 0) {
+            SharedBatchBuffers **slot = &g_shared_batches[p->hash[0] & (SHARED_BATCH_SLOTS-1)];
+            while (*slot && *slot != p) slot = &(*slot)->next;
+            assert(*slot == p);
+            *slot = p->next;
+            GLuint ids[] = {p->vbo, p->ibo}; glDeleteBuffers(2, ids);
+            free(p);
+        }
+    } else
+#endif
+    {
+        GLuint ids[] = {b->vbo, b->ibo}; glDeleteBuffers(2, ids);
+    }
+    memset(b, 0, sizeof *b);
+}
+
 /* Milestone 75: the VBO layout draw_batch() hardcodes must equal the struct's
  * real layout. Compile-time (C99: negative array size, not C11 _Static_assert),
  * so a field reorder becomes a build error instead of scrambled attributes. */
@@ -812,8 +1428,14 @@ typedef char n2_batchvertex_layout_check[
     (offsetof(BatchedVertex, pos)    ==  0 &&
      offsetof(BatchedVertex, uv)     == 12 &&
      offsetof(BatchedVertex, normal) == 20 &&
+#ifdef __vita__
+     offsetof(BatchedVertex, col)    == 24 &&
+     sizeof(BatchedVertex)           == 28
+#else
      offsetof(BatchedVertex, col)    == 32 &&
-     sizeof(BatchedVertex)           == 36) ? 1 : -1];
+     sizeof(BatchedVertex)           == 36
+#endif
+    ) ? 1 : -1];
 
 /* Milestone 79: dump one batch's member list, in the exact order
  * upload_world_batches partitioned it -- this runs inside batch_emit, so the
@@ -937,6 +1559,15 @@ static void batch_audit_report(const N2Scene *s, const BSortEnt *ent, int i0, in
 }
 
 /* merge meshes [i0,i1) of the sort array into one uploaded batch */
+static float *const *g_batch_normals;   /* set for the duration of a step */
+static PackedMesh *g_batch_packed;
+static const uint64_t *g_batch_prepared_hash;
+#ifdef __vita__
+unsigned long long sceKernelGetProcessTimeWide(void);
+static unsigned long long g_batch_pack_us, g_batch_gl_us;
+static long g_batch_bytes;
+#endif
+
 static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
                        GLuint tex, N2Batch *b, int bidx, const char *audit,
                        const unsigned char *mtexmode) {
@@ -944,6 +1575,38 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     for (int k = i0; k < i1; k++) {
         nv += s->meshes[ent[k].idx].nverts; ni += s->meshes[ent[k].idx].nidx;
     }
+#ifdef __vita__
+    unsigned long long g_batch_t0 = sceKernelGetProcessTimeWide();
+    if (g_batch_reuse && g_batch_prepared_hash && g_batch_packed && !audit) {
+        SharedBatchBuffers *p=batch_buffers_find(g_batch_prepared_hash,nv,ni);
+        if (p) {
+            memset(b,0,sizeof *b); p->refs++;
+            b->vbo=p->vbo; b->ibo=p->ibo; b->shared_buffers=p;
+            b->index_count=ni; b->tex=tex; b->nmesh=i1-i0; b->emit_idx=bidx;
+            b->texkey=s->meshes[ent[i0].idx].texkey;
+            b->drawmode=mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
+            b->reflect=s->meshes[ent[i0].idx].reflect;   /* as the upload path below */
+            for (int c=0; c<3; c++) { b->bbox_min[c]=1e30f; b->bbox_max[c]=-1e30f; }
+            int named=0;
+            for (int k=i0; k<i1; k++) {
+                int idx=ent[k].idx; const N2Mesh *m=&s->meshes[idx];
+                PackedMesh *pk=&g_batch_packed[idx]; assert(pk->hash_valid);
+                for (int c=0; c<3; c++) {
+                    if (pk->bb[c]<b->bbox_min[c]) b->bbox_min[c]=pk->bb[c];
+                    if (pk->bb[c+3]>b->bbox_max[c]) b->bbox_max[c]=pk->bb[c+3];
+                }
+                if (m->scen<8) b->scen_count[m->scen]++;
+                if (m->texkey) named++;
+                if (!pk->borrowed) free(pk->v);
+                pk->v=NULL;
+            }
+            b->unresolved=(unsigned char)(!tex && named==i1-i0);
+            g_batch_reused++; g_batch_reused_bytes+=(long)nv*sizeof(BatchedVertex)+(long)ni*2;
+            g_batch_pack_us+=sceKernelGetProcessTimeWide()-g_batch_t0;
+            return 1;
+        }
+    }
+#endif
     BatchedVertex *bv = (BatchedVertex *)malloc((size_t)nv * sizeof *bv);
     uint16_t *bi = (uint16_t *)malloc((size_t)ni * sizeof *bi);
     if (!bv || !bi) { free(bv); free(bi); return 0; }
@@ -951,14 +1614,31 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     int vo = 0, io = 0;
     for (int k = i0; k < i1; k++) {
         const N2Mesh *m = &s->meshes[ent[k].idx];
-        float *nor = (float *)calloc((size_t)m->nverts * 3, sizeof(float));
+        PackedMesh *pk = g_batch_packed ? &g_batch_packed[ent[k].idx] : NULL;
+        if (pk && pk->v) {                      /* prepared by the worker */
+            memcpy(bv + vo, pk->v, (size_t)m->nverts * sizeof *bv);
+            for (int c = 0; c < 3; c++) {
+                if (pk->bb[c] < mn[c]) mn[c] = pk->bb[c];
+                if (pk->bb[c+3] > mx[c]) mx[c] = pk->bb[c+3];
+            }
+            for (int t = 0; t < m->nidx; t++) bi[io + t] = (uint16_t)(m->idx[t] + vo);
+            /* Each ordinary source mesh belongs to exactly one emission run.
+               Release staging as it is consumed, spreading frees across steps
+               and lowering heap pressure while GPU residents coexist. */
+            if (!pk->borrowed) free(pk->v);
+            pk->v = NULL;
+            vo += m->nverts; io += m->nidx;
+            continue;
+        }
+        float *pre = g_batch_normals ? g_batch_normals[ent[k].idx] : NULL;
+        float *nor = pre ? pre : (float *)calloc((size_t)m->nverts * 3, sizeof(float));
         if (!nor) { free(bv); free(bi); return 0; }
-        mesh_normals(m, nor);          /* per source mesh: no cross-mesh smoothing */
+        if (!pre) mesh_normals(m, nor);   /* per source mesh: no cross-mesh smoothing */
         for (int v = 0; v < m->nverts; v++) {
             BatchedVertex *o = &bv[vo + v]; const float *p = m->verts + v*5;
             o->pos[0]=p[0]; o->pos[1]=p[1]; o->pos[2]=p[2];
             o->uv[0]=p[3];  o->uv[1]=p[4];
-            o->normal[0]=nor[v*3]; o->normal[1]=nor[v*3+1]; o->normal[2]=nor[v*3+2];
+            BV_SET_NORMAL(o, nor[v*3], nor[v*3+1], nor[v*3+2]);
             if (m->vcol) { o->col[0]=m->vcol[v*4]; o->col[1]=m->vcol[v*4+1];
                            o->col[2]=m->vcol[v*4+2]; o->col[3]=m->vcol[v*4+3]; }
             else { o->col[0]=o->col[1]=o->col[2]=o->col[3]=255; }  /* neutral */
@@ -969,21 +1649,62 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
         }
         for (int t = 0; t < m->nidx; t++) bi[io + t] = (uint16_t)(m->idx[t] + vo);
         vo += m->nverts; io += m->nidx;
-        free(nor);
+        if (!pre) free(nor);
     }
     if (audit && audit[0] != '#') batch_audit_report(s, ent, i0, i1, bv, bi, bidx, audit);
+#ifdef __vita__
+    unsigned long long t_gl = sceKernelGetProcessTimeWide();
+    g_batch_pack_us += t_gl - g_batch_t0;
+#endif
     memset(b, 0, sizeof *b);
+    int reused = 0;
+#ifdef __vita__
+    uint64_t payload_hash[2] = {UINT64_C(14695981039346656037), UINT64_C(0x6a09e667f3bcc909)};
+    if (g_batch_reuse) {
+        if (g_batch_prepared_hash) memcpy(payload_hash,g_batch_prepared_hash,sizeof payload_hash);
+        else batch_fingerprint(s,ent,i0,i1,g_batch_packed,bv,payload_hash);
+        SharedBatchBuffers *p = batch_buffers_find(payload_hash, nv, ni);
+        if (p) {
+            p->refs++;
+            b->vbo = p->vbo; b->ibo = p->ibo; b->shared_buffers = p;
+            reused = 1; g_batch_reused++;
+            g_batch_reused_bytes += (long)nv * sizeof *bv + (long)ni * sizeof *bi;
+        }
+    }
+#endif
+    if (!reused) {
+#ifdef __vita__
+    unsigned long long after_lookup = sceKernelGetProcessTimeWide();
+    g_batch_pack_us += after_lookup - t_gl; t_gl = after_lookup;
+#endif
     glGenBuffers(1, &b->vbo); glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
     glBufferData(GL_ARRAY_BUFFER, (long)nv * (long)sizeof *bv, bv, GL_STATIC_DRAW);
+#ifdef __vita__
+    g_batch_bytes += (long)nv * (long)sizeof *bv + (long)ni * 2;
+#endif
     glGenBuffers(1, &b->ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, bi, GL_STATIC_DRAW);
     if (glGetError() != GL_NO_ERROR) {
         glDeleteBuffers(1, &b->vbo); glDeleteBuffers(1, &b->ibo);
         memset(b, 0, sizeof *b); free(bv); free(bi); return 0;
     }
+#ifdef __vita__
+    if (g_batch_reuse) {
+        SharedBatchBuffers *p = calloc(1, sizeof *p);
+        if (p) {
+            p->hash[0] = payload_hash[0]; p->hash[1] = payload_hash[1];
+            p->nv = nv; p->ni = ni; p->refs = 1; p->vbo = b->vbo; p->ibo = b->ibo;
+            unsigned slot = payload_hash[0] & (SHARED_BATCH_SLOTS-1);
+            p->next = g_shared_batches[slot]; g_shared_batches[slot] = p;
+            b->shared_buffers = p;
+        }
+    }
+#endif
+    }
     b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
     b->texkey = s->meshes[ent[i0].idx].texkey;
     b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
+    b->reflect = s->meshes[ent[i0].idx].reflect;
     int named = 0;
     for (int k = i0; k < i1; k++) {
         int sc = s->meshes[ent[k].idx].scen;
@@ -998,10 +1719,15 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     b->unresolved = (unsigned char)(!tex && named == i1 - i0);
     for (int c = 0; c < 3; c++) { b->bbox_min[c] = mn[c]; b->bbox_max[c] = mx[c]; }
     free(bv); free(bi);
+#ifdef __vita__
+    g_batch_gl_us += sceKernelGetProcessTimeWide() - t_gl;
+#endif
     return 1;
 }
 
 struct WorldBatchUpload {
+    PackedMesh *packed;
+    float *const *normals;
     const N2Scene *scene;
     const unsigned char *modes;
     const char *audit;
@@ -1009,13 +1735,15 @@ struct WorldBatchUpload {
     N2Batch *batches;
     int *run0, *run1;
     int meshes, next, count;
+    struct PreparedBatch { int begin, end; uint64_t hash[2]; } *prepared;
+    int prepared_count;
 };
 
 void upload_world_batches_cancel(WorldBatchUpload **slot) {
     if (!slot || !*slot) return;
     WorldBatchUpload *j = *slot;
     render_batch_array_free(&j->batches, &j->count);
-    free(j->ent); free(j->run0); free(j->run1); free(j);
+    free(j->prepared); free(j->ent); free(j->run0); free(j->run1); free(j);
     *slot = NULL;
 }
 
@@ -1053,22 +1781,1025 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
     int m = 0;
     for (int i = 0; i < n; i++) {
         const N2Mesh *mesh = &s->meshes[i];
-        if (mesh->cat == N2_SKY || mesh->cat == N2_GLOW) continue;
+        if (mesh->world_role == 1 || mesh->cat == N2_SKY || mesh->cat == N2_GLOW) continue;
         GLuint tex = mtex[i];
         if (!tex && mesh->cat == N2_TERRAIN) tex = texTerr;   /* fallback baked in */
         float cx = (mbb[i][0]+mbb[i][2])*0.5f, cy = (mbb[i][1]+mbb[i][3])*0.5f;
         uint64_t cell = (uint64_t)(uint32_t)((int)((cy-y0)/BATCH_CELL)*4096
                                            + (int)((cx-x0)/BATCH_CELL));
         ent[m].key = cell << 32 | tex; ent[m].idx = i;
-        int mode = mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE;
-        ent[m].group = (unsigned char)n2_world_batch_material_group(
-            &s->meshes[i], mode);
+        ent[m].cell_x = ent[m].cell_y = 0;
+#ifdef __vita__
+        /* Fixed world tiles; resident bounds must not shift batch membership. */
+        ent[m].cell_x = (int)floorf(cx / 128.0f);
+        ent[m].cell_y = (int)floorf(cy / 128.0f);
+        ent[m].key = tex;
+#endif
+        ent[m].group = batch_group(mesh, mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE);
         m++;
     }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
     j->meshes = m;
     return j;
 }
+
+void upload_world_batches_set_normals(WorldBatchUpload *job, float *const *normals) {
+    if (job) job->normals = normals;
+}
+void render_mesh_normals(const N2Mesh *m, float *nor) { mesh_normals(m, nor); }
+
+void upload_world_batches_set_packed(WorldBatchUpload *job, PackedMesh *packed) {
+    if (job) job->packed = packed;
+}
+
+WorldBatchUpload *upload_world_batches_prepare_cpu(const N2Scene *s,
+    const float (*bounds)[4], const GLuint *logical_textures,
+    const unsigned char *modes, PackedMesh *packed) {
+#ifdef __vita__
+    /* Metadata only: avoid a second resident-sized packed allocation. */
+    WorldBatchUpload *j=upload_world_batches_begin(s,bounds,logical_textures,0,NULL,modes);
+    if (!j) return NULL;
+    j->modes=NULL;
+    j->prepared=calloc((size_t)(j->meshes ? j->meshes : 1),sizeof *j->prepared);
+    if (!j->prepared) { upload_world_batches_cancel(&j); return NULL; }
+    for (int i0=0; i0<j->meshes;) {
+        extern int world_build_aborted(void);
+        if (world_build_aborted()) { upload_world_batches_cancel(&j); return NULL; }
+        int i=i0+1, verts=s->meshes[j->ent[i0].idx].nverts;
+        while (i<j->meshes && j->ent[i].key==j->ent[i0].key &&
+               j->ent[i].cell_x==j->ent[i0].cell_x && j->ent[i].cell_y==j->ent[i0].cell_y &&
+               j->ent[i].group==j->ent[i0].group &&
+               verts+s->meshes[j->ent[i].idx].nverts<=BATCH_MAXVERTS)
+            verts+=s->meshes[j->ent[i++].idx].nverts;
+        for (int k=i0; k<i; k++) if (!packed || !packed[j->ent[k].idx].hash_valid) {
+            upload_world_batches_cancel(&j); return NULL;
+        }
+        struct PreparedBatch *p=&j->prepared[j->prepared_count++]; p->begin=i0; p->end=i;
+        batch_fingerprint(s,j->ent,i0,i,packed,NULL,p->hash);
+        i0=i;
+    }
+    j->packed=packed;
+    return j;
+#else
+    (void)s; (void)bounds; (void)logical_textures; (void)modes; (void)packed;
+    return NULL;
+#endif
+}
+
+int upload_world_batches_bind_prepared(WorldBatchUpload *j, const GLuint *textures,
+    GLuint terrain_texture, const unsigned char *modes) {
+    if (!j || !j->prepared || j->count || j->next) return 0;
+    /* Texture failures or different material modes use the original grouping. */
+    for (int b=0; b<j->prepared_count; b++) {
+        struct PreparedBatch *p=&j->prepared[b]; GLuint first=0;
+        for (int k=p->begin; k<p->end; k++) {
+            int idx=j->ent[k].idx; const N2Mesh *m=&j->scene->meshes[idx];
+            GLuint tex=textures[idx]; if (!tex && m->cat==N2_TERRAIN) tex=terrain_texture;
+            int mode=modes ? modes[idx] : N2_DRAW_OPAQUE;
+            int group=batch_group(m,mode);
+            if (group!=j->ent[k].group || (k>p->begin && tex!=first)) {
+                printf("worker batch plan: run %d mesh %s key %08x: group %d vs planned %d, "
+                       "texture %u vs run %u\n", b, m->sname, m->texkey, group, j->ent[k].group,
+                       (unsigned)tex, (unsigned)first);
+                return 0;
+            }
+            if (k==p->begin) first=tex;
+        }
+    }
+    for (int k=0; k<j->meshes; k++) {
+        int idx=j->ent[k].idx; GLuint tex=textures[idx];
+        if (!tex && j->scene->meshes[idx].cat==N2_TERRAIN) tex=terrain_texture;
+        j->ent[k].key=tex;
+    }
+    j->modes=modes;
+    printf("worker batch plan: %d prepared runs accepted\n",j->prepared_count);
+    return 1;
+}
+
+/* Same per-vertex result as batch_emit's own loop. */
+int render_pack_mesh(const N2Mesh *m, PackedMesh *out) {
+    out->v = NULL;
+    out->borrowed = 0;
+    out->hash_valid = 0;
+    if (!m || m->nverts <= 0) return 0;
+    N2SharedGeometry *shared = m->shared_geometry;
+    if (shared && shared->packed) {
+        out->v = shared->packed; out->borrowed = 1;
+        memcpy(out->bb,shared->packed_bb,sizeof out->bb);
+        memcpy(out->hash,shared->packed_hash,sizeof out->hash); out->hash_valid=1;
+        return 1;
+    }
+    BatchedVertex *bv = (BatchedVertex *)malloc((size_t)m->nverts * sizeof *bv);
+    float *nor = (float *)calloc((size_t)m->nverts * 3, sizeof(float));
+    if (!bv || !nor) { free(bv); free(nor); return 0; }
+    mesh_normals(m, nor);
+    float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+    for (int v = 0; v < m->nverts; v++) {
+        BatchedVertex *o = &bv[v]; const float *p = m->verts + v*5;
+        o->pos[0]=p[0]; o->pos[1]=p[1]; o->pos[2]=p[2];
+        o->uv[0]=p[3];  o->uv[1]=p[4];
+        BV_SET_NORMAL(o, nor[v*3], nor[v*3+1], nor[v*3+2]);
+        if (m->vcol) { o->col[0]=m->vcol[v*4]; o->col[1]=m->vcol[v*4+1];
+                       o->col[2]=m->vcol[v*4+2]; o->col[3]=m->vcol[v*4+3]; }
+        else { o->col[0]=o->col[1]=o->col[2]=o->col[3]=255; }
+        for (int c = 0; c < 3; c++) {
+            if (p[c] < mn[c]) mn[c] = p[c];
+            if (p[c] > mx[c]) mx[c] = p[c];
+        }
+    }
+    free(nor);
+    for (int c = 0; c < 3; c++) { out->bb[c] = mn[c]; out->bb[c+3] = mx[c]; }
+    out->v = bv;
+#ifdef __vita__
+    out->hash[0]=UINT64_C(14695981039346656037); out->hash[1]=UINT64_C(0x6a09e667f3bcc909);
+    batch_payload_hash(bv,(size_t)m->nverts*sizeof *bv,out->hash);
+    batch_payload_hash(m->idx,(size_t)m->nidx*sizeof *m->idx,out->hash);
+    out->hash_valid=1;
+#endif
+    if (shared) {
+        shared->packed = bv;
+        memcpy(shared->packed_bb,out->bb,sizeof out->bb);
+        memcpy(shared->packed_hash,out->hash,sizeof out->hash);
+        out->borrowed = 1;
+    }
+    return 1;
+}
+
+#ifdef __vita__
+static struct { GLuint fbo, tex, depth; int w, h, failed, active; } g_scene;
+/* The 3D -> screen upscale touches every display pixel; running it through
+   the main fragment program (fog, branches) cost ~8 ms of GPU per frame. */
+static const char *BLIT_VS =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; varying vec2 vUV;\n"
+    "void main(){ vUV=aUV; gl_Position=vec4(aPos.xy*2.0-1.0,0.0,1.0); }\n";
+static const char *BLIT_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex;\n"
+    "void main(){ gl_FragColor=vec4(texture2D(uTex,vUV).rgb,1.0); }\n";
+
+static struct { GLuint fbo, tex, depth; int w, h, failed; } g_refl;
+int render_refl_begin(int w, int h, const float clear_rgb[3]) {
+    if (g_refl.failed) return 0;
+    if (!g_refl.fbo || g_refl.w != w || g_refl.h != h) {
+        if (g_refl.fbo) { glDeleteFramebuffers(1, &g_refl.fbo); glDeleteTextures(1, &g_refl.tex);
+                          glDeleteRenderbuffers(1, &g_refl.depth); g_refl.fbo = 0; }
+        glGenTextures(1, &g_refl.tex);
+        glBindTexture(GL_TEXTURE_2D, g_refl.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &g_refl.fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_refl.fbo);
+        glGenRenderbuffers(1, &g_refl.depth);
+        glBindRenderbuffer(GL_RENDERBUFFER, g_refl.depth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_refl.depth);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_refl.tex, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            printf("road reflection unavailable (framebuffer incomplete)\n");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            g_refl.failed = 1;
+            return 0;
+        }
+        g_refl.w = w; g_refl.h = h;
+        printf("road reflection target %dx%d\n", w, h);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_refl.fbo);
+    glViewport(0, 0, w, h);
+    glClearColor(clear_rgb[0], clear_rgb[1], clear_rgb[2], 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    return 1;
+}
+void render_refl_end(int screen_w, int screen_h) {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, screen_w, screen_h);
+}
+GLuint render_refl_texture(void) { return g_refl.failed ? 0 : g_refl.tex; }
+
+/* Car environment cube (car.fx EnvMapTexture; the game renders a 128 px
+   dynamic cube). Here: six 64 px faces in one 192x128 target, laid out
+   +X -X +Y / -Y +Z -Z, each face rendered into its own viewport. */
+static struct { GLuint fbo, tex, depth; int failed, ready; } g_env;
+int render_env_begin(int face, const float clear_rgb[3]) {
+    if (g_env.failed) return 0;
+    if (!g_env.fbo) {
+        glGenTextures(1, &g_env.tex);
+        glBindTexture(GL_TEXTURE_2D, g_env.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 192, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &g_env.fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_env.fbo);
+        glGenRenderbuffers(1, &g_env.depth);
+        glBindRenderbuffer(GL_RENDERBUFFER, g_env.depth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, 192, 128);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_env.depth);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_env.tex, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            printf("car environment map unavailable (framebuffer incomplete)\n");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            g_env.failed = 1;
+            return 0;
+        }
+        /* start from the fog colour everywhere until the faces fill in */
+        glViewport(0, 0, 192, 128);
+        glClearColor(clear_rgb[0], clear_rgb[1], clear_rgb[2], 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        printf("car environment map 6x64 px (192x128 atlas)\n");
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_env.fbo);
+    int x = (face % 3) * 64, y = (face / 3) * 64;
+    glViewport(x, y, 64, 64);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x, y, 64, 64);
+    glClearColor(clear_rgb[0], clear_rgb[1], clear_rgb[2], 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    return 1;
+}
+void render_env_end(int screen_w, int screen_h) {
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, screen_w, screen_h);
+    g_env.ready = 1;
+}
+/* Until the cube has been rendered, a neutral 1x1 texel: sampling texture 0
+   on the Vita reads whatever memory is there (lime-green trim). */
+static GLuint g_env_static; static int g_env_static_on;
+void render_env_static(const unsigned char *rgba, int w, int h) {
+    if (!rgba) {
+        if (g_env_static) glDeleteTextures(1, &g_env_static);
+        g_env_static = 0;
+        return;
+    }
+    if (!g_env_static) glGenTextures(1, &g_env_static);
+    glBindTexture(GL_TEXTURE_2D, g_env_static);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+void render_env_use_static(int on) { g_env_static_on = on; }
+GLuint render_env_texture(void) {
+    if (g_env_static_on && g_env_static) return g_env_static;
+    if (!g_env.failed && g_env.ready) return g_env.tex;
+    static GLuint blank;
+    if (!blank) {
+        static const unsigned char px[4] = { 64, 64, 64, 255 };
+        glGenTextures(1, &blank);
+        glBindTexture(GL_TEXTURE_2D, blank);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    return blank;
+}
+/* View matrix for cube face f (eye at e): rows right, up, -forward. */
+void render_env_view(int face, const float e[3], float *V) {
+    static const float F[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
+    static const float U[6][3] = { {0,0,1}, {0,0,1}, {0,0,1}, {0,0,1}, {0,1,0}, {0,1,0} };
+    const float *f = F[face], *u = U[face];
+    float r[3] = { f[1]*u[2]-f[2]*u[1], f[2]*u[0]-f[0]*u[2], f[0]*u[1]-f[1]*u[0] };
+    float m[16] = { r[0], u[0], -f[0], 0,  r[1], u[1], -f[1], 0,  r[2], u[2], -f[2], 0,
+                    -(r[0]*e[0]+r[1]*e[1]+r[2]*e[2]), -(u[0]*e[0]+u[1]*e[1]+u[2]*e[2]),
+                    f[0]*e[0]+f[1]*e[1]+f[2]*e[2], 1 };
+    memcpy(V, m, sizeof m);
+}
+static GLuint g_blit_prog;
+static GLuint blit_program(void);
+void render_debug_texture(GLuint tex, GpuMesh *quad, int x, int y, int w, int h,
+                          int screen_w, int screen_h) {
+    GLuint p = blit_program();
+    if (!tex || !quad || p == (GLuint)-1) return;
+    GLboolean depth = glIsEnabled(GL_DEPTH_TEST), blend = glIsEnabled(GL_BLEND);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND);
+    glViewport(x, y, w, h);
+    glUseProgram(p);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    draw_gpumesh(quad);
+    glViewport(0, 0, screen_w, screen_h);
+    if (depth) glEnable(GL_DEPTH_TEST);
+    if (blend) glEnable(GL_BLEND);
+}
+
+static GLuint blit_program(void) {
+    if (!g_blit_prog) {
+        GLuint p = glCreateProgram();
+        glAttachShader(p, compile(GL_VERTEX_SHADER, BLIT_VS));
+        glAttachShader(p, compile(GL_FRAGMENT_SHADER, BLIT_FS));
+        glBindAttribLocation(p, 0, "aPos");
+        glBindAttribLocation(p, 1, "aUV");
+        glLinkProgram(p);
+        GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        g_blit_prog = ok ? p : (GLuint)-1;
+        printf("blit program: %s\n", ok ? "ok" : "link failed");
+    }
+    return g_blit_prog;
+}
+
+/* ---- NFSU2 bloom (overbright.fx + filter.fx chain, decoded from SPEED2.EXE) ----
+ * Original, per frame: S = scene at half res; A = overbright(S); twice
+ * { B = H-blur(A); A = V-blur(B) } with taps (1/3 at +-1, 1/6 at +-3 texels);
+ * A -= S * sub (reverse-subtract, clamped); glow buffer G = G * per-channel
+ * decay (0x78, 0x5a, 0xaa)/255 + A * add; screen += G. The overbright
+ * offset and add follow an eased level each frame (bloom_levels: 0x5bc180
+ * / 0x5bc100); sub is 0xB0/255 in game (0x8654a4 == 6), else 0xA0/255.
+ * Here S is a bilinear tap of the full-res scene (= the 2x2 box the copy made),
+ * the subtract and the G update ride on the last blur pass, and G ping-pongs
+ * between two half-res targets (the original G is full res and also receives
+ * the light-glow sprites; ours holds bloom only, so half res loses nothing). */
+static const char *BLOOM_OB_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform float uObOfs;\n"
+    "void main(){\n"
+    "  vec3 c=clamp((texture2D(uTex,vUV).rgb-uObOfs)*4.0,0.0,1.0);\n"     /* OverBrightOffset 0x7ff10c/255*0.5 */
+    "  c*=dot(c,vec3(0.5882353));\n"                                       /* OverBrightGreyScale 150/255 */
+    "  gl_FragColor=vec4(c*c,1.0);\n"
+    "}\n";
+#define BLOOM_BLUR_SRC \
+    "  vec3 b=(texture2D(uTex,vUV-uStep).rgb+texture2D(uTex,vUV+uStep).rgb)*0.3333333\n" \
+    "       +(texture2D(uTex,vUV-3.0*uStep).rgb+texture2D(uTex,vUV+3.0*uStep).rgb)*0.1666667;\n"
+static const char *BLOOM_BLUR_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform vec2 uStep;\n"
+    "void main(){\n" BLOOM_BLUR_SRC "  gl_FragColor=vec4(b,1.0);\n}\n";
+static const char *BLOOM_GLOW_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform sampler2D uScene; uniform sampler2D uGlow;\n"
+    "uniform vec2 uStep; uniform float uSub; uniform float uAdd;\n"
+    "void main(){\n" BLOOM_BLUR_SRC
+    "  vec3 a=max(b-texture2D(uScene,vUV).rgb*uSub,0.0);\n"
+    "  gl_FragColor=vec4(texture2D(uGlow,vUV).rgb*vec3(0.4705882,0.3529412,0.6666667)+a*uAdd,1.0);\n"
+    "}\n";
+/* The same chain in two passes. The blur is separable, so H then V equals one
+ * 4x4 tap grid with weights wi*wj (1/3 at +-1, 1/6 at +-3 texels; 1/9, 1/18,
+ * 1/36). Every tap lands on a half-res texel centre, so applying the
+ * overbright per tap (clamped, as the 8-bit target did) is the overbright
+ * pass sampled exactly where the first blur read it. Pass 1 = overbright + H
+ * + V, pass 2 = H + V + glow update: 2 GPU scenes instead of 5. */
+#define BLOOM_GRID(T) \
+    "  vec3 b=(" T("-1.0,-1.0") "+" T("1.0,-1.0") "+" T("-1.0,1.0") "+" T("1.0,1.0") ")*0.1111111\n" \
+    "   +(" T("-1.0,-3.0") "+" T("1.0,-3.0") "+" T("-1.0,3.0") "+" T("1.0,3.0") \
+    "    +" T("-3.0,-1.0") "+" T("3.0,-1.0") "+" T("-3.0,1.0") "+" T("3.0,1.0") ")*0.0555556\n" \
+    "   +(" T("-3.0,-3.0") "+" T("3.0,-3.0") "+" T("-3.0,3.0") "+" T("3.0,3.0") ")*0.0277778;\n"
+#define BLOOM_TAP_OB(o) "ob(texture2D(uTex,vUV+vec2(" o ")*uStep).rgb)"
+#define BLOOM_TAP(o) "texture2D(uTex,vUV+vec2(" o ")*uStep).rgb"
+static const char *BLOOM_OBBLUR_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform vec2 uStep; uniform float uObOfs;\n"
+    "vec3 ob(vec3 x){ vec3 c=clamp((x-uObOfs)*4.0,0.0,1.0);\n"
+    "  c*=dot(c,vec3(0.5882353)); return clamp(c*c,0.0,1.0); }\n"
+    "void main(){\n" BLOOM_GRID(BLOOM_TAP_OB) "  gl_FragColor=vec4(b,1.0);\n}\n";
+static const char *BLOOM_GLOW2_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform sampler2D uScene; uniform sampler2D uGlow;\n"
+    "uniform vec2 uStep; uniform float uSub; uniform float uAdd;\n"
+    "void main(){\n" BLOOM_GRID(BLOOM_TAP)
+    "  vec3 a=max(b-texture2D(uScene,vUV).rgb*uSub,0.0);\n"
+    "  gl_FragColor=vec4(texture2D(uGlow,vUV).rgb*vec3(0.4705882,0.3529412,0.6666667)+a*uAdd,1.0);\n"
+    "}\n";
+/* The chain again as the original's separable passes, but with every tap
+ * a non-dependent read: the vertex shader hands the fragment shader the
+ * four tap coordinates (-3, -1, +1, +3 steps along uStep) as varyings, so
+ * the GPU prefetches them instead of stalling on 16-18 computed-coordinate
+ * reads per pixel (the fused 2-pass chain cost ~6 ms a frame on the Vita,
+ * GPU probe 10-12). Pass 1 = overbright + H (per tap, from the full-res
+ * scene at half-res texel centres = the 2x2 box), 2 = V, 3 = H, 4 = V +
+ * the scene subtract + the glow update: 4 small scenes, 18 reads. Each
+ * pass writes an 8-bit target as the original's did. */
+static const char *BLOOM_SEP_VS =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; uniform vec2 uStep;\n"
+    "varying vec2 vUV; varying vec2 vT0; varying vec2 vT1; varying vec2 vT2; varying vec2 vT3;\n"
+    "void main(){ vUV=aUV; vT0=aUV-3.0*uStep; vT1=aUV-uStep; vT2=aUV+uStep; vT3=aUV+3.0*uStep;\n"
+    "  gl_Position=vec4(aPos.xy*2.0-1.0,0.0,1.0); }\n";
+#define BLOOM_SEP_DECL \
+    "varying vec2 vUV; varying vec2 vT0; varying vec2 vT1; varying vec2 vT2; varying vec2 vT3;\n"
+#define BLOOM_SEP_SUM(T) \
+    "  vec3 b=(" T("vT1") "+" T("vT2") ")*0.3333333+(" T("vT0") "+" T("vT3") ")*0.1666667;\n"
+#define BLOOM_SEP_TAP(v) "texture2D(uTex," v ").rgb"
+#define BLOOM_SEP_TAP_OB(v) "ob(texture2D(uTex," v ").rgb)"
+static const char *BLOOM_SEP_OB_FS =
+    GLSL_HEADER BLOOM_SEP_DECL
+    "uniform sampler2D uTex; uniform float uObOfs;\n"
+    "vec3 ob(vec3 x){ vec3 c=clamp((x-uObOfs)*4.0,0.0,1.0);\n"
+    "  c*=dot(c,vec3(0.5882353)); return clamp(c*c,0.0,1.0); }\n"
+    "void main(){\n" BLOOM_SEP_SUM(BLOOM_SEP_TAP_OB) "  gl_FragColor=vec4(b,1.0);\n}\n";
+static const char *BLOOM_SEP_BLUR_FS =
+    GLSL_HEADER BLOOM_SEP_DECL
+    "uniform sampler2D uTex;\n"
+    "void main(){\n" BLOOM_SEP_SUM(BLOOM_SEP_TAP) "  gl_FragColor=vec4(b,1.0);\n}\n";
+static const char *BLOOM_SEP_GLOW_FS =
+    GLSL_HEADER BLOOM_SEP_DECL
+    "uniform sampler2D uTex; uniform sampler2D uScene; uniform sampler2D uGlow;\n"
+    "uniform float uSub; uniform float uAdd;\n"
+    "void main(){\n" BLOOM_SEP_SUM(BLOOM_SEP_TAP)
+    "  vec3 a=max(b-texture2D(uScene,vUV).rgb*uSub,0.0);\n"
+    "  gl_FragColor=vec4(texture2D(uGlow,vUV).rgb*vec3(0.4705882,0.3529412,0.6666667)+a*uAdd,1.0);\n"
+    "}\n";
+/* Visual treatment (screenfilter.fx ps_1_4 technique, 3 passes), in-game
+ * values: FilterBlend t = 0.2 (no camera FX), TintColor = (0.5,0.5,0.5)*0.25t
+ * with w = 0.2 left by the front end, SaturationScale 0.4, ramp bias 0.45,
+ * gain curves k = 0.5 + (0.2-0.5)t = 0.44 around pivot 0.4. Each pass wrote an
+ * 8-bit target, hence the clamps. The game applies it before adding the glow
+ * buffer. Gain curve (0x5bbdb0): m = (1/k-2)(1-x/s);
+ * x < s ? x/(m+1) : (m-x)/(m-1). */
+/* Depth of field composite (depth_of_field.efx ps_2_0, drawn by 0x5cccd0
+ * after the screen flash, before the visual treatment): s = the sharp frame
+ * with the depth in alpha, b = its blurred copy (half res, box + 2 x H/V);
+ * w = sat8(d * F + O1) + sat8(O2 - d * F) with sat8 = clamp to [0, 0.8]
+ * (DofFalloff F, DofOffset1 O1, DofOffset2 O2 from 0x5d2850). The
+ * letterbox (0x5cbdc0, after the 3D post and before the FE) blacks out the
+ * rows outside |y - 0.5| <= uLbH. */
+#define FIN_DOF_DECL "uniform sampler2D uBlur; uniform vec3 uDof;\n"
+#define FIN_DOF_MIX \
+    "  { float w=clamp(s.a*uDof.x+uDof.y,0.0,0.8)+clamp(uDof.z-s.a*uDof.x,0.0,0.8);\n" \
+    "    s.rgb=mix(s.rgb,texture2D(uBlur,vUV).rgb,w); }\n"
+#define FIN_OUT \
+    "  gl_FragColor=vec4((c+texture2D(uGlow,vUV).rgb*uBloom)*step(abs(vUV.y-0.5),uLbH),1.0);\n" \
+    "}\n"
+/* the speed blur's blend over the frame (0x5cc460: BLENDFACTOR /
+   INVBLENDFACTOR, factor = its strength), before the flash and the DOF */
+#define FIN_SPEED_DECL "uniform sampler2D uSpeedTex; uniform float uSpeed;\n"
+#define FIN_SPEED_MIX "  if(uSpeed>0.0) s.rgb=mix(s.rgb,texture2D(uSpeedTex,vUV).rgb,uSpeed);\n"
+#define BLOOM_FINAL_LUT(DECL, MIX) \
+    GLSL_HEADER \
+    "varying vec2 vUV; uniform sampler2D uTex; uniform sampler2D uGlow; uniform sampler2D uLut;\n" \
+    "uniform float uVT; uniform float uBloom; uniform float uLift; uniform vec3 uFlash; uniform float uLbH;\n" \
+    FIN_SPEED_DECL DECL \
+    /* uLut: r = gain curve, g = blue ramp, at x*255/256 + 0.5/256 */ \
+    "void main(){\n" \
+    "  vec4 s=texture2D(uTex,vUV);\n" \
+    FIN_SPEED_MIX MIX \
+    "  vec3 c=min(s.rgb*uFlash,1.0);\n" \
+    "  if(uVT>0.5){\n" \
+    "    c.b=texture2D(uLut,vec2(c.b*0.99609375+0.001953125,0.5)).g;\n"   /* RAMPMAP (1x256, indexed by blue) */ \
+    "    c=mix(c,vec3(s.a),uLift);\n"                                       /* TintColor.w */ \
+    "    c=clamp(c+clamp(1.0-(max(c.r,c.g)-c.b),0.0,1.0)*0.01,0.0,1.0);\n" \
+    "    vec3 q=c*0.99609375+0.001953125;\n" \
+    "    vec3 g=vec3(texture2D(uLut,vec2(q.r,0.5)).r,texture2D(uLut,vec2(q.g,0.5)).r,texture2D(uLut,vec2(q.b,0.5)).r);\n" \
+    "    float w=texture2D(uLut,vec2(dot(q,vec3(0.3,0.59,0.11)),0.5)).r;\n" /* GAINMAP alpha */ \
+    "    c=mix(g,c,w);\n" \
+    "  }\n" \
+    FIN_OUT
+/* The same treatment with the curves as polynomials: five dependent LUT reads
+   per pixel made this full-screen pass ~5 ms of GPU on the Vita. Least-squares
+   cubics over the 256 8-bit inputs: blue ramp max error 0.03/255, gain curve
+   split at its pivot 0.4 (continuous there) max error 0.02/255 below and
+   0.09/255 above, all under the LUT's own 8-bit rounding. r, g, b and the
+   luma weight go through the gain curve as one vec4. */
+#define BLOOM_FINAL_POLY(DECL, MIX) \
+    GLSL_HEADER \
+    "varying vec2 vUV; uniform sampler2D uTex; uniform sampler2D uGlow;\n" \
+    "uniform float uVT; uniform float uBloom; uniform float uLift; uniform vec3 uFlash; uniform float uLbH;\n" \
+    FIN_SPEED_DECL DECL \
+    "void main(){\n" \
+    "  vec4 s=texture2D(uTex,vUV);\n" \
+    FIN_SPEED_MIX MIX \
+    "  vec3 c=min(s.rgb*uFlash,1.0);\n" \
+    "  if(uVT>0.5){\n" \
+    "    c.b=((0.040048*c.b+0.139653)*c.b+0.820287)*c.b-0.000106;\n"       /* RAMPMAP */ \
+    "    c=mix(c,vec3(s.a),uLift);\n" \
+    "    c=clamp(c+clamp(1.0-(max(c.r,c.g)-c.b),0.0,1.0)*0.01,0.0,1.0);\n" \
+    "    vec4 q=vec4(c,dot(c,vec3(0.3,0.59,0.11)));\n" \
+    "    vec4 lo=((0.360683*q+0.382482)*q+0.789274)*q-0.000070;\n" \
+    "    vec4 hi=((0.321546*q-1.239069)*q+2.232983)*q-0.315162;\n" \
+    "    vec4 g=clamp(mix(lo,hi,step(0.4,q)),0.0,1.0);\n"                  /* GAINMAP */ \
+    "    c=mix(g.rgb,c,g.a);\n" \
+    "  }\n" \
+    FIN_OUT
+static const char *BLOOM_FINAL_FS = BLOOM_FINAL_LUT("", "");
+static const char *BLOOM_FINAL_DOF_FS = BLOOM_FINAL_LUT(FIN_DOF_DECL, FIN_DOF_MIX);
+static const char *BLOOM_FINAL_POLY_FS = BLOOM_FINAL_POLY("", "");
+static const char *BLOOM_FINAL_POLY_DOF_FS = BLOOM_FINAL_POLY(FIN_DOF_DECL, FIN_DOF_MIX);
+/* the DOF blur passes: the bloom's tap grid on the plain frame */
+static const char *DOF_BLUR_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform vec2 uStep;\n"
+    "void main(){\n" BLOOM_GRID(BLOOM_TAP) "  gl_FragColor=vec4(b,1.0);\n}\n";
+/* Speed / nitrous motion blur (0x5cc460, filter.fx through 0x5c5c00): 4 taps
+ * of weight 0.25, tap i at uv - i * offset, the offset given per corner
+ * (x: o0 on the left edge, o2 on the right; y: o1 at the top, o3 at the
+ * bottom, D3D v down) and interpolated across the quad -- a zoom along the
+ * camera's motion. Pass 2 repeats it at 4x the offsets (16 taps in all).
+ * Tap coordinates come from the vertex shader (non-dependent reads). */
+static const char *SPEED_VS =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; uniform vec4 uOfs;\n"
+    "varying vec2 vT0; varying vec2 vT1; varying vec2 vT2; varying vec2 vT3;\n"
+    "void main(){\n"
+    "  vec2 o=vec2(mix(uOfs.x,uOfs.z,aUV.x),-mix(uOfs.y,uOfs.w,1.0-aUV.y));\n"
+    "  vT0=aUV; vT1=aUV-o; vT2=aUV-2.0*o; vT3=aUV-3.0*o;\n"
+    "  gl_Position=vec4(aPos.xy*2.0-1.0,0.0,1.0); }\n";
+static const char *SPEED_FS =
+    GLSL_HEADER
+    "varying vec2 vT0; varying vec2 vT1; varying vec2 vT2; varying vec2 vT3; uniform sampler2D uTex;\n"
+    "void main(){ gl_FragColor=vec4((texture2D(uTex,vT0).rgb+texture2D(uTex,vT1).rgb\n"
+    "  +texture2D(uTex,vT2).rgb+texture2D(uTex,vT3).rgb)*0.25,1.0); }\n";
+
+static struct {
+    int state;                 /* 0 untried, 1 ready, -1 unavailable */
+    int w, h, cur;             /* half-res size; G[cur] is the latest glow */
+    GLuint fbo[4], tex[4];     /* A, B, G0, G1 */
+    GLuint ob, blur, glow, obblur, glow2;   /* obblur+glow2: the fused chain */
+    GLint blur_step, glow_step, obblur_step, glow2_step;
+    struct { GLuint p; GLint vt, bloom, lift, flash, lbh, dof, speed; } fin[2];   /* plain, depth of field */
+    GLuint speed; GLint speed_ofs;   /* the speed blur passes */
+    GLuint dofblur; GLint dofblur_step;
+    GLuint lut;
+    GLuint sob, sblur, sglow;  /* the separable chain (non-dependent taps) */
+    GLint sob_step, sblur_step, sglow_step;
+} g_bloom;
+static int g_bloom_on = -1, g_vt_on = -1, g_vt_lift = 0;
+/* the scene camera's depth of field and letterbox for this frame */
+/* scene: the depth alpha is being written now; frame: this frame's 3D has it */
+static struct { int on, scene, frame; float F, O1, O2; float lbh; } g_dof = { 0, 0, 0, 0, 0, 0, 1.0f };
+void render_set_dof(float centre, float range)
+{
+    /* 0x5d2850: off when both are 0; centre < 0 -> 0, range < 0 -> 8; depth
+       in the alpha is viewZ / 1024, DofFalloff F = 1 / (range * 0.01953125),
+       DofOffset1 = -(c / 1024 + r / 2048) F, DofOffset2 = (c / 1024 - r / 2048) F */
+    if (centre == 0.0f && range == 0.0f) { g_dof.on = 0; return; }
+    float c = centre < 0.0f ? 0.0f : centre, r = range < 0.0f ? 8.0f : range;
+    if (r < 1e-4f) r = 1e-4f;   /* the original divides by 0 here (x87 inf) */
+    float h = r * 0.00048828125f, m = c * 0.0009765625f;
+    g_dof.F = 1.0f / (r * 0.01953125f);
+    g_dof.O1 = -(m + h) * g_dof.F;
+    g_dof.O2 = (m - h) * g_dof.F;
+    /* The composite's blur weight is clamp(a F + O1, 0, .8) + clamp(O2 - a F,
+       0, .8) over the depth alpha a in 0..1 -- piecewise linear, so its
+       largest value is at a = 0 or a = 1. When that stays under half a step
+       of the 8-bit output the effect changes no pixel (the race intros ask
+       for centre 50 km, range 100 km: weight 0 everywhere), so its two
+       half-res blur scenes and the depth-alpha writes are skipped. */
+    float w0 = fminf(fmaxf(g_dof.O1, 0.0f), .8f) + fminf(fmaxf(g_dof.O2, 0.0f), .8f);
+    float w1 = fminf(fmaxf(g_dof.F + g_dof.O1, 0.0f), .8f) + fminf(fmaxf(g_dof.O2 - g_dof.F, 0.0f), .8f);
+    g_dof.on = fmaxf(w0, w1) >= 0.002f;
+}
+static int g_lb_scissor;
+void render_set_letterbox(float lb)
+{
+    /* 0x5cbdc0: two black bars of ftol(lb * 480) lines of the 480-line frame */
+    int h = lb > 0.0f ? (int)(lb * 480.0f) : 0;
+    g_dof.lbh = h > 0 ? 0.5f - (float)h / 480.0f : 1.0f;
+    /* The composite blacks the bars out (uLbH), so the 3D pass need not
+       draw under them: a scissor on the band in between (vitaGL clips whole
+       tiles outside it). Set after the scene's clear, dropped at its end;
+       2 rows of margin for the bloom / blur taps at the edge. */
+    if (g_scene.active && h > 0) {
+        int H = g_scene.h;
+        int y0 = (int)((0.5f - g_dof.lbh) * (float)H) - 2, y1 = (int)((0.5f + g_dof.lbh) * (float)H + 0.999f) + 2;
+        if (y0 < 0) y0 = 0;
+        if (y1 > H) y1 = H;
+        glScissor(0, y0, g_scene.w, y1 - y0);
+        glEnable(GL_SCISSOR_TEST);
+        g_lb_scissor = 1;
+    }
+}
+#ifdef __vita__
+void vita_set_dof(int on);
+#endif
+void render_dof_scene(int on)
+{
+    /* the depth alpha needs the shim's per-draw switch (Vita) and the
+       post-process path that reads it */
+#ifdef __vita__
+    g_dof.scene = on && g_dof.on && g_scene.active;
+    if (g_dof.scene) g_dof.frame = 1;
+    vita_set_dof(g_dof.scene);
+#else
+    (void)on; g_dof.scene = 0;
+#endif
+}
+int render_dof_writes(void) { return g_dof.scene; }
+/* the screen flash (screen effect slot 0, drawn by 0x5c7860 before the
+   visual treatment): the frame times 2 x colour / 255 per channel. Only
+   the post-process composite applies it (not the plain blit). */
+static float g_flash[3] = { 1.0f, 1.0f, 1.0f };
+void render_set_flash(const float mul[3]) {
+    for (int i = 0; i < 3; i++) g_flash[i] = mul ? mul[i] : 1.0f;
+}
+/* the speed blur for this frame: strength (0 = off) and the four corner
+   offsets of the first pass (0x5cc460); the bloom level f of screen effect
+   slot 4 (0x5bc180, the nitrous kick) */
+static struct { float k, o[4]; int on; } g_speed = { 0, { 0, 0, 0, 0 }, -1 };
+static float g_bloom_f;
+void render_set_speedblur(float k, const float o[4]) {
+    g_speed.k = k;
+    for (int i = 0; i < 4; i++) g_speed.o[i] = o ? o[i] : 0.0f;
+}
+void render_set_bloom_level(float f) { g_bloom_f = f; }
+
+/* bloom and the visual treatment both post-process the finished 3D frame */
+static int bloom_wanted(void) {
+    if (g_bloom_on < 0) {
+        FILE *f = fopen("ux0:data/OpenUG2/nobloom.txt", "r");
+        g_bloom_on = !f; if (f) fclose(f);
+        f = fopen("ux0:data/OpenUG2/novt.txt", "r");
+        g_vt_on = !f; if (f) fclose(f);
+        /* TintColor.w = 0.2 mixes the frame ALPHA into every pixel; on PC the
+           scene alpha evidently is not written (side-by-side on HW 10-09: with
+           the lift blacks turn milky grey, without it matches the game), so
+           the lift is opt-in for comparisons */
+        f = fopen("ux0:data/OpenUG2/vtlift.txt", "r");
+        g_vt_lift = f != NULL; if (f) fclose(f);
+        f = fopen("ux0:data/OpenUG2/nospeedblur.txt", "r");
+        g_speed.on = !f; if (f) fclose(f);
+        printf("speed blur: %s\n", g_speed.on ? "on" : "off (nospeedblur.txt)");
+        printf("bloom: %s; visual treatment: %s\n", g_bloom_on ? "on" : "off (nobloom.txt)",
+               g_vt_on ? (g_vt_lift ? "on, with alpha lift (vtlift.txt)" : "on") : "off (novt.txt)");
+    }
+    return (g_bloom_on || g_vt_on) && g_bloom.state >= 0;
+}
+
+static GLuint bloom_program_vs(const char *vs, const char *fs, const char *name);
+static GLuint bloom_program(const char *fs, const char *name) { return bloom_program_vs(BLIT_VS, fs, name); }
+static GLuint bloom_program_vs(const char *vs, const char *fs, const char *name) {
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    glBindAttribLocation(p, 0, "aPos");
+    glBindAttribLocation(p, 1, "aUV");
+    glLinkProgram(p);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { printf("bloom: %s program failed to link\n", name); return 0; }
+    glUseProgram(p);
+    GLint u;
+    if ((u = glGetUniformLocation(p, "uTex")) >= 0) glUniform1i(u, 0);
+    if ((u = glGetUniformLocation(p, "uScene")) >= 0) glUniform1i(u, 1);
+    if ((u = glGetUniformLocation(p, "uGlow")) >= 0) glUniform1i(u, 2);
+    if ((u = glGetUniformLocation(p, "uLut")) >= 0) glUniform1i(u, 5);
+    if ((u = glGetUniformLocation(p, "uSpeedTex")) >= 0) glUniform1i(u, 4);
+    return p;
+}
+
+/* 0x5bc180, once a frame from the renderer (0x5d2b5a): level x = 0.2 +
+ * 0.8 f, f = 0.45 outside the game; in game (0x8654a4 == 6) 0, or screen
+ * effect slot 4's k (+0x1e0) while the slot is active (+0x3c) -- the
+ * nitrous preset's kick (render_set_bloom_level). 0x5bc100 eases s = 0.8 s + 0.2 x and sets, through ftol, the glow add
+ * 0x7ff114 = 10 + (72 - 10) s and the overbright offset 0x7ff10c = 216 +
+ * (62 - 216) s (both /255; the offset then x 0.5, 0x5c641b). In a race s
+ * settles at 0.2: add 22, offset 185 -- not the start values 170 / 205,
+ * nor the 80 the add takes outside the game (0x5ccb59). The 3D world (and
+ * so this chain) runs only in game here; s starts where the front end
+ * left it (0.56). */
+static float g_bloom_s = 0.56f;
+static void bloom_levels(float *ofs, float *sub, float *add) {
+    const float x = 0.2f + (1.0f - 0.2f) * g_bloom_f;   /* f: slot 4's k while it is active, else 0 */
+    g_bloom_s = (1.0f - 0.2f) * g_bloom_s + 0.2f * x;
+    int a = (int)((float)(72 - 10) * g_bloom_s + 10.0f);
+    int o = (int)((float)(62 - 216) * g_bloom_s + 216.0f);
+    *add = (float)a / 255.0f;
+    *ofs = (float)o / 255.0f * 0.5f;
+    *sub = (float)0xB0 / 255.0f;
+}
+
+static int bloom_setup(int sw, int sh) {
+    g_bloom.state = -1;
+    g_bloom.w = sw / 2; g_bloom.h = sh / 2;
+    for (int i = 0; i < 4; i++) {
+        glGenTextures(1, &g_bloom.tex[i]);
+        glBindTexture(GL_TEXTURE_2D, g_bloom.tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_bloom.w, g_bloom.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &g_bloom.fbo[i]);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_bloom.fbo[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_bloom.tex[i], 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            printf("bloom: unavailable (framebuffer %d incomplete)\n", i);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            return 0;
+        }
+        glViewport(0, 0, g_bloom.w, g_bloom.h);
+        glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);   /* G starts dark */
+    }
+    g_bloom.ob = bloom_program(BLOOM_OB_FS, "overbright");
+    g_bloom.blur = bloom_program(BLOOM_BLUR_FS, "blur");
+    g_bloom.glow = bloom_program(BLOOM_GLOW_FS, "glow");
+    {   int lut = 0;   /* ux0:data/OpenUG2/vtlut.txt: the LUT treatment, for A/B */
+#ifdef __vita__
+        FILE *fl = fopen("ux0:data/OpenUG2/vtlut.txt", "rb");
+        if (fl) { fclose(fl); lut = 1; }
+#endif
+        g_bloom.fin[0].p = bloom_program(lut ? BLOOM_FINAL_FS : BLOOM_FINAL_POLY_FS, "final");
+        g_bloom.fin[1].p = bloom_program(lut ? BLOOM_FINAL_DOF_FS : BLOOM_FINAL_POLY_DOF_FS,
+                                         "final + depth of field");
+        printf("visual treatment: %s curves\n", lut ? "LUT (vtlut.txt)" : "polynomial");
+    }
+    if (!g_bloom.ob || !g_bloom.blur || !g_bloom.glow || !g_bloom.fin[0].p) return 0;
+    g_bloom.blur_step = glGetUniformLocation(g_bloom.blur, "uStep");
+    g_bloom.glow_step = glGetUniformLocation(g_bloom.glow, "uStep");
+    for (int i = 0; i < 2; i++) {
+        GLuint p = g_bloom.fin[i].p;
+        if (!p) continue;
+        g_bloom.fin[i].vt = glGetUniformLocation(p, "uVT");
+        g_bloom.fin[i].bloom = glGetUniformLocation(p, "uBloom");
+        g_bloom.fin[i].lift = glGetUniformLocation(p, "uLift");
+        g_bloom.fin[i].flash = glGetUniformLocation(p, "uFlash");
+        g_bloom.fin[i].lbh = glGetUniformLocation(p, "uLbH");
+        g_bloom.fin[i].dof = glGetUniformLocation(p, "uDof");
+        g_bloom.fin[i].speed = glGetUniformLocation(p, "uSpeed");
+        GLint u = glGetUniformLocation(p, "uBlur");
+        if (u >= 0) glUniform1i(u, 3);   /* bloom_program left p bound */
+    }
+    g_bloom.speed = bloom_program_vs(SPEED_VS, SPEED_FS, "speed blur");
+    g_bloom.speed_ofs = g_bloom.speed ? glGetUniformLocation(g_bloom.speed, "uOfs") : -1;
+    g_bloom.dofblur = bloom_program(DOF_BLUR_FS, "depth of field blur");
+    g_bloom.dofblur_step = g_bloom.dofblur ? glGetUniformLocation(g_bloom.dofblur, "uStep") : -1;
+    if (!g_bloom.dofblur) g_bloom.fin[1].p = 0;
+    printf("depth of field: %s\n", g_bloom.fin[1].p ? "ready" : "unavailable");
+    g_bloom.obblur = bloom_program(BLOOM_OBBLUR_FS, "overbright+blur");
+    g_bloom.glow2 = bloom_program(BLOOM_GLOW2_FS, "blur+glow");
+#ifdef __vita__
+    {   FILE *f5 = fopen("ux0:data/OpenUG2/bloom5.txt", "rb");   /* A/B: the 5-pass chain */
+        if (f5) { fclose(f5); g_bloom.obblur = g_bloom.glow2 = 0; } }
+#endif
+    {   /* ux0:data/OpenUG2/bloomfused.txt: the fused 2-pass chain, for A/B */
+        int fused = 0;
+#ifdef __vita__
+        FILE *ff = fopen("ux0:data/OpenUG2/bloomfused.txt", "rb");
+        if (ff) { fclose(ff); fused = 1; }
+#endif
+        if (!fused) {
+            g_bloom.sob = bloom_program_vs(BLOOM_SEP_VS, BLOOM_SEP_OB_FS, "separable overbright+H");
+            g_bloom.sblur = bloom_program_vs(BLOOM_SEP_VS, BLOOM_SEP_BLUR_FS, "separable blur");
+            g_bloom.sglow = bloom_program_vs(BLOOM_SEP_VS, BLOOM_SEP_GLOW_FS, "separable V+glow");
+            if (!g_bloom.sob || !g_bloom.sblur || !g_bloom.sglow) g_bloom.sob = 0;
+            else {
+                g_bloom.sob_step = glGetUniformLocation(g_bloom.sob, "uStep");
+                g_bloom.sblur_step = glGetUniformLocation(g_bloom.sblur, "uStep");
+                g_bloom.sglow_step = glGetUniformLocation(g_bloom.sglow, "uStep");
+                printf("bloom: separable chain, 4 passes, non-dependent taps\n");
+            }
+        }
+    }
+    if (g_bloom.obblur && g_bloom.glow2) {
+        g_bloom.obblur_step = glGetUniformLocation(g_bloom.obblur, "uStep");
+        g_bloom.glow2_step = glGetUniformLocation(g_bloom.glow2, "uStep");
+        printf("bloom: fused chain, 2 passes\n");
+    } else {
+        g_bloom.obblur = g_bloom.glow2 = 0;
+        printf("bloom: 5-pass chain\n");
+    }
+    {   /* treatment curves (screenfilter.fx): r = gain, k 0.44 pivot 0.4
+           (0x5bbdb0), g = ramp bias 0.45 */
+        unsigned char lut[256 * 4];
+        for (int i = 0; i < 256; i++) {
+            float x = (float)i / 255.0f;
+            float m = (1.0f / 0.44f - 2.0f) * (1.0f - x / 0.4f);
+            float gn = x < 0.4f ? x / (m + 1.0f) : (m - x) / (m - 1.0f);
+            float rb = x / ((1.0f / 0.45f - 2.0f) * (1.0f - x) + 1.0f);
+            gn = gn < 0.0f ? 0.0f : gn > 1.0f ? 1.0f : gn;
+            lut[i * 4 + 0] = (unsigned char)(gn * 255.0f + 0.5f);
+            lut[i * 4 + 1] = (unsigned char)(rb * 255.0f + 0.5f);
+            lut[i * 4 + 2] = 0; lut[i * 4 + 3] = 255;
+        }
+        glGenTextures(1, &g_bloom.lut);
+        glBindTexture(GL_TEXTURE_2D, g_bloom.lut);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, lut);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    g_bloom.state = 1;
+    printf("bloom: half-res targets %dx%d\n", g_bloom.w, g_bloom.h);
+    return 1;
+}
+
+static void bloom_pass(int target, GLuint prog, GLuint tex0, GpuMesh *quad) {
+    glBindFramebuffer(GL_FRAMEBUFFER, g_bloom.fbo[target]);
+    glViewport(0, 0, g_bloom.w, g_bloom.h);
+    glUseProgram(prog);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex0);
+    draw_gpumesh(quad);
+}
+
+/* Runs the chain from g_scene.tex and leaves the composited frame in the
+   default framebuffer at screen size. 0 = not available (caller blits). */
+static int bloom_composite(GpuMesh *quad, int sw, int sh) {
+    if (!g_bloom.state && !bloom_setup(g_scene.w, g_scene.h)) return 0;
+    if (g_bloom.state != 1 || !quad) return 0;
+    enum { A, B };
+    int prev = 2 + g_bloom.cur, next = 2 + (g_bloom.cur ^ 1);
+    float tx = 1.0f / (float)g_bloom.w, ty = 1.0f / (float)g_bloom.h;
+#ifdef __vita__
+    extern int vita_probe_skip;                         /* GPU probe pass 9 */
+    if (vita_probe_skip == 9) { next = prev; goto composite; }
+#endif
+    if (!g_bloom_on) { next = prev; goto composite; }   /* G stays cleared */
+    float ob_ofs, sub, add;
+    bloom_levels(&ob_ofs, &sub, &add);
+    if (g_bloom.sob) {
+        glUseProgram(g_bloom.sob);
+        glUniform2f(g_bloom.sob_step, tx, 0.0f);
+        glUniform1f(glGetUniformLocation(g_bloom.sob, "uObOfs"), ob_ofs);
+        bloom_pass(A, g_bloom.sob, g_scene.tex, quad);            /* overbright + H */
+        glUseProgram(g_bloom.sblur);
+        glUniform2f(g_bloom.sblur_step, 0.0f, ty);
+        bloom_pass(B, g_bloom.sblur, g_bloom.tex[A], quad);       /* V */
+        glUniform2f(g_bloom.sblur_step, tx, 0.0f);
+        bloom_pass(A, g_bloom.sblur, g_bloom.tex[B], quad);       /* H */
+        glUseProgram(g_bloom.sglow);
+        glUniform2f(g_bloom.sglow_step, 0.0f, ty);
+        glUniform1f(glGetUniformLocation(g_bloom.sglow, "uSub"), sub);
+        glUniform1f(glGetUniformLocation(g_bloom.sglow, "uAdd"), add);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, g_scene.tex);
+        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[prev]);
+        bloom_pass(next, g_bloom.sglow, g_bloom.tex[A], quad);    /* V + subtract + glow */
+        g_bloom.cur ^= 1;
+        goto composite;
+    }
+    if (g_bloom.obblur) {
+        glUseProgram(g_bloom.obblur);
+        glUniform2f(g_bloom.obblur_step, tx, ty);
+        glUniform1f(glGetUniformLocation(g_bloom.obblur, "uObOfs"), ob_ofs);
+        bloom_pass(A, g_bloom.obblur, g_scene.tex, quad);   /* overbright + H + V */
+        glUseProgram(g_bloom.glow2);
+        glUniform2f(g_bloom.glow2_step, tx, ty);
+        glUniform1f(glGetUniformLocation(g_bloom.glow2, "uSub"), sub);
+        glUniform1f(glGetUniformLocation(g_bloom.glow2, "uAdd"), add);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, g_scene.tex);
+        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[prev]);
+        bloom_pass(next, g_bloom.glow2, g_bloom.tex[A], quad);  /* H + V + glow */
+        g_bloom.cur ^= 1;
+        goto composite;
+    }
+    glUseProgram(g_bloom.ob);
+    glUniform1f(glGetUniformLocation(g_bloom.ob, "uObOfs"), ob_ofs);
+    bloom_pass(A, g_bloom.ob, g_scene.tex, quad);
+    glUseProgram(g_bloom.blur);
+    glUniform2f(g_bloom.blur_step, tx, 0.0f);
+    bloom_pass(B, g_bloom.blur, g_bloom.tex[A], quad);     /* H */
+    glUniform2f(g_bloom.blur_step, 0.0f, ty);
+    bloom_pass(A, g_bloom.blur, g_bloom.tex[B], quad);     /* V */
+    glUniform2f(g_bloom.blur_step, tx, 0.0f);
+    bloom_pass(B, g_bloom.blur, g_bloom.tex[A], quad);     /* H */
+    /* last V blur + subtract the scene + update the glow buffer */
+    glUseProgram(g_bloom.glow);
+    glUniform2f(g_bloom.glow_step, 0.0f, ty);
+    glUniform1f(glGetUniformLocation(g_bloom.glow, "uSub"), sub);
+    glUniform1f(glGetUniformLocation(g_bloom.glow, "uAdd"), add);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, g_scene.tex);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[prev]);
+    bloom_pass(next, g_bloom.glow, g_bloom.tex[B], quad);
+    g_bloom.cur ^= 1;
+composite:;  /* screen = treatment(dof(scene)) + G */
+    /* depth of field (0x5cc8b0 / 0x5cc9a0): the frame box-filtered to half
+       res, then twice H + V with the bloom's taps -- the tap grid does a
+       box + H + V from the full-res frame, then H + V; A and B are free
+       once the glow is updated */
+    int dof = g_dof.frame && g_dof.on && g_bloom.fin[1].p;
+    if (dof && g_bloom.sblur) {   /* the same blur as separable non-dependent passes */
+        glUseProgram(g_bloom.sblur);
+        glUniform2f(g_bloom.sblur_step, tx, 0.0f);
+        bloom_pass(B, g_bloom.sblur, g_scene.tex, quad);          /* box + H */
+        glUniform2f(g_bloom.sblur_step, 0.0f, ty);
+        bloom_pass(A, g_bloom.sblur, g_bloom.tex[B], quad);       /* V */
+        glUniform2f(g_bloom.sblur_step, tx, 0.0f);
+        bloom_pass(B, g_bloom.sblur, g_bloom.tex[A], quad);       /* H */
+        glUniform2f(g_bloom.sblur_step, 0.0f, ty);
+        bloom_pass(A, g_bloom.sblur, g_bloom.tex[B], quad);       /* V */
+    } else if (dof) {
+        glUseProgram(g_bloom.dofblur);
+        glUniform2f(g_bloom.dofblur_step, tx, ty);
+        bloom_pass(B, g_bloom.dofblur, g_scene.tex, quad);
+        bloom_pass(A, g_bloom.dofblur, g_bloom.tex[B], quad);
+    }
+    /* speed blur (0x5cc460): B = the frame's 4 taps at o, A = B's at 4o,
+       blended over the frame by the strength cut to a byte (ftol, render
+       state 0xc1); skipped below 1/255. Half res here (A and B are free once
+       the glow is updated; not alongside the DOF, which holds A -- the NIS
+       intros that use it stand still). */
+    float speed = 0.0f;
+    if (!dof && g_speed.on > 0 && g_speed.k >= 1.0f / 255.0f && g_bloom.speed) {
+        const float *o = g_speed.o;
+        glUseProgram(g_bloom.speed);
+        glUniform4f(g_bloom.speed_ofs, o[0], o[1], o[2], o[3]);
+        bloom_pass(B, g_bloom.speed, g_scene.tex, quad);
+        glUniform4f(g_bloom.speed_ofs, 4.0f * o[0], 4.0f * o[1], 4.0f * o[2], 4.0f * o[3]);
+        bloom_pass(A, g_bloom.speed, g_bloom.tex[B], quad);
+        speed = (float)(int)(fminf(g_speed.k, 1.0f) * 255.0f) / 255.0f;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, sw, sh);
+    {   const int f = dof;
+        glUseProgram(g_bloom.fin[f].p);
+        glUniform1f(g_bloom.fin[f].vt, g_vt_on ? 1.0f : 0.0f);
+        glUniform1f(g_bloom.fin[f].bloom, g_bloom_on ? 1.0f : 0.0f);
+        glUniform1f(g_bloom.fin[f].lift, g_vt_lift ? 0.2f : 0.0f);   /* TintColor.w */
+        glUniform3f(g_bloom.fin[f].flash, g_flash[0], g_flash[1], g_flash[2]);
+        glUniform1f(g_bloom.fin[f].lbh, g_dof.lbh);
+        glUniform1f(g_bloom.fin[f].speed, speed);
+        if (speed > 0.0f) { glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[A]); }
+        if (f) {
+            glUniform3f(g_bloom.fin[f].dof, g_dof.F, g_dof.O1, g_dof.O2);
+            glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[A]);
+        }
+    }
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[next]);
+    glActiveTexture(GL_TEXTURE5); glBindTexture(GL_TEXTURE_2D, g_bloom.lut);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_scene.tex);
+    draw_gpumesh(quad);
+    return 1;
+}
+
+int render_scene_begin(int screen_w, int screen_h, float scale) {
+    g_scene.active = 0;
+    g_dof.frame = 0;
+    /* bloom reads the finished 3D frame, so it needs the scene in a texture
+       even at native resolution */
+    if (g_scene.failed || (scale >= 0.999f && !bloom_wanted())) return 0;
+    if (scale > 1.0f) scale = 1.0f;
+    int w = (int)(screen_w * scale) & ~7, h = (int)(screen_h * scale) & ~7;
+    if (w < 64 || h < 64) return 0;
+    if (!g_scene.fbo || g_scene.w != w || g_scene.h != h) {
+        if (g_scene.fbo) { glDeleteFramebuffers(1, &g_scene.fbo); glDeleteTextures(1, &g_scene.tex);
+                           glDeleteRenderbuffers(1, &g_scene.depth); g_scene.fbo = 0; }
+        glGenTextures(1, &g_scene.tex);
+        glBindTexture(GL_TEXTURE_2D, g_scene.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &g_scene.fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_scene.fbo);
+        glGenRenderbuffers(1, &g_scene.depth);
+        glBindRenderbuffer(GL_RENDERBUFFER, g_scene.depth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_scene.depth);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_scene.tex, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            printf("scaled rendering unavailable (framebuffer incomplete); using native\n");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            g_scene.failed = 1;
+            return 0;
+        }
+        g_scene.w = w; g_scene.h = h;
+        printf("scaled rendering: 3D at %dx%d, HUD at %dx%d\n", w, h, screen_w, screen_h);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_scene.fbo);
+    glViewport(0, 0, g_scene.w, g_scene.h);
+    g_scene.active = 1;
+    return 1;
+}
+
+void render_scene_end(const RProg *rp, GpuMesh *quad, int screen_w, int screen_h,
+                      float fog_density) {
+    if (!g_scene.active) return;
+    g_scene.active = 0;
+    if (g_lb_scissor) { glDisable(GL_SCISSOR_TEST); g_lb_scissor = 0; }
+    GLboolean depth = glIsEnabled(GL_DEPTH_TEST), blend = glIsEnabled(GL_BLEND);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND);
+    if (g_dof.scene) render_dof_scene(0);
+    int composited = bloom_wanted() && bloom_composite(quad, screen_w, screen_h);
+    g_dof.frame = 0;
+    if (composited) {
+        glUseProgram(rp->prog);
+        if (depth) glEnable(GL_DEPTH_TEST);
+        if (blend) glEnable(GL_BLEND);
+        return;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, screen_w, screen_h);
+    blit_program();
+    if (g_blit_prog != (GLuint)-1) {
+        glUseProgram(g_blit_prog);
+        glBindTexture(GL_TEXTURE_2D, g_scene.tex);
+        draw_gpumesh(quad);
+        glUseProgram(rp->prog);
+        if (depth) glEnable(GL_DEPTH_TEST);
+        if (blend) glEnable(GL_BLEND);
+        return;
+    }
+    /* unit quad [0,1]^2 -> NDC [-1,1]^2; texture origin is bottom-left too */
+    static const float M[16] = {2,0,0,0, 0,2,0,0, 0,0,1,0, -1,-1,0,1};
+    glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, M);
+    render_model(rp, NULL);
+    glUniform1f(rp->uFogDensity, 0.0f);
+    glUniform1f(rp->uUseTex, 1.0f);
+    glUniform1f(rp->uEmissiveTex, 1.0f);
+    glUniform1f(rp->uVista, 0.0f);
+    glUniform3f(rp->uColor, 1.0f, 1.0f, 1.0f);
+    glUniform1f(rp->uAlpha, 1.0f);
+    glBindTexture(GL_TEXTURE_2D, g_scene.tex);
+    draw_gpumesh(quad);
+    glUniform1f(rp->uEmissiveTex, 0.0f);
+    glUniform1f(rp->uUseTex, 0.0f);
+    glUniform1f(rp->uFogDensity, fog_density);
+    if (depth) glEnable(GL_DEPTH_TEST);
+    if (blend) glEnable(GL_BLEND);
+}
+#endif
 
 int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
                              N2Batch **out, int *count, int *meshbatch) {
@@ -1080,22 +2811,72 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     N2Batch *bat = j->batches;
     int *run0 = j->run0, *run1 = j->run1;
     const char *audit = j->audit;
-    while (j->next < j->meshes && max_batches-- > 0) {
+    g_batch_normals = j->normals;
+    g_batch_packed = j->packed;
+#ifdef __vita__
+    g_batch_reuse = 1;
+    if (!j->next) g_batch_reused = g_batch_reused_bytes = 0;
+#endif
+#ifdef __vita__
+    /* Count limits alone allow a large resident to monopolise a frame.
+       Check between complete batches; synchronous startup remains unbounded. */
+    unsigned long long step_begin = sceKernelGetProcessTimeWide();
+    unsigned long long budget_us = max_batches >= 128 ? 24000 : 6000;   /* smooth: a city frame has ~8 ms to spare */
+    int sliced = max_batches != INT_MAX;
+#endif
+    while (j->next < j->meshes && max_batches > 0) {
+#ifdef __vita__
+        long reused_before = g_batch_reused;
+#endif
         int i0 = j->next, i = i0 + 1;
+        if (j->prepared) {
+            assert(j->count<j->prepared_count && j->prepared[j->count].begin==i0);
+            i=j->prepared[j->count].end;
+            g_batch_prepared_hash=j->prepared[j->count].hash;
+        } else {
+        g_batch_prepared_hash=NULL;
         int verts = s->meshes[ent[i0].idx].nverts;
         while (i < j->meshes && ent[i].key == ent[i0].key &&
+               ent[i].cell_x == ent[i0].cell_x && ent[i].cell_y == ent[i0].cell_y &&
                ent[i].group == ent[i0].group &&
                verts + s->meshes[ent[i].idx].nverts <= BATCH_MAXVERTS)
             verts += s->meshes[ent[i++].idx].nverts;
+        }
         if (!batch_emit(s, ent, i0, i, (GLuint)ent[i0].key,
                         &bat[j->count], j->count, audit, j->modes)) {
+            g_batch_normals = NULL; g_batch_packed = NULL;
+            g_batch_prepared_hash=NULL;
+#ifdef __vita__
+            g_batch_reuse = 0;
+#endif
             upload_world_batches_cancel(slot); return -1;
         }
         run0[j->count] = i0; run1[j->count] = i;
         j->count++; j->next = i;
+#ifdef __vita__
+        /* Retained GPU buffers still cost CPU packing time, bounded below,
+           but should not consume the allowance for actual GPU uploads. */
+        if (g_batch_reused == reused_before) max_batches--;
+        if (sliced && sceKernelGetProcessTimeWide() - step_begin >= budget_us) break;
+#else
+        max_batches--;
+#endif
     }
+    g_batch_normals = NULL; g_batch_packed = NULL;
+    g_batch_prepared_hash=NULL;
+#ifdef __vita__
+    g_batch_reuse = 0;
+#endif
     if (j->next < j->meshes) return 0;
     int nb = j->count;
+#ifdef __vita__
+    printf("batches: %d built, CPU packing %llu ms, GL buffers %llu ms, %ld KB uploaded\n",
+           nb, g_batch_pack_us / 1000, g_batch_gl_us / 1000, g_batch_bytes >> 10);
+    g_batch_pack_us = g_batch_gl_us = 0; g_batch_bytes = 0;
+    printf("tile GPU reuse: %ld batches, %ld KB retained without upload\n",
+           g_batch_reused, g_batch_reused_bytes >> 10);
+    g_batch_reused = g_batch_reused_bytes = 0;
+#endif
     qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);   /* minimise texture binds */
     /* mesh -> final batch, replayed from each batch's own emission run so it is
        the production partition rather than a second derivation (M133) */
@@ -1146,6 +2927,7 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
     for (int i = 0; i < n; i++)
         if (s->meshes[i].cat == cat) {
             ent[m].key = mtex[i]; ent[m].idx = i;
+            ent[m].cell_x = ent[m].cell_y = 0;
             int mode = mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE;
             ent[m].group = (unsigned char)n2_world_batch_material_group(
                 &s->meshes[i], mode);
@@ -1186,13 +2968,118 @@ void render_batch_array_free(N2Batch **batches, int *count) {
     if (*batches) {
         int n = count && *count > 0 ? *count : 0;
         for (int i = 0; i < n; i++) {
-            if ((*batches)[i].vbo) glDeleteBuffers(1, &(*batches)[i].vbo);
-            if ((*batches)[i].ibo) glDeleteBuffers(1, &(*batches)[i].ibo);
+            render_batch_release(&(*batches)[i]);
         }
         free(*batches);
     }
     *batches = NULL;
     if (count) *count = 0;
+}
+
+void render_batch_reuse_selftest(void) {
+#ifdef __vita__
+    /* Isolate upload checks from errors left by graphics initialization. */
+    GLenum prior_error;
+    while ((prior_error = glGetError()) != GL_NO_ERROR)
+        printf("tile GPU reuse selftest: prior GL error 0x%x\n", (unsigned)prior_error);
+    float vertices[5][15] = {{-4,-4,0,0,0, -2,-4,0,1,0, -4,-2,0,0,1},
+        {252,252,0,0,0, 254,252,0,1,0, 252,254,0,0,1},
+        {1024,1024,0,0,0, 1026,1024,0,1,0, 1024,1026,0,0,1},
+        {2048,2048,0,0,0, 2050,2048,0,1,0, 2048,2050,0,0,1},
+        {3072,3072,0,0,0, 3074,3072,0,1,0, 3072,3074,0,0,1}};
+    uint16_t indices[] = {0,1,2}; N2Mesh meshes[5] = {{0}};
+    float bounds[5][4]; GLuint textures[5] = {0};
+    for (int i = 0; i < 5; i++) {
+        meshes[i].verts = vertices[i]; meshes[i].idx = indices;
+        meshes[i].nverts = meshes[i].nidx = 3; meshes[i].cat = N2_OTHER;
+        bounds[i][0] = bounds[i][1] = vertices[i][0];
+        bounds[i][2] = bounds[i][3] = vertices[i][0] + 2;
+    }
+    N2Scene first = {meshes, 2, 2}, second = {meshes, 3, 3};
+    /* Packed scenery survives resident retirement and is borrowed unchanged
+       by the next worker, rather than recomputing its normals and colours. */
+    N2Mesh cached = meshes[0];
+    cached.verts = malloc(sizeof vertices[0]); cached.idx = malloc(sizeof indices);
+    cached.shared_geometry = calloc(1,sizeof(N2SharedGeometry));
+    assert(cached.verts && cached.idx && cached.shared_geometry);
+    memcpy(cached.verts,vertices[0],sizeof vertices[0]);
+    memcpy(cached.idx,indices,sizeof indices);
+    cached.shared_geometry->refs=2;
+    cached.shared_geometry->verts=cached.verts; cached.shared_geometry->idx=cached.idx;
+    N2Mesh retained_mesh=cached;
+    PackedMesh packed_a={0},packed_b={0};
+    assert(sizeof(BatchedVertex)==28);   /* Vita layout (render.h) */
+    assert(render_pack_mesh(&cached,&packed_a));
+    assert(render_pack_mesh(&retained_mesh,&packed_b));
+    assert(packed_a.borrowed && packed_b.borrowed && packed_a.v==packed_b.v);
+    n2_mesh_geometry_release(&cached);
+    assert(retained_mesh.shared_geometry->refs==1 && packed_b.v[0].pos[0]==-4);
+    n2_mesh_geometry_release(&retained_mesh);
+    N2Batch *a = NULL, *b = NULL; int na, nb;
+    na = upload_world_batches(&first,bounds,textures,0,&a,NULL,NULL,NULL);
+    nb = upload_world_batches(&second,bounds,textures,0,&b,NULL,NULL,NULL);
+    printf("tile GPU reuse selftest: upload counts %d, %d\n", na, nb);
+    assert(na == 2 && nb == 3);
+    int shared = 0;
+    for (int i = 0; i < na; i++) for (int j = 0; j < nb; j++)
+        if (a[i].vbo == b[j].vbo && a[i].ibo == b[j].ibo) shared++;
+    assert(shared == 2); /* distant added tile must not change existing runs */
+    /* Reused batches pass the one-upload allowance; the fourth new batch
+       stops the slice with the fifth pending. Cancellation releases both
+       borrowed references and the newly allocated GPU buffers. */
+    N2Scene five = {meshes,5,5};
+    WorldBatchUpload *job = upload_world_batches_begin(&five,bounds,textures,0,NULL,NULL);
+    N2Batch *partial = NULL; int partial_count = 0;
+    assert(job && !upload_world_batches_step(&job,1,&partial,&partial_count,NULL));
+    upload_world_batches_cancel(&job); /* releases partial shared references */
+    render_batch_array_free(&a,&na);
+    for (int j = 0; j < nb; j++) {
+        SharedBatchBuffers *p = b[j].shared_buffers;
+        assert(p && p->refs == 1);
+        GLint size = 0; glBindBuffer(GL_ARRAY_BUFFER,b[j].vbo);
+        glGetBufferParameteriv(GL_ARRAY_BUFFER,GL_BUFFER_SIZE,&size);
+        assert(size == 3 * sizeof(BatchedVertex));
+    }
+    /* Same placement with changed UV must allocate different GPU contents. */
+    vertices[0][3] = 0.25f;
+    N2Batch *changed = NULL; int nc = upload_world_batches(&first,bounds,textures,0,&changed,NULL,NULL,NULL);
+    assert(nc == 2);
+    int retained = 0;
+    for (int i = 0; i < nc; i++) for (int j = 0; j < nb; j++)
+        if (changed[i].vbo == b[j].vbo) retained++;
+    assert(retained == 1);
+    PackedMesh plan_packed[2]={{0}}; unsigned char plan_modes[2]={0};
+    assert(render_pack_mesh(&meshes[0],&plan_packed[0]));
+    assert(render_pack_mesh(&meshes[1],&plan_packed[1]));
+    WorldBatchUpload *plan=upload_world_batches_prepare_cpu(&first,bounds,textures,plan_modes,plan_packed);
+    assert(plan && upload_world_batches_bind_prepared(plan,textures,0,plan_modes));
+    N2Batch *planned=NULL; int planned_count=0;
+    assert(upload_world_batches_step(&plan,INT_MAX,&planned,&planned_count,NULL)==1);
+    assert(planned_count==nc);
+    int matched=0;
+    for (int i=0; i<planned_count; i++) for (int k=0; k<nc; k++)
+        if (planned[i].vbo==changed[k].vbo && planned[i].ibo==changed[k].ibo) matched++;
+    assert(matched==nc); /* prepared and fallback fingerprints must agree */
+    assert(!memcmp(planned,changed,(size_t)nc*sizeof *planned));
+    render_batch_array_free(&planned,&planned_count);
+    unsigned char mismatch_modes[2]={N2_DRAW_CUTOUT,0};
+    plan=upload_world_batches_prepare_cpu(&first,bounds,textures,plan_modes,plan_packed);
+    assert(plan && !upload_world_batches_bind_prepared(plan,textures,0,mismatch_modes));
+    upload_world_batches_cancel(&plan);
+    float merged_bounds[2][4];
+    memcpy(merged_bounds[0],bounds[0],sizeof merged_bounds[0]);
+    memcpy(merged_bounds[1],bounds[0],sizeof merged_bounds[1]);
+    GLuint mismatch_textures[2]={0,1};
+    plan=upload_world_batches_prepare_cpu(&first,merged_bounds,textures,plan_modes,plan_packed);
+    assert(plan && !upload_world_batches_bind_prepared(plan,mismatch_textures,0,plan_modes));
+    upload_world_batches_cancel(&plan);
+    assert(!plan_packed[0].v && !plan_packed[1].v);
+    render_batch_array_free(&changed,&nc);
+    render_batch_array_free(&b,&nb);
+    for (int i = 0; i < SHARED_BATCH_SLOTS; i++) assert(!g_shared_batches[i]);
+    assert(glGetError() == GL_NO_ERROR);
+    g_batch_reused = g_batch_reused_bytes = 0;
+#endif
 }
 
 void draw_batch(const N2Batch *b) {
@@ -1202,9 +3089,11 @@ void draw_batch(const N2Batch *b) {
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(BatchedVertex), (void*)12);
     glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(BatchedVertex), (void*)20);
+    glVertexAttribPointer(2, 3, BV_NORMAL_GL_TYPE, BV_NORMAL_GL_NORM, sizeof(BatchedVertex),
+                          (void*)offsetof(BatchedVertex, normal));
     glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(BatchedVertex), (void*)32);
+    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(BatchedVertex),
+                          (void*)offsetof(BatchedVertex, col));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
     glDrawElements(GL_TRIANGLES, b->index_count, GL_UNSIGNED_SHORT, 0);
 }
@@ -1306,6 +3195,175 @@ void draw_gpumesh(GpuMesh *g) {
     glDrawElements(GL_TRIANGLES, g->nidx, GL_UNSIGNED_SHORT, 0);
 }
 
+/* ---- car.fx state (see carfx.c) ---- */
+static struct {
+    int checked, enabled, active;
+    GLint fx, sh[10], dmin, drange, smin, srange, pw, emin, erange;
+    const CarFxMat *last;
+} g_cfx;
+int render_carfx_enabled(void) {
+    if (!g_cfx.checked) {
+        g_cfx.checked = 1;
+        FILE *f = fopen("ux0:data/OpenUG2/oldcar.txt", "r");
+        g_cfx.enabled = !f; if (f) fclose(f);
+        printf("car shading: %s\n", g_cfx.enabled ? "original car.fx" : "port shader (oldcar.txt)");
+    }
+    return g_cfx.enabled;
+}
+void render_carfx_begin(const RProg *r) {
+    if (!render_carfx_enabled() || !carfx_loaded()) return;
+    if (!g_cfx.fx) {
+        static const char *const n[10] = { "uSH0","uSH1","uSH2","uSH3","uSH4","uSH5","uSH6","uSH7","uSH8","uSH9" };
+        g_cfx.fx = glGetUniformLocation(r->prog, "uCarFx");
+        for (int i = 0; i < 10; i++) g_cfx.sh[i] = glGetUniformLocation(r->prog, n[i]);
+        g_cfx.dmin = glGetUniformLocation(r->prog, "uCDiffMin");
+        g_cfx.drange = glGetUniformLocation(r->prog, "uCDiffRange");
+        g_cfx.smin = glGetUniformLocation(r->prog, "uCSpecMin");
+        g_cfx.srange = glGetUniformLocation(r->prog, "uCSpecRange");
+        g_cfx.pw = glGetUniformLocation(r->prog, "uCPow");
+        g_cfx.emin = glGetUniformLocation(r->prog, "uCEnvMin");
+        g_cfx.erange = glGetUniformLocation(r->prog, "uCEnvRange");
+        int ok = g_cfx.fx != -1 && g_cfx.sh[9] != -1 && g_cfx.erange != -1 && g_cfx.dmin != -1;
+        printf("car shading: uniforms %s\n", ok ? "ok" : "MISSING (main program dropped them)");
+        if (!ok) g_cfx.fx = -1;
+    }
+    if (g_cfx.fx == -1) return;
+    glActiveTexture(GL_TEXTURE0 + RENDER_ENV_UNIT);
+    glBindTexture(GL_TEXTURE_2D, render_env_texture());
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1f(g_cfx.fx, 1.0f);
+    g_cfx.active = 1; g_cfx.last = NULL;
+}
+void render_carfx_sh(const float sh[10][4]) {
+    if (!g_cfx.active) return;
+    for (int i = 0; i < 10; i++) glUniform4fv(g_cfx.sh[i], 1, sh[i]);
+}
+static uint32_t g_cfx_swap[8]; static int g_cfx_nswap;
+void render_carfx_swap(const uint32_t *materials, int n) {
+    g_cfx_nswap = n < 0 ? 0 : n > 8 ? 8 : n;
+    for (int i = 0; i < g_cfx_nswap; i++) g_cfx_swap[i] = materials[i];
+}
+int render_carfx_swapped(uint32_t material) {
+    for (int i = 0; material && i < g_cfx_nswap; i++) if (g_cfx_swap[i] == material) return 1;
+    return 0;
+}
+void render_carfx_part(uint32_t material, int cat) {
+    if (!g_cfx.active) return;
+    int swapped = render_carfx_swapped(material);
+    const CarFxMat *m = material && !swapped ? carfx_material(material) : NULL;
+    if (!m) m = swapped || cat == N2_CAR_BODY || cat == N2_CAR_MISC ? carfx_paint() : carfx_default();
+    if (m == g_cfx.last) return;
+    g_cfx.last = m;
+    glUniform4fv(g_cfx.dmin, 1, m->diff_min);
+    glUniform4fv(g_cfx.drange, 1, m->diff_range);
+    glUniform3fv(g_cfx.smin, 1, m->spec_min);
+    glUniform3fv(g_cfx.srange, 1, m->spec_range);
+    glUniform3f(g_cfx.pw, m->spec_pow, m->env_pow, 0.0f);
+    glUniform3fv(g_cfx.emin, 1, m->env_min);
+    glUniform3fv(g_cfx.erange, 1, m->env_range);
+}
+int render_carfx_active(void) { return g_cfx.active; }
+
+/* worldbone.fx vs_1_1 (decoded 10-11): v0 pos, v1 normal, v2 uv, v3 weights,
+   v4 indices into BlendMatrices (16 per slice); the normal goes through the
+   first bone only. r = SH(N) with the car.fx quadratic form, E = the eye
+   direction (unclamped dot), oD0.rgb = (DiffuseMin + DiffuseRange * N.E) *
+   r, oD0.a = DiffuseMin.a + DiffuseRange.a * N.E; ps_1_1: 2 * tex * oD0
+   (with depth of field on, its second pass writes the depth alpha: uDofW). No fog
+   term in the effect. The skinning itself runs on the CPU (nisdraw.c). */
+static const char *VS_BONE =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor;\n"
+    "uniform mat4 uMVP; uniform vec3 uEye;\n"
+    "uniform vec4 uSH0, uSH1, uSH2, uSH3, uSH4, uSH5, uSH6, uSH7, uSH8, uSH9;\n"
+    "uniform vec4 uDMin, uDRange;\n"
+    "varying vec2 vUV; varying vec4 vD; varying float vDepth;\n"
+    "void main(){\n"
+    "  vec3 n=aNor;\n"
+    "  vec4 s=uSH0+uSH1*(n.x*n.x)+uSH2*(n.y*n.y)+uSH3*(n.z*n.z)+uSH4*(n.y*n.x)\n"
+    "        +uSH5*(n.x*n.z)+uSH6*(n.z*n.y)+uSH7*n.x+uSH8*n.y+uSH9*n.z;\n"
+    "  float d=dot(normalize(uEye-aPos),n);\n"
+    "  vec4 dl=uDMin+uDRange*d;\n"
+    "  vD=clamp(vec4(dl.rgb*s.rgb,dl.a),0.0,1.0);\n"
+    "  vUV=aUV; gl_Position=uMVP*vec4(aPos,1.0); vDepth=gl_Position.w; }\n";
+static const char *FS_BONE =
+    GLSL_HEADER
+    "varying vec2 vUV; varying vec4 vD; varying float vDepth;\n"
+    "uniform sampler2D uTex; uniform float uCut, uBlend, uDofW;\n"
+    "void main(){\n"
+    "  vec4 t=texture2D(uTex,vUV);\n"
+    "  if(uCut>0.5 && t.a<0.5) discard;\n"
+    "  gl_FragColor=vec4(clamp(2.0*t.rgb*vD.rgb,0.0,1.0),uBlend>0.5?t.a:" DOF_ALPHA("1.0") "); }\n";
+GLuint render_bone_program(void) {
+    static GLuint prog; static int tried;
+    if (tried) return prog;
+    tried = 1;
+#ifdef __vita__
+    prog = program_cached(VS_BONE, FS_BONE);
+#else
+    prog = glCreateProgram();
+    glAttachShader(prog, compile(GL_VERTEX_SHADER, VS_BONE));
+    glAttachShader(prog, compile(GL_FRAGMENT_SHADER, FS_BONE));
+    glBindAttribLocation(prog, 0, "aPos");
+    glBindAttribLocation(prog, 1, "aUV");
+    glBindAttribLocation(prog, 2, "aNor");
+    glLinkProgram(prog);
+#endif
+    GLint ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    printf("worldbone program: %s\n", ok ? "ok" : "link failed");
+    if (!ok) { glDeleteProgram(prog); prog = 0; }
+    return prog;
+}
+/* worldnodepth.fx (SPEED2.EXE, the Acid particles, aciddraw.c): colour =
+   saturate(2 * tex * vertex colour), alpha = tex * vertex alpha, no fog. */
+static const char *VS_PARTICLE =
+    GLSL_HEADER
+    "attribute vec3 aPos; attribute vec2 aUV; attribute vec4 aColor;\n"
+    "uniform mat4 uMVP;\n"
+    "varying vec2 vUV; varying vec4 vC;\n"
+    "void main(){ vUV=aUV; vC=aColor; gl_Position=uMVP*vec4(aPos,1.0); }\n";
+static const char *FS_PARTICLE =
+    GLSL_HEADER
+    "varying vec2 vUV; varying vec4 vC;\n"
+    "uniform sampler2D uTex;\n"
+    "void main(){ vec4 t=texture2D(uTex,vUV);\n"
+    "  gl_FragColor=vec4(clamp(2.0*t.rgb*vC.rgb,0.0,1.0),t.a*vC.a); }\n";
+GLuint render_particle_program(void) {
+    static GLuint prog; static int tried;
+    if (tried) return prog;
+    tried = 1;
+#ifdef __vita__
+    /* Contiguous locations (colour at 2, RENDER_PARTICLE_COLOR_LOC): with
+       0, 1, 3 vitaGL takes its unaligned-attribute path, and the particles
+       drew as solid saturated squares (vertex colour no longer 0..1). */
+    prog = glCreateProgram();
+    glAttachShader(prog, compile(GL_VERTEX_SHADER, VS_PARTICLE));
+    glAttachShader(prog, compile(GL_FRAGMENT_SHADER, FS_PARTICLE));
+    glBindAttribLocation(prog, 0, "aPos");
+    glBindAttribLocation(prog, 1, "aUV");
+    glBindAttribLocation(prog, RENDER_PARTICLE_COLOR_LOC, "aColor");
+    glLinkProgram(prog);
+#else
+    prog = glCreateProgram();
+    glAttachShader(prog, compile(GL_VERTEX_SHADER, VS_PARTICLE));
+    glAttachShader(prog, compile(GL_FRAGMENT_SHADER, FS_PARTICLE));
+    glBindAttribLocation(prog, 0, "aPos");
+    glBindAttribLocation(prog, 1, "aUV");
+    glBindAttribLocation(prog, RENDER_PARTICLE_COLOR_LOC, "aColor");
+    glLinkProgram(prog);
+#endif
+    GLint ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    printf("worldnodepth program: %s\n", ok ? "ok" : "link failed");
+    if (!ok) { glDeleteProgram(prog); prog = 0; }
+    return prog;
+}
+void render_carfx_end(void) {
+    carfx_use_paint(0);   /* a car's own paint material ends with its pass */
+    if (!g_cfx.active) return;
+    glUniform1f(g_cfx.fx, 0.0f);
+    g_cfx.active = 0;
+}
+
 void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) {
     const GLint loc[]={r->uUseTex,r->uAlphaTest,r->uTextureAlpha,r->uAlpha,r->uDecal,
                        r->uRimTint,r->uSpec,r->uEnv,r->uClearcoat};
@@ -1330,7 +3388,8 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
     glUniform1f(r->uTextureAlpha,translucent?1.0f:0.0f);
     glUniform1f(r->uAlpha,1.0f);glUniform1f(r->uDecal,0.0f);
     uint32_t material=mesh->car_material;
-    if (!texture || (material!=N2_MAT_MAGSILVER && material!=N2_MAT_MAGCHROME))
+    if (!texture || (material!=N2_MAT_MAGSILVER && material!=N2_MAT_MAGCHROME &&
+                     !render_carfx_swapped(material)))
         glUniform1f(r->uRimTint,0.0f);
     if (material==N2_MAT_RUBBER || material==N2_MAT_INTERIOR || material==N2_MAT_DULLPLASTIC) {
         glUniform1f(r->uSpec,0.0f);glUniform1f(r->uEnv,0.0f);
@@ -1339,6 +3398,7 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
     glEnable(GL_DEPTH_TEST);glDepthMask(translucent?GL_FALSE:GL_TRUE);
     if(translucent){glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);}
     else glDisable(GL_BLEND);
+    render_carfx_part(mesh->car_material, mesh->cat);
     draw_gpumesh(mesh);
     for(int i=0;i<9;i++)glUniform1f(loc[i],saved[i]);
     glBindTexture(GL_TEXTURE_2D,(GLuint)oldtex);
@@ -1402,6 +3462,46 @@ int render_car_glass_order(const N2Scene *scene,const float mvp[16],int *order) 
 #  define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
 #endif
 int g_tex_s3tc = 0;
+int g_world_dxt = 1;
+int render_world_dxt_enabled(void) { return g_world_dxt && g_tex_s3tc; }
+
+int render_dxt_base_plan(const N2Tex *t, int *w, int *h, int *offset, int *bytes) {
+    if (!t || t->prehalved || !t->dxt || (t->dxtfmt != 1 && t->dxtfmt != 3 && t->dxtfmt != 5) ||
+        t->w < 4 || t->h < 4 || t->w > 2048 || t->h > 2048 ||
+        (t->w & (t->w-1)) || (t->h & (t->h-1))) return 0;
+    int bpb = t->dxtfmt == 1 ? 8 : 16;
+    int tw = t->w, th = t->h, off = 0;
+    int size = (tw/4)*(th/4)*bpb;
+    if (t->dxtlen < size) return 0;
+    if (tw >= 64 && th >= 64) {
+        /* Use the authored half-resolution level, matching existing detail.
+         * Never expand GPU residency just because the source lacks that mip. */
+        off = size; tw /= 2; th /= 2;
+        size = (tw/4)*(th/4)*bpb;
+        if (t->dxtlen - off < size) return 0;
+    }
+    *w = tw; *h = th; *offset = off; *bytes = size;
+    return 1;
+}
+
+void render_dxt_plan_selftest(void) {
+    unsigned char sentinel = 0; N2Tex t = {0};
+    int w,h,off,bytes;
+    t.dxt = &sentinel; t.dxtfmt = 1; t.w = 64; t.h = 128; t.dxtlen = 5120;
+    assert(render_dxt_base_plan(&t,&w,&h,&off,&bytes));
+    assert(w == 32 && h == 64 && off == 4096 && bytes == 1024);
+    t.dxtlen--;
+    assert(!render_dxt_base_plan(&t,&w,&h,&off,&bytes));
+    t.w = 4; t.h = 8; t.dxtfmt = 3; t.dxtlen = 32;
+    assert(render_dxt_base_plan(&t,&w,&h,&off,&bytes) && off == 0 && bytes == 32);
+    t.dxtfmt = 5;
+    assert(render_dxt_base_plan(&t,&w,&h,&off,&bytes));
+    t.w = 2; assert(!render_dxt_base_plan(&t,&w,&h,&off,&bytes));
+    t.w = 7; assert(!render_dxt_base_plan(&t,&w,&h,&off,&bytes));
+    t.w = 4096; assert(!render_dxt_base_plan(&t,&w,&h,&off,&bytes));
+    t.w = 4; t.prehalved = 1;
+    assert(!render_dxt_base_plan(&t,&w,&h,&off,&bytes));
+}
 int   g_tex_aniso_max = 1;
 float g_tex_aniso     = 1.0f;
 #define GL_TEXTURE_MAX_ANISOTROPY_EXT_    0x84FE
@@ -1444,7 +3544,80 @@ void render_texture_detail(float aniso) {
     glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
 }
 
+#ifdef __vita__
+/* Patched vitaGL (vita/lib): uploads a whole compressed mip chain in one
+   allocation. Weak so the stock library (VGL=stock) still links; then the
+   single-level path below is used. */
+extern GLboolean vglCompressedTexImageChainUG2(GLenum internalFormat, GLsizei width,
+                                               GLsizei height, GLint levels,
+                                               const void *data) __attribute__((weak));
+/* 1 = DXT world textures get their stored mip chain (down to 4x4). Off when
+   ux0:data/OpenUG2/nomips.txt exists, for A/B checks without a rebuild. */
+static int g_tex_mips = -1;
+long g_tex_mip_count, g_tex_mip_bytes, g_tex_flat_count;
+static int tex_mips_enabled(void) {
+    if (g_tex_mips < 0) {
+        FILE *f = fopen("ux0:data/OpenUG2/nomips.txt", "rb");
+        g_tex_mips = (f == NULL) && vglCompressedTexImageChainUG2 != NULL;
+        if (f) fclose(f);
+        printf("texture mips: %s\n", g_tex_mips ? "DXT chains to 4x4 (LINEAR_MIPMAP_NEAREST)"
+               : vglCompressedTexImageChainUG2 ? "off (nomips.txt)" : "off (stock vitaGL)");
+    }
+    return g_tex_mips;
+}
+/* Levels available from the planned base level down to 4x4. */
+static int dxt_chain_levels(const N2Tex *t, int w, int h, int offset) {
+    int bpb = t->dxtfmt == 1 ? 8 : 16, n = 0, off = offset;
+    while (w >= 4 && h >= 4 && n < 12) {
+        int sz = (w/4) * (h/4) * bpb;
+        if (off + sz > t->dxtlen) break;
+        off += sz; n++; w /= 2; h /= 2;
+    }
+    return n;
+}
+#endif
+
 GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
+#ifdef __vita__
+    int dw, dh, offset, bytes;
+    if (g_tex_s3tc && render_dxt_base_plan(t, &dw, &dh, &offset, &bytes)) {
+        GLenum fmt = t->dxtfmt == 1 ? GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+                   : t->dxtfmt == 3 ? GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+                                   : GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
+        GLuint id = 0; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
+        int levels = tex_mips_enabled() ? dxt_chain_levels(t, dw, dh, offset) : 0;
+        if (levels > 1) {
+            /* Filter first: the chain upload sets the GXM mip count from it.
+               Bilinear within the nearest level -- trilinear is half rate. */
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            if (vglCompressedTexImageChainUG2(fmt, dw, dh, levels, t->dxt + offset) &&
+                vglGetTexDataPointer(GL_TEXTURE_2D)) {
+                int bpb = t->dxtfmt == 1 ? 8 : 16, w = dw, h = dh;
+                for (int l = 0; l < levels; l++, w /= 2, h /= 2)
+                    g_tex_mip_bytes += (long)(w/4) * (h/4) * bpb;
+                g_tex_mip_count++;
+                return id;
+            }
+            /* allocation failed: fall through to the single level */
+        }
+        g_tex_flat_count++;
+        /* Exactly one level: no compressed mip reallocation or sub-block tails. */
+        glCompressedTexImage2D(GL_TEXTURE_2D, 0, fmt, dw, dh, 0, bytes, t->dxt + offset);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        if (!vglGetTexDataPointer(GL_TEXTURE_2D) || glGetError() != GL_NO_ERROR) {
+            if (id) glDeleteTextures(1, &id);
+            return 0;
+        }
+        return id;
+    }
+    return t->rgb ? upload_tex(t) : 0;
+#else
     if (g_tex_s3tc && t->dxtfmt && t->dxt && t->dxtlen > 0) {
         GLenum fmt = (t->dxtfmt == 3) ? GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
                    : (t->dxtfmt == 5) ? GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
@@ -1458,6 +3631,33 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
            base-only LINEAR filter -- which only ever samples level 0, so a short
            chain can never leave the texture incomplete/black. */
         int lw = t->w, lh = t->h, off = 0, level = 0, complete = 0;
+#ifdef __vita__
+        /* PS Vita: (1) skip the full-size level of 64px+ textures -- a quarter
+           of the texture memory, which is what lets the world fit in VRAM at
+           all; (2) stop the chain at 4x4. vitaGL sizes its mip-chain buffer
+           with sub-block levels smaller than one DXT block, so uploading the
+           2x2/1x1 levels wrote a block past the end of the allocation and
+           corrupted the heap once textures spilled out of the GPU pools. */
+        int skip = (t->w >= 64 && t->h >= 64) ? 1 : 0, src_level = 0;
+        for (;;) {
+            int bw = lw < 4 ? 1 : lw/4, bh = lh < 4 ? 1 : lh/4;
+            int sz = bw * bh * bpb;
+            if (off + sz > t->dxtlen) break;
+            if (lw < 4 || lh < 4) { complete = level > 0; break; }
+            if (src_level >= skip) {
+                glCompressedTexImage2D(GL_TEXTURE_2D, level, fmt, lw, lh, 0, sz, t->dxt + off);
+                level++;
+            }
+            off += sz; src_level++;
+            if (lw > 1) lw /= 2; if (lh > 1) lh /= 2;
+        }
+        if (!level) {   /* tiny (<4px) texture: one block, no chain to miscount */
+            int sz = bpb;
+            if (sz <= t->dxtlen)
+                glCompressedTexImage2D(GL_TEXTURE_2D, 0, fmt, t->w, t->h, 0, sz, t->dxt);
+            complete = 0;
+        }
+#else
         for (;;) {
             int bw = lw < 4 ? 1 : lw/4, bh = lh < 4 ? 1 : lh/4;
             int sz = bw * bh * bpb;
@@ -1467,6 +3667,7 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
             if (lw == 1 && lh == 1) { complete = 1; break; }
             if (lw > 1) lw /= 2; if (lh > 1) lh /= 2;
         }
+#endif
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
@@ -1476,21 +3677,81 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
         return id;
     }
     return upload_tex(t);   /* portable fallback: CPU-decoded RGBA + mipmaps */
+#endif
 }
+
+#ifdef __vita__
+void render_prehalve_tex(N2Tex *t) {
+    int w = t->w, h = t->h;
+    if (t->prehalved || !t->rgb || w < 64 || h < 64 || (w & 1) || (h & 1)) return;
+    int hw = w / 2, hh = h / 2;
+    unsigned char *hr = (unsigned char *)malloc((size_t)hw * hh * 3);
+    unsigned char *ha = t->alpha ? (unsigned char *)malloc((size_t)hw * hh) : NULL;
+    if (!hr || (t->alpha && !ha)) { free(hr); free(ha); return; }
+    for (int y = 0; y < hh; y++)
+        for (int x = 0; x < hw; x++) {
+            long a = (long)(2*y) * w + 2*x, b = a + 1, c = a + w, d = c + 1, o = (long)y * hw + x;
+            for (int k = 0; k < 3; k++)
+                hr[o*3+k] = (unsigned char)((t->rgb[a*3+k] + t->rgb[b*3+k] +
+                                             t->rgb[c*3+k] + t->rgb[d*3+k] + 2) >> 2);
+            if (ha) ha[o] = (unsigned char)((t->alpha[a] + t->alpha[b] +
+                                             t->alpha[c] + t->alpha[d] + 2) >> 2);
+        }
+    free(t->rgb); free(t->alpha);
+    t->rgb = hr; t->alpha = ha; t->w = hw; t->h = hh; t->prehalved = 1;
+}
+#endif
 
 GLuint upload_tex(const N2Tex *t) {
     GLuint id = 0; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
-    if (t->alpha) {   /* interleave the decal-mask plane -> RGBA */
-        unsigned char *px = (unsigned char *)malloc((size_t)t->w * t->h * 4);
-        if (!px) { glDeleteTextures(1, &id); return 0; }
-        for (long p = 0; p < (long)t->w * t->h; p++) {
-            px[p*4]=t->rgb[p*3]; px[p*4+1]=t->rgb[p*3+1];
-            px[p*4+2]=t->rgb[p*3+2]; px[p*4+3]=t->alpha[p];
+    int w = t->w, h = t->h;
+    const unsigned char *rgb = t->rgb, *alpha = t->alpha;
+#ifdef __vita__
+    /* PS Vita: halve 64px+ textures (2x2 box filter) before upload. Most
+       world textures are 8-bit palettized in the data, so they arrive here
+       as full RGB and, uncompressed, filled the whole of VRAM by themselves.
+       Same trade as dropping the top level of the DXT ones. */
+    unsigned char *half_rgb = NULL, *half_alpha = NULL;
+    if (rgb && !t->prehalved && w >= 64 && h >= 64 && !(w & 1) && !(h & 1)) {
+        int hw = w / 2, hh = h / 2;
+        half_rgb = (unsigned char *)malloc((size_t)hw * hh * 3);
+        half_alpha = alpha ? (unsigned char *)malloc((size_t)hw * hh) : NULL;
+        if (half_rgb && (!alpha || half_alpha)) {
+            for (int y = 0; y < hh; y++)
+                for (int x = 0; x < hw; x++) {
+                    long a = (long)(2*y) * w + 2*x, b = a + 1, c = a + w, d = c + 1;
+                    long o = (long)y * hw + x;
+                    for (int k = 0; k < 3; k++)
+                        half_rgb[o*3+k] = (unsigned char)((rgb[a*3+k] + rgb[b*3+k] +
+                                                           rgb[c*3+k] + rgb[d*3+k] + 2) / 4);
+                    if (half_alpha)
+                        half_alpha[o] = (unsigned char)((alpha[a] + alpha[b] +
+                                                         alpha[c] + alpha[d] + 2) / 4);
+                }
+            rgb = half_rgb; alpha = half_alpha; w = hw; h = hh;
         }
-        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,t->w,t->h,0,GL_RGBA,GL_UNSIGNED_BYTE,px);
+    }
+#endif
+    if (alpha) {   /* interleave the decal-mask plane -> RGBA */
+        unsigned char *px = (unsigned char *)malloc((size_t)w * h * 4);
+        if (!px) {
+            glDeleteTextures(1, &id);
+#ifdef __vita__
+            free(half_rgb); free(half_alpha);
+#endif
+            return 0;
+        }
+        for (long p = 0; p < (long)w * h; p++) {
+            px[p*4]=rgb[p*3]; px[p*4+1]=rgb[p*3+1];
+            px[p*4+2]=rgb[p*3+2]; px[p*4+3]=alpha[p];
+        }
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,px);
         free(px);
     } else
-        glTexImage2D(GL_TEXTURE_2D,0,GL_RGB,t->w,t->h,0,GL_RGB,GL_UNSIGNED_BYTE,t->rgb);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGB,w,h,0,GL_RGB,GL_UNSIGNED_BYTE,rgb);
+#ifdef __vita__
+    free(half_rgb); free(half_alpha);
+#endif
     glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT);

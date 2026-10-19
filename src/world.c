@@ -1,15 +1,26 @@
 /* world.c — OpenUG2 World module implementation. */
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <ctype.h>
 #include <math.h>
 #include <limits.h>
+#include <dirent.h>
+#include <strings.h>
 
 #include "world.h"
+#include "world_tiles.h"
 #include "physics.h"
 #include "resource.h"
+
+#ifdef __vita__
+void vita_mark(const char *fmt, ...);
+#define VMARK(...) vita_mark(__VA_ARGS__)
+#else
+#define VMARK(...) ((void)0)
+#endif
 
 static void grid_build(World *w);
 static void nav_build_adj(World *w);
@@ -17,9 +28,7 @@ static void nav_build_adj(World *w);
 static void world_scene_free(N2Scene *scene) {
     if (!scene) return;
     for (int i = 0; i < scene->count; i++) {
-        free(scene->meshes[i].verts);
-        free(scene->meshes[i].idx);
-        free(scene->meshes[i].vcol);
+        n2_mesh_geometry_release(&scene->meshes[i]);
     }
     free(scene->meshes);
     memset(scene, 0, sizeof *scene);
@@ -32,9 +41,9 @@ void world_neighborhood_free(WorldNeighborhood *neighborhood) {
     world_scene_free(&neighborhood->vista);
     for (int i = 0; i < WORLD_MAXREG; i++) {
         free(neighborhood->rgn[i].tpk.blk);
-        free(neighborhood->rgn[i].data);
+        if (!neighborhood->rgn[i].pinned) free(neighborhood->rgn[i].data);
     }
-    free(neighborhood->loc4);
+    if (!neighborhood->loc4_shared) free(neighborhood->loc4);
     free(neighborhood->mastertpk.blk);
     if (neighborhood->master_mapped)
         res_unmap_file(neighborhood->master, neighborhood->masterlen);
@@ -42,6 +51,8 @@ void world_neighborhood_free(WorldNeighborhood *neighborhood) {
         free(neighborhood->master);
     free(neighborhood->commontpk.blk);
     free(neighborhood->common);
+    free(neighborhood->adstpk.blk);
+    free(neighborhood->ads);
     free(neighborhood->grass.rgb);
     free(neighborhood->grass.alpha);
     free(neighborhood->grass.dxt);
@@ -125,7 +136,16 @@ static int world_dedup(World *w) {
     float (*bb)[6] = (float (*)[6])malloc((size_t)nm * sizeof *bb);
     int   *ord     = (int *)malloc((size_t)nm * sizeof *ord);
     char  *drop    = (char *)calloc((size_t)nm, 1);
-    for (int i = 0; i < nm; i++) { n2_mesh_bbox(&s->meshes[i], bb[i]); ord[i] = i; }
+    for (int i = 0; i < nm; i++) {
+        if (s->meshes[i].world_bounds_valid) {
+            for (int k = 0; k < 3; k++) {
+                bb[i][2*k] = s->meshes[i].world_bounds[k];
+                bb[i][2*k+1] = s->meshes[i].world_bounds[k+3];
+            }
+        }
+        else n2_mesh_bbox(&s->meshes[i], bb[i]);
+        ord[i] = i;
+    }
 
     dd_s = s; dd_bb = (const float (*)[6])bb;
     qsort(ord, (size_t)nm, sizeof *ord, dd_cmp);
@@ -136,6 +156,18 @@ static int world_dedup(World *w) {
         for (int k = i + 1; k < j; k++) { drop[ord[k]] = 1; droptri += s->meshes[ord[k]].nidx / 3; }
         i = j;
     }
+
+    /* Survivors are still in exact-key order here. Verify uniqueness before
+       moving/freeing meshes, using the existing bounds and sort instead of
+       computing every bbox and sorting the complete scene a second time. */
+    int residual = 0, previous = -1;
+    for (int i = 0; i < nm; i++) {
+        int index = ord[i];
+        if (drop[index]) continue;
+        if (previous >= 0 && dd_same(previous, index)) residual++;
+        previous = index;
+    }
+    assert(residual == 0);
 
     /* new index = count of survivors before this original slot */
     int *keptbefore = (int *)malloc((size_t)(nm + 1) * sizeof *keptbefore);
@@ -148,8 +180,7 @@ static int world_dedup(World *w) {
 
     int wr = 0;
     for (int i = 0; i < nm; i++) {
-        if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx);
-                       free(s->meshes[i].vcol); continue; }
+        if (drop[i]) { n2_mesh_geometry_release(&s->meshes[i]); continue; }
         if (wr != i) s->meshes[wr] = s->meshes[i];
         wr++;
     }
@@ -159,21 +190,6 @@ static int world_dedup(World *w) {
     assert(wr == keptbefore[nm]);
     for (int r = 0; r < w->neighborhood.nreg; r++)
         assert(w->neighborhood.rgn[r].mesh0 <= w->neighborhood.rgn[r].mesh1 && w->neighborhood.rgn[r].mesh1 <= wr);
-
-    /* z-fight proof: rebuild the key over survivors and confirm none collide.
-       Cheap (load-time, one pass) and it is the actual deliverable — if this
-       ever fires, duplicates slipped through and --track ALL will z-fight. */
-    int residual = 0;
-    {
-        float (*bb2)[6] = (float (*)[6])malloc((size_t)wr * sizeof *bb2);
-        int   *ord2     = (int *)malloc((size_t)wr * sizeof *ord2);
-        for (int i = 0; i < wr; i++) { n2_mesh_bbox(&s->meshes[i], bb2[i]); ord2[i] = i; }
-        dd_s = s; dd_bb = (const float (*)[6])bb2;
-        qsort(ord2, (size_t)wr, sizeof *ord2, dd_cmp);
-        for (int i = 1; i < wr; i++) if (dd_same(ord2[i-1], ord2[i])) residual++;
-        free(bb2); free(ord2);
-    }
-    assert(residual == 0);
 
     free(bb); free(ord); free(drop); free(keptbefore);
     printf("dedup: %d -> %d meshes (dropped %d duplicates, %ld triangles); "
@@ -245,7 +261,32 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
     w->neighborhood.nreg = nreg;
 
     char loc4p[1024]; snprintf(loc4p, sizeof loc4p, "%s/LOC4DYNTEX.BIN", troot);
+#ifdef __vita__
+    {   /* 3.5 MB that never changes and is only read: one buffer, read from
+           the card once and borrowed by every build. A private copy per build
+           needed a contiguous 3.4 MB block the fragmented heap often lacked. */
+        static unsigned char *loc4_cache; static long loc4_cache_len; static char loc4_cache_path[1024];
+        if (!loc4_cache || strcmp(loc4_cache_path, loc4p)) {
+            free(loc4_cache);
+            loc4_cache = n2_read_file(loc4p, &loc4_cache_len);
+            snprintf(loc4_cache_path, sizeof loc4_cache_path, "%s", loc4p);
+        }
+        w->neighborhood.loc4 = loc4_cache;
+        w->neighborhood.loc4len = loc4_cache ? loc4_cache_len : 0;
+        w->neighborhood.loc4_shared = loc4_cache != NULL;
+    }
+#else
     w->neighborhood.loc4 = n2_read_file(loc4p, &w->neighborhood.loc4len);
+#endif
+    w->neighborhood.ads = n2_read_global_ads(troot, &w->neighborhood.adslen);
+    if (w->neighborhood.ads) {
+        w->neighborhood.adstpk = n2_tpk_open(w->neighborhood.ads, w->neighborhood.adslen);
+        w->neighborhood.nadskeys = n2_tpk_keys(w->neighborhood.ads,
+            w->neighborhood.adstpk, w->neighborhood.adskeys, 32);
+    }
+    VMARK("  regional ads: %d keys; Best Buy %s", w->neighborhood.nadskeys,
+          n2_resolve_key(0xde510e5fu, w->neighborhood.adskeys,
+                         w->neighborhood.nadskeys) ? "inventoried" : "unavailable");
 
     /* per-region: own TPK keys + shared LOC4 keys pick each mesh's diffuse
        slot; single-region mode also pulls a big "master" neighbour's TPK for
@@ -255,9 +296,34 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         WRegion *g = &w->neighborhood.rgn[r];
         snprintf(g->name, sizeof g->name, "%s", regs[r]);
         char trackp[1024]; snprintf(trackp, sizeof trackp, "%s/%s.BUN", troot, regs[r]);
-        g->data = n2_read_file(trackp, &g->len);
+#ifdef __vita__
+        /* decide on world tiles BEFORE taking the pinned bundle: switching
+           them on strips (reallocates) it */
+        if (nreg == 1) (void)world_tiles_enabled(regs[r]);
+        g->data = res_bundle(trackp, &g->len);    /* pinned, shared by every build */
+        g->pinned = g->data != NULL;
+        if (!g->data)
+#endif
+        g->data = res_take(trackp, &g->len);      /* startup may have read it already */
+        if (!g->data) g->data = n2_read_file(trackp, &g->len);
         g->mesh0 = g->mesh1 = w->neighborhood.scene.count;
         if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); continue; }
+        VMARK("  region %s in memory (%ld MB)", regs[r], g->len >> 20);
+#ifdef __vita__
+        /* The pinned bundle never changes, so its light list (a whole-bundle
+           scan plus an O(n^2) de-duplication) is built once and copied. */
+        static const unsigned char *lights_src; static N2LightSrc *lights_cache; static int nlights_cache;
+        static unsigned lights_gen;
+        if (g->pinned && nreg == 1 && lights_cache && lights_src == g->data && lights_gen == res_pin_gen() &&
+            w->neighborhood.nlights == 0) {
+            w->neighborhood.lights = (N2LightSrc *)malloc((size_t)(nlights_cache ? nlights_cache : 1) *
+                                                          sizeof *lights_cache);
+            if (w->neighborhood.lights) {
+                memcpy(w->neighborhood.lights, lights_cache, (size_t)nlights_cache * sizeof *lights_cache);
+                w->neighborhood.nlights = w->neighborhood.lightcap = nlights_cache;
+            }
+        } else
+#endif
         {
             const int light_cap = 8192;
             N2LightSrc *lights = (N2LightSrc *)malloc(
@@ -268,12 +334,37 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
                 world_append_lights(w, lights, nlight);
                 free(lights);
             }
+#ifdef __vita__
+            if (g->pinned && nreg == 1) {
+                free(lights_cache);
+                lights_cache = (N2LightSrc *)malloc((size_t)(w->neighborhood.nlights ? w->neighborhood.nlights : 1) *
+                                                    sizeof *lights_cache);
+                if (lights_cache) {
+                    memcpy(lights_cache, w->neighborhood.lights,
+                           (size_t)w->neighborhood.nlights * sizeof *lights_cache);
+                    nlights_cache = w->neighborhood.nlights; lights_src = g->data; lights_gen = res_pin_gen();
+                }
+            }
+#endif
         }
         g->tpk = n2_tpk_open(g->data, g->len);
-        int ntk = n2_tpk_keys(g->data, g->tpk, tkeys, 16384);
-        if (w->neighborhood.loc4 && ntk < 16384)
-            ntk += n2_car_tex_keys(w->neighborhood.loc4, w->neighborhood.loc4len, tkeys + ntk, 16384 - ntk);
-        if (nreg == 1 && g->len > 8L*1024*1024 && g->len < 60L*1024*1024) {
+        long size_on_disk = g->len;
+#ifdef __vita__
+        if (g->pinned) size_on_disk = res_bundle_file_len();   /* compact copy is smaller */
+#endif
+        int ntk = 0;
+        /* The key list only feeds the master pick and the non-instance mesh
+           walk; a pinned instance build uses neither. */
+        if (!instance_world || !(nreg == 1 && size_on_disk >= 60L*1024*1024)) {
+            ntk = n2_tpk_keys(g->data, g->tpk, tkeys, 16384);
+            if (w->neighborhood.loc4 && ntk < 16384)
+                ntk += n2_car_tex_keys(w->neighborhood.loc4, w->neighborhood.loc4len, tkeys + ntk, 16384 - ntk);
+        }
+        /* Not for an instance world (the drag / drift venues L4RB, L4RC): every
+           texture their scenes use is in their own bundle or LOC4DYNTEX (PC
+           probe 10-11: 0 keys found only in STREAML4RD), and on the Vita the
+           115 MB STREAML4RD read can never fit -- it failed once per build. */
+        if (!instance_world && nreg == 1 && size_on_disk > 8L*1024*1024 && size_on_disk < 60L*1024*1024) {
             /* Location-4 shared library; use the other big region if we ARE it */
             const char *mn = strcmp(regs[r], "STREAML4RD") ? "STREAML4RD" : "STREAML4RA";
             char mp[1024]; snprintf(mp, sizeof mp, "%s/%s.BUN", troot, mn);
@@ -286,11 +377,43 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
             }
         }
         if (!instance_world) {
+            for (int i = 0; i < w->neighborhood.nadskeys && ntk < 16384; i++)
+                tkeys[ntk++] = w->neighborhood.adskeys[i];
             n2_vista_out = &w->neighborhood.vista;      /* backdrop impostors go here, not away */
             n2_walk_meshes(g->data, 0, g->len, &w->neighborhood.scene, tkeys, ntk);
             n2_vista_out = NULL;
         }
         g->mesh1 = w->neighborhood.scene.count;
+#ifdef __vita__
+        if (!w->neighborhood.have_grass && g->pinned) {
+            /* decoded once per pinned bundle, then copied */
+            static const unsigned char *grass_src; static N2Tex grass_cache; static int grass_ok = -1;
+            static unsigned grass_gen;
+            if (grass_ok < 0 || grass_src != g->data || grass_gen != res_pin_gen()) {
+                grass_gen = res_pin_gen();
+                free(grass_cache.rgb); free(grass_cache.alpha); free(grass_cache.dxt);
+                memset(&grass_cache, 0, sizeof grass_cache);
+                grass_ok = n2_load_texture(g->data, g->len, "TRN_GRASSC", &grass_cache);
+                grass_src = g->data;
+            }
+            if (grass_ok) {
+                N2Tex t = grass_cache;
+                size_t px = (size_t)t.w * (size_t)t.h;
+                t.rgb = grass_cache.rgb ? malloc(px * 3) : NULL;
+                t.alpha = grass_cache.alpha ? malloc(px) : NULL;
+                t.dxt = grass_cache.dxt ? malloc((size_t)grass_cache.dxtlen) : NULL;
+                if ((grass_cache.rgb && !t.rgb) || (grass_cache.alpha && !t.alpha) ||
+                    (grass_cache.dxt && !t.dxt)) {
+                    free(t.rgb); free(t.alpha); free(t.dxt);
+                } else {
+                    if (t.rgb) memcpy(t.rgb, grass_cache.rgb, px * 3);
+                    if (t.alpha) memcpy(t.alpha, grass_cache.alpha, px);
+                    if (t.dxt) memcpy(t.dxt, grass_cache.dxt, (size_t)grass_cache.dxtlen);
+                    w->neighborhood.grass = t; w->neighborhood.have_grass = 1;
+                }
+            }
+        }
+#endif
         if (!w->neighborhood.have_grass)
             w->neighborhood.have_grass = n2_load_texture(g->data, g->len, "TRN_GRASSC", &w->neighborhood.grass);
         if (!instance_world) {
@@ -306,12 +429,36 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
 
     if (instance_world) {
         const char *bundle_names[WORLD_MAXREG];
-        for (int r = 0; r < nreg; r++) bundle_names[r] = regs[r];
-        if (!world_instance_build_for_event(&w->neighborhood.scene, &w->neighborhood.vista, troot,
+        for (int r = 0; r < nreg; r++) {
+            bundle_names[r] = regs[r];
+            world_instance_lend_bundle(regs[r], w->neighborhood.rgn[r].data, w->neighborhood.rgn[r].len);
+        }
+        int built = 0;
+#ifdef __vita__
+        /* prebuilt tiles: read and share instead of placing */
+        if (nreg == 1 && world_tiles_enabled(regs[0])) {
+            built = world_tiles_assemble(&w->neighborhood.scene, &w->neighborhood.vista, troot, regs[0],
+                                         options->focus_x, options->focus_y, options->view_radius,
+                                         options->scenery_event, &w->neighborhood.inst_stats) > 0;
+            if (!built) {   /* the bundle is stripped of models: no old-style build to fall back on */
+                world_scene_free(&w->neighborhood.scene); world_scene_free(&w->neighborhood.vista);
+                printf("world tiles: assembly failed; this area waits for the next build\n");
+                return 0;
+            }
+        }
+#endif
+        if (!built) {
+        VMARK("  instance build start");
+        built = world_instance_build_for_event(&w->neighborhood.scene, &w->neighborhood.vista, troot,
                                   bundle_names, nreg,
                                   options->focus_x, options->focus_y,
                                   options->view_radius,
-                                  w->neighborhood.loc4, w->neighborhood.loc4len, &w->neighborhood.inst_stats, options->scenery_event)) {
+                                  w->neighborhood.loc4, w->neighborhood.loc4len, &w->neighborhood.inst_stats, options->scenery_event);
+        }
+        world_instance_lend_bundle(NULL, NULL, 0);
+        VMARK("  instance build done: %d", built);
+        if (built && world_build_aborted()) return 0;
+        if (!built) {
             fprintf(stderr, "instance world: no complete home district at "
                             "(%.1f, %.1f)\n",
                     options->focus_x, options->focus_y);
@@ -343,6 +490,9 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
        This handles the overlapping-superset bundles under --track ALL: the 8
        bundles re-ship the same tiles byte-identically, so the exact key
        (texkey,bbox,tri,vert) fuses them to one clean layer (residual == 0). */
+    /* Normalize before comparing cached and freshly placed ground. */
+    for (int i=0; i<w->neighborhood.scene.count; i++)
+        n2_mesh_bias_terrain(&w->neighborhood.scene.meshes[i]);
     world_dedup(w);
 
     /* Terrain/road de-fighting (Phase 73.5). The paved ROAD strips and the
@@ -359,8 +509,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
        units; distant coplanar ground fades into fog before it can shimmer. */
     for (int i = 0; i < w->neighborhood.scene.count; i++) {
         N2Mesh *m = &w->neighborhood.scene.meshes[i];
-        if (m->cat != N2_TERRAIN) continue;
-        for (int v = 0; v < m->nverts; v++) m->verts[v*5+2] -= 0.05f;
+        n2_mesh_bias_terrain(m);
     }
 
     /* per-mesh XY bounds — the draw cull and the ground grid both key off it */
@@ -368,6 +517,12 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
     w->neighborhood.mbb = (float (*)[4])malloc((size_t)nm * 4 * sizeof(float));
     for (int i = 0; i < nm; i++) {
         N2Mesh *m = &w->neighborhood.scene.meshes[i];
+        if (m->world_bounds_valid) {
+            float *bb = w->neighborhood.mbb[i];
+            bb[0] = m->world_bounds[0]; bb[1] = m->world_bounds[1];
+            bb[2] = m->world_bounds[3]; bb[3] = m->world_bounds[4];
+            continue;
+        }
         float x0=1e30f, y0=1e30f, x1=-1e30f, y1=-1e30f;
         for (int v = 0; v < m->nverts; v++) {
             float *p = m->verts + v*5;
@@ -377,6 +532,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         w->neighborhood.mbb[i][0]=x0; w->neighborhood.mbb[i][1]=y0; w->neighborhood.mbb[i][2]=x1; w->neighborhood.mbb[i][3]=y1;
     }
     grid_build(w);
+    VMARK("  dedup + ground grid done");
     /* Shared gameplay textures (e.g. STARTLINE) live outside TRACKS. Instance
        prototype material matching already inventories this archive during
        its build; retain the bytes here as the final texture-resolution source,
@@ -384,7 +540,17 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
     char commonp[1024];
     int plen = snprintf(commonp, sizeof commonp, "%s/../GLOBAL/InGameCommon.bun", troot);
     if (plen >= 0 && (size_t)plen < sizeof commonp) {
+#ifdef __vita__
+        /* same 1.6 MB file every streamed build: read the card once */
+        static unsigned char *common_cache; static long common_cache_len;
+        if (!common_cache) common_cache = n2_read_file(commonp, &common_cache_len);
+        if (common_cache && (w->neighborhood.common = (unsigned char *)malloc((size_t)common_cache_len))) {
+            memcpy(w->neighborhood.common, common_cache, (size_t)common_cache_len);
+            w->neighborhood.commonlen = common_cache_len;
+        }
+#else
         w->neighborhood.common = n2_read_file(commonp, &w->neighborhood.commonlen);
+#endif
         if (w->neighborhood.common) w->neighborhood.commontpk = n2_tpk_open(w->neighborhood.common, w->neighborhood.commonlen);
     }
     if (options) {
@@ -413,8 +579,11 @@ int world_city_load(WorldCity *city,
     World facade;
     memset(&facade, 0, sizeof facade);
     facade.neighborhood = *initial_neighborhood;
+    VMARK("  city: events");
     world_load_events(&facade, troot);   /* tags nodes loaded immediately after */
+    VMARK("  city: nav");
     world_load_nav(&facade, troot);
+    VMARK("  city: nav done");
     nav_build_adj(&facade);
     world_set_mode(&facade, MODE_FREEROAM, -1);
     world_build_districts(&facade);
@@ -456,6 +625,13 @@ static int world_texture_decode(const World *w, const WRegion *g,
         int ok = n2_tpk_decode(w->neighborhood.common, w->neighborhood.commonlen, w->neighborhood.commontpk, key, tex);
         if (ok && g_world_texaudit)
             printf("TEXSOURCE key %08x  GLOBAL/InGameCommon.bun\n", key);
+        /* Only inspect the ad archive for its own keys, after every original
+           source has had its chance. No additional world pass is needed. */
+        if (!ok && n2_resolve_key(key, w->neighborhood.adskeys, w->neighborhood.nadskeys)) {
+            ok = n2_tpk_decode(w->neighborhood.ads, w->neighborhood.adslen,
+                               w->neighborhood.adstpk, key, tex);
+            if (ok && g_world_texaudit) printf("TEXSOURCE key %08x  GLOBAL/GlobalTextures\n", key);
+        }
         return ok;
     }
     int ok = n2_tpk_decode(g->data, g->len, g->tpk, key, tex);
@@ -474,10 +650,9 @@ static int world_texture_decode(const World *w, const WRegion *g,
  * Neighboring residents request mostly the same textures. Keep the uploaded
  * images (and final misses) instead of decoding/uploading them on every swap.
  * The sources a key resolves against (region bundle, LOC4, master, common) are
- * bundle-global and identical for every neighborhood of one process -- a track
- * switch re-execs -- so a key's decoded result cannot change between builds.
- * ponytail: retain one bundle's visited keys until shutdown; add eviction if
- * multi-bundle in-process streaming makes this measured memory cost too large.
+ * bundle-global and identical for every neighborhood of one track, so a key's
+ * decoded result cannot change between builds; a track switch (main.c, the
+ * Vita venue switch) clears the whole cache before the next track loads.
  * The cache owns the GL names; residents only borrow them. Any caller that
  * replaces the underlying archives in-process must call
  * world_texture_cache_clear() first (see tools/world_texture_test.c).
@@ -517,7 +692,15 @@ static WTexCacheEntry *world_texcache_slot(uint32_t key) {
     return &g_texcache[h];
 }
 
+#ifdef __vita__
+static void world_predecode_free(void);
+#endif
 void world_texture_cache_clear(void) {
+#ifdef __vita__
+    /* the worker's predecoded textures are keyed by name too, and another
+       track's bundle reuses names (its own terrain, road ...) */
+    world_predecode_free();
+#endif
     for (int i = 0; i < g_texcache_cap; i++)
         if (g_texcache[i].state == 1 && g_texcache[i].tex)
             glDeleteTextures(1, &g_texcache[i].tex);
@@ -531,6 +714,193 @@ void world_texture_cache_clear(void) {
  * only there -- is what gets remembered as unresolvable. `owner` supplies the
  * mesh named by the TEXFAIL census, or NULL for the light key (never
  * reported, same as before). */
+#ifdef __vita__
+/* ---- worker-side texture predecode (see world.h) ---- */
+typedef struct {
+    uint32_t key;
+    signed char pass_ok;    /* pass whose source decoded it, -1 = neither */
+    unsigned char noise, mode, used;
+    N2Tex tex;
+} WPreTex;
+static WPreTex *g_pre; static int g_npre;
+
+static const WTexCacheEntry *world_texcache_find(uint32_t key) {
+    if (!g_texcache_cap) return NULL;
+    uint32_t h = key & (uint32_t)(g_texcache_cap - 1);
+    while (g_texcache[h].state) {
+        if (g_texcache[h].key == key) return &g_texcache[h];
+        h = (h + 1) & (uint32_t)(g_texcache_cap - 1);
+    }
+    return NULL;
+}
+
+static void world_predecode_free(void) {
+    for (int i = 0; i < g_npre; i++) {
+        free(g_pre[i].tex.rgb); free(g_pre[i].tex.alpha); free(g_pre[i].tex.dxt);
+    }
+    free(g_pre); g_pre = NULL; g_npre = 0;
+}
+
+static int world_texture_decode(const World *w, const WRegion *g,
+                                uint32_t key, N2Tex *tex, int common_only);
+
+/* Keys proven to be clean DXT textures (not noise, base plan OK), kept on the
+   card per bundle. Their classification needs no pixels, so later builds --
+   and later sessions -- stage the compressed bytes without decoding them.
+   Worker thread only. */
+#define TEXCLASS_CAP 16384
+static uint32_t g_texclass[TEXCLASS_CAP];
+static int g_texclass_n, g_texclass_dirty, g_texclass_loaded;
+static char g_texclass_path[128];
+
+static int texclass_has(uint32_t key) {
+    if (!key) return 0;
+    for (uint32_t h = key & (TEXCLASS_CAP-1);; h = (h+1) & (TEXCLASS_CAP-1)) {
+        if (!g_texclass[h]) return 0;
+        if (g_texclass[h] == key) return 1;
+    }
+}
+static void texclass_add(uint32_t key) {
+    if (!key || g_texclass_n >= TEXCLASS_CAP/2 || texclass_has(key)) return;
+    uint32_t h = key & (TEXCLASS_CAP-1);
+    while (g_texclass[h]) h = (h+1) & (TEXCLASS_CAP-1);
+    g_texclass[h] = key; g_texclass_n++; g_texclass_dirty = 1;
+}
+static void texclass_save(void);
+static void texclass_load(const char *region) {
+    const char *b = strrchr(region, '/'); b = b ? b+1 : region;
+    const char *b2 = strrchr(b, '\\'); if (b2) b = b2+1;
+    char tag[48]; int n = 0;
+    for (; *b && n < 47; b++)
+        if ((*b >= 'A' && *b <= 'Z') || (*b >= 'a' && *b <= 'z') || (*b >= '0' && *b <= '9')) tag[n++] = *b;
+    tag[n] = 0;
+    char path[128];
+    snprintf(path, sizeof path, "ux0:data/OpenUG2/cache/texclass_%s.bin", tag);
+    if (g_texclass_loaded && !strcmp(path, g_texclass_path)) return;
+    if (g_texclass_loaded) {   /* a track switch: the old bundle's list out, the new one's in */
+        texclass_save();
+        memset(g_texclass, 0, sizeof g_texclass); g_texclass_n = 0; g_texclass_dirty = 0;
+    }
+    g_texclass_loaded = 1;
+    snprintf(g_texclass_path, sizeof g_texclass_path, "%s", path);
+    FILE *f = fopen(g_texclass_path, "rb");
+    if (!f) return;
+    uint32_t k;
+    while (fread(&k, sizeof k, 1, f) == 1) texclass_add(k);
+    fclose(f);
+    g_texclass_dirty = 0;
+}
+static void texclass_save(void) {
+    if (!g_texclass_dirty || !g_texclass_path[0]) return;
+    FILE *f = fopen(g_texclass_path, "wb");
+    if (!f) return;
+    for (int i = 0; i < TEXCLASS_CAP; i++)
+        if (g_texclass[i]) fwrite(&g_texclass[i], sizeof g_texclass[i], 1, f);
+    fclose(f);
+    g_texclass_dirty = 0;
+}
+
+unsigned long long sceKernelGetProcessTimeWide(void);
+
+void world_predecode_textures(const WorldNeighborhood *nb) {
+    world_predecode_free();
+    n2_tpk_keep_dxt = render_world_dxt_enabled();
+    if (!nb || nb->nreg < 1) return;
+    World facade; memset(&facade, 0, sizeof facade);
+    facade.neighborhood = *nb;
+    const WRegion *g = &nb->rgn[0];
+    int cap = nb->scene.count + nb->vista.count + 1;
+    g_pre = (WPreTex *)calloc((size_t)cap, sizeof *g_pre);
+    if (!g_pre) return;
+    int compressed_count = 0, known_count = 0;
+    long decoded_bytes_released = 0;
+    unsigned long long t_begin = sceKernelGetProcessTimeWide(), t_fetch = 0;
+    extern volatile long n2_pix_stat_reads, n2_pix_stat_bytes;
+    extern volatile unsigned long long n2_pix_stat_us;
+    long pix_reads0 = n2_pix_stat_reads, pix_bytes0 = n2_pix_stat_bytes;
+    unsigned long long pix_us0 = n2_pix_stat_us;
+    texclass_load(g->name);
+    for (int i = 0; i < cap; i++) {
+        const N2Mesh *owner = i < nb->scene.count ? &nb->scene.meshes[i]
+            : i < nb->scene.count + nb->vista.count ? &nb->vista.meshes[i - nb->scene.count] : NULL;
+        if (owner && owner->world_role == 1) continue;
+        uint32_t key = i < nb->scene.count ? nb->scene.meshes[i].texkey
+                     : i < nb->scene.count + nb->vista.count
+                       ? nb->vista.meshes[i - nb->scene.count].texkey
+                       : N2_TEX_SFX_FLARE_GLOWA;
+        if (!key) continue;
+        const WTexCacheEntry *e = world_texcache_find(key);
+        if (e && (e->state == 1 || e->state == 2)) continue;   /* already resolved */
+        int dup = 0;
+        for (int j = 0; j < g_npre && !dup; j++) dup = g_pre[j].key == key;
+        if (dup) continue;
+        WPreTex *p = &g_pre[g_npre];
+        memset(p, 0, sizeof *p);
+        p->key = key; p->pass_ok = -1;
+        int dw, dh, offset, bytes;
+        /* A key already proven clean DXT needs only its compressed bytes. */
+        int known = render_world_dxt_enabled() && texclass_has(key);
+        unsigned long long t0 = sceKernelGetProcessTimeWide();
+        n2_tpk_skip_pixels = known;
+        if (g->data && world_texture_decode(&facade, g, key, &p->tex, 0)) p->pass_ok = 0;
+        else if ((nb->common || nb->ads) && world_texture_decode(&facade, g, key, &p->tex, 1)) p->pass_ok = 1;
+        n2_tpk_skip_pixels = 0;
+        if (p->pass_ok >= 0 && known && !p->tex.rgb &&
+            !render_dxt_base_plan(&p->tex, &dw, &dh, &offset, &bytes)) {
+            /* not what the cache recorded: classify it from pixels after all */
+            free(p->tex.dxt); free(p->tex.alpha); memset(&p->tex, 0, sizeof p->tex);
+            if (!world_texture_decode(&facade, g, key, &p->tex, p->pass_ok)) p->pass_ok = -1;
+            known = 0;
+        }
+        t_fetch += sceKernelGetProcessTimeWide() - t0;
+        if (p->pass_ok >= 0) {
+            p->noise = (unsigned char)(p->tex.rgb ? n2_tex_noise(&p->tex) : 0);
+            p->mode = (unsigned char)n2_tex_mode(&p->tex);
+            if (!p->noise && render_world_dxt_enabled() &&
+                render_dxt_base_plan(&p->tex, &dw, &dh, &offset, &bytes)) {
+                /* Classification is complete; stage compressed bytes only. */
+                compressed_count++;
+                if (p->tex.rgb)
+                    decoded_bytes_released += (long)p->tex.w * p->tex.h * (p->tex.alpha ? 4 : 3);
+                else known_count++;
+                free(p->tex.rgb); free(p->tex.alpha);
+                p->tex.rgb = NULL; p->tex.alpha = NULL;
+                texclass_add(key);
+            } else if (!p->noise) render_prehalve_tex(&p->tex);
+        }
+        g_npre++;
+    }
+    unsigned long long t_class = sceKernelGetProcessTimeWide();
+    texclass_save();
+    printf("textures predecoded on worker: %d\n", g_npre);
+    VMARK("  textures: %d DXT staged (%d known, no decode), %ld KB decoded staging released; "
+          "fetch+decode %llu ms, other %llu ms, class cache %d keys; "
+          "card: %ld reads, %ld KB, %llu ms",
+          compressed_count, known_count, decoded_bytes_released / 1024,
+          t_fetch / 1000, (t_class - t_begin - t_fetch) / 1000, g_texclass_n,
+          n2_pix_stat_reads - pix_reads0, (n2_pix_stat_bytes - pix_bytes0) / 1024,
+          (n2_pix_stat_us - pix_us0) / 1000);
+}
+
+/* Render thread: take a predecoded result for (key, pass). 1 = handled
+   (*ok says whether it decoded), 0 = not predecoded, decode as usual. */
+static int world_predecode_take(uint32_t key, int pass, N2Tex *out, int *ok,
+                                int *noise, unsigned char *mode) {
+    for (int i = 0; i < g_npre; i++) {
+        WPreTex *p = &g_pre[i];
+        if (p->key != key || p->used) continue;
+        if (p->pass_ok != pass) {             /* this source cannot decode it */
+            *ok = 0;               /* entry stays for the pass that can */
+            return 1;
+        }
+        *out = p->tex; memset(&p->tex, 0, sizeof p->tex);   /* ownership moves */
+        *ok = 1; *noise = p->noise; *mode = p->mode; p->used = 1;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
                            int last, uint32_t *keys, GLuint *texs,
                            unsigned char *modes, int cap, WTextureBind *binding,
@@ -551,9 +921,45 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
     if (e && e->pass == binding->source && e->key == tk) return 0; /* failed here */
     if (e) { e->key = tk; e->pass = binding->source; }
     N2Tex tt = {0};   /* zero-init: n2_tpk_decode leaves dxt untouched */
-    int ok = world_texture_decode(w, g, tk, &tt, pass);
-    if (ok && !n2_tex_noise(&tt)) {
+    int ok, noisy = 0, premode = -1;
+#ifdef __vita__
+    n2_tpk_keep_dxt = render_world_dxt_enabled();
+    {   int pn = 0; unsigned char pm = 0;
+        if (world_predecode_take(tk, pass, &tt, &ok, &pn, &pm)) {
+            noisy = pn; if (ok) premode = pm;
+        } else {
+            ok = world_texture_decode(w, g, tk, &tt, pass);
+            noisy = ok && n2_tex_noise(&tt);
+        }
+    }
+#else
+    ok = world_texture_decode(w, g, tk, &tt, pass);
+    noisy = ok && n2_tex_noise(&tt);
+#endif
+    if (ok && !noisy) {
+#ifdef __vita__
+        /* Upload the original DXT blocks, not the CPU-decoded RGB: 4-8x less
+           GPU memory (render.c also drops the full-size level on the Vita).
+           Uncompressed world textures filled all of VRAM by themselves. The
+           decoded copy still feeds n2_tex_mode below, as on desktop. */
+        GLuint id = render_world_dxt_enabled() && tt.dxt && tt.dxtfmt
+                  ? upload_tpk_texture_to_gpu(&tt) : upload_tex(&tt);
+        if (!id && tt.dxt) {
+            if (!tt.rgb) {
+                N2Tex retry = {0};
+                n2_tpk_keep_dxt = 0;
+                if (world_texture_decode(w, g, tk, &retry, pass)) {
+                    free(tt.dxt);
+                    tt = retry;
+                }
+                n2_tpk_keep_dxt = render_world_dxt_enabled();
+            }
+            if (tt.rgb) id = upload_tex(&tt);
+            VMARK("texture %08x: DXT upload failed; decoded fallback %s", tk, id ? "ok" : "failed");
+        }
+#else
         GLuint id = upload_tex(&tt);
+#endif
         if (!id || glGetError() != GL_NO_ERROR) {
             if (id) glDeleteTextures(1, &id);
             free(tt.rgb); free(tt.alpha); free(tt.dxt);
@@ -562,7 +968,8 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
         }
         /* Exact STREAM material modes; world_texture_decode preserves the
            separate, still-conservative LOC4 fallback policy. */
-        unsigned char mode = (unsigned char)n2_tex_mode(&tt);
+        unsigned char mode = premode >= 0 ? (unsigned char)premode
+                                          : (unsigned char)n2_tex_mode(&tt);
         keys[*n] = tk; texs[*n] = id;
         if (modes) modes[*n] = mode;
         (*n)++;
@@ -571,13 +978,13 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
             e->state = 1; e->tex = id; e->mode = mode; e->build = binding->build;
         }
     } else {
-        if (owner && g_world_texaudit && (ok || pass || !w->neighborhood.common)) {
+        if (owner && g_world_texaudit && (ok || pass || (!w->neighborhood.common && !w->neighborhood.ads))) {
             /* M133: separate "the archive has no such record" from "we
                decoded it and then threw it away" -- they need different
                fixes and the old counters merged them. */
             printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
                    ok ? "DECODED-BUT-REJECTED-AS-NOISE" :
-                   pass ? "not in common TPK" : "not in region/LOC4/master",
+                   pass ? "not in common/ad TPK" : "not in region/LOC4/master",
                    owner->sname, owner->cat);
             if (ok) g_world_texnoise++; else g_world_texmiss++;
         }
@@ -596,7 +1003,7 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
     if (binding->pass == 2) return binding->count < 0 ? -1 : 1;
     if (max_decodes <= 0) return 0;
     if (!binding->build) binding->build = ++g_texbind_build;
-    int npass = w->neighborhood.common ? 2 : 1;
+    int npass = (w->neighborhood.common || w->neighborhood.ads) ? 2 : 1;
     /* Finish the original binding order across ALL regions first. Only then
        retry still-unbound requests against common; never borrow from an
        unrelated region or preempt a later region's successful old lookup. */
@@ -623,6 +1030,7 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
                     : i < meshes + light ? NULL
                     : &w->neighborhood.vista.meshes[i - meshes - light];
                 uint32_t key = owner ? owner->texkey : N2_TEX_SFX_FLARE_GLOWA;
+                if (owner && owner->world_role == 1) continue;
                 int decoded = world_bind_key(w, g, key, binding->pass, last,
                     keys, texs, modes, cap, binding, owner);
                 if (binding->count < 0) goto done;
@@ -636,10 +1044,14 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
 done:
     /* Keep every region alive until the last shared-fallback decision. */
     for (int r = 0; r < w->neighborhood.nreg; r++) {
-        free(w->neighborhood.rgn[r].data); w->neighborhood.rgn[r].data = NULL;
+        if (!w->neighborhood.rgn[r].pinned) free(w->neighborhood.rgn[r].data);
+        w->neighborhood.rgn[r].data = NULL;
     }
     free(w->neighborhood.commontpk.blk); memset(&w->neighborhood.commontpk, 0, sizeof w->neighborhood.commontpk);
     free(w->neighborhood.common); w->neighborhood.common = NULL; w->neighborhood.commonlen = 0;
+    free(w->neighborhood.adstpk.blk); memset(&w->neighborhood.adstpk, 0, sizeof w->neighborhood.adstpk);
+    free(w->neighborhood.ads); w->neighborhood.ads = NULL; w->neighborhood.adslen = 0;
+    w->neighborhood.nadskeys = 0;
     binding->pass = 2;
     return binding->count < 0 ? -1 : 1;
 }
@@ -670,7 +1082,103 @@ void world_ground_grid_free(WGroundGrid *grid) {
     if (g_active_grid == grid) g_active_grid = &g_empty_grid;
     free(grid->start);
     free(grid->list);
+    free(grid->tstart);
+    free(grid->tlist);
     memset(grid, 0, sizeof *grid);
+}
+
+/* Fine triangle grid; see WGroundGrid. Triangles are padded by more than
+   the margin the pick functions' XY reject uses, so every triangle a query
+   could accept is listed in the query point's cell. Optional: on any failure
+   the grid simply has no fine level. */
+#define TCELL 16.0f
+static void tri_box(const N2Mesh *me, int t, float b[4]) {
+    const float *p0 = me->verts + me->idx[t]*5, *p1 = me->verts + me->idx[t+1]*5,
+                *p2 = me->verts + me->idx[t+2]*5;
+    float mnx = p0[0], mxx = p0[0], mny = p0[1], mxy = p0[1];
+    if (p1[0] < mnx) mnx = p1[0]; if (p1[0] > mxx) mxx = p1[0];
+    if (p2[0] < mnx) mnx = p2[0]; if (p2[0] > mxx) mxx = p2[0];
+    if (p1[1] < mny) mny = p1[1]; if (p1[1] > mxy) mxy = p1[1];
+    if (p2[1] < mny) mny = p2[1]; if (p2[1] > mxy) mxy = p2[1];
+    float mg = 0.04f*((mxx-mnx)+(mxy-mny)) + 0.01f;
+    b[0] = mnx-mg; b[1] = mny-mg; b[2] = mxx+mg; b[3] = mxy+mg;
+}
+static void ground_tri_grid_build(WGroundGrid *g, const N2Scene *scene, float x1, float y1) {
+    g->tgw = g->tgh = 0; g->tstart = NULL; g->tlist = NULL;
+    if (scene->count >= (1 << 17)) return;
+    int tgw = (int)((x1 - g->x0)/TCELL) + 1, tgh = (int)((y1 - g->y0)/TCELL) + 1;
+    if (tgw <= 0 || tgh <= 0 || (long long)tgw * tgh > 4000000) return;
+    size_t cells = (size_t)tgw * (size_t)tgh;
+    int *tstart = (int *)calloc(cells + 1, sizeof *tstart);
+    if (!tstart) return;
+    uint32_t *tlist = NULL; int *cursor = NULL;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            for (size_t c = 0; c < cells; c++) tstart[c+1] += tstart[c];
+            if (!tstart[cells]) { free(tstart); return; }
+            tlist = (uint32_t *)malloc((size_t)tstart[cells] * sizeof *tlist);
+            cursor = (int *)malloc(cells * sizeof *cursor);
+            if (!tlist || !cursor) { free(tlist); free(cursor); free(tstart); return; }
+            memcpy(cursor, tstart, cells * sizeof *cursor);
+        }
+        for (int i = 0; i < scene->count; i++) {
+            const N2Mesh *me = &scene->meshes[i];
+            if (me->cat != N2_ROAD && me->cat != N2_TERRAIN) continue;
+            if (me->nidx / 3 >= (1 << 15)) {      /* cannot pack: no fine level */
+                free(tlist); free(cursor); free(tstart); return;
+            }
+            for (int t = 0; t + 2 < me->nidx; t += 3) {
+                float b[4]; tri_box(me, t, b);
+                int cx0 = (int)floorf((b[0]-g->x0)/TCELL), cy0 = (int)floorf((b[1]-g->y0)/TCELL);
+                int cx1 = (int)floorf((b[2]-g->x0)/TCELL), cy1 = (int)floorf((b[3]-g->y0)/TCELL);
+                if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0;
+                if (cx1 >= tgw) cx1 = tgw-1; if (cy1 >= tgh) cy1 = tgh-1;
+                for (int cy = cy0; cy <= cy1; cy++)
+                    for (int cx = cx0; cx <= cx1; cx++) {
+                        size_t c = (size_t)cy*tgw + cx;
+                        if (pass == 0) tstart[c+1]++;
+                        else tlist[cursor[c]++] = ((uint32_t)i << 15) | (uint32_t)(t/3);
+                    }
+            }
+        }
+    }
+    free(cursor);
+    g->tgw = tgw; g->tgh = tgh; g->tstart = tstart; g->tlist = tlist;
+    printf("ground triangle grid: %dx%d cells of %.0f m, %d entries (%ld KB)\n",
+           tgw, tgh, (double)TCELL, tstart[cells],
+           (long)(((size_t)tstart[cells] * 4 + (cells + 1) * 4) >> 10));
+}
+
+/* Candidate triangles for a point query: its fine cell (n may be 0). */
+static const uint32_t *tri_cell_grid(const WGroundGrid *grid, float x, float y, int *n) {
+    *n = 0;
+    if (!grid->tlist) return NULL;
+    int cx = (int)floorf((x - grid->x0)/TCELL), cy = (int)floorf((y - grid->y0)/TCELL);
+    if (cx < 0 || cy < 0 || cx >= grid->tgw || cy >= grid->tgh) return grid->tlist;
+    int c = cy*grid->tgw + cx;
+    *n = grid->tstart[c+1] - grid->tstart[c];
+    return grid->tlist + grid->tstart[c];
+}
+
+int world_predecoded_texture_info(uint32_t key, unsigned char *mode) {
+    *mode=N2_DRAW_OPAQUE;
+#ifdef __vita__
+    if (!key) return 0;
+    const WTexCacheEntry *e=world_texcache_find(key);
+    if (e && e->state==1) { *mode=e->mode; return 1; }
+    if (e && e->state==2) return 0;
+    for (int i=0; i<g_npre; i++) if (g_pre[i].key==key) {
+        if (g_pre[i].pass_ok<0 || g_pre[i].noise) return 0;
+        *mode=g_pre[i].mode; return 1;
+    }
+#else
+    (void)key;
+#endif
+    return 0;
+}
+
+static const uint32_t *tri_cell(float x, float y, int *n) {
+    return tri_cell_grid(g_active_grid, x, y, n);
 }
 
 int world_ground_grid_build(WGroundGrid *grid, const N2Scene *scene,
@@ -733,6 +1241,7 @@ int world_ground_grid_build(WGroundGrid *grid, const N2Scene *scene,
     next.x0 = x0; next.y0 = y0;
     next.gw = gw; next.gh = gh;
     next.start = start; next.list = list;
+    ground_tri_grid_build(&next, scene, x1, y1);
     world_ground_grid_free(grid);
     *grid = next;
     return 1;
@@ -907,13 +1416,38 @@ int world_scripted_defs(const World *w, const char *troot,
    all 20 (A10..A44). The closure is expressed as omission, so the barrier
    positions are exactly the links where the freeroam graph leaves the event
    corridor -- computed below, never typed in. */
+/* Which Paths<4000+i>.bin files exist in ROUTES<stem>, from one directory
+   listing. Probing all 4000 candidate names with fopen is instant on a PC but
+   costs seconds on a console memory card, where every miss is a real I/O. */
+static void world_paths_present(const char *troot, const char *stem,
+                                unsigned char present[4000]) {
+    memset(present, 0, 4000);
+    char dirp[1024];
+    snprintf(dirp, sizeof dirp, "%s/ROUTES%s", troot, stem);
+    DIR *dir = opendir(dirp);
+    if (!dir) return;
+    struct dirent *de;
+    while ((de = readdir(dir))) {
+        const char *n = de->d_name;   /* exactly "Paths####.bin", any case */
+        if (strlen(n) != 13 || strncasecmp(n, "Paths", 5) || strcasecmp(n + 9, ".bin")) continue;
+        if (!isdigit((unsigned char)n[5]) || !isdigit((unsigned char)n[6]) ||
+            !isdigit((unsigned char)n[7]) || !isdigit((unsigned char)n[8])) continue;
+        int id = atoi(n + 5);
+        if (id >= 4000 && id < 8000) present[id - 4000] = 1;
+    }
+    closedir(dir);
+}
+
 int world_load_events(World *w, const char *troot) {
     w->city.nev = 0; w->city.mode = MODE_FREEROAM; w->city.active_ev = -1;
+    static unsigned char present[4000];
     for (int r = 0; r < w->neighborhood.nreg; r++) {
         const char *rn = w->neighborhood.rgn[r].name;
         const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
         unsigned char *d = NULL; long len = 0;
+        world_paths_present(troot, stem, present);
         for (int fi = 0; fi < 4000 && !d; fi++) {   /* first Paths file that exists */
+            if (!present[fi]) continue;
             char p[1024];
             snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", troot, stem, 4000 + fi);
             d = n2_read_file(p, &len);
@@ -966,10 +1500,13 @@ int world_load_nav(World *w, const char *troot) {
     w->city.nnav = w->city.nnavedge = 0;
     w->city.navbb[0] = w->city.navbb[2] = 1e30f; w->city.navbb[1] = w->city.navbb[3] = -1e30f;
 
+    static unsigned char present[4000];
     for (int r = 0; r < w->neighborhood.nreg; r++) {
         const char *rn = w->neighborhood.rgn[r].name;
         const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
+        world_paths_present(troot, stem, present);
         for (int fi = 0; fi < 4000; fi++) {          /* Paths<id>.bin ids are sparse */
+            if (!present[fi]) continue;
             char p[1024];
             snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", troot, stem, 4000 + fi);
             long len = 0; unsigned char *d = n2_read_file(p, &len);
@@ -1168,7 +1705,20 @@ int world_set_mode(World *w, int mode, int evidx) {
            "barriers %d, directed links masked %d\n",
            e->id, e->reg, e->circuit ? "circuit" : "sprint", e->len100m,
            e->node1 - e->node0, w->city.nbar, w->city.nmasked);
+#ifdef __vita__
+    /* These closures are inferred, not authored: every link leaving the racing
+       line gets an 18 m wall, and near junctions one can stand across the
+       route itself (event 4001, just after the start). A race now loads its
+       own authored barrier props (BARRIERS_<id> scenery), so the inferred
+       walls are neither drawn nor solid; the nav corridor (navopen) stays. */
+    int inferred = w->city.nbar;
+    w->city.nbar = 0;
+    printf("race event %d: %d inferred closures disabled (authored barrier scenery used)\n",
+           e->id, inferred);
+    return inferred;
+#else
     return w->city.nbar;
+#endif
 }
 
 static float seg_d2(float px,float py,float ax,float ay,float bx,float by,float *ox,float *oy);
@@ -1281,6 +1831,24 @@ int world_race_start(World *w, const char *troot, int evidx, int maxlaps) {
     return R->ngate;
 }
 
+/* A reversed track (0x89e7a4): the same gates driven the other way round.
+   A circuit keeps gate 0 (its start/finish line) and runs the rest backwards;
+   a sprint runs from the forward finish to the forward start. */
+void world_race_reverse(World *w) {
+    WRace *R = &w->city.race;
+    int n = R->ngate;
+    if (n < 2) return;
+    const WEvent *e = &w->city.ev[R->ev];
+    WGate tmp[WORLD_MAXGATE];
+    for (int k = 0; k < n; k++) {
+        int src = e->circuit ? (k == 0 ? 0 : n - k) : n - 1 - k;
+        tmp[k] = R->gate[src];
+        tmp[k].dx = -tmp[k].dx; tmp[k].dy = -tmp[k].dy;
+    }
+    memcpy(R->gate, tmp, (size_t)n * sizeof *tmp);
+    printf("race armed reversed: event %d, %d gates\n", e->id, n);
+}
+
 void world_race_stop(World *w) { w->city.race.active = 0; }
 
 /* Do segments AB and CD properly straddle each other? */
@@ -1301,13 +1869,39 @@ int world_race_update(World *w, float x, float y) {
     R->px = x; R->py = y;
     if (px == x && py == y) return 0;
 
+    /* The armed gate, or (Vita) one of the next few: the retail game shows no
+       checkpoints and fences its route, so a missed waypoint after a wrong
+       branch should not cost a whole lap. Crossing a later gate counts the
+       skipped ones; the lookahead never runs past the start/finish line. */
+#ifdef __vita__
+    const int lookahead = 3;
+#else
+    const int lookahead = 0;
+#endif
+    int hitk = -1, circuit = w->city.ev[R->ev].circuit;
+    for (int s = 0; s <= lookahead && hitk < 0; s++) {
+        if (s > 0) {
+            if (R->next == 0) break;                     /* the start line is never skipped */
+            int raw = R->next + s;                       /* index ngate = the finish line again */
+            if (raw > R->ngate || (!circuit && raw >= R->ngate)) break;
+        }
+        int k = (R->next + s) % R->ngate;
+        const WGate *g = &R->gate[k];
+        /* the gate line: centre +- half across the direction of travel */
+        float ax = g->x - (-g->dy)*g->half, ay = g->y - (g->dx)*g->half;
+        float bx = g->x + (-g->dy)*g->half, by = g->y + (g->dx)*g->half;
+        if (!seg_cross(px, py, x, y, ax, ay, bx, by)) continue;
+        /* and only in the direction of travel, so reversing back out un-scores nothing */
+        if ((x-px)*g->dx + (y-py)*g->dy <= 0.0f) continue;
+        hitk = k;
+        if (s > 0) {
+            printf("race: %d checkpoint(s) skipped, counted at gate %d\n", s, k);
+            R->cleared += s;
+            R->next = k;
+        }
+    }
+    if (hitk < 0) return 0;
     const WGate *g = &R->gate[R->next];
-    /* the gate line: centre +- half across the direction of travel */
-    float ax = g->x - (-g->dy)*g->half, ay = g->y - (g->dx)*g->half;
-    float bx = g->x + (-g->dy)*g->half, by = g->y + (g->dx)*g->half;
-    if (!seg_cross(px, py, x, y, ax, ay, bx, by)) return 0;
-    /* and only in the direction of travel, so reversing back out un-scores nothing */
-    if ((x-px)*g->dx + (y-py)*g->dy <= 0.0f) return 0;
 
     const WEvent *e = &w->city.ev[R->ev];
     int was = R->next;
@@ -1535,18 +2129,35 @@ int world_district_at(const World *w, float x, float y, float maxdist) {
    ROAD/TERRAIN only, barycentric coverage with the -0.01 edge tolerance, and
    the reference key that biases UP-steps by 3x so a curb lip above the car
    never beats the road just below it. */
-static int wg_pick(const N2Scene *s, const int *srcmap, float x, float y, float refz,
+/* srcmap: optional list of `count` indices into s->meshes (a grid cell);
+   NULL scans all s->count meshes. */
+static int wg_pick(const N2Scene *s, const int *srcmap, int count,
+                   const uint32_t *tris, int ntris, float x, float y, float refz,
                    float *outz, float outn[3], WGroundHit *hit) {
     float best = 0.0f, bestkey = 1e30f; int found = 0, bestcat = WSURF_NONE;
     int highest = (refz >= N2_GROUND_HIGHEST);
-    for (int m = 0; m < s->count; m++) {
-        int mc = s->meshes[m].cat;
+    int nm = tris ? ntris : count;
+    for (int m = 0; m < nm; m++) {
+        int mi = tris ? (int)(tris[m] >> 15) : (srcmap ? srcmap[m] : m);
+        const N2Mesh *me = &s->meshes[mi];
+        int mc = me->cat;
         if (mc != N2_ROAD && mc != N2_TERRAIN) continue;
-        const N2Mesh *me = &s->meshes[m];
-        for (int t = 0; t + 2 < me->nidx; t += 3) {
+        int t0 = tris ? (int)(tris[m] & 0x7fffu)*3 : 0;
+        int t1 = tris ? t0 + 3 : me->nidx;
+        for (int t = t0; t + 2 < me->nidx && t < t1; t += 3) {
             const float *a = me->verts + me->idx[t]*5;
             const float *b = me->verts + me->idx[t+1]*5;
             const float *c = me->verts + me->idx[t+2]*5;
+            /* XY box reject before the divide. The barycentric test below
+               accepts up to 0.01 outside each edge, i.e. less than 0.03 of
+               the triangle's diameter, which the margin covers. */
+            {   /* plain compares: fminf/fmaxf are library calls on this ARM */
+                float mnx = a[0] < b[0] ? a[0] : b[0], mxx = a[0] < b[0] ? b[0] : a[0];
+                float mny = a[1] < b[1] ? a[1] : b[1], mxy = a[1] < b[1] ? b[1] : a[1];
+                if (c[0] < mnx) mnx = c[0]; else if (c[0] > mxx) mxx = c[0];
+                if (c[1] < mny) mny = c[1]; else if (c[1] > mxy) mxy = c[1];
+                float mg = 0.04f*((mxx-mnx)+(mxy-mny)) + 0.001f;
+                if (x < mnx-mg || x > mxx+mg || y < mny-mg || y > mxy+mg) continue; }
             float d = (b[1]-c[1])*(a[0]-c[0]) + (c[0]-b[0])*(a[1]-c[1]);
             if (d > -1e-9f && d < 1e-9f) continue;
             float u = ((b[1]-c[1])*(x-c[0]) + (c[0]-b[0])*(y-c[1])) / d;
@@ -1561,7 +2172,7 @@ static int wg_pick(const N2Scene *s, const int *srcmap, float x, float y, float 
                 bestkey = key; best = z; found = 1;
                 bestcat = (mc == N2_ROAD) ? WSURF_ROAD : WSURF_TERRAIN;
                 if (hit) {
-                    hit->mesh = srcmap ? srcmap[m] : m;
+                    hit->mesh = mi;
                     hit->tri = t / 3;
                     hit->cat = bestcat;
                     hit->z = z;
@@ -1601,7 +2212,7 @@ static int wg_pick(const N2Scene *s, const int *srcmap, float x, float y, float 
     return found ? bestcat : WSURF_NONE;
 }
 
-static int wg_at(const N2Scene *s, float x, float y, float fallback,
+static int wg_at_grid(const WGroundGrid *grid, const N2Scene *s, float x, float y, float fallback,
                  float *outz, float outn[3], WGroundHit *hit) {
     /* `fallback` is the caller's current Z at every callsite, so it doubles as
        the layer reference: pick the surface nearest it, not the highest deck
@@ -1612,21 +2223,21 @@ static int wg_at(const N2Scene *s, float x, float y, float fallback,
     if (outn) { outn[0]=0.0f; outn[1]=0.0f; outn[2]=1.0f; }
     if (hit) { hit->mesh=-1; hit->tri=-1; hit->cat=WSURF_NONE; hit->z=fallback;
                hit->normal[0]=0.0f; hit->normal[1]=0.0f; hit->normal[2]=1.0f; }
-    if (s->meshes != g_grid.meshes)                        /* not the loaded world */
-        return wg_pick(s, NULL, x, y, refz, outz, outn, hit);
-    int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
-    if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return WSURF_NONE;
-    /* borrow the cell's meshes into a scratch scene and reuse the exact scan */
-    static N2Mesh scratch[512];
-    static int srcmap[512];
-    N2Scene sub = { scratch, 0, 512 };
-    int c = cy*g_grid.gw + cx;
-    for (int k = g_grid.start[c]; k < g_grid.start[c+1] && sub.count < 512; k++) {
-        int src = g_grid.list[k];
-        srcmap[sub.count] = src;
-        scratch[sub.count++] = s->meshes[src];
-    }
-    return wg_pick(&sub, srcmap, x, y, refz, outz, outn, hit);
+    if (!grid || s->meshes != grid->meshes)               /* no matching index */
+        return wg_pick(s, NULL, s->count, NULL, 0, x, y, refz, outz, outn, hit);
+    int cx = (int)((x - grid->x0) / GCELL), cy = (int)((y - grid->y0) / GCELL);
+    if (cx < 0 || cy < 0 || cx >= grid->gw || cy >= grid->gh) return WSURF_NONE;
+    int nt; const uint32_t *tris = tri_cell_grid(grid, x, y, &nt);
+    if (tris) return wg_pick(s, NULL, 0, tris, nt, x, y, refz, outz, outn, hit);
+    /* no fine level: scan the cell's meshes in place (at most 512) */
+    int c = cy*grid->gw + cx, n = grid->start[c+1] - grid->start[c];
+    return wg_pick(s, grid->list + grid->start[c], n < 512 ? n : 512, NULL, 0,
+                   x, y, refz, outz, outn, hit);
+}
+
+static int wg_at(const N2Scene *s, float x, float y, float fallback,
+                 float *outz, float outn[3], WGroundHit *hit) {
+    return wg_at_grid(g_active_grid, s, x, y, fallback, outz, outn, hit);
 }
 
 /* ROAD/TERRAIN triangle covering (x,y) and CLOSEST to wz inside [wz-down,
@@ -1634,18 +2245,33 @@ static int wg_at(const N2Scene *s, float x, float y, float fallback,
    acceptance rule differs, so this cannot select a surface the wheel cannot
    reach. The nearest covering triangle overall is recorded separately in
    *nearest, whether or not it is reachable, so a rejection stays attributable. */
-static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
+static int wws_pick(const N2Scene *s, const int *srcmap, int count,
+                    const uint32_t *tris, int ntris, float x, float y,
                     float wz, float up, float down, WGroundHit *hit,
                     WGroundHit *nearest, float *neard) {
     int bestcat = WSURF_NONE; float bestad = 1e30f;
-    for (int m = 0; m < s->count; m++) {
-        int mc = s->meshes[m].cat;
+    int nm = tris ? ntris : count;
+    for (int m = 0; m < nm; m++) {
+        int mi = tris ? (int)(tris[m] >> 15) : (srcmap ? srcmap[m] : m);
+        const N2Mesh *me = &s->meshes[mi];
+        int mc = me->cat;
         if (mc != N2_ROAD && mc != N2_TERRAIN) continue;
-        const N2Mesh *me = &s->meshes[m];
-        for (int t = 0; t + 2 < me->nidx; t += 3) {
+        int t0 = tris ? (int)(tris[m] & 0x7fffu)*3 : 0;
+        int t1 = tris ? t0 + 3 : me->nidx;
+        for (int t = t0; t + 2 < me->nidx && t < t1; t += 3) {
             const float *a = me->verts + me->idx[t]*5;
             const float *b = me->verts + me->idx[t+1]*5;
             const float *c = me->verts + me->idx[t+2]*5;
+            /* XY box reject before the divide. The barycentric test below
+               accepts up to 0.01 outside each edge, i.e. less than 0.03 of
+               the triangle's diameter, which the margin covers. */
+            {   /* plain compares: fminf/fmaxf are library calls on this ARM */
+                float mnx = a[0] < b[0] ? a[0] : b[0], mxx = a[0] < b[0] ? b[0] : a[0];
+                float mny = a[1] < b[1] ? a[1] : b[1], mxy = a[1] < b[1] ? b[1] : a[1];
+                if (c[0] < mnx) mnx = c[0]; else if (c[0] > mxx) mxx = c[0];
+                if (c[1] < mny) mny = c[1]; else if (c[1] > mxy) mxy = c[1];
+                float mg = 0.04f*((mxx-mnx)+(mxy-mny)) + 0.001f;
+                if (x < mnx-mg || x > mxx+mg || y < mny-mg || y > mxy+mg) continue; }
             float d = (b[1]-c[1])*(a[0]-c[0]) + (c[0]-b[0])*(a[1]-c[1]);
             if (d > -1e-9f && d < 1e-9f) continue;
             float u = ((b[1]-c[1])*(x-c[0]) + (c[0]-b[0])*(y-c[1])) / d;
@@ -1657,11 +2283,18 @@ static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
             float dz = z - wz, ad = dz < 0 ? -dz : dz;
             if (ad < *neard) {                       /* remember for diagnostics */
                 *neard = ad;
-                if (nearest) { nearest->mesh = srcmap ? srcmap[m] : m; nearest->tri = t/3;
+                if (nearest) { nearest->mesh = mi; nearest->tri = t/3;
                                nearest->cat = cat; nearest->z = z;
                                nearest->normal[0]=0; nearest->normal[1]=0; nearest->normal[2]=1; }
             }
             if (dz > up || dz < -down) continue;     /* candidate, not contact */
+            {   /* never stand a wheel on a near-vertical face (seam, kerb
+                   skirt): normal z below 0.34 is steeper than ~70 deg */
+                float e1x=b[0]-a[0], e1y=b[1]-a[1], e1z=b[2]-a[2];
+                float e2x=c[0]-a[0], e2y=c[1]-a[1], e2z=c[2]-a[2];
+                float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
+                if (nz < 0) nz = -nz;
+                if (nz*nz < 0.34f*0.34f*(nx*nx+ny*ny+nz*nz)) continue; }
             /* Among reachable candidates the CLOSEST wins: continuity, so the
                surface the wheel is already riding (0 m away) always beats one
                stacked above it. The window above is what refuses a deck the
@@ -1669,7 +2302,7 @@ static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
             if (bestcat != WSURF_NONE && ad >= bestad) continue;
             bestcat = cat; bestad = ad;
             if (hit) {
-                hit->mesh = srcmap ? srcmap[m] : m; hit->tri = t/3;
+                hit->mesh = mi; hit->tri = t/3;
                 hit->cat = cat; hit->z = z;
                 float e1x=b[0]-a[0], e1y=b[1]-a[1], e1z=b[2]-a[2];
                 float e2x=c[0]-a[0], e2y=c[1]-a[1], e2z=c[2]-a[2];
@@ -1733,7 +2366,7 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
                hit->normal[0]=0; hit->normal[1]=0; hit->normal[2]=1; }
     int cat;
     if (s->meshes != g_grid.meshes)
-        cat = wws_pick(s, NULL, x, y, wheel_z, reach_up, reach_down, hit, &near, &neard);
+        cat = wws_pick(s, NULL, s->count, NULL, 0, x, y, wheel_z, reach_up, reach_down, hit, &near, &neard);
     else {
         int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
         if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) {
@@ -1741,14 +2374,15 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
             if (verdict) *verdict = WWS_NOCOVER;
             return WSURF_NONE;
         }
-        static N2Mesh scratch[512];
-        static int srcmap[512];
-        N2Scene sub = { scratch, 0, 512 };
-        int c = cy*g_grid.gw + cx;
-        for (int k = g_grid.start[c]; k < g_grid.start[c+1] && sub.count < 512; k++) {
-            int src = g_grid.list[k]; srcmap[sub.count] = src; scratch[sub.count++] = s->meshes[src];
+        int nt; const uint32_t *tris = tri_cell(x, y, &nt);
+        if (tris)
+            cat = wws_pick(s, NULL, 0, tris, nt, x, y, wheel_z, reach_up, reach_down,
+                           hit, &near, &neard);
+        else {
+            int c = cy*g_grid.gw + cx, n = g_grid.start[c+1] - g_grid.start[c];
+            cat = wws_pick(s, g_grid.list + g_grid.start[c], n < 512 ? n : 512, NULL, 0,
+                           x, y, wheel_z, reach_up, reach_down, hit, &near, &neard);
         }
-        cat = wws_pick(&sub, srcmap, x, y, wheel_z, reach_up, reach_down, hit, &near, &neard);
     }
     if (cand) *cand = near;                  /* attribution, reachable or not */
     if (cat != WSURF_NONE) { if (verdict) *verdict = WWS_CONTACT; return cat; }
@@ -1842,9 +2476,10 @@ static float camera_tri_distance(const float p[3],const float *a,const float *b,
                    (edge[2]*q[0]-edge[0]*q[2])*n[1]+
                    (edge[0]*q[1]-edge[1]*q[0])*n[2];
         if(side<0)inside=0;
-        t=ee>0?fmaxf(0,fminf(1,t/ee)):0;float dd=0;
+        if(ee>0){t/=ee;if(t>1)t=1;if(t<0)t=0;}else t=0;
+        float dd=0;
         for(int k=0;k<3;k++){float x=q[k]-t*edge[k];dd+=x*x;}
-        best=fminf(best,dd);
+        if(dd<best)best=dd;
     }
     return sqrtf(inside?d*d/nn:best);
 }
@@ -1857,19 +2492,31 @@ float world_camera_clip(const N2Scene *s,const float (*bounds)[4],
     if(!s || length<1e-5f || radius<=0)return 1;
     /* ponytail: reuse resident XY bounds; add a spatial index only if measured
        camera-query cost warrants one. No separate collision mesh ownership. */
+    /* Segment box grown by the radius. Inline compares (fminf/fmaxf are
+       library calls on the Vita) and the contiguous bounds array is tested
+       before the mesh record is touched: same result, far less per mesh. */
+    float lo[3],hi[3];
+    for(int k=0;k<3;k++){
+        lo[k]=(anchor[k]<eye[k]?anchor[k]:eye[k])-radius;
+        hi[k]=(anchor[k]>eye[k]?anchor[k]:eye[k])+radius;
+    }
     for(int mi=0;mi<s->count;mi++) {
+        if(bounds && (hi[0]<bounds[mi][0] || lo[0]>bounds[mi][2] ||
+                      hi[1]<bounds[mi][1] || lo[1]>bounds[mi][3]))continue;
         const N2Mesh*m=&s->meshes[mi];
-        if(m->cat==N2_SKY || m->cat==N2_GLOW)continue;
-        if(bounds && (fmaxf(anchor[0],eye[0])+radius<bounds[mi][0] ||
-           fminf(anchor[0],eye[0])-radius>bounds[mi][2] ||
-           fmaxf(anchor[1],eye[1])+radius<bounds[mi][1] ||
-           fminf(anchor[1],eye[1])-radius>bounds[mi][3]))continue;
+        if(m->world_role==2 || m->cat==N2_SKY || m->cat==N2_GLOW)continue;
+        /* Z overlap first: the road and terrain meshes under the car pass the
+           XY test every frame and would otherwise have every triangle walked */
+        if(m->world_bounds_valid && (hi[2]<m->world_bounds[2] || lo[2]>m->world_bounds[5]))continue;
         for(int ti=0;ti+2<m->nidx;ti+=3) {
             const float*a=m->verts+5*m->idx[ti],*b=m->verts+5*m->idx[ti+1],*c=m->verts+5*m->idx[ti+2];
             int outside=0;
-            for(int k=0;k<3;k++)
-                if(fmaxf(anchor[k],eye[k])+radius<fminf(a[k],fminf(b[k],c[k])) ||
-                   fminf(anchor[k],eye[k])-radius>fmaxf(a[k],fmaxf(b[k],c[k])))outside=1;
+            for(int k=0;k<3;k++) {
+                float mn=a[k],mx=a[k];
+                if(b[k]<mn)mn=b[k]; if(b[k]>mx)mx=b[k];
+                if(c[k]<mn)mn=c[k]; if(c[k]>mx)mx=c[k];
+                if(hi[k]<mn || lo[k]>mx){outside=1;break;}
+            }
             if(outside)continue;
             float t=0;
             /* Distance is 1-Lipschitz: clearance steps cannot tunnel through
@@ -1900,6 +2547,12 @@ int world_ground_hit(const N2Scene *s, float x, float y, float fallback,
                      WGroundHit *hit) {
     float z = fallback, n[3] = {0,0,1};
     return wg_at(s, x, y, fallback, &z, n, hit);
+}
+
+int world_ground_hit_grid(const WGroundGrid *grid, const N2Scene *s,
+                          float x, float y, float fallback, WGroundHit *hit) {
+    float z = fallback, n[3] = {0,0,1};
+    return wg_at_grid(grid, s, x, y, fallback, &z, n, hit);
 }
 
 int world_ground_patch_normal(const N2Scene *s, float x, float y, float heading,
@@ -1940,7 +2593,46 @@ float world_ground_z(const N2Scene *s, float x, float y, float fallback) {
     return z;
 }
 
+static void world_dedup_selftest(void) {
+    World w = {0};
+    const float vertices[15] = {0,0,0,0,0, 2,0,0,1,0, 0,2,0,0,1};
+    const uint16_t indices[3] = {0,1,2};
+    w.neighborhood.scene.meshes = calloc(4, sizeof(N2Mesh));
+    assert(w.neighborhood.scene.meshes);
+    w.neighborhood.scene.count = w.neighborhood.scene.cap = 4;
+    for (int i = 0; i < 4; i++) {
+        N2Mesh *m = &w.neighborhood.scene.meshes[i];
+        m->verts = malloc(sizeof vertices); m->idx = malloc(sizeof indices);
+        assert(m->verts && m->idx);
+        memcpy(m->verts, vertices, sizeof vertices);
+        memcpy(m->idx, indices, sizeof indices);
+        m->nverts = 3; m->nidx = 3; m->cat = N2_ROAD;
+        m->texkey = (i & 1) ? 22 : 11;
+        if (i & 1) {
+            m->vcol = calloc(12, 1); assert(m->vcol);
+            m->vcol[0] = (unsigned char)i; /* distinct prelight must survive */
+        }
+    }
+    w.neighborhood.nreg = 2;
+    /* A cached placed duplicate must group with an uncached parser mesh. */
+    N2Mesh *cached = &w.neighborhood.scene.meshes[2];
+    cached->world_bounds_valid = 1;
+    cached->world_bounds[0] = cached->world_bounds[1] = cached->world_bounds[2] = 0;
+    cached->world_bounds[3] = cached->world_bounds[4] = 2;
+    cached->world_bounds[5] = 0;
+    w.neighborhood.rgn[0].mesh1 = 2;
+    w.neighborhood.rgn[1].mesh0 = 2; w.neighborhood.rgn[1].mesh1 = 4;
+    assert(world_dedup(&w) == 1 && w.neighborhood.scene.count == 3);
+    assert(w.neighborhood.rgn[0].mesh0 == 0 && w.neighborhood.rgn[0].mesh1 == 2);
+    assert(w.neighborhood.rgn[1].mesh0 == 2 && w.neighborhood.rgn[1].mesh1 == 3);
+    assert(w.neighborhood.scene.meshes[0].texkey == 11);
+    assert(w.neighborhood.scene.meshes[1].vcol[0] == 1);
+    assert(w.neighborhood.scene.meshes[2].vcol[0] == 3);
+    world_neighborhood_free(&w.neighborhood);
+}
+
 void world_ground_selftest(void) {
+    world_dedup_selftest();
     /* Two stacked decks with different normals: reference Z must select one
        triangle and return that SAME triangle's height and orientation. */
     float lower_v[15]={0,0,0,0,0, 2,0,0,0,0, 0,2,0,0,0};
@@ -1959,6 +2651,40 @@ void world_ground_selftest(void) {
            fabsf(hit.normal[1]-n[1])<1e-6f &&
            fabsf(hit.normal[2]-n[2])<1e-6f);
     assert(z>10.0f && z<11.0f && n[0]<-0.4f && n[2]>0.8f);
+
+    /* Detached candidate checks must match the brute-force layer selector
+       while leaving the active resident's index and contact unchanged. */
+    {
+        const WGroundGrid *saved_grid = g_active_grid;
+        WGroundGrid active_grid = {0}, candidate_grid = {0};
+        N2Mesh active_mesh = m[0];
+        N2Scene active_scene = {&active_mesh, 1, 1};
+        float bounds[2][4] = {{0,0,2,2}, {0,0,2,2}};
+        assert(world_ground_grid_build(&active_grid, &active_scene, bounds));
+        assert(world_ground_grid_build(&candidate_grid, &s, bounds));
+        world_ground_grid_activate(&active_grid);
+        const float points[3][2] = {{0.25f,0.25f}, {1,1}, {1.75f,1.75f}};
+        const float refs[3] = {0,10,N2_GROUND_HIGHEST};
+        for (int coarse = 0; coarse < 2; coarse++) {
+            WGroundGrid query = candidate_grid;
+            if (coarse) query.tlist = NULL;
+            for (int p = 0; p < 3; p++) for (int r = 0; r < 3; r++) {
+                WGroundHit brute, indexed;
+                int a = world_ground_hit_grid(NULL, &s, points[p][0], points[p][1], refs[r], &brute);
+                int b = world_ground_hit_grid(&query, &s, points[p][0], points[p][1], refs[r], &indexed);
+                assert(a == b && brute.mesh == indexed.mesh && brute.tri == indexed.tri);
+                assert(fabsf(brute.z-indexed.z) < 1e-6f);
+                for (int c = 0; c < 3; c++)
+                    assert(fabsf(brute.normal[c]-indexed.normal[c]) < 1e-6f);
+                assert(g_active_grid == &active_grid);
+            }
+        }
+        assert(world_ground_hit(&active_scene,0.25f,0.25f,10,&hit) == WSURF_ROAD);
+        assert(fabsf(hit.z) < 1e-6f);
+        world_ground_grid_activate(saved_grid);
+        world_ground_grid_free(&candidate_grid);
+        world_ground_grid_free(&active_grid);
+    }
 
     /* A noisy centre-triangle normal must not pitch the entire chassis when
        the footprint itself lies on one coherent shallow road plane. */
@@ -2102,4 +2828,136 @@ int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
 int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r) {
     float probe[3] = {x,y,z};
     return !world_wall_push(s,probe,r,NULL);
+}
+
+/* ---- NFSU2 regional fog (decoded from SPEED2.EXE, 10-09) ----
+ * Track bundles (L4RA.BUN ...) carry chunk 0x8003B600: named spatial tables,
+ * one 0x8003B601 each: 0x3B602 header {u32 name hash, f32 x0 y0 x1 y1,
+ * u32 nodes, entries, stride, values}, 0x3B605 palette (entries x stride),
+ * 0x3B608 quadtree (nodes x u16[4]; word0 == 0 -> leaf, word1 = palette
+ * index; else children for x<mid&y<mid, x<mid&y>=mid, x>=mid&y<mid, rest).
+ * Outside the box -> entry 0. The game looks up "Normal Fog" (hash of the
+ * name, h = h*33 + c from ~0) at the camera, and eases the result toward the
+ * new entry by distance moved / 50 m (0x5fa660). Values: v0 fog amount, v1
+ * fog start (m), v2 v3 v4 = B G R (0..255). The shader then uses world.fx's
+ * FogValue = (250, 1/(250-start), min(1-v0, 0.6)) and colour = RGB*0.75/255. */
+static struct {
+    int ok;
+    float box[4];
+    int nodes, entries, stride, values;
+    unsigned char *palette;   /* entries * stride bytes */
+    uint16_t *tree;           /* nodes * 4 */
+    float cur[8], last[2];
+    int have_cur;
+} g_fog;
+
+static uint32_t fog_hash(const char *s) {
+    uint32_t h = 0xFFFFFFFFu;
+    while (*s) h = h * 33u + (unsigned char)*s++;
+    return h;
+}
+
+int world_fog_load(const char *troot, const char *track) {
+    free(g_fog.palette); free(g_fog.tree);
+    memset(&g_fog, 0, sizeof g_fog);
+    const char *stem = !strncmp(track, "STREAM", 6) ? track + 6 : track;
+    char path[1024]; snprintf(path, sizeof path, "%s/%s.BUN", troot, stem);
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("fog: %s not found\n", path); return 0; }
+    uint32_t want = fog_hash("Normal Fog"), hd[2];
+    unsigned char *blk = NULL; uint32_t blen = 0;
+    while (fread(hd, 4, 2, f) == 2) {   /* top-level chunk walk; the table is near the front */
+        if (hd[0] == 0x8003B600u) {
+            blk = (unsigned char *)malloc(hd[1] ? hd[1] : 1); blen = hd[1];
+            if (!blk || fread(blk, 1, blen, f) != blen) { free(blk); blk = NULL; }
+            break;
+        }
+        if (fseek(f, (long)hd[1], SEEK_CUR)) break;
+    }
+    fclose(f);
+    if (!blk) { printf("fog: no 0x8003B600 table in %s\n", path); return 0; }
+    for (uint32_t o = 0; o + 8 <= blen; ) {
+        uint32_t m, s; memcpy(&m, blk + o, 4); memcpy(&s, blk + o + 4, 4);
+        if (o + 8 + s > blen) break;
+        if (m == 0x8003B601u && s >= 44) {
+            unsigned char *q = blk + o + 8, *qe = q + s;
+            uint32_t hash; memcpy(&hash, q + 8, 4);   /* first child is the 0x3B602 header */
+            if (hash == want) {
+                const unsigned char *hdr = NULL, *pal = NULL, *tree = NULL;
+                uint32_t pal_len = 0, tree_len = 0;
+                while (q + 8 <= qe) {
+                    uint32_t cm, cs; memcpy(&cm, q, 4); memcpy(&cs, q + 4, 4);
+                    if (q + 8 + cs > qe) break;
+                    if (cm == 0x3B602u && cs >= 36) hdr = q + 8;
+                    else if (cm == 0x3B605u) { pal = q + 8; pal_len = cs; }
+                    else if (cm == 0x3B608u) { tree = q + 8; tree_len = cs; }
+                    q += 8 + cs;
+                }
+                if (hdr && pal && tree) {
+                    uint32_t v[4]; memcpy(g_fog.box, hdr + 4, 16); memcpy(v, hdr + 20, 16);
+                    g_fog.nodes = (int)v[0]; g_fog.entries = (int)v[1];
+                    g_fog.stride = (int)v[2]; g_fog.values = (int)v[3];
+                    if (g_fog.values >= 5 && g_fog.values <= 8 && g_fog.stride >= g_fog.values * 4 &&
+                        pal_len >= (uint32_t)(g_fog.entries * g_fog.stride) &&
+                        tree_len >= (uint32_t)g_fog.nodes * 8u && g_fog.nodes > 0 && g_fog.entries > 0) {
+                        g_fog.palette = (unsigned char *)malloc(pal_len);
+                        g_fog.tree = (uint16_t *)malloc(tree_len);
+                        if (g_fog.palette && g_fog.tree) {
+                            memcpy(g_fog.palette, pal, pal_len);
+                            memcpy(g_fog.tree, tree, tree_len);
+                            g_fog.ok = 1;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        o += 8 + s;
+    }
+    free(blk);
+    printf("fog: %s \"Normal Fog\" %s (%d entries, %d nodes, box %.0f,%.0f..%.0f,%.0f)\n",
+           path, g_fog.ok ? "loaded" : "missing", g_fog.entries, g_fog.nodes,
+           g_fog.box[0], g_fog.box[1], g_fog.box[2], g_fog.box[3]);
+    return g_fog.ok;
+}
+
+static const float *fog_entry(float x, float y) {
+    float x0 = g_fog.box[0], y0 = g_fog.box[1], x1 = g_fog.box[2], y1 = g_fog.box[3];
+    int idx = 0;
+    if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
+        int n = 0;
+        for (int guard = 0; guard < 64 && g_fog.tree[n * 4] != 0; guard++) {
+            float mx = (x0 + x1) * 0.5f, my = (y0 + y1) * 0.5f;
+            int c = x < mx ? (y < my ? 0 : 1) : (y < my ? 2 : 3);
+            if (x < mx) x1 = mx; else x0 = mx;
+            if (y < my) y1 = my; else y0 = my;
+            n = g_fog.tree[n * 4 + c];
+            if (n >= g_fog.nodes) { n = 0; break; }
+        }
+        idx = g_fog.tree[n * 4] == 0 ? g_fog.tree[n * 4 + 1] : 0;
+    }
+    if (idx >= g_fog.entries) idx = 0;
+    return (const float *)(g_fog.palette + (size_t)idx * (size_t)g_fog.stride);
+}
+
+/* out: start (m), floor (min fog factor), rgb 0..1. 0 = no table. */
+int world_fog_eval(float x, float y, float *start, float *floor_f, float rgb[3]) {
+    if (!g_fog.ok) return 0;
+    const float *e = fog_entry(x, y);
+    float t = 1.0f;
+    if (g_fog.have_cur) {
+        float dx = x - g_fog.last[0], dy = y - g_fog.last[1];
+        float d = sqrtf(dx * dx + dy * dy);
+        t = d < 50.0f ? d / 50.0f : 1.0f;
+    }
+    for (int i = 0; i < g_fog.values; i++)
+        g_fog.cur[i] = g_fog.have_cur ? g_fog.cur[i] + (e[i] - g_fog.cur[i]) * t : e[i];
+    g_fog.have_cur = 1; g_fog.last[0] = x; g_fog.last[1] = y;
+    *start = g_fog.cur[1] < 249.0f ? g_fog.cur[1] : 249.0f;
+    float fl = 1.0f - g_fog.cur[0];
+    *floor_f = fl < 0.6f ? fl : 0.6f;
+    rgb[0] = g_fog.cur[4] * (0.75f / 255.0f);
+    rgb[1] = g_fog.cur[3] * (0.75f / 255.0f);
+    rgb[2] = g_fog.cur[2] * (0.75f / 255.0f);
+    return 1;
 }

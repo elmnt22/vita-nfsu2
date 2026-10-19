@@ -14,11 +14,13 @@ typedef struct {
 
 typedef struct {
     uint16_t type_index;
+    const unsigned char *record_id; /* identity within the pinned immutable bundle */
     uint16_t flags;
     /* Populated by the section walker from 0x34102, not from 0x34103. */
     uint32_t model_keys[3];
     float bounds_min[3], bounds_max[3];
     float matrix[16];
+    int region_id, record_index;   /* scenery record identity (section, index) */
 } WInstPlacement;
 
 typedef struct {
@@ -33,6 +35,7 @@ typedef struct {
     long rejected_meshes;
     long keyed_models;
     long lod_fallbacks;
+    long lod_replacements, lod_saved_indices;
     long unkeyed_models;
     long scenery_hidden; /* explicit event preview only; before scene emission */
     /* What the builder actually selected, which is not always what was asked:
@@ -70,6 +73,22 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
                          WInstStats *stats);
 /* Explicit load-time scenery preview: 0 = unchanged, -1 = free roam,
  * positive = authored event group id. Not a live race/career state machine. */
+/* Lend an already-loaded STREAM bundle to the next build so it is not read a
+ * second time; the caller keeps ownership. Pass name NULL to clear all. */
+void world_instance_lend_bundle(const char *name, const unsigned char *data, long len);
+/* Set before building; do not change while a streaming worker is running. */
+void world_instance_set_detail(int low);
+/* World tile conversion: every placement resolved as far (full model kept as
+   the collision copy beside its stand-in, so a tile can choose either at
+   load), and a focus outside every district borrows the nearest one. */
+void world_instance_set_convert(int on);
+/* Union of the companion's district boxes (minx, miny, maxx, maxy). */
+int world_instance_bounds(const char *track_root, const char *bundle, float out[4]);
+/* Every district box (minx, miny, maxx, maxy); caller frees *boxes. */
+int world_instance_district_boxes(const char *track_root, const char *bundle,
+                                  float (**boxes)[4], int *count);
+void world_instance_cache_selftest(void);
+
 int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
                          const char *track_root,
                          const char *const *bundles, int bundle_count,

@@ -79,7 +79,7 @@ static void test_map_project_and_pick_round_trip(void) {
     }
     /* now project a world point, place it in NDC the way hud_draw does, and
        pick it back */
-    float asp = (float)W / (float)H, MAP_R = 0.30f;
+    float asp = (float)W / (float)H, MAP_R = HUD_MAP_R;
     float px = cx_ndc + mx * MAP_R / asp, py = cy_ndc + my * MAP_R;
     assert(hud_map_pick(px, py, W, H, &s, &back_x, &back_y));
     assert(near(back_x, tx, 2.0f));

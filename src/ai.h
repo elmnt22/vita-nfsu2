@@ -1,6 +1,7 @@
-/* ai.h — OpenUG2 AI module: opponents that follow the game's own racing line
- * (the ROUTES Paths .bin waypoints), with corner-aware pacing and mild
- * rubber-banding toward the player. Also loads/grids a circuit. */
+/* ai.h — OpenUG2 legacy AI module: the free-roam traffic and roaming cars on
+ * the authored road paths (to be replaced by the retail traffic AI), car
+ * contacts for them, and the circuit line loader the research tools read.
+ * Race opponents run on the retail AI (airacer.c). */
 #ifndef OPENUG2_AI_H
 #define OPENUG2_AI_H
 
@@ -51,7 +52,16 @@ typedef struct {
     unsigned respawns, wait_ticks;
     float lane_offset, max_impact;
     unsigned air_ticks;
+    unsigned next_retry;   /* ticks until a dead end looks for its continuation again */
+#ifdef __vita__
+    const N2Mesh *lane_scene;
+    int lane_from, lane_to;
+    unsigned lane_age, lane_valid;
+    float lane_x, lane_y, lane_z, lane_heading;
+#endif
 } AiTraffic;
+void ai_lane_cache_selftest(void);
+void ai_lane_cache_report(void);
 typedef struct {
     N2Scene *scene;
     const float (*obst)[4], (*obstz)[2];
@@ -110,12 +120,6 @@ int load_roaming_circuit(const char *dataroot, const char *circuit, N2Scene *sce
                          N2Path *aipath, AiCar *ais, const float player[3],
                          int *start_idx);
 
-/* One tick for one AI: steer toward the next waypoint, pace for the bend
- * ahead, rubber-band toward player_prog (monotonic lap*n+rel progress),
- * follow the ground, count laps. k staggers per-car top speed. */
-void ai_step(AiCar *ai, int k, const N2Path *aipath, N2Scene *scene,
-             int start_idx, int player_prog);
-
 /* Input-only test driver. Borrows a validated, open XY polyline; never writes
  * the car pose/velocity or queries/snaps its ground height. Speeds: m/tick. */
 typedef struct {
@@ -127,5 +131,12 @@ typedef struct { float throttle, steer; int handbrake; } AiDriveInput;
 int ai_drive_route_valid(const N2Path *path);
 int ai_drive_init(AiDrive *drive, const N2Path *path, const float pos[3], float heading);
 AiDriveInput ai_drive_step(AiDrive *drive, const float pos[3], float heading, float speed);
+
+/* Diagnostic: worst traffic tilt since the last report (main.c logs it). */
+typedef struct {
+    float tilt, pitch, roll, pos[3], wz[4], ax[4], ground_z, half_length;
+    int valid[4], ground_cat; unsigned contact;
+} AiTiltRecord;
+extern AiTiltRecord g_ai_tilt;
 
 #endif

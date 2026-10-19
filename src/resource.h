@@ -12,6 +12,33 @@
 unsigned char *res_map_file(const char *path, long *len);
 void res_unmap_file(unsigned char *data, long len);
 
+/* One-slot hand-off for a file that was already read whole: res_keep parks
+ * the buffer under its path, res_take returns it (ownership moves to the
+ * caller) if the path matches, res_drop frees anything left unclaimed. Lets
+ * startup read a 100+ MB STREAM bundle once instead of twice. */
+void res_keep(const char *path, unsigned char *data, long len);
+unsigned char *res_take(const char *path, long *len);
+void res_drop(void);
+
+#ifdef __vita__
+/* Pinned compact STREAM bundle (PS Vita). Loaded once and shared by every
+ * world build for the life of the process; never freed by callers. The copy
+ * drops the TPK pixel payloads (read back from the file on demand through
+ * n2_pix_stub / n2_pix_read) and shrinks top-level padding while keeping
+ * every chunk's 128-byte alignment. */
+unsigned char *res_bundle(const char *path, long *len);
+/* Vita, world tiles in use: keep only the textures/lights part of the pinned
+   bundle (now, and for a bundle pinned later). */
+void res_pin_strip(void);
+int res_is_pinned(const void *data);
+long res_bundle_file_len(void);   /* size of the pinned bundle's file */
+/* Free the pinned bundle so another track's can be pinned (the boot's world
+   tile conversion of every track). Caches keyed by the pinned pointer must
+   also compare res_pin_gen(): a new pin can reuse the old address. */
+void res_unpin(void);
+unsigned res_pin_gen(void);
+#endif
+
 /* Enumerate selectable tracks: STREAM*.BUN files under troot. Writes up to
  * max names (extension stripped) and sets *sel to the entry matching cur.
  * Returns the count. */

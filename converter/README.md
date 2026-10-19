@@ -1,0 +1,44 @@
+# OpenUG2 World Data Converter (Windows)
+
+Does the Vita's one-time "OPTIMIZING WORLD DATA" boot step on a PC: about
+2 minutes for all six tracks instead of 15-20+ on the console.
+
+It runs the game's own conversion (`src/world_tiles.c`, `src/resource.c`,
+built 32-bit like the Vita, same as the simulator) on the player's NFSU2
+folder and writes what the Vita would write to `ux0:data/OpenUG2/cache`:
+
+- `cache/tiles/<TRACK>_v5.pak` + `.idx` -- the prebuilt world tiles
+- `cache/<TRACK>.BUN.compact` -- the compact bundle copies
+
+for STREAML4RA (city), L4RB/L4RD (drag), L4RC (drift), L4RF (Street X),
+L4RG (URL). The output is byte-identical to the simulator's own boot
+conversion (checked 2026-10-18; mesh counts match the Vita's logs).
+World detail is set to low, as the Vita's default.
+
+## Use
+
+1. Run `UG2Converter.exe` (one file, nothing to install). It finds the NFSU2
+   install from the registry; otherwise Browse to the folder with `TRACKS`.
+2. Convert.
+3. Send to Vita: the Vita's FTP server on port 1337 (VitaShell: SELECT, or
+   vitacompanion). Or copy the `cache` folder from "Open output folder" into
+   `ux0:data/OpenUG2/` by hand.
+
+Command line: `UG2Converter.exe --cli GAME OUT` (convert, log in
+`OUT/convert_log.txt`), `UG2Converter.exe --send IP OUT`.
+
+When sending, the Vita's old `.idx` files are deleted first and each track's
+index goes up last, so a cut-off transfer reads as "not converted" (the Vita
+then converts that track itself) instead of as a broken set.
+
+Not converted here: shader binaries (GPU-specific, the Vita compiles them),
+the shop cache (built in seconds on first shop visit), texclass lists
+(learned while playing).
+
+## Build
+
+    ./converter/build_converter.sh   # -> converter/build/UG2Converter.exe
+
+zig cc, SDL2 linked statically (`SDL2_DIR`, default the simulator's). A
+`WTILE_VERSION` bump or a change to the conversion code needs a rebuild of
+the tool too.

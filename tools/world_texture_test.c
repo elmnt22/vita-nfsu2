@@ -72,6 +72,7 @@ static void run_case(const char *tracks,const char *masterpath,
     assert(binding.count==n); /* completed cursor neither repeats nor re-emits */
     assert(n==want_count); /* RED before common-library support: 0 instead of 1. */
     assert(!w->neighborhood.common && !w->neighborhood.commontpk.blk && !w->neighborhood.commonlen && !w->neighborhood.commontpk.nblk);
+    assert(!w->neighborhood.ads && !w->neighborhood.adstpk.blk && !w->neighborhood.adslen && !w->neighborhood.nadskeys);
     if(n) {
         assert(keys[0]==requested && modes[0]==N2_DRAW_BLEND);
         unsigned char rgba[4*4*4];glBindTexture(GL_TEXTURE_2D,ids[0]);
@@ -174,26 +175,48 @@ static GLuint test_resident_resource_build(const char *region_path) {
     neighborhood.mbb[0][0]=0; neighborhood.mbb[0][1]=0;
     neighborhood.mbb[0][2]=4; neighborhood.mbb[0][3]=4;
 
+    neighborhood.vista.meshes = calloc(1, sizeof *neighborhood.vista.meshes);
+    assert(neighborhood.vista.meshes);
+    neighborhood.vista.count = neighborhood.vista.cap = 1;
+    N2Mesh *vista = neighborhood.vista.meshes;
+    *vista = *mesh;
+    vista->verts = malloc(sizeof verts);
+    vista->idx = malloc(3 * sizeof *vista->idx);
+    assert(vista->verts && vista->idx);
+    memcpy(vista->verts, verts, sizeof verts);
+    memcpy(vista->idx, mesh->idx, 3 * sizeof *vista->idx);
+
     WorldResidentResources resources = {0};
-    assert(world_resident_resources_build(&resources, &neighborhood, NULL));
+    assert(world_resident_resources_build(&resources, &neighborhood, 1, NULL));
     assert(resources.texture_count == 1 && resources.textures[0]);
     assert(resources.mesh_count == 1 && resources.mesh_textures[0]);
     assert(resources.ordinary_count > 0 && resources.ordinary[0].vbo &&
            resources.ordinary[0].ibo);
+    assert(resources.vista_count == 1 && resources.vista[0].vbo);
+    GLuint vista_vbo = resources.vista[0].vbo;
     assert(!neighborhood.rgn[0].data);
     GLuint bound = resources.textures[0];
+    world_resident_resources_free(&resources);
+    assert(!glIsBuffer(vista_vbo));
+    assert(world_resident_resources_build(&resources, &neighborhood, 0, NULL));
+    assert(resources.ordinary_count == 1 && !resources.vista && !resources.vista_count);
     world_resident_resources_free(&resources);
     assert(world_ground_grid_build(&neighborhood.grid,&neighborhood.scene,
                                    (const float (*)[4])neighborhood.mbb));
     WorldResident candidate={0};candidate.world=neighborhood;
     candidate.radius=candidate.world.radius=1400;
     for(int leave=0;leave<2;leave++) {
+        candidate.resources.mesh_packed = calloc(1, sizeof *candidate.resources.mesh_packed);
+        assert(candidate.resources.mesh_packed);
+        candidate.resources.normals_count = 1;
+        assert(render_pack_mesh(candidate.world.scene.meshes, candidate.resources.mesh_packed));
         assert(!world_resident_finish_step(&candidate,1,1,0,1,NULL));
         assert(candidate.resources.upload && !candidate.resources.ordinary);
         /* A supported start is insufficient: the last step must reject a
          * player who has since left this detached candidate's ground. */
         int status=world_resident_finish_step(&candidate,leave?1e8f:1,1,0,1,NULL);
         assert(status==(leave?-1:1));
+        assert(!candidate.resources.mesh_packed); /* consumed, then array released */
         world_resident_resources_free(&candidate.resources);
     }
     world_neighborhood_free(&candidate.world);
@@ -309,6 +332,11 @@ static void test_sliced_batches(void) {
     assert(nd==4 && direct_map[0]==direct_map[1] && direct_map[2]!=direct_map[0]);
     assert(direct_map[6]!=direct_map[2] && direct_map[4]==-1 && direct_map[5]==-1);
     WorldBatchUpload *job=upload_world_batches_begin(&scene,bounds,textures,0,NULL,modes);
+    PackedMesh packed_meshes[7] = {{0}};
+    for (int i=0;i<7;i++)
+        if (meshes[i].cat != N2_SKY && meshes[i].cat != N2_GLOW)
+            assert(render_pack_mesh(&meshes[i], &packed_meshes[i]));
+    upload_world_batches_set_packed(job, packed_meshes);
     assert(job && !upload_world_batches_step(&job,0,&sliced,&count,sliced_map));
     for(int step=1;step<=nd;step++) {
         assert(upload_world_batches_step(&job,1,&sliced,&count,sliced_map)==(step==nd));
@@ -318,6 +346,7 @@ static void test_sliced_batches(void) {
         }
     }
     assert(!job && count==nd && !memcmp(direct_map,sliced_map,sizeof direct_map));
+    for (int i=0;i<7;i++) assert(!packed_meshes[i].v);
     for(int i=0;i<nd;i++) {
         assert_same_buffer(GL_ARRAY_BUFFER,direct[i].vbo,sliced[i].vbo);
         assert_same_buffer(GL_ELEMENT_ARRAY_BUFFER,direct[i].ibo,sliced[i].ibo);
@@ -501,6 +530,7 @@ static void test_noise_rejects_only_mis_decodes(void) {
 }
 
 int main(void) {
+    assert(n2_tpk_inventory_selftest());
     char root[]="build/world-texture-XXXXXX";assert(mkdtemp(root));
     char tracks[160],global[160],region[192],common[192],master[192];
     snprintf(tracks,sizeof tracks,"%s/TRACKS",root);
@@ -549,6 +579,18 @@ int main(void) {
     /* A TPK-only unrelated region must not change the old source policy. */
     run_case(tracks,master,0,0,0,1);
     assert(!unlink(common));run_case(tracks,NULL,0,0,0,0);
+    /* Regional ads work without InGameCommon and preserve RGBA/draw mode.
+       NA wins over ROW; regional matches still win over either ad pack. */
+    char ads[192],row[192];
+    snprintf(ads,sizeof ads,"%s/GlobalTexturesNA.bin",global);
+    snprintf(row,sizeof row,"%s/GlobalTexturesROW.bin",global);
+    write_tpk(ads,KEY,0);write_tpk(row,KEY,1);
+    run_case(tracks,NULL,1,0,0,0);
+    run_case(tracks,NULL,1,0,1,0);
+    write_tpk(region,KEY,1);run_case(tracks,NULL,1,1,0,0);
+    write_tpk(region,KEY+1,1);
+    assert(!unlink(ads));run_case(tracks,NULL,1,1,0,0);
+    assert(!unlink(row));run_case(tracks,NULL,0,0,0,0);
     assert(!unlink(region)&&!unlink(master));
     assert(!rmdir(tracks)&&!rmdir(global)&&!rmdir(root));
     SDL_GL_DeleteContext(ctx);SDL_DestroyWindow(win);SDL_Quit();

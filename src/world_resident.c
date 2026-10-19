@@ -5,8 +5,16 @@
 #include <string.h>
 #include <time.h>
 #include <limits.h>
+#include <assert.h>
 
 #include "physics.h"
+
+#ifdef __vita__
+void vita_mark(const char *fmt, ...);
+#define VMARK(...) vita_mark(__VA_ARGS__)
+#else
+#define VMARK(...) ((void)0)
+#endif
 
 int world_resident_policy_valid(const WResidentPolicy *policy) {
     if (!policy || !isfinite(policy->resident_radius) ||
@@ -18,6 +26,57 @@ int world_resident_policy_valid(const WResidentPolicy *policy) {
            policy->resident_radius >= policy->draw_radius +
                                       policy->cell_size +
                                       policy->safety_margin;
+}
+
+static float resident_distance2(const float a[2], const float b[2]) {
+    float x = a[0]-b[0], y = a[1]-b[1];
+    return x*x+y*y;
+}
+
+int world_resident_candidate_useful(const WResidentPolicy *policy,
+                                   const float active[2], const float candidate[2],
+                                   const float player[2], const float predicted[2]) {
+    if (!world_resident_policy_valid(policy) || !active || !candidate ||
+        !player || !predicted) return 0;
+    for (int i=0;i<2;i++)
+        if (!isfinite(active[i]) || !isfinite(candidate[i]) ||
+            !isfinite(player[i]) || !isfinite(predicted[i])) return 0;
+    float reach = policy->resident_radius-policy->safety_margin;
+    float current = resident_distance2(player, candidate);
+    if (current > reach*reach) return 0;
+    /* Preserve a useful prepared area when a prediction crosses another cell.
+       It must cover the car and improve current or predicted coverage. Actual
+       ground support is still checked before upload and activation. */
+    return current+400.0f < resident_distance2(player, active) ||
+           resident_distance2(predicted, candidate)+400.0f <
+               resident_distance2(predicted, active);
+}
+
+int world_resident_target_behind(const float offset[2], const float velocity_mps[2]) {
+    if (!offset || !velocity_mps) return 0;
+    float d2=offset[0]*offset[0]+offset[1]*offset[1];
+    float v2=velocity_mps[0]*velocity_mps[0]+velocity_mps[1]*velocity_mps[1];
+    float dot=offset[0]*velocity_mps[0]+offset[1]*velocity_mps[1];
+    /* More than 120 degrees behind. A near-perpendicular target on a bend
+       should not cancel several seconds of useful work. */
+    return isfinite(d2) && isfinite(v2) && isfinite(dot) &&
+           d2 > 100.0f*100.0f && v2 > 8.0f*8.0f && dot < -0.5f*sqrtf(d2*v2);
+}
+
+void world_resident_streaming_selftest(void) {
+    WResidentPolicy p={350,220,50,80};
+    const float active[2]={320,-640}, candidate[2]={160,-400};
+    const float player[2]={278,-500}, predicted[2]={160,-320};
+    assert(world_resident_candidate_useful(&p,active,candidate,player,predicted));
+    const float away[2]={480,-640}, outside[2]={-400,-400};
+    assert(!world_resident_candidate_useful(&p,active,away,player,predicted));
+    assert(!world_resident_candidate_useful(&p,active,outside,player,predicted));
+    const float south[2]={0,-25}, bend[2]={-166,16}, reverse[2]={0,150};
+    assert(!world_resident_target_behind(bend,south));
+    assert(world_resident_target_behind(reverse,south));
+    const float slow[2]={0,-2}, nearby[2]={0,50};
+    assert(!world_resident_target_behind(reverse,slow));
+    assert(!world_resident_target_behind(nearby,south));
 }
 
 int world_resident_target(const WResidentPolicy *policy,
@@ -102,9 +161,13 @@ int world_resident_route_point(const WResidentPolicy *policy,
     return 1;
 }
 
+static void resident_free_normals(WorldResidentResources *resources);
+
 void world_resident_resources_free(WorldResidentResources *resources) {
     if (!resources) return;
     upload_world_batches_cancel(&resources->upload);
+    upload_world_batches_cancel(&resources->cpu_plan);
+    resident_free_normals(resources);
     /* World textures belong to the process-wide key cache in world.c and are
        shared with every other resident: this array only borrows them. The
        grass upload is this build's own, so it is still released here. */
@@ -176,9 +239,163 @@ static uint32_t wrb_ms(struct timespec *a, struct timespec *b) {
                       (b->tv_nsec - a->tv_nsec) / 1000000);
 }
 
+static void resident_free_normals(WorldResidentResources *resources) {
+    if (resources->mesh_normals)
+        for (int i = 0; i < resources->normals_count; i++) free(resources->mesh_normals[i]);
+    free(resources->mesh_normals);
+    resources->mesh_normals = NULL;
+    if (resources->mesh_packed)
+        for (int i = 0; i < resources->normals_count; i++)
+            if (!resources->mesh_packed[i].borrowed) free(resources->mesh_packed[i].v);
+    free(resources->mesh_packed);
+    resources->mesh_packed = NULL;
+    resources->normals_count = 0;
+}
+
+#ifdef __vita__
+static int resident_validate_meshes(const WorldResident *resident);
+/* Worker-side CPU work that used to run on the render thread while a
+   resident was being finished: mesh validation, collision walls and the
+   per-vertex normals batch upload needs. Nothing here touches GL. */
+int world_build_aborted(void);
+static SDL_atomic_t resident_tex_fetch;   /* see world_resident_texture_fetch */
+static int resident_worker_precompute(WorldResident *candidate) {
+    /* The mesh arrays grew by doubling; give the unused tail back. newlib
+       shrinks in place, and a failed shrink just keeps the larger array. */
+    for (int pass = 0; pass < 2; pass++) {
+        N2Scene *s = pass ? &candidate->world.vista : &candidate->world.scene;
+        if (s->meshes && s->count > 0 && s->cap > s->count + 16) {
+            int before = s->cap;
+            N2Mesh *m = (N2Mesh *)realloc(s->meshes, (size_t)s->count * sizeof *m);
+            if (m) {
+                /* the ground grid points into this array */
+                if (!pass && candidate->world.grid.meshes == s->meshes) candidate->world.grid.meshes = m;
+                s->meshes = m; s->cap = s->count;
+            }
+            if (!pass) VMARK("  worker: mesh records %d -> %d slots (%ld KB freed)", before, s->cap,
+                             (long)(before - s->cap) * (long)sizeof(N2Mesh) >> 10);
+        }
+    }
+    if (!resident_validate_meshes(candidate)) return 0;
+    candidate->meshes_validated = 1;
+    VMARK("  worker: meshes validated");
+    if (world_build_aborted()) return 0;
+    WorldResidentResources *r = &candidate->resources;
+    const N2Scene *scene = &candidate->world.scene;
+    int n = scene->count;
+    r->obstacles = (float (*)[4])calloc((size_t)n, sizeof *r->obstacles);
+    r->obstacle_z = (float (*)[2])calloc((size_t)n, sizeof *r->obstacle_z);
+    r->obstacle_src = (int *)calloc((size_t)n, sizeof *r->obstacle_src);
+    if (!r->obstacles || !r->obstacle_z || !r->obstacle_src) return 0;
+    r->obstacle_count = phys_collect_walls(scene, r->obstacles, r->obstacle_src,
+                                           r->obstacle_z, n);
+    VMARK("  worker: %d collision walls", r->obstacle_count);
+    if (world_build_aborted()) return 0;
+    SDL_AtomicSet(&resident_tex_fetch, 1);
+    world_predecode_textures(&candidate->world);
+    SDL_AtomicSet(&resident_tex_fetch, 0);
+    VMARK("  worker: textures predecoded");
+    if (world_build_aborted()) return 0;
+    /* whole meshes in batch vertex layout: the render thread then only
+       concatenates them (a mesh that fails to pack is packed there instead) */
+    r->mesh_packed = (PackedMesh *)calloc((size_t)n, sizeof *r->mesh_packed);
+    if (r->mesh_packed) {
+        int reused_packed = 0;
+        r->normals_count = n; /* cleanup also owns a partially packed abort */
+        for (int i = 0; i < n; i++) {
+            if ((i & 31) == 0 && world_build_aborted()) return 0;
+            const N2Mesh *m = &scene->meshes[i];
+            if (m->world_role == 1 || m->cat == N2_SKY || m->cat == N2_GLOW) continue;   /* not world batches */
+            if (m->shared_geometry && m->shared_geometry->packed) reused_packed++;
+            render_pack_mesh(m, &r->mesh_packed[i]);
+        }
+        VMARK("  worker: %d packed meshes reused", reused_packed);
+    }
+    VMARK("  worker: meshes packed");
+    if (world_build_aborted()) return 0;
+    Uint64 plan_begin=SDL_GetPerformanceCounter();
+    GLuint *logical=calloc((size_t)n,sizeof *logical);
+    unsigned char *modes=calloc((size_t)n,sizeof *modes);
+    if (logical && modes && r->mesh_packed) {
+        for (int i=0; i<n; i++) {
+            const N2Mesh *m=&scene->meshes[i]; unsigned char mode=0;
+            int resolved=world_predecoded_texture_info(m->texkey,&mode);
+            logical[i]=resolved ? m->texkey : m->cat==N2_TERRAIN ? UINT32_MAX : 0;
+            modes[i]=resolved ? n2_world_draw_mode(m,mode) : N2_DRAW_OPAQUE;
+        }
+        r->cpu_plan=upload_world_batches_prepare_cpu(scene,
+            (const float (*)[4])candidate->world.mbb,logical,modes,r->mesh_packed);
+    }
+    free(logical); free(modes);
+    VMARK("  worker: batch plan %s in %u ms",r->cpu_plan ? "prepared" : "fallback",
+        (unsigned)((SDL_GetPerformanceCounter()-plan_begin)*1000/SDL_GetPerformanceFrequency()));
+    extern void vita_mark_stats(void);
+    vita_mark_stats();
+    if (world_build_aborted()) return 0;
+    return 1;
+}
+#endif
+
+#ifdef __vita__
+/* The same off-thread work for a prepare run outside a job (the track
+   switch's thread): its finish then only uploads. */
+int world_resident_precompute(WorldResident *candidate) {
+    return resident_worker_precompute(candidate);
+}
+#endif
+
+#define HITCH_MAX 64
+static struct { const char *label; Uint64 t; } g_hitch[HITCH_MAX];
+static int g_hitch_n = -1;   /* -1: no open span */
+static Uint64 g_hitch_t0;
+
+void hitch_begin(void) {
+    g_hitch_t0 = SDL_GetPerformanceCounter();
+    g_hitch_n = 0;
+}
+
+void hitch_mark(const char *label) {
+    if (g_hitch_n < 0 || g_hitch_n >= HITCH_MAX) return;
+    g_hitch[g_hitch_n].label = label;
+    g_hitch[g_hitch_n].t = SDL_GetPerformanceCounter();
+    g_hitch_n++;
+}
+
+void hitch_report(double threshold_ms) {
+    if (g_hitch_n < 0) return;
+    double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
+    Uint64 end = SDL_GetPerformanceCounter();
+    double total = (double)(end - g_hitch_t0) * f;
+    if (total >= threshold_ms) {
+        char line[1024];
+        int len = snprintf(line, sizeof line, "hitch %.1f ms:", total);
+        Uint64 prev = g_hitch_t0;
+        for (int i = 0; i < g_hitch_n && len < (int)sizeof line - 48; i++) {
+            double ms = (double)(g_hitch[i].t - prev) * f;
+            prev = g_hitch[i].t;
+            if (ms >= 1.0)
+                len += snprintf(line + len, sizeof line - (size_t)len, " %s=%.1f",
+                                g_hitch[i].label, ms);
+        }
+        double rest = (double)(end - prev) * f;
+        if (rest >= 1.0 && len < (int)sizeof line - 32)
+            snprintf(line + len, sizeof line - (size_t)len, " rest=%.1f", rest);
+        printf("%s\n", line);
+    }
+    g_hitch_n = -1;
+}
+
+typedef struct { uint32_t key; int index; } ResidentTexSlot;
+static int resident_tex_slot_cmp(const void *a, const void *b) {
+    const ResidentTexSlot *p = (const ResidentTexSlot *)a, *q = (const ResidentTexSlot *)b;
+    if (p->key != q->key) return p->key < q->key ? -1 : 1;
+    return (p->index > q->index) - (p->index < q->index);   /* first slot wins, as before */
+}
+
 static int resident_resources_step(WorldResidentResources *resources,
                                    WorldNeighborhood *neighborhood,
                                    int max_batches,
+                                   int include_vista,
                                    WResidentBuildTiming *timing) {
     if (!resources || !neighborhood || neighborhood->scene.count <= 0 ||
         !neighborhood->scene.meshes || !neighborhood->mbb) return -1;
@@ -207,7 +424,11 @@ static int resident_resources_step(WorldResidentResources *resources,
         resources->mesh_count = mesh_count;
     }
 
-    if (resources->texture_binding.pass < 2) {
+    /* Setup stages, one frame each when sliced: 0 texture binding, 1 mesh ->
+       texture lookup, 2 grass + sky/glow + batch plan, 3 batch uploads. They
+       used to share one frame (a 45-60 ms hitch per streaming build). */
+    int sliced = max_batches != INT_MAX;
+    if (resources->setup_stage == 0) {
         Uint64 texture_begin = SDL_GetPerformanceCounter();
         World facade;
         memset(&facade, 0, sizeof facade);
@@ -217,32 +438,68 @@ static int resident_resources_step(WorldResidentResources *resources,
         int bound = world_bind_textures_step(
             &facade, resources->texture_keys, resources->textures,
             resources->texture_modes, texture_cap, &resources->texture_binding,
-            max_batches == INT_MAX ? INT_MAX : 8);
+            max_batches == INT_MAX ? INT_MAX :
+#ifdef __vita__
+            max_batches >= 128 ? 16 : 8);   /* urgent : smooth (decoded on the worker; upload only) */
+#else
+            8);
+#endif
         *neighborhood = facade.neighborhood;
+        resources->texture_ticks += SDL_GetPerformanceCounter() - texture_begin;
+        hitch_mark("fin.tex_bind");
         if (bound < 0) goto fail;
-        if (!bound) {
-            resources->texture_ticks += SDL_GetPerformanceCounter() - texture_begin;
-            return 0;
-        }
+        if (!bound) return 0;
         resources->texture_count = resources->texture_binding.count;
         for (int i = 0; i < resources->texture_count; i++)
             if (!resources->textures[i]) goto fail;
+        resources->setup_stage = 1;
+        if (sliced) return 0;
+    }
 
+    if (resources->setup_stage == 1) {
+        Uint64 texture_begin = SDL_GetPerformanceCounter();
+        /* key -> first texture slot through a sorted index: the linear scan
+           per mesh was meshes x textures (~2.5M compares) in one frame. */
+        int nt = resources->texture_count;
+        ResidentTexSlot *slots = (ResidentTexSlot *)malloc(
+            (size_t)(nt ? nt : 1) * sizeof *slots);
+        if (!slots) goto fail;
+        for (int j = 0; j < nt; j++) {
+            slots[j].key = resources->texture_keys[j];
+            slots[j].index = j;
+        }
+        qsort(slots, (size_t)nt, sizeof *slots, resident_tex_slot_cmp);
         for (int i = 0; i < mesh_count; i++) {
             resources->mesh_batch[i] = -1;
-            for (int j = 0; j < resources->texture_count; j++)
-                if (resources->texture_keys[j] == neighborhood->scene.meshes[i].texkey) {
-                    resources->mesh_textures[i] = resources->textures[j];
-                    resources->mesh_modes[i] = (unsigned char)n2_world_draw_mode(
-                        &neighborhood->scene.meshes[i], resources->texture_modes[j]);
-                    break;
-                }
+            uint32_t key = neighborhood->scene.meshes[i].texkey;
+            int lo = 0, hi = nt;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (slots[mid].key < key) lo = mid + 1; else hi = mid;
+            }
+            if (lo < nt && slots[lo].key == key) {
+                int j = slots[lo].index;
+                resources->mesh_textures[i] = resources->textures[j];
+                resources->mesh_modes[i] = (unsigned char)n2_world_draw_mode(
+                    &neighborhood->scene.meshes[i], resources->texture_modes[j]);
+            }
         }
+        free(slots);
+        resources->texture_ticks += SDL_GetPerformanceCounter() - texture_begin;
+        hitch_mark("fin.tex_lookup");
+        resources->setup_stage = 2;
+        if (sliced) return 0;
+    }
+
+    if (resources->setup_stage == 2) {
+        Uint64 texture_begin = SDL_GetPerformanceCounter();
         if (neighborhood->have_grass)
             resources->terrain_texture = upload_tex(&neighborhood->grass);
+        hitch_mark("fin.grass");
         resources->texture_ticks += SDL_GetPerformanceCounter() - texture_begin;
         if (timing) timing->textures_ms = (uint32_t)(
             resources->texture_ticks * 1000 / SDL_GetPerformanceFrequency());
+        VMARK("  resident: %d textures uploaded", resources->texture_count);
 
         Uint64 batch_begin = SDL_GetPerformanceCounter();
         resources->sky_count = upload_cat_batches(
@@ -252,16 +509,33 @@ static int resident_resources_step(WorldResidentResources *resources,
             &neighborhood->scene, N2_GLOW, resources->mesh_textures,
             &resources->glow, NULL);
         if (resources->sky_count < 0 || resources->glow_count < 0) goto fail;
-        resources->upload = upload_world_batches_begin(
+        hitch_mark("fin.sky_glow");
+        if (resources->cpu_plan) {
+            if (upload_world_batches_bind_prepared(resources->cpu_plan,
+                    resources->mesh_textures,resources->terrain_texture,resources->mesh_modes)) {
+                resources->upload=resources->cpu_plan; resources->cpu_plan=NULL;
+            } else {
+                printf("worker batch plan: rejected texture/material mismatch; regrouping\n");
+                upload_world_batches_cancel(&resources->cpu_plan);
+            }
+        }
+        if (!resources->upload) resources->upload = upload_world_batches_begin(
             &neighborhood->scene, (const float (*)[4])neighborhood->mbb,
             resources->mesh_textures, resources->terrain_texture,
             NULL, resources->mesh_modes);
         if (!resources->upload) goto fail;
+        upload_world_batches_set_normals(resources->upload, resources->mesh_normals);
+        upload_world_batches_set_packed(resources->upload, resources->mesh_packed);
+        hitch_mark("fin.plan");
+        VMARK("  resident: sky %d, glow %d batches; world batch upload begins",
+              resources->sky_count, resources->glow_count);
         resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+        resources->setup_stage = 3;
         return 0; /* keep texture/partition work separate from ordinary uploads */
     }
 
     Uint64 batch_begin = SDL_GetPerformanceCounter();
+    hitch_mark("fin.pre_upload");
     int uploaded = upload_world_batches_step(&resources->upload, max_batches,
                         &resources->ordinary, &resources->ordinary_count,
                         resources->mesh_batch);
@@ -271,7 +545,13 @@ static int resident_resources_step(WorldResidentResources *resources,
         return 0;
     }
     if (resources->ordinary_count <= 0 || !resources->ordinary) goto fail;
-    if (!resident_vista_batches(resources, neighborhood)) goto fail;
+    hitch_mark("fin.batch_upload");
+    VMARK("  resident: %d world batches uploaded", resources->ordinary_count);
+    hitch_mark("fin.vmark_batches");
+    resident_free_normals(resources);
+    hitch_mark("fin.free_normals");
+    if (include_vista && !resident_vista_batches(resources, neighborhood)) goto fail;
+    hitch_mark("fin.vista");
 
     resources->debug_batches = (WorldMeshBatch *)calloc(
         (size_t)resources->ordinary_count, sizeof *resources->debug_batches);
@@ -284,12 +564,18 @@ static int resident_resources_step(WorldResidentResources *resources,
         resources->debug_batches[i].chunk_id = (uint32_t)i;
     }
     resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+    hitch_mark("fin.debug_batches");
     if (timing) {
         timing->batches_ms = (uint32_t)(resources->batch_ticks * 1000 /
                                        SDL_GetPerformanceFrequency());
         clock_gettime(CLOCK_MONOTONIC, &rt0);
     }
 
+    if (resources->obstacles) {   /* collected by the worker (Vita) */
+        VMARK("  resident: %d collision obstacles (worker)", resources->obstacle_count);
+        if (glGetError() != GL_NO_ERROR) goto fail;
+        return 1;
+    }
     int obstacle_cap = mesh_count;
     resources->obstacles = (float (*)[4])calloc(
         (size_t)obstacle_cap, sizeof *resources->obstacles);
@@ -304,6 +590,28 @@ static int resident_resources_step(WorldResidentResources *resources,
         resources->obstacle_src, resources->obstacle_z, obstacle_cap);
     if (timing) { clock_gettime(CLOCK_MONOTONIC, &rt1);
                   timing->collision_ms = wrb_ms(&rt0, &rt1); }
+    VMARK("  resident: %d collision obstacles", resources->obstacle_count);
+#if 0
+    {   /* CPU mesh memory by role: what streaming could drop after upload */
+        const N2Scene *sc = &neighborhood->scene;
+        unsigned char *wall = (unsigned char *)calloc((size_t)sc->count + 1, 1);
+        long bytes[3] = {0, 0, 0};   /* ground, wall source, render-only */
+        for (int i = 0; wall && i < resources->obstacle_count; i++) {
+            int m = resources->obstacle_src[i];
+            if (m >= 0 && m < sc->count) wall[m] = 1;
+        }
+        for (int i = 0; wall && i < sc->count; i++) {
+            const N2Mesh *m = &sc->meshes[i];
+            long b = (long)m->nverts * 5 * 4 + (long)m->nidx * 2;
+            int k = (m->cat == N2_ROAD || m->cat == N2_TERRAIN) ? 0 : wall[i] ? 1 : 2;
+            bytes[k] += b;
+        }
+        free(wall);
+        VMARK("  mesh memory: ground %ld MB, walls %ld MB, render-only %ld MB, mesh records %ld MB",
+              bytes[0] >> 20, bytes[1] >> 20, bytes[2] >> 20,
+              ((long)sc->count * (long)sizeof(N2Mesh)) >> 20);
+    }
+#endif
     if (glGetError() != GL_NO_ERROR) goto fail;
     return 1;
 
@@ -314,16 +622,30 @@ fail:
 
 int world_resident_resources_build(WorldResidentResources *resources,
                                    WorldNeighborhood *neighborhood,
+                                   int include_vista,
                                    WResidentBuildTiming *timing) {
     world_resident_resources_free(resources);
     int status;
-    do { status = resident_resources_step(resources, neighborhood, INT_MAX, timing); }
+    do { status = resident_resources_step(resources, neighborhood, INT_MAX, include_vista, timing); }
     while (!status);
     return status > 0;
 }
 
+static int resident_validate_meshes(const WorldResident *resident);
+
 int world_resident_validate_cpu(const WorldResident *resident,
                                 float player_x, float player_y, float player_z) {
+    if (!resident || !isfinite(player_x) || !isfinite(player_y) ||
+        !isfinite(player_z)) return 0;
+    if (!resident->meshes_validated && !resident_validate_meshes(resident)) return 0;
+    WGroundHit hit;
+    return world_ground_hit_grid(&resident->world.grid, &resident->world.scene,
+                                player_x, player_y, player_z, &hit) !=
+           WSURF_NONE;
+}
+
+static int resident_validate_meshes(const WorldResident *resident) {
+    const float player_x = 0, player_y = 0, player_z = 0;
     if (!resident || !isfinite(player_x) || !isfinite(player_y) ||
         !isfinite(player_z) || !isfinite(resident->center[0]) ||
         !isfinite(resident->center[1]) || !isfinite(resident->radius) ||
@@ -337,7 +659,14 @@ int world_resident_validate_cpu(const WorldResident *resident,
         world->inst_stats.rejected_meshes != 0 ||
         world->center[0] != resident->center[0] ||
         world->center[1] != resident->center[1] ||
-        world->radius != resident->radius) return 0;
+        world->radius != resident->radius) {
+        printf("resident validate: setup mismatch (grid %s, rejected %d, centre/radius %s)\n",
+               world->grid.meshes != scene->meshes ? "points at another mesh array" : "ok",
+               (int)world->inst_stats.rejected_meshes,
+               world->center[0] != resident->center[0] || world->center[1] != resident->center[1] ||
+               world->radius != resident->radius ? "differ" : "ok");
+        return 0;
+    }
 
     int ground_meshes = 0;
     for (int i = 0; i < scene->count; i++) {
@@ -345,19 +674,22 @@ int world_resident_validate_cpu(const WorldResident *resident,
         if (!mesh->verts || !mesh->idx || mesh->nverts <= 0 || mesh->nidx <= 0)
             return 0;
         if (mesh->cat == N2_ROAD || mesh->cat == N2_TERRAIN) ground_meshes++;
-        for (int j = 0; j < mesh->nverts; j++)
+        if (mesh->world_bounds_valid) {
+            for (int k = 0; k < 6; k++) if (!isfinite(mesh->world_bounds[k])) return 0;
             for (int k = 0; k < 3; k++)
-                if (!isfinite(mesh->verts[j*5+k])) return 0;
+                if (mesh->world_bounds[k] > mesh->world_bounds[k+3]) return 0;
+        } else {
+            for (int j = 0; j < mesh->nverts; j++)
+                for (int k = 0; k < 3; k++)
+                    if (!isfinite(mesh->verts[j*5+k])) return 0;
+        }
         for (int j = 0; j < mesh->nidx; j++)
             if (mesh->idx[j] >= mesh->nverts) return 0;
         for (int j = 0; j < 4; j++)
             if (!isfinite(world->mbb[i][j])) return 0;
     }
-    if (!ground_meshes) return 0;
-
-    WGroundHit hit;
-    return world_ground_hit(scene, player_x, player_y, player_z, &hit) !=
-           WSURF_NONE;
+    if (!ground_meshes) printf("resident validate: no ground meshes\n");
+    return ground_meshes > 0;
 }
 
 int world_resident_prepare(WorldResident *candidate,
@@ -371,6 +703,7 @@ int world_resident_prepare(WorldResident *candidate,
     candidate->center[0] = center_x;
     candidate->center[1] = center_y;
     candidate->radius = args->policy.resident_radius;
+    candidate->omit_vista = args->omit_vista;
     struct timespec t0, t1;
     if (timing) clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -398,7 +731,7 @@ int world_resident_finish(WorldResident *candidate, float x, float y, float z,
                   timing->validate_ms = wrb_ms(&t0, &t1); t0 = t1; }
 
     if (!world_resident_resources_build(&candidate->resources,
-                                        &candidate->world, timing)) return 0;
+                                        &candidate->world, !candidate->omit_vista, timing)) return 0;
     if (timing) timing->total_ms = timing->neighborhood_ms +
                     timing->validate_ms + timing->textures_ms +
                     timing->batches_ms + timing->collision_ms;
@@ -414,13 +747,16 @@ int world_resident_finish_step(WorldResident *candidate, float x, float y, float
         if (timing) timing->validate_ms = (uint32_t)(
             (SDL_GetPerformanceCounter() - begin) * 1000 / SDL_GetPerformanceFrequency());
     }
+    hitch_mark("fin.validate");
     int status = resident_resources_step(&candidate->resources, &candidate->world,
-                                         max_batches, timing);
+                                         max_batches, !candidate->omit_vista, timing);
     if (status > 0) {
         WGroundHit hit;
         if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
-            world_ground_hit(&candidate->world.scene, x, y, z, &hit) == WSURF_NONE)
+            world_ground_hit_grid(&candidate->world.grid, &candidate->world.scene,
+                                  x, y, z, &hit) == WSURF_NONE)
             return -1;
+        hitch_mark("fin.ground_check");
         if (timing) timing->total_ms = timing->neighborhood_ms + timing->validate_ms +
                 timing->textures_ms + timing->batches_ms + timing->collision_ms;
     }
@@ -451,17 +787,98 @@ struct WResidentJob {
     WorldResident *candidate;
     WResidentBuildTiming timing;
     int ok;
+    int aborted;
+    Uint32 start_ms;
 };
+
+static SDL_atomic_t g_resident_abort;
+int world_build_aborted(void) { return SDL_AtomicGet(&g_resident_abort); }
 
 /* Loader-only parser scratch is shared within each translation unit. Keep
  * ownership until join, including completed-but-not-yet-consumed requests. */
 static SDL_atomic_t resident_loader_busy;
+/* a streaming build is on the worker (reading tiles and textures) */
+int world_resident_loader_busy(void) { return SDL_AtomicGet(&resident_loader_busy); }
+/* the worker is reading textures from the card right now */
+int world_resident_texture_fetch(void) { return SDL_AtomicGet(&resident_tex_fetch); }
+
+#ifdef __vita__
+/* Where a freshly prepared resident's CPU memory goes (loader thread, after
+   precompute). "own" bytes belong to this resident alone; "shared" bytes are
+   also referenced by the placement cache or the previous resident. */
+static void resident_memory_report(const WorldResident *r) {
+    enum { GROUND, WALL, COLL, STANDIN, DRAWN, VISTA, NCAT };
+    static const char *const name[NCAT] = { "ground", "walls", "collision-only",
+                                            "stand-ins", "drawn", "vista" };
+    long own[NCAT] = {0}, shared[NCAT] = {0}, vcol_bytes = 0;
+    const N2Scene *sc = &r->world.scene;
+    const WorldResidentResources *res = &r->resources;
+    unsigned char *wall = (unsigned char *)calloc((size_t)sc->count + 1, 1);
+    for (int i = 0; wall && i < res->obstacle_count; i++) {
+        int m = res->obstacle_src[i];
+        if (m >= 0 && m < sc->count) wall[m] = 1;
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        const N2Scene *s = pass ? &r->world.vista : sc;
+        for (int i = 0; i < s->count; i++) {
+            const N2Mesh *m = &s->meshes[i];
+            long b = (long)m->nverts * (m->authored_normals ? 8 : 5) * 4 + (long)m->nidx * 2;
+            if (m->vcol) { b += (long)m->nverts * 4; vcol_bytes += (long)m->nverts * 4; }
+            int k = pass ? VISTA
+                  : (m->cat == N2_ROAD || m->cat == N2_TERRAIN) ? GROUND
+                  : m->world_role == 1 ? COLL : m->world_role == 2 ? STANDIN
+                  : (wall && wall[i]) ? WALL : DRAWN;
+            if (m->shared_geometry) shared[k] += b; else own[k] += b;
+        }
+    }
+    free(wall);
+    long normals = 0, packed_own = 0, packed_borrowed = 0;
+    for (int i = 0; res->mesh_normals && i < res->normals_count; i++)
+        if (res->mesh_normals[i]) normals += (long)sc->meshes[i].nverts * 12;
+    for (int i = 0; res->mesh_packed && i < sc->count; i++) {
+        const PackedMesh *pk = &res->mesh_packed[i];
+        if (!pk->v) continue;
+        long b = (long)sc->meshes[i].nverts * (long)sizeof(BatchedVertex);
+        if (pk->borrowed) packed_borrowed += b; else packed_own += b;
+    }
+    long records = (long)(sc->cap + r->world.vista.cap) * (long)sizeof(N2Mesh);
+    extern size_t world_instance_cache_bytes(void);
+    char line[400]; int n = 0;
+    for (int k = 0; k < NCAT; k++)
+        n += snprintf(line + n, sizeof line - (size_t)n, "%s %ld+%ld ", name[k],
+                      own[k] >> 20, shared[k] >> 20);
+    VMARK("  memory (MB own+shared): %s| vcol %ld | records %ld (%d meshes x %d B) | "
+          "normals %ld | packed %ld own, %ld cached | lights %ld KB | walls %ld KB | placement cache %ld",
+          line, vcol_bytes >> 20, records >> 20, sc->count, (int)sizeof(N2Mesh),
+          normals >> 20, packed_own >> 20, packed_borrowed >> 20,
+          (long)r->world.nlights * (long)sizeof(N2LightSrc) >> 10,
+          (long)res->obstacle_count * 28 >> 10, (long)(world_instance_cache_bytes() >> 20));
+    const WGroundGrid *g = &r->world.grid;
+    long grid = 0;
+    if (g->start) grid += ((long)g->gw * g->gh + 1) * 4 + (long)g->start[g->gw * g->gh] * 4;
+    if (g->tstart) grid += ((long)g->tgw * g->tgh + 1) * 4 + (long)g->tstart[g->tgw * g->tgh] * 4;
+    VMARK("  memory (MB): loc4 copy %ld, ads copy %ld, ground grid %ld, mbb %ld KB",
+          r->world.loc4_shared ? 0 : r->world.loc4len >> 20, r->world.adslen >> 20, grid >> 20,
+          (long)sc->count * 16 >> 10);
+}
+#endif
 
 static int resident_worker(void *data) {
     WResidentJob *job = data;
+#ifdef __vita__
+    extern void vita_heap_report(const char *label);
+    vita_heap_report("at build start");
+#endif
     job->ok = world_resident_prepare(job->candidate, &job->args,
                                      job->candidate->center[0],
                                      job->candidate->center[1], &job->timing);
+#ifdef __vita__
+    if (job->ok && world_build_aborted()) job->ok = 0;
+    if (job->ok) job->ok = resident_worker_precompute(job->candidate);
+    job->aborted = world_build_aborted();
+    if (job->ok) resident_memory_report(job->candidate);
+    vita_heap_report("at build end");
+#endif
     /* SDL's atomic release/acquire publishes all candidate writes. No GL,
      * active-scene queries or partial-output cleanup occurs on this thread. */
     SDL_AtomicSet(&job->done, 1);
@@ -493,9 +910,11 @@ int world_resident_job_start(WResidentJob **slot, const WResidentBuildArgs *args
     job->candidate->center[0] = center_x;
     job->candidate->center[1] = center_y;
     SDL_AtomicSet(&job->done, 0);
+    job->start_ms = SDL_GetTicks();
     if (!SDL_AtomicCAS(&resident_loader_busy, 0, 1)) {
         free(job->candidate); resident_job_free(job); return 0;
     }
+    SDL_AtomicSet(&g_resident_abort, 0);
     job->thread = SDL_CreateThread(resident_worker, "world-prepare", job);
     if (!job->thread) {
         SDL_AtomicSet(&resident_loader_busy, 0);
@@ -510,13 +929,37 @@ int world_resident_job_take(WResidentJob **slot, WorldResident **candidate,
     if (!slot || !*slot || !candidate || !SDL_AtomicGet(&(*slot)->done)) return 0;
     WResidentJob *job = *slot;
     SDL_WaitThread(job->thread, NULL);
-    *candidate = job->candidate;
-    if (timing) *timing = job->timing;
-    int result = job->ok ? 1 : -1;
+    int result;
+    if (job->aborted) {         /* asked to stop: not a failed cell */
+        printf("resident build aborted at (%.0f,%.0f) after %u ms\n",
+               job->candidate->center[0], job->candidate->center[1],
+               SDL_GetTicks() - job->start_ms);
+        world_resident_free(job->candidate);
+        result = 0;
+    } else {
+        *candidate = job->candidate;
+        if (timing) *timing = job->timing;
+        result = job->ok ? 1 : -1;
+    }
+    SDL_AtomicSet(&g_resident_abort, 0);
     resident_job_free(job);
     SDL_AtomicSet(&resident_loader_busy, 0);
     *slot = NULL;
     return result;
+}
+
+int world_resident_job_abort(WResidentJob *job) {
+    if (!job || SDL_AtomicGet(&job->done)) return 0;
+    return SDL_AtomicCAS(&g_resident_abort, 0, 1) ? 1 : 0;
+}
+
+int world_resident_job_info(const WResidentJob *job, float center[2],
+                            unsigned *age_ms) {
+    if (!job) return 0;
+    center[0] = job->candidate->center[0];
+    center[1] = job->candidate->center[1];
+    *age_ms = SDL_GetTicks() - job->start_ms;
+    return 1;
 }
 
 void world_resident_job_cancel(WResidentJob **slot) {
@@ -525,6 +968,9 @@ void world_resident_job_cancel(WResidentJob **slot) {
     SDL_WaitThread(job->thread, NULL);
     world_resident_free(job->candidate);
     resident_job_free(job);
+    /* an abort asked of this job must not stop the next prepare (the track
+       switch's runs outside a job) */
+    SDL_AtomicSet(&g_resident_abort, 0);
     SDL_AtomicSet(&resident_loader_busy, 0);
     *slot = NULL;
 }
@@ -560,11 +1006,11 @@ int world_resident_retire_step(WorldResident **slot, int max_items) {
         while (*counts[g] > 0) {
             if (!max_items) return 0;
             N2Batch *b = &batches[g][--*counts[g]];
-            GLuint ids[] = {b->vbo, b->ibo};
-            glDeleteBuffers(2, ids);
+            render_batch_release(b);
             max_items--;
         }
     }
+    hitch_mark("ret.batches");
     N2Scene *scenes[] = {&r->world.scene, &r->world.vista};
     for (int g = 0; g < 2; g++) {
         N2Scene *s = scenes[g];
@@ -572,11 +1018,13 @@ int world_resident_retire_step(WorldResident **slot, int max_items) {
         while (s->count > 0) {
             if (!max_items) return 0;
             N2Mesh *m = &s->meshes[--s->count];
-            free(m->verts); free(m->idx); free(m->vcol);
+            n2_mesh_geometry_release(m);
             max_items--;
         }
     }
+    hitch_mark("ret.meshes");
     world_resident_free(r); /* emptied arrays and remaining small owners */
+    hitch_mark("ret.free");
     *slot = NULL;
     return 1;
 }

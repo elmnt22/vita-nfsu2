@@ -10,7 +10,17 @@ typedef struct {
     unsigned char membership, checked;
 } WGSelected;
 typedef struct { WGSelected *items; size_t count; } WGSelection;
-enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4 };
+enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4, WG_LOCK=8 };
+
+/* Career progression walls: the translucent blue panes that seal districts
+ * until the career opens them (BARRIERS_CAREER0..4), plus the demo build's
+ * (BARRIERS_DEMO). The port has no career, so the whole city is open, as
+ * after the career: placements belonging only to these groups are hidden.
+ * TEMPORARY, for testing: when career progress exists, show each
+ * BARRIERS_CAREER<n> until that stage is reached (BARRIERS_DEMO stays hidden). */
+static int wg_lock_group(const char *name) {
+    return !strncmp(name,"BARRIERS_CAREER",15) || !strcmp(name,"BARRIERS_DEMO");
+}
 
 /* Runtime policy remains deliberately narrower than retail semantics. Normal
  * free roam hides only placements proven exclusive to numeric event groups.
@@ -79,7 +89,7 @@ static int wg_selection_open(const WGTable *table,int event,WGSelection *out) {
     for(size_t p=0;p<table->group_bytes;) {
         const unsigned char *g=table->groups+p;
         int id=wg_event_id((const char *)g+8);
-        unsigned bits=id?WG_EVENT:WG_OTHER;
+        unsigned bits=id?WG_EVENT:wg_lock_group((const char *)g+8)?WG_LOCK:WG_OTHER;
         if(id>0&&id==event){bits|=WG_ACTIVE;found=1;}
         uint32_t refs=wg_u32(g+48);
         for(uint32_t j=0;j<refs;j++)items[wg_u16(g+52+2*(size_t)j)].membership|=(unsigned char)bits;
@@ -97,6 +107,10 @@ static const WGSelected *wg_selection_find(const WGSelection *s,unsigned section
 }
 static int wg_selection_visible(const WGSelection *s,unsigned section,unsigned row) {
     const WGSelected *i=wg_selection_find(s,section,row);
-    return !i || !(i->membership&WG_EVENT) || (i->membership&(WG_OTHER|WG_ACTIVE));
+    if (!i) return 1;
+    /* the selected race's own group, or any ordinary group, keeps it */
+    if (i->membership&(WG_OTHER|WG_ACTIVE)) return 1;
+    /* only other events' closures and/or career locks: hidden */
+    return !(i->membership&(WG_EVENT|WG_LOCK));
 }
 #endif

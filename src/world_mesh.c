@@ -49,7 +49,7 @@ void render_world_map(const WorldMeshBatch *batches, uint32_t n,
     GLint aNor = glGetAttribLocation(program, "a_Normal");
     GLint aUV  = glGetAttribLocation(program, "a_UV0");
     GLint aCol = glGetAttribLocation(program, "a_Color");
-    const GLsizei stride = (GLsizei)sizeof(BatchedVertex);   /* 36 B */
+    const GLsizei stride = (GLsizei)sizeof(BatchedVertex);   /* 28 B Vita, 36 B desktop */
 
 #ifndef N2_GLES
     if (debug_mode == 2) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);   /* desktop only */
@@ -64,7 +64,7 @@ void render_world_map(const WorldMeshBatch *batches, uint32_t n,
             glVertexAttribPointer((GLuint)aPos, 3, GL_FLOAT, GL_FALSE, stride,
                                   (const void *)offsetof(BatchedVertex, pos)); }
         if (aNor >= 0) { glEnableVertexAttribArray((GLuint)aNor);
-            glVertexAttribPointer((GLuint)aNor, 3, GL_FLOAT, GL_FALSE, stride,
+            glVertexAttribPointer((GLuint)aNor, 3, BV_NORMAL_GL_TYPE, BV_NORMAL_GL_NORM, stride,
                                   (const void *)offsetof(BatchedVertex, normal)); }
         if (aUV  >= 0) { glEnableVertexAttribArray((GLuint)aUV);
             glVertexAttribPointer((GLuint)aUV, 2, GL_FLOAT, GL_FALSE, stride,

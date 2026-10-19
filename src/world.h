@@ -45,6 +45,7 @@ typedef struct {
 typedef struct {
     char name[64];
     unsigned char *data; long len;   /* file buffer, freed after texture bind */
+    int pinned;                      /* Vita: shared pinned bundle, never freed */
     N2Tpk tpk;
     int mesh0, mesh1;                /* this region's mesh range in the scene */
 } WRegion;
@@ -59,6 +60,12 @@ typedef struct {
     int gw, gh;
     int *start;
     int *list;
+    /* Fine triangle grid (same origin): each cell lists the ROAD/TERRAIN
+       triangles whose padded XY box overlaps it, packed (mesh << 15) | tri.
+       NULL when the scene is too large to pack; queries then use `list`. */
+    int tgw, tgh;
+    int *tstart;
+    uint32_t *tlist;
 } WGroundGrid;
 
 typedef struct {
@@ -67,8 +74,11 @@ typedef struct {
     WRegion rgn[WORLD_MAXREG];
     int nreg;
     unsigned char *loc4; long loc4len;
+    int loc4_shared;                 /* Vita: loc4 is the process-wide copy; never freed here */
     unsigned char *master; long masterlen; N2Tpk mastertpk; int master_mapped;
     unsigned char *common; long commonlen; N2Tpk commontpk;
+    unsigned char *ads; long adslen; N2Tpk adstpk;
+    uint32_t adskeys[32]; int nadskeys; /* shipped regional pack: one texture */
     N2Tex grass; int have_grass;
     N2LightSrc *lights; int nlights, lightcap;
     float (*mbb)[4];
@@ -177,6 +187,7 @@ int world_set_mode(World *w, int mode, int evidx);
  *
  * Returns the gate count (gate 0 = start/finish, 1.. = checkpoints). */
 int world_race_start(World *w, const char *troot, int evidx, int maxlaps);
+void world_race_reverse(World *w);   /* after world_race_start: the reversed track's gate order */
 
 /* Feed the car's XY once per frame. Only the single armed gate can be cleared,
  * and only by CROSSING it (previous position -> current position segment test),
@@ -234,6 +245,16 @@ typedef struct {
     int pass, region, request, count;
     uint32_t build, source;
 } WTextureBind;
+/* Set while the background resident build has been asked to stop; long
+   loader stages poll it and fail early (the caller discards the result). */
+int world_build_aborted(void);
+#ifdef __vita__
+/* Worker side: decode (from the card), screen and halve every texture this
+   neighborhood will request that the GL cache does not hold yet, so the
+   render thread only uploads. Must not overlap a texture bind. */
+void world_predecode_textures(const WorldNeighborhood *nb);
+int world_predecoded_texture_info(uint32_t key, unsigned char *mode);
+#endif
 int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
                              unsigned char *modes, int cap,
                              WTextureBind *binding, int max_decodes);
@@ -245,7 +266,7 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
  * names and must not delete them. Binding returns -1 on allocation/upload
  * failure; callers must reject that candidate. Releases every cached texture; call it on a
  * GL thread, and before pointing the loader at different archives in the same
- * process (a track switch re-execs, so only tests need that). */
+ * process (the Vita venue track switch does). */
 void world_texture_cache_clear(void);
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
@@ -274,6 +295,9 @@ typedef struct {
 } WGroundHit;
 int world_ground_hit(const N2Scene *s, float x, float y, float fallback,
                      WGroundHit *hit);
+/* Query an inactive resident's own index without changing the active grid. */
+int world_ground_hit_grid(const WGroundGrid *grid, const N2Scene *s,
+                          float x, float y, float fallback, WGroundHit *hit);
 
 /* Derive a chassis plane from the footprint around an already-selected centre
  * contact. Returns 0 when the footprint cannot be supported by one coherent
@@ -361,5 +385,9 @@ extern float world_rc_min[2], world_rc_max[2];
  * or mesh (see docs/FORMATS.md). Returns the number written (<= cap). */
 int world_scripted_defs(const World *w, const char *troot,
                         ScriptedDef *out, int cap);
+
+/* Regional fog from the track bundle's "Normal Fog" table (see world.c). */
+int world_fog_load(const char *troot, const char *track);
+int world_fog_eval(float x, float y, float *start, float *floor_f, float rgb[3]);
 
 #endif

@@ -14,6 +14,11 @@ typedef struct {
 typedef struct WorldResident WorldResident;
 
 int world_resident_policy_valid(const WResidentPolicy *policy);
+int world_resident_candidate_useful(const WResidentPolicy *policy,
+                                   const float active[2], const float candidate[2],
+                                   const float player[2], const float predicted[2]);
+int world_resident_target_behind(const float offset[2], const float velocity_mps[2]);
+void world_resident_streaming_selftest(void);
 int world_resident_target(const WResidentPolicy *policy,
                           float player_x, float player_y,
                           float active_x, float active_y,
@@ -44,7 +49,12 @@ typedef struct {
     int *obstacle_src;
     int obstacle_count;
     WorldBatchUpload *upload;  /* owns partial ordinary batches until complete */
+    WorldBatchUpload *cpu_plan; /* worker-created grouping; no GPU owners */
+    float **mesh_normals;      /* Vita: precomputed by the worker, per mesh */
+    int normals_count;
+    PackedMesh *mesh_packed;   /* Vita: batch-layout vertices from the worker */
     WTextureBind texture_binding;
+    int setup_stage;           /* 0 bind, 1 lookup, 2 grass/sky/plan, 3 uploads */
     uint64_t texture_ticks;
     uint64_t batch_ticks;      /* aggregate across sliced GL-thread work */
 } WorldResidentResources;
@@ -59,8 +69,10 @@ typedef struct {
     uint32_t total_ms;
 } WResidentBuildTiming;
 
+/* include_vista is true only for the full graphics tier or explicit audits. */
 int world_resident_resources_build(WorldResidentResources *resources,
                                    WorldNeighborhood *neighborhood,
+                                   int include_vista,
                                    WResidentBuildTiming *timing);
 void world_resident_resources_free(WorldResidentResources *resources);
 
@@ -70,6 +82,8 @@ struct WorldResident {
     float center[2];
     float radius;
     unsigned long generation;
+    int meshes_validated;      /* Vita: worker already ran the mesh checks */
+    int omit_vista;            /* ordinary/baseline never draw backdrop batches */
 };
 
 typedef struct {
@@ -78,6 +92,7 @@ typedef struct {
     int scenery_event;
     int sky_profile;
     WResidentPolicy policy;
+    int omit_vista;
 } WResidentBuildArgs;
 
 int world_resident_validate_cpu(const WorldResident *resident,
@@ -96,6 +111,9 @@ int world_resident_prepare(WorldResident *candidate, const WResidentBuildArgs *a
                            WResidentBuildTiming *timing);
 int world_resident_finish(WorldResident *candidate, float x, float y, float z,
                           WResidentBuildTiming *timing);
+/* Vita: a job's worker-side CPU work (validation, walls, texture predecode,
+ * packing, batch plan) for a prepare run outside a job. No GL. */
+int world_resident_precompute(WorldResident *candidate);
 /* Background finish: 0 pending, 1 complete, -1 failed. Retains partial resources
  * in candidate; free safely on cancellation. Check CURRENT support on the last
  * step as well as validating the detached scene before the first upload. */
@@ -115,6 +133,12 @@ int world_resident_job_start(WResidentJob **job, const WResidentBuildArgs *args,
 int world_resident_job_take(WResidentJob **job, WorldResident **candidate,
                             WResidentBuildTiming *timing);
 void world_resident_job_cancel(WResidentJob **job);
+/* Non-blocking: ask the worker to stop at its next stage boundary; a later
+   take then disposes the result and returns 0. 1 = newly requested. */
+int world_resident_job_abort(WResidentJob *job);
+/* Target centre and age of a running job. */
+int world_resident_job_info(const WResidentJob *job, float center[2],
+                            unsigned *age_ms);
 void world_resident_activate(WorldResident **active,
                              WorldResident **candidate);
 void world_resident_free(WorldResident *resident);
@@ -123,5 +147,13 @@ void world_resident_free(WorldResident *resident);
  * The partial owner must not be queried/rendered. world_resident_free remains
  * safe for immediate shutdown/cancellation at any step. */
 int world_resident_retire_step(WorldResident **resident, int max_items);
+
+/* Frame-thread hitch profiler: hitch_begin() opens a frame span, hitch_mark()
+ * charges the time since the previous mark to a label (string literal), and
+ * hitch_report() logs the breakdown only when the span exceeded threshold_ms.
+ * Marks outside an open span (e.g. on the worker) are ignored. */
+void hitch_begin(void);
+void hitch_mark(const char *label);
+void hitch_report(double threshold_ms);
 
 #endif

@@ -43,7 +43,19 @@ static uint32_t n2_sky_remap_key(int profile, uint32_t source_key) {
     if (source_key == cap[N2_SKY_SUNRISE])  return cap[profile];
     return source_key;
 }
+/* One allocation holding many meshes' geometry (a prebuilt world tile):
+   freed when the last mesh pointing into it is released. */
+typedef struct { unsigned refs; void *data; void *geoms; } N2GeomBlock;
 typedef struct {
+    unsigned refs;
+    void *verts, *idx, *vcol, *packed;
+    float packed_bb[6];
+    uint64_t packed_hash[2];
+    N2GeomBlock *block;   /* non-NULL: verts/idx/vcol and this record live in it */
+} N2SharedGeometry;
+
+typedef struct {
+    N2SharedGeometry *shared_geometry; /* immutable scenery; atomic resident/cache ownership */
     float   *verts;   /* nverts*5 floats: pos.xyz, uv; when authored_normals is set,
                          followed by nverts*3 normal floats in the same allocation. */
     unsigned char authored_normals;
@@ -81,6 +93,10 @@ typedef struct {
                               source vertices were excluded (M133) */
     char aname[28];        /* instance asset name (27 chars + terminator) */
     unsigned char inst;    /* mesh was placed from an instance matrix */
+    unsigned char world_role; /* 0 shared, 1 collision only, 2 rendering only */
+    unsigned char world_bounds_valid; /* placed world XYZ was checked; invalidate after edits */
+    float world_bounds[6]; /* min XYZ, max XYZ; world placement only */
+    unsigned char terrain_biased; /* 5 cm world-space adjustment applied exactly once */
     /* car meshes only (M135): a stable id shared by every GPU slice emitted
        from ONE 0x80134010 object occurrence, whether or not that object was
        split into several meshes by n2_walk_car. Distinct from namekey, which
@@ -94,7 +110,45 @@ typedef struct {
     unsigned char car_mount; /* N2_MOUNT_*; shared by every slice of a car part */
     unsigned char car_part; /* independent modification slot + 1, or zero */
     unsigned char car_under; /* hood underside, retained beneath replacement skins */
+    unsigned char car_decal; /* decal mesh slice: 1 + loc*8 + n (DUMMY_DECAL<n+1>) | shape << 6, 0 none */
+    unsigned char car_cf;    /* carbon fibre class, n2_carbon_mesh */
+    unsigned char car_wide;  /* a stock body / door mesh a wide body kit (KITWnn) replaces */
+    unsigned char car_anim;  /* the opening part it rides on (GLOBALB 0x34608 by slot): 1 hood, 2 trunk,
+                                3 left door, 4 right door, 0 none; | 8 = the right half of a split hood */
+    /* track meshes placed from a scenery record: which one (section region
+       id, record index), so a prebuilt world tile can apply an event's
+       scenery selection at load time. scen_has 0 = always visible (ground). */
+    unsigned char scen_has;
+    uint16_t scen_region, scen_index;
+    unsigned char reflect;   /* world: drawn with the road reflection (N2_SUB_REFLECT) */
 } N2Mesh;
+#define N2_SUB_REFLECT 0x00000040u   /* +56 bytes 40 00 00 00 (little endian) */
+
+static void n2_mesh_geometry_release(N2Mesh *m) {
+    N2SharedGeometry *g = m->shared_geometry;
+    if (g) {
+        if (__atomic_sub_fetch(&g->refs, 1, __ATOMIC_ACQ_REL) == 0) {
+            N2GeomBlock *b = g->block;
+            free(g->packed);
+            if (b) {
+                if (__atomic_sub_fetch(&b->refs, 1, __ATOMIC_ACQ_REL) == 0) {
+                    free(b->data); free(b->geoms); free(b);
+                }
+            } else { free(g->verts); free(g->idx); free(g->vcol); free(g); }
+        }
+    } else { free(m->verts); free(m->idx); free(m->vcol); }
+    m->verts = NULL; m->idx = NULL; m->vcol = NULL; m->shared_geometry = NULL;
+}
+
+static void n2_mesh_bias_terrain(N2Mesh *m) {
+    if (m->cat != N2_TERRAIN || m->terrain_biased) return;
+    /* Shared ground is admitted only after normalization. */
+    for (int v=0; v<m->nverts; v++) m->verts[v*5+2]-=0.05f;
+    if (m->world_bounds_valid) {
+        m->world_bounds[2]-=0.05f; m->world_bounds[5]-=0.05f;
+    }
+    m->terrain_biased=1;
+}
 
 #include "car_config.h"
 
@@ -112,6 +166,7 @@ typedef struct {
  * world-space bbox, then uses this to distinguish different material slices
  * that share one source vertex pool and happen to have equal counts. */
 static int n2_mesh_content_cmp(const N2Mesh *a, const N2Mesh *b) {
+    if (a->world_role != b->world_role) return a->world_role < b->world_role ? -1 : 1;
     if (a->texkey != b->texkey) return a->texkey < b->texkey ? -1 : 1;
     if (a->nidx != b->nidx) return a->nidx < b->nidx ? -1 : 1;
     if (a->nverts != b->nverts) return a->nverts < b->nverts ? -1 : 1;
@@ -172,7 +227,9 @@ typedef struct { int w, h; unsigned char *rgb; unsigned char *alpha;
      * usage: 0 none, 1 cutout (alpha test), 2 blending.
      * blend: 0 none, 1 ordinary src/1-src, 2 additive.
      * wz:    1 write depth (opaque/cutout), 0 do not (blended/additive). */
-    unsigned char order, usage, blend, wz; } N2Tex;
+    unsigned char order, usage, blend, wz;
+    unsigned char prehalved;   /* Vita: rgb/alpha already box-halved for upload */
+} N2Tex;
 
 /* Derived draw-mode classification -- NOT a raw stored field, computed from
  * usage/blend exactly as measured (see the N2Tex comment above). */
@@ -200,6 +257,31 @@ static int n2_world_batch_material_group(const N2Mesh *m, int effective_mode) {
 }
 
 /* ---- file I/O ---- */
+#ifdef __vita__
+#include <fcntl.h>
+#include <unistd.h>
+/* newlib's fread trickles large files through a small stdio buffer (~2 MB/s
+   from a Vita memory card for the 113 MB STREAM bundles); read() hands each
+   4 MB chunk straight to the filesystem. */
+static unsigned char *n2_read_file(const char *path, long *out_len) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    long n = (long)lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    unsigned char *buf = (unsigned char *)malloc(n > 0 ? (size_t)n : 1);
+    long got = 0;
+    while (buf && got < n) {
+        long want = n - got > (4L << 20) ? (4L << 20) : n - got;
+        long k = (long)read(fd, buf + got, (size_t)want);
+        if (k <= 0) break;
+        got += k;
+    }
+    close(fd);
+    if (buf && got != n) { free(buf); buf = NULL; }
+    if (out_len) *out_len = n;
+    return buf;
+}
+#else
 static unsigned char *n2_read_file(const char *path, long *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -210,6 +292,7 @@ static unsigned char *n2_read_file(const char *path, long *out_len) {
     if (out_len) *out_len = n;
     return buf;
 }
+#endif
 
 static uint32_t n2_u32(const unsigned char *p) {
     return asset_chunk_u32(p);
@@ -218,6 +301,14 @@ static uint32_t n2_u32(const unsigned char *p) {
 /* Skip the run of 0x11 filler bytes that prefixes a vertex/leaf payload. */
 static int n2_skip_filler(const unsigned char *p, int n) {
     int i = 0; while (i < n && p[i] == 0x11) i++; return i;
+}
+/* A TPK's pixel payload (0x33320002) starts 0x80-aligned from the chunk
+   header (all 583 retail packs). The filler run can overshoot into pixel
+   bytes that are themselves 0x11 (InGameCommon.bun: 3 bytes, which shifted
+   every particle texture), so back it off to that boundary. */
+static long n2_tpk_pixel_skip(long run) {
+    long r = run - (run + 8) % 0x80;
+    return r >= 0 ? r : run;
 }
 
 /* Shipped district point-light source (0x135003, 96-byte records). This is
@@ -370,7 +461,22 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
         if (n2_icontains(p, s, "NEON") || n2_icontains(p, s, "GLOW") ||
             n2_icontains(p, s, "FLARE") || n2_icontains(p, s, "BULB"))
             return N2_GLOW;
-        for (long i = 0; i + 5 < s; i++) {
+        /* The asset name is the leaf's trailing string (at +0xa4..+0xb0).
+           The header before it holds binary bounds whose bytes can spell an
+           uppercase run -- "EX4VC" in TRN_SH_ROADA_CHOP_A13_R8's floats --
+           and the first run decides, so that road deck (sprint 4179) and 16
+           other L4RA ground pieces came out N2_OTHER with no collision and
+           cars fell through. Start at the name when the leaf has one. */
+        long scan0 = 0;
+        {   long e = s, b;
+            while (e > 0 && !p[e-1]) e--;
+            b = e;
+            while (b > 0 && (p[b-1]=='_' || p[b-1]=='-' || p[b-1]=='.' ||
+                             (p[b-1]>='A'&&p[b-1]<='Z') || (p[b-1]>='a'&&p[b-1]<='z') ||
+                             (p[b-1]>='0'&&p[b-1]<='9'))) b--;
+            if (e - b >= 4 && b >= 0x40) scan0 = b;
+        }
+        for (long i = scan0; i + 5 < s; i++) {
             /* start of an uppercase A-Z name run */
             if (p[i] >= 'A' && p[i] <= 'Z') {
                 long j = i;
@@ -385,6 +491,18 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                         (L >= 4 && !memcmp(n, "SKY_", 4))) return N2_SKY;
                     if (n2_contains(n, L, "ROAD")) return N2_ROAD;
                     if (n2_contains(n, L, "TERRAIN")) return N2_TERRAIN;
+                    /* Mixed-case retail ground names (TRN_SH_RoadA_CHOP_A13_R8,
+                       a road deck on sprint 4179) end the uppercase run at
+                       "TRN_SH_R", so the tests above missed them: the deck drew
+                       as N2_OTHER with no ground and cars fell through it. Read
+                       a TRN_ name to its end in any case. */
+                    if (L >= 4 && !memcmp(n, "TRN_", 4)) {
+                        long k = j;
+                        while (k < s && (p[k]=='_' || (p[k]>='A'&&p[k]<='Z') ||
+                                         (p[k]>='a'&&p[k]<='z') || (p[k]>='0'&&p[k]<='9'))) k++;
+                        if (n2_icontains(n, k - i, "ROAD")) return N2_ROAD;
+                        if (n2_icontains(n, k - i, "TERRAIN")) return N2_TERRAIN;
+                    }
                     /* RDP_ is the shipped road-paint/pavement family: RDP_LANEA,
                        RDP_ROADSTRIP, RDP_AIRPORT_* are the textures real roads
                        already wear, and TRN_RDP_RUNWAY_/TRN_RDP_DRAG_ are the
@@ -931,12 +1049,20 @@ static void n2_m102_note(int why, const char *anm, int cat, int nslot, int nsub,
 
 /* Declared here because n2_walk_meshes' per-submesh road path (M101) needs
  * them; the definitions stay with the car material code further down. */
-typedef struct { uint32_t start, count, mat, matid; } N2Sub;
+typedef struct { uint32_t start, count, mat, matid, flags; } N2Sub;
 static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
                              N2Sub *out, int cap);
 static int n2_mesh_texslots(const unsigned char *d, long beg, long end,
                             uint32_t *out, int cap);
 static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys);
+/* Keys a car mesh takes from its own material slot even when an earlier
+ * slot resolves too: the composited car skin (<CAR>_SKIN1 ...), set by the
+ * caller before n2_load_car. Per translation unit. */
+static uint32_t n2_own_slot_keys[8];
+static int n2_own_slot_key(uint32_t k) {
+    for (int i = 0; k && i < 8; i++) if (n2_own_slot_keys[i] == k) return 1;
+    return 0;
+}
 
 /* A texture slot usually names a diffuse map. A few name a MATERIAL that never
  * carries one, and those must not take the "substitute the object's sibling
@@ -1507,6 +1633,7 @@ static int n2_car_variant_numbers(const unsigned char *d, long len, int kind,
 }
 
 static int n2_car_part(const char *name) {
+    if(strstr(name,"_KITW"))return N2_PART_WIDE;   /* <CAR>_KITWnn_BODY / _DOOR_*: a wide body kit */
     if(strstr(name,"_FRONT_BUMP"))return N2_PART_FRONT;
     if(strstr(name,"_REAR_BUMP"))return N2_PART_REAR;
     if(strstr(name,"_SKIRT"))return N2_PART_SKIRT;
@@ -1517,6 +1644,7 @@ static int n2_car_part(const char *name) {
     if(strstr(name,"_TRUNK_AUDIO"))return N2_PART_AUDIO;
     if(strstr(name,"_EXHAUST"))return N2_PART_EXHAUST;
     if(strstr(name,"_SPOILER"))return N2_PART_SPOILER;
+    if(strstr(name,"_LEFT_SIDE") || strstr(name,"_RIGHT_SIDE"))return N2_PART_MIRROR;   /* <CAR>_KIT00_LEFT_SIDE_MIRROR */
     return -1;
 }
 
@@ -1542,6 +1670,77 @@ static void n2_car_mesh_name(const unsigned char *d,long beg,long end,char out[6
     }
 }
 
+/* Decals (0x61ff40): a decal location is the car mesh
+ * <CAR>_DECAL_<LOC>_<SHAPE>_<SIZE> its location part names (SHAPE SQUARE /
+ * RECT / WIDE, SIZE SMALL / MEDIUM / LARGE), whose materials DUMMY_DECAL1..8
+ * take the decals of slots 0x61 + loc*8 + n: the decal part's NAME hash
+ * continued with "_SQUARE" / "_RECT" / "_WIDE". Here a location's mesh is
+ * kept when the location holds a decal; its slices carry the synthetic key
+ * of their slot ("DECAL_<LOC>_TEX<n>", the slot's own name) for the binder. */
+#define N2_DECAL_LOCS 7
+#define N2_DECAL_SLOTS 8
+static const char *const n2_decal_loc_name[N2_DECAL_LOCS] = {
+    "HOOD", "FRONT_WINDOW", "REAR_WINDOW", "LEFT_DOOR", "RIGHT_DOOR", "LEFT_QUARTER", "RIGHT_QUARTER" };
+static const char *const n2_decal_shape_name[3] = { "SQUARE", "RECT", "WIDE" };
+/* the last loaded car's shape per location (0 square, 1 rect, 2 wide; -1 none) */
+static int n2_decal_shape[N2_DECAL_LOCS] = { -1, -1, -1, -1, -1, -1, -1 };
+static uint32_t n2_bstr(const char *s, uint32_t h) {
+    for (; *s; s++) h = h * 33u + (unsigned char)*s;
+    return h;
+}
+static uint32_t n2_decal_key(int loc, int n) {
+    char b[48]; snprintf(b, sizeof b, "DECAL_%s_TEX%d", n2_decal_loc_name[loc], n);
+    return n2_bstr(b, 0xffffffffu);
+}
+static int n2_decal_used(const N2CarConfig *cfg, int loc) {
+    for (int n = 0; cfg && n < N2_DECAL_SLOTS; n++) if (cfg->decal[loc][n]) return 1;
+    return 0;
+}
+/* -2: not a decal mesh; -1: a decal mesh not wanted; else its location */
+/* The opening part a car mesh rides on, as GLOBALB chunk 0x34608 maps car
+   slots (0x620ae0 reads it per mesh): hood 9 / HOOD_UNDER 0x19 -> the hood,
+   trunk 0xa / TRUNK_UNDER 0x1a / SPOILER 0xc -> the trunk, DOOR_LEFT 0x11 /
+   DOOR_PANEL_LEFT 0x13 -> the left door, 0x12 / 0x14 the right one (the
+   decal slots are set where the decals are cut). | 8: a split hood's right
+   half (STYLEnn_HOOD_RIGHT, KITnn_HOOD_UNDER_RIGHT; names are cut at 27
+   characters, so "RIGH"). */
+static unsigned char n2_car_anim_class(const char *part) {
+    if (strstr(part, "_TRUNK_AUDIO")) return 0;
+    if (strstr(part, "_HOOD")) return (unsigned char)(1 | (strstr(part, "_HOOD_RIGH") || strstr(part, "_UNDER_RIGH") ? 8 : 0));
+    if (strstr(part, "_TRUNK") || strstr(part, "_SPOILER")) return 2;
+    if (strstr(part, "_DOOR_LEFT") || strstr(part, "_DOOR_PANEL_LEFT")) return 3;
+    if (strstr(part, "_DOOR_RIGH") || strstr(part, "_DOOR_PANEL_RIGH")) return 4;
+    return 0;
+}
+static int n2_car_decal_loc(const unsigned char *d, long beg, long end, const N2CarConfig *cfg) {
+    char name[64]; n2_car_mesh_name(d, beg, end, name);
+    char *at = strstr(name, "_DECAL_");
+    if (!at) return -2;
+    /* a wide body's own door / quarter decals (WB_DECAL_*): <CAR>_WIDEn_DECAL_<loc>,
+       n the kit (KITW0n, parts[N2_PART_WIDE] = 1 + n) */
+    const char *wd = strstr(name, "_WIDE");
+    int wb = wd && wd < at;
+    if (wb && (wd[5] < '1' || wd[5] > '9' || !cfg || cfg->parts[N2_PART_WIDE] != 1 + (wd[5] - '0'))) return -1;
+    char car[64]; size_t cl = (size_t)(at - name); memcpy(car, name, cl); car[cl] = 0;
+    N2Leaf h[2]; int nh = 0;
+    n2_find_leaves(d, beg, end, 0x00134011u, h, &nh, 2);
+    if (nh < 1 || h[0].size < 0x40) return -1;
+    const unsigned char *p = d + h[0].off;
+    for (int loc = 0; loc < N2_DECAL_LOCS; loc++) {
+        if (!n2_decal_used(cfg, loc)) continue;
+        if (loc >= 3 ? (cfg->parts[N2_PART_WIDE] > 1) != wb : wb) continue;   /* a wide body's panels: its own */
+        const char *size = cfg->decal_layout[loc] == 2 ? "SMALL" : "MEDIUM";
+        for (int sh = 0; sh < 3; sh++) {
+            char full[128];
+            snprintf(full, sizeof full, "%s_DECAL_%s_%s_%s_A", car, n2_decal_loc_name[loc], n2_decal_shape_name[sh], size);
+            uint32_t k = n2_bstr(full, 0xffffffffu);
+            for (int q = 0; q + 4 <= 0x40; q += 4)
+                if (n2_u32(p + q) == k) { n2_decal_shape[loc] = sh; return loc; }
+        }
+    }
+    return -1;
+}
+
 /* Classify a car mesh against the active profile.
  * Returns 1 = skip outright. Otherwise reports the variant token and the
  * family key (name minus that token minus any _A.._D LOD suffix) so
@@ -1558,12 +1757,22 @@ static int n2_car_is_variant(const unsigned char *d, long beg, long end,
     if (out_fam)  *out_fam  = 0;
     char name[64];n2_car_mesh_name(d,beg,end,name);
     const unsigned char *n=(const unsigned char *)name;long L=strlen(name);
-    if(strstr(name,"KITW") || strstr(name,"WIDE") || strstr(name,"DECAL"))return 1;
+    /* Wide body kits (DB group 6, "<CAR>_KITWnn_BODY"): KITWnn's body and
+       doors in place of the car's own, parts[N2_PART_WIDE] = 1 + nn */
+    const char *kw=strstr(name,"_KITW");
+    int wide=cfg?cfg->parts[N2_PART_WIDE]:0, wnum=-1;
+    if(kw && kw[5]>='0' && kw[5]<='9' && kw[6]>='0' && kw[6]<='9')wnum=(kw[5]-'0')*10+(kw[6]-'0');
+    if(wnum>=0 && (wide<2 || wnum!=wide-1))return 1;
+    if(wnum<0 && (strstr(name,"KITW") || strstr(name,"WIDE") || strstr(name,"DECAL")))return 1;
+    if(wnum<0 && wide>1 && (strstr(name,"_BODY") || strstr(name,"_DOOR_")))return 1;
     int num=0;long ta=0,tl=0;
-    int kind=n2_name_variant(n,L,&num,&ta,&tl);
+    int kind=wnum>=0?1:n2_name_variant(n,L,&num,&ta,&tl);
+    if(wnum>=0){num=wnum;ta=(long)(kw+1-name);tl=6;}
     int part=n2_car_part(name),choice=part>=0?cfg->parts[part]:0;
+    if(wnum>=0)choice=0;
     if(choice>=1000)return 1;
-    if(choice>0) {
+    if(wnum>=0) {}
+    else if(choice>0) {
         int wanted_kind=(choice-1)/100+1,wanted_num=(choice-1)%100;
         if(kind && !(kind==1 && num==0) && (kind!=wanted_kind || num!=wanted_num))return 1;
     } else {
@@ -1876,6 +2085,86 @@ static int n2_mesh_texslots(const unsigned char *d, long beg, long end,
     return n;
 }
 
+/* Optional regional advertisement pack. NA is the default, ROW the fallback.
+ * Vita builds reuse the small archive across streamed residents; callers own
+ * their copy, so ordinary teardown and cancelled builds remain unchanged. */
+static unsigned char *n2_read_global_ads(const char *track_root, long *len) {
+    char path[1024];
+#ifdef __vita__
+    static unsigned char *cached;
+    static long cached_len;
+    static char cached_root[1024];
+    static int attempted;
+    if (strcmp(cached_root, track_root)) {
+        free(cached); cached = NULL; attempted = 0;
+        snprintf(cached_root, sizeof cached_root, "%s", track_root);
+    }
+    if (!attempted) {
+#endif
+        int n = snprintf(path, sizeof path, "%s/../GLOBAL/GlobalTexturesNA.bin", track_root);
+        if (n < 0 || (size_t)n >= sizeof path) { *len = 0; return NULL; }
+        long size = 0;
+        unsigned char *data = n2_read_file(path, &size);
+        if (!data) {
+            snprintf(path, sizeof path, "%s/../GLOBAL/GlobalTexturesROW.bin", track_root);
+            data = n2_read_file(path, &size);
+        }
+#ifdef __vita__
+        cached = data; cached_len = size; attempted = 1;
+    }
+    *len = 0;
+    if (!cached) return NULL;
+    unsigned char *copy = malloc((size_t)cached_len);
+    if (copy) { memcpy(copy, cached, (size_t)cached_len); *len = cached_len; }
+    return copy;
+#else
+        *len = size; return data;
+#endif
+}
+
+/* Lamp slots name generic keys (HEADLIGHT_LEFT, HEADLIGHT_GLASS_RIGHT,
+ * BRAKELIGHT_LEFT, ...) that no pack holds: the game swaps them for the
+ * fitted lamp part's own textures through the car's texture table
+ * (0x631e20 builds "<part>_HEADLIGHT" + "_OFF" / "_GLASS_OFF", 0x638190
+ * lists the generic keys, 0x60c940 binds them). The part is the mesh's own
+ * (<CAR>_KITnn / _STYLEnn before _HEADLIGHT / _BRAKELIGHT); a mesh of
+ * another part takes the stock KIT00 lamps. Returns how many it changed. */
+static uint32_t n2_lamp_hash(const char *a, const char *b) {
+    uint32_t h = 0xffffffffu;
+    for (; *a; a++) h = h * 33u + (unsigned char)*a;
+    for (; *b; b++) h = h * 33u + (unsigned char)*b;
+    return h;
+}
+static int n2_lamp_remap(const char *part, uint32_t *slots, int n) {
+    int any = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t k = slots[i];
+        if (k == 0xa7e6ea53u || k == 0xa532fc46u || k == 0x267d188cu || k == 0xf68ef19fu ||
+            k == 0xd947f346u || k == 0x02b52399u || k == 0x000bcbbfu || k == 0x01f40b32u ||
+            k == 0x3617dcfcu || k == 0x1d33b7b5u) any = 1;
+    }
+    if (!any) return 0;
+    char car[40], head[48], brake[48];
+    const char *kit = strstr(part, "_KIT"), *sty = strstr(part, "_STYLE");
+    const char *cut = kit && (!sty || kit < sty) ? kit : sty;
+    size_t cl = cut ? (size_t)(cut - part) : strlen(part);
+    if (cl >= sizeof car) cl = sizeof car - 1;
+    memcpy(car, part, cl); car[cl] = 0;
+    const char *h = strstr(part, "_HEADLIG"), *b = strstr(part, "_BRAKELIG");
+    if (h && h - part < 40) snprintf(head, sizeof head, "%.*s_HEADLIGHT", (int)(h - part), part);
+    else snprintf(head, sizeof head, "%s_KIT00_HEADLIGHT", car);
+    if (b && b - part < 40) snprintf(brake, sizeof brake, "%.*s_BRAKELIGHT", (int)(b - part), part);
+    else snprintf(brake, sizeof brake, "%s_KIT00_BRAKELIGHT", car);
+    for (int i = 0; i < n; i++) {
+        uint32_t k = slots[i];
+        if (k == 0xa7e6ea53u || k == 0xa532fc46u) slots[i] = n2_lamp_hash(head, "_OFF");
+        else if (k == 0x267d188cu || k == 0xf68ef19fu) slots[i] = n2_lamp_hash(head, "_GLASS_OFF");
+        else if (k == 0xd947f346u || k == 0x02b52399u) slots[i] = n2_lamp_hash(brake, "_OFF");
+        else if (k == 0x000bcbbfu || k == 0x01f40b32u) slots[i] = n2_lamp_hash(brake, "_GLASS_OFF");
+        else if (k == 0x3617dcfcu || k == 0x1d33b7b5u) slots[i] = n2_lamp_hash(car, "_CENTRE_BRAKELIGHT_OFF");
+    }
+    return 1;
+}
 static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys) {
     if (!v) return 0;
     for (int i = 0; i < nkeys; i++) if (keys[i] == v) return v;
@@ -1929,6 +2218,11 @@ static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
         out[i].mat   = n2_u32(q + 28);
         out[i].matid = n2_u32(q + 32);
         out[i].start = n2_u32(q + 52);
+        /* +56: per-slice render flags. 0x40000000 marks the slices the
+           original draws with worldreflect.fx (the wet-road reflection):
+           3972 of 3991 L4RA road slices and ~1100 terrain ones carry it,
+           almost nothing else does (10-09 scan). */
+        out[i].flags = n2_u32(q + 56);
     }
     return n;
 }
@@ -2159,6 +2453,42 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
     const N2CarConfig *cfg=walk->cfg;
     long s=end-ds;
     if(tag==0x80134010u) {
+        int dloc = n2_car_decal_loc(d, ds, ds + s, cfg);
+        if (dloc == -1) return 0;
+        if (dloc >= 0) {   /* a decal location: one slice per DUMMY_DECALn */
+            N2Leaf vtx[4], idx[4]; int nv = 0, ni = 0;
+            n2_find_leaves(d, ds, ds + s, 0x00134B01u, vtx, &nv, 4);
+            n2_find_leaves(d, ds, ds + s, 0x00134B03u, idx, &ni, 4);
+            if (nv < 1 || ni < 1) return 0;
+            uint32_t slots[16]; int nslot = n2_mesh_texslots(d, ds, ds + s, slots, 16);
+            N2Sub sub[16]; int nsub = n2_mesh_submeshes(d, ds, ds + s, sub, 16);
+            uint32_t nk2 = n2_car_name_key(d, ds, ds + s);
+            static uint32_t g_decal_tier = 0x80000000u;
+            uint32_t tierid = g_decal_tier++;
+            for (int k = 0; k < nsub; k++) {
+                uint32_t key = sub[k].mat < (uint32_t)nslot ? slots[sub[k].mat] : 0;
+                int n = -1;
+                for (int j = 0; j < N2_DECAL_SLOTS; j++) {
+                    char dn[16]; snprintf(dn, sizeof dn, "DUMMY_DECAL%d", j + 1);
+                    if (key == n2_bstr(dn, 0xffffffffu)) n = j;
+                }
+                if (n < 0) continue;
+                int before = scene->count;
+                n2_add_pair(d, vtx[0], idx[0], N2_CAR_MISC, scene, 36, 28,
+                            walk->prelight ? 24 : -1, 0, n2_decal_key(dloc, n), NULL,
+                            sub[k].start, sub[k].count, (unsigned char)N2_DRAW_OPAQUE);
+                if (scene->count > before) {
+                    N2Mesh *m = &scene->meshes[before];
+                    m->car_decal = (unsigned char)((1 + dloc * N2_DECAL_SLOTS + n) | n2_decal_shape[dloc] << 6);
+                    m->car_anim = dloc == 0 ? 1 : dloc == 3 ? 3 : dloc == 4 ? 4 : 0;   /* slots 0x34 / 0x37 / 0x38 */
+                    m->car_source = ds;
+                    m->namekey = nk2 ^ (0x9e3779b9u * (unsigned)(n + 1));
+                    m->tierid = tierid;
+                    m->car_mount = N2_MOUNT_BODY;
+                }
+            }
+            return 0;
+        }
         int vkind = 0, vnum = 0; uint32_t vfam = 0;
         if (n2_car_is_variant(d, ds, ds + s, cfg, &vkind, &vnum, &vfam)) return 0;
         int cat = n2_car_category(d, ds, ds + s);
@@ -2192,6 +2522,8 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
            the records actually resolve to different textures, emit one
            mesh per record instead. */
         uint32_t slots[16]; int nslot = n2_mesh_texslots(d, ds, ds + s, slots, 16);
+        if (n2_lamp_remap(part, slots, nslot) && !tk)   /* the lamps' own art, now resolvable */
+            for (int q = 0; q < nslot && !tk; q++) tk = n2_resolve_key(slots[q], keys, nkeys);
         uint32_t mslots[32]; int nmslot = n2_mesh_matslots(d, ds, ds + s, mslots, 32);
         N2Sub sub[32]; int nsub = pairs == 1 ? n2_mesh_submeshes(d, ds, ds + s, sub, 32) : 0;
         /* Validate the partition structurally before trusting a split at
@@ -2250,6 +2582,9 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
            per-car key list. Retain only validated slot ownership; the
            runtime resolves the exact key locally or in the shared pack. */
         if (brake && trust_cls && nsub >= 1 && !differ) tk = subtex[0];
+        /* a panel whose material names a composited key (the car skin,
+           n2_own_slot_keys) wears it, not the first key that resolves */
+        if (!brake && trust_cls && nsub >= 1 && !differ && n2_own_slot_key(subtex[0])) tk = subtex[0];
         /* One 0x80134010 occurrence, split or not, shares one tierid so
            n2_car_dedupe_lod can score and drop/keep its whole slice set
            atomically instead of resolving each split slice on its own. */
@@ -2268,6 +2603,14 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                     scene->meshes[before].car_source = ds;
                     scene->meshes[before].car_part=(unsigned char)(part_slot+1);
                     scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
+                    scene->meshes[before].car_anim=n2_car_anim_class(part);
+                    scene->meshes[before].car_wide=!strstr(part,"KITW") && (strstr(part,"_BODY") || strstr(part,"_DOOR_"));
+                    scene->meshes[before].car_cf=(unsigned char)(strstr(part,"KITW")?3:
+                        strstr(part,"_FRONT_BUMP") || strstr(part,"_REAR_BUMP")?1:
+                        strstr(part,"_HOOD") && !strstr(part,"_UNDER")?4:
+                        strstr(part,"_TRUNK") && !strstr(part,"_UNDER") && !strstr(part,"_AUDIO")?5:
+                        strstr(part,"_SKIRT") || strstr(part,"_BODY") ||
+                        strstr(part,"_DOOR_LEFT") || strstr(part,"_DOOR_RIGHT")?2:0);
                     /* The dominant slice keeps the plain family key so it
                        still dedupes against LOD tiers that never split
                        (a lower tier can lack the badge slot entirely, so
@@ -2299,6 +2642,14 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                     scene->meshes[before].car_source = ds;
                     scene->meshes[before].car_part=(unsigned char)(part_slot+1);
                     scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
+                    scene->meshes[before].car_anim=n2_car_anim_class(part);
+                    scene->meshes[before].car_wide=!strstr(part,"KITW") && (strstr(part,"_BODY") || strstr(part,"_DOOR_"));
+                    scene->meshes[before].car_cf=(unsigned char)(strstr(part,"KITW")?3:
+                        strstr(part,"_FRONT_BUMP") || strstr(part,"_REAR_BUMP")?1:
+                        strstr(part,"_HOOD") && !strstr(part,"_UNDER")?4:
+                        strstr(part,"_TRUNK") && !strstr(part,"_UNDER") && !strstr(part,"_AUDIO")?5:
+                        strstr(part,"_SKIRT") || strstr(part,"_BODY") ||
+                        strstr(part,"_DOOR_LEFT") || strstr(part,"_DOOR_RIGHT")?2:0);
                     scene->meshes[before].namekey = nk2;
                     scene->meshes[before].vkind = vkind;
                     scene->meshes[before].vnum = vnum;
@@ -2316,38 +2667,52 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                         const uint32_t *keys, int nkeys, const N2CarConfig *cfg,
                         int prelight) {
     N2CarWalk walk={scene,keys,nkeys,cfg,prelight};
+    for (int l = 0; l < N2_DECAL_LOCS; l++) n2_decal_shape[l] = -1;
     asset_chunks_walk(d,beg,end,n2_car_chunk,&walk);
 }
 /* A socket is owned by a retained source object. Material slices and LOD
- * copies may repeat it; disagreeing transforms reject the attachment. */
-static int n2_car_socket(const unsigned char *d,long len,const N2Scene *s,
-                         uint32_t key,float out[16]) {
-    int found=0;
+ * copies may repeat it; disagreeing transforms reject the attachment.
+ * Batch form: one walk of the sources answers n keys (res[k] = 1 found,
+ * 0 absent, -1 invalid); a broken source chunk fails every key. */
+static void n2_car_sockets(const unsigned char *d,long len,const N2Scene *s,
+                           const uint32_t *keys,int n,float (*out)[16],int *res) {
+    for(int k=0;k<n;k++)res[k]=0;
     for(int i=0;i<s->count;i++) {
         long off=s->meshes[i].car_source;
         if(off<8 || off>len)continue;
-        int seen=0;for(int j=0;j<i;j++)if(s->meshes[j].car_source==off)seen=1;
+        int seen=0;for(int j=0;j<i && !seen;j++)if(s->meshes[j].car_source==off)seen=1;
         if(seen)continue;
-        uint32_t size=n2_u32(d+off-4);if((long)size>len-off)return -1;
+        uint32_t size=n2_u32(d+off-4);
+        if((long)size>len-off) {for(int k=0;k<n;k++)res[k]=-1;return;}
         N2Leaf leaf[4];int nl=0;n2_find_leaves(d,off,off+size,0x0013401au,leaf,&nl,4);
         for(int l=0;l<nl;l++) {
             const unsigned char *p=d+leaf[l].off;long bytes=leaf[l].size;
             int pad=n2_skip_filler(p,(int)bytes);p+=pad;bytes-=pad;
-            if(bytes%80)return -1;
-            for(long at=0;at<bytes;at+=80)if(n2_u32(p+at)==key) {
-                float m[16];memcpy(m,p+at+16,sizeof m);
-                for(int a=0;a<16;a++)if(!isfinite(m[a]))return -1;
-                if(fabsf(m[3])+fabsf(m[7])+fabsf(m[11])+fabsf(m[15]-1)>1e-4f)return -1;
-                for(int a=0;a<3;a++)for(int b=a;b<3;b++) {
-                    float dot=0;for(int k=0;k<3;k++)dot+=m[a*4+k]*m[b*4+k];
-                    if(fabsf(dot-(a==b?1.f:0.f))>.002f)return -1;
+            if(bytes%80) {for(int k=0;k<n;k++)res[k]=-1;return;}
+            for(long at=0;at<bytes;at+=80) {
+                uint32_t key=n2_u32(p+at);
+                for(int k=0;k<n;k++) {
+                    if(keys[k]!=key || res[k]<0)continue;
+                    float m[16];memcpy(m,p+at+16,sizeof m);
+                    int bad=0;
+                    for(int a=0;a<16;a++)if(!isfinite(m[a]))bad=1;
+                    if(!bad && fabsf(m[3])+fabsf(m[7])+fabsf(m[11])+fabsf(m[15]-1)>1e-4f)bad=1;
+                    for(int a=0;a<3 && !bad;a++)for(int b=a;b<3;b++) {
+                        float dot=0;for(int c=0;c<3;c++)dot+=m[a*4+c]*m[b*4+c];
+                        if(fabsf(dot-(a==b?1.f:0.f))>.002f)bad=1;
+                    }
+                    if(!bad && res[k]) {for(int a=0;a<16;a++)if(fabsf(out[k][a]-m[a])>1e-5f)bad=1;}
+                    if(bad)res[k]=-1;
+                    else if(!res[k]) {memcpy(out[k],m,sizeof m);res[k]=1;}
                 }
-                if(found) {for(int a=0;a<16;a++)if(fabsf(out[a]-m[a])>1e-5f)return -1;}
-                else {memcpy(out,m,sizeof m);found=1;}
             }
         }
     }
-    return found;
+}
+static int n2_car_socket(const unsigned char *d,long len,const N2Scene *s,
+                         uint32_t key,float out[16]) {
+    int res;n2_car_sockets(d,len,s,&key,1,(float (*)[16])out,&res);
+    return res;
 }
 
 /* Sockets are validated orthonormal by n2_car_socket. Rotate normals with
@@ -2688,7 +3053,7 @@ static int n2_car_prepare_wheels(N2Scene *s) {
 
 static void n2_free_scene(N2Scene *s) {
     for (int i = 0; i < s->count; i++) {
-        free(s->meshes[i].verts); free(s->meshes[i].idx); free(s->meshes[i].vcol);
+        n2_mesh_geometry_release(&s->meshes[i]);
     }
     free(s->meshes); memset(s, 0, sizeof(*s));
 }
@@ -2966,6 +3331,20 @@ static long n2_global_car_record(const unsigned char *g,long glen,const char *ca
         }
     }
     return found;
+}
+
+/* Stock turbo: the 9-point boost curve at record +0x334, right after the
+ * torque curve (+0x30c, 10 points). SPEED2.EXE shows the HUD turbo gauge
+ * ("Turbo" vs "NoTurbo" script) when the max of the car's 9 turbo values is
+ * above 0 (fn 0x457b00). Non-zero for GOLF ECLIPSE 3000GT SKYLINE
+ * LANCEREVO8 RX7 IMPREZAWRX. Returns the max, or -1 when the car is not in
+ * the table. */
+static float n2_global_car_turbo(const unsigned char *g,long glen,const char *name) {
+    long at=n2_global_car_record(g,glen,name);
+    if(at<0 || at+0x334+36>glen)return -1.0f;
+    float m=0.0f;
+    for(int i=0;i<9;i++){float v;memcpy(&v,g+at+0x334+4*i,4);if(v>m)m=v;}
+    return m;
 }
 
 /* Source dimensions/inertia for diagnostics and subsequent dynamics work.
@@ -3517,6 +3896,26 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
 }
 
 /* Find a named texture in the file's local TPK and decode it. Returns 1 on hit. */
+typedef struct { long hbeg, hsize, dbase; long fbase, flen; } N2TpkBlk;
+#ifdef __vita__
+/* resource.c: pixel payloads of the pinned compact bundle live in the file
+   (dbase < 0, fbase/flen give the payload after its 0x11 filler). */
+int n2_pix_stub(const unsigned char *d, long hdr, long *foff, long *flen);
+int n2_pix_read(long foff, void *dst, long n);
+/* resource.c: cached n2_tpk_open result for the pinned bundle */
+int n2_tpk_memo_get(const unsigned char *d, void **blk, int *nblk);
+void n2_tpk_memo_put(const unsigned char *d, const void *blk, int nblk, size_t elem);
+/* Set by the world texture binder: also hand back the raw DXT mip chain so
+   it can be uploaded compressed. Per translation unit (static). */
+static int n2_tpk_keep_dxt;
+/* Vita, with n2_tpk_keep_dxt: stage DXT blocks without decoding pixels (rgb
+   and alpha come back NULL). Only for keys already classified clean DXT. */
+static int n2_tpk_skip_pixels;
+#endif
+typedef struct { N2TpkBlk *blk; int nblk; } N2Tpk;
+static N2Tpk n2_tpk_open(const unsigned char *d, long len);
+static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t hash, N2Tex *tex);
+
 static int n2_load_texture(const unsigned char *d, long len, const char *name, N2Tex *t) {
     memset(t, 0, sizeof *t);   /* all outputs defined on success AND failure */
     /* TPK header block marker: magic 0xb3310000 (LE bytes 00 00 31 b3) */
@@ -3533,6 +3932,14 @@ static int n2_load_texture(const unsigned char *d, long len, const char *name, N
     long nlen = (long)strlen(name);
     for (long i = hbeg; i + 0x3c < hbeg + hsize; i++) {
         if (memcmp(d + i, name, nlen) == 0 && d[i + nlen] == 0) {
+#ifdef __vita__
+            /* pixel bytes may live in the file (pinned bundle) */
+            { N2Tpk tk = n2_tpk_open(d, len);
+              int ok = n2_tpk_decode(d, len, tk, n2_u32(d + i + 0x18), t);
+              free(tk.blk);
+              if (ok) { free(t->alpha); t->alpha = NULL; free(t->dxt); t->dxt = NULL; }
+              return ok; }
+#endif
             uint32_t off = n2_u32(d + i + 0x24);
             uint16_t w = d[i+0x38] | d[i+0x39] << 8, hh = d[i+0x3a] | d[i+0x3b] << 8;
             if (w == 0 || hh == 0 || w > 2048 || hh > 2048) return 0;
@@ -3611,10 +4018,13 @@ static int n2_tex_noise(const N2Tex *t) {
  * 0xb3310000 header blocks (each paired with a following 0x33320002 pixel block);
  * a single O(len) pass records them all, so a huge shared "master" region can be
  * mmap'd and queried without re-scanning it per texture. */
-typedef struct { long hbeg, hsize, dbase; } N2TpkBlk;
-typedef struct { N2TpkBlk *blk; int nblk; } N2Tpk;
+
 static N2Tpk n2_tpk_open(const unsigned char *d, long len) {
     N2Tpk t; t.blk = NULL; t.nblk = 0; int cap = 0;
+#ifdef __vita__
+    { void *b; int nb;
+      if (n2_tpk_memo_get(d, &b, &nb)) { t.blk = (N2TpkBlk *)b; t.nblk = nb; return t; } }
+#endif
     long ph = -1; uint32_t phs = 0;
     for (long i = 0; i + 8 < len; i++) {
         if (d[i]==0 && d[i+1]==0 && d[i+2]==0x31 && d[i+3]==0xb3) {    /* header 0xb3310000 */
@@ -3625,10 +4035,22 @@ static N2Tpk n2_tpk_open(const unsigned char *d, long len) {
             if (t.nblk == cap) { cap = cap ? cap*2 : 64;
                 t.blk = (N2TpkBlk *)realloc(t.blk, (size_t)cap*sizeof(N2TpkBlk)); }
             t.blk[t.nblk].hbeg = ph; t.blk[t.nblk].hsize = phs;
-            t.blk[t.nblk].dbase = pbase + n2_skip_filler(d + pbase, (int)room);
+            t.blk[t.nblk].fbase = -1; t.blk[t.nblk].flen = 0;
+#ifdef __vita__
+            long sfoff, sflen;
+            if (n2_u32(d + i + 4) == 0 && n2_pix_stub(d, i, &sfoff, &sflen)) {
+                t.blk[t.nblk].dbase = -1;           /* filler already skipped */
+                t.blk[t.nblk].fbase = sfoff;
+                t.blk[t.nblk].flen = sflen;
+            } else
+#endif
+            t.blk[t.nblk].dbase = pbase + n2_tpk_pixel_skip(n2_skip_filler(d + pbase, (int)room));
             t.nblk++; ph = -1;
         }
     }
+#ifdef __vita__
+    n2_tpk_memo_put(d, t.blk, t.nblk, sizeof(N2TpkBlk));
+#endif
     return t;
 }
 /* Collect every record hash (@+0x18) across all blocks. Returns the count. */
@@ -3636,6 +4058,29 @@ static int n2_tpk_keys(const unsigned char *d, N2Tpk t, uint32_t *keys, int maxk
     int n = 0;
     for (int b = 0; b < t.nblk && n < maxk; b++) {
         long hbeg = t.blk[b].hbeg, hend = hbeg + t.blk[b].hsize;
+        /* Retail headers also contain a pack-name record (0x33310001).
+           Treating that name as a texture advances 124 bytes from the wrong
+           position and skips real textures, including the single Best Buy
+           entry. Inventory only the authored 0x33310004 record table. */
+        int table = 0;
+        for (long p = hbeg; p + 8 <= hend;) {
+            uint32_t id = n2_u32(d + p), size = n2_u32(d + p + 4);
+            long q = p + 8;
+            if ((long)size > hend - q) break;
+            if (id == 0x33310004u) {
+                table = 1;
+                long end = q + size;
+                q += n2_skip_filler(d + q, (int)size);
+                for (; q + 0x7c <= end && n < maxk; q += 0x7c)
+                    /* Each table row starts with 12 bytes before its name;
+                       the hash is +0x18 relative to that name. */
+                    keys[n++] = n2_u32(d + q + 12 + 0x18);
+                break;
+            }
+            p = q + size;
+        }
+        if (table) continue;
+        /* Legacy flat headers used by small parser fixtures. */
         for (long i = hbeg; i + 0x40 < hend && n < maxk; i++) {
             if (!(d[i] >= 'A' && d[i] <= 'Z')) continue;
             if (d[i+0x17] != 0) continue;                 /* 24-byte name null-terminated */
@@ -3644,6 +4089,25 @@ static int n2_tpk_keys(const unsigned char *d, N2Tpk t, uint32_t *keys, int maxk
         }
     }
     return n;
+}
+
+/* Asset-free regression for the retail pack-name/table layout. */
+static int n2_tpk_inventory_selftest(void) {
+    unsigned char d[281] = {0};
+    const uint32_t values[][2] = {
+        {0,0xb3310000u},{4,264},{8,0x33310001u},{12,124},
+        {140,0x33310004u},{144,124},{184,0xde510e5fu},
+        {272,0x33320002u},{276,1}
+    };
+    for (unsigned i=0; i<sizeof values/sizeof values[0]; i++)
+        for (int b=0; b<4; b++) d[values[i][0]+b]=(unsigned char)(values[i][1]>>(b*8));
+    memcpy(d+20,"GLOBALTEXTURESNA",15);
+    memcpy(d+160,"ADS_BESTBUY_BBH_A",16);
+    N2Tpk t = n2_tpk_open(d, sizeof d);
+    uint32_t keys[4] = {0};
+    int n = n2_tpk_keys(d, t, keys, 4);
+    free(t.blk);
+    return n == 1 && keys[0] == 0xde510e5fu;
 }
 
 /* Format dispatch (M135-R, PROVEN): +0x3e is an explicit format tag, not a
@@ -3670,6 +4134,9 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
     memset(tex, 0, sizeof *tex);
     for (int b = 0; b < t.nblk; b++) {
         long hbeg = t.blk[b].hbeg, hend = hbeg + t.blk[b].hsize, dbase = t.blk[b].dbase;
+        /* file-backed pixel block (Vita pinned bundle): bytes are fetched into
+           `fsrc` and addressed as if the payload started at offset 0 */
+        long plen = dbase >= 0 ? len : t.blk[b].flen;
         for (long i = hbeg; i + 0x40 < hend; i++) {
             if (!(d[i] >= 'A' && d[i] <= 'Z')) continue;
             if (n2_u32(d + i + 0x18) != hash) continue;
@@ -3707,15 +4174,28 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                  * bounds-check the actual palette/index bytes -- a record
                  * whose declared offsets don't fit the file is corrupt, not
                  * decodable, regardless of what its tag claims. */
-                if (dbase+paloff+1024 > len || dbase+off+(long)w*hh > len) {
+                long pb = dbase >= 0 ? dbase : 0;
+                if (pb+paloff+1024 > plen || pb+off+(long)w*hh > plen) {
                     free(tex->rgb); free(alf); continue;
                 }
                 const unsigned char *pal = d + dbase + paloff, *ix = d + dbase + off;
+                unsigned char *fsrc = NULL;
+#ifdef __vita__
+                if (dbase < 0) {
+                    fsrc = (unsigned char *)malloc(1024 + (long)w*hh);
+                    if (!fsrc || !n2_pix_read(t.blk[b].fbase + paloff, fsrc, 1024) ||
+                        !n2_pix_read(t.blk[b].fbase + off, fsrc + 1024, (long)w*hh)) {
+                        free(fsrc); free(tex->rgb); free(alf); continue;
+                    }
+                    pal = fsrc; ix = fsrc + 1024;
+                }
+#endif
                 for (long p = 0; p < (long)w*hh; p++) {   /* P8: index -> RGBA palette */
                     const unsigned char *c = pal + (long)ix[p]*4;
                     tex->rgb[p*3]=c[0]; tex->rgb[p*3+1]=c[1]; tex->rgb[p*3+2]=c[2];
                     if (alf) alf[p] = c[3];
                 }
+                free(fsrc);
                 tex->afmt = 8;                      /* P8 */
             } else {
                 /* Block-count-based length, not a flat w*h/2 guess: DXT1 is
@@ -3728,9 +4208,58 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                 long dxt3 = is_dxt3;   /* format choice: from the proven +0x3e tag, not size */
                 long bx = ((long)w + 3) / 4, by = ((long)hh + 3) / 4;
                 long need = bx * by * (dxt3 ? 16 : 8);
-                if (dbase + off + need > len) { free(tex->rgb); free(alf); continue; }
-                if (dxt3) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
-                else      { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
+                long pb = dbase >= 0 ? dbase : 0;
+                if (pb + off + need > plen) { free(tex->rgb); free(alf); continue; }
+                const unsigned char *src = d + dbase + off;
+                unsigned char *fsrc = NULL;
+                long chain = need;
+#ifdef __vita__
+                /* whole stored mip chain (+0x2c Size), for compressed upload */
+                { long sz = (long)n2_u32(d + i + 0x2c);
+                  if (n2_tpk_keep_dxt && sz > need && pb + off + sz <= plen) chain = sz; }
+                if (dbase < 0 || n2_tpk_keep_dxt) {
+                    fsrc = (unsigned char *)malloc((size_t)chain);
+                    if (!fsrc) { free(tex->rgb); free(alf); continue; }
+                    /* An already-classified texture needs no pixels, and the
+                       upload (render_dxt_base_plan) takes only the half-size
+                       level of a 64px+ power-of-two texture (plus the smaller
+                       mips below it). Read from that level to the end of the
+                       chain; the full-size level, ~3/4 of the bytes, stays an
+                       unread gap in front of it. Same rules as the plan. */
+                    long lv1 = 0;
+                    if (dbase < 0 && n2_tpk_keep_dxt && n2_tpk_skip_pixels && w >= 64 && hh >= 64 &&
+                        w <= 2048 && hh <= 2048 && !(w & (w-1)) && !(hh & (hh-1))) {
+                        long l1 = (long)(w/8) * (long)(hh/8) * (dxt3 ? 16 : 8);
+                        if (need + l1 <= chain) lv1 = chain - need;   /* level 1 + smaller mips */
+                    }
+                    if (lv1) {
+                        chain = need + lv1;
+                        if (!n2_pix_read(t.blk[b].fbase + off + need, fsrc + need, lv1)) {
+                            free(fsrc); free(tex->rgb); free(alf); continue;
+                        }
+                    } else if (dbase < 0) {
+                        if (!n2_pix_read(t.blk[b].fbase + off, fsrc, chain)) {
+                            free(fsrc); free(tex->rgb); free(alf); continue;
+                        }
+                    } else memcpy(fsrc, src, (size_t)chain);
+                    src = fsrc;
+                }
+#endif
+#ifdef __vita__
+                if (n2_tpk_keep_dxt && n2_tpk_skip_pixels) {
+                    free(tex->rgb); tex->rgb = NULL; free(alf); alf = NULL;
+                    tex->afmt = dxt3 ? 3 : 1;
+                } else
+#endif
+                if (dxt3) { n2_dxt3(src, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                else      { n2_dxt1(src, w, hh, tex->rgb, alf); tex->afmt = 1; }
+#ifdef __vita__
+                if (n2_tpk_keep_dxt) {   /* ownership of the chain moves to tex */
+                    tex->dxt = fsrc; tex->dxtlen = (int)chain; tex->dxtfmt = dxt3 ? 3 : 1;
+                    fsrc = NULL;
+                }
+#endif
+                free(fsrc);
             }
             if (alf) {
 #ifdef N2_NO_WORLD_ALPHA

@@ -415,6 +415,7 @@ static void test_background_scene(const char *root, const char *track) {
 }
 
 int main(int argc, char **argv) {
+    world_resident_streaming_selftest();
     test_policy();
     test_route_points();
     test_ground_grid_ownership();
