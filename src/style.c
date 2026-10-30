@@ -205,15 +205,21 @@ void style_accum_init(StyleAccum *a, int mask)                          /* 0x56e
     a->total = 0;
 }
 
-int style_accum_tick(StyleAccum *a, float dt, StyleMoment **shown, int max)   /* 0x56fd10 */
+static int accum_tick(StyleAccum *a, float dt, StyleMoment **shown, StyleShown *snap, int max)   /* 0x56fd10 */
 {
     int n = 0;
     a->total = 0;
     for (int i = 0; i < STYLE_NMOM; i++) {
         StyleMoment *m = a->m[i];
         if (!m || !m->active) continue;
-        if ((m->state == 0 || (2 < m->state && m->state < 5)) && !m->hold && n < max && shown)
-            shown[n++] = m;
+        if ((m->state == 0 || (2 < m->state && m->state < 5)) && !m->hold && n < max) {
+            if (shown) shown[n] = m;
+            if (snap) {                   /* what 0x4da6f0 reads, before the reset below */
+                snap[n].index = m->index; snap[n].state = m->state; snap[n].cont = m->rec->cont;
+                snap[n].cur = m->cur; snap[n].mult = m->mult; snap[n].label = m->rec->hash;
+            }
+            n++;
+        }
         if (m->counts) a->total += (float)(int)m->banked;
     }
     for (int i = 0; i < STYLE_NMOM; i++) {
@@ -232,6 +238,14 @@ int style_accum_tick(StyleAccum *a, float dt, StyleMoment **shown, int max)   /*
         m_tick(m, dt);
     }
     return n;
+}
+int style_accum_tick(StyleAccum *a, float dt, StyleMoment **shown, int max)
+{
+    return accum_tick(a, dt, shown, NULL, shown ? max : 0);
+}
+int style_accum_tick_snap(StyleAccum *a, float dt, StyleShown *snap, int max)
+{
+    return accum_tick(a, dt, NULL, snap, max);
 }
 
 void style_accum_finish(StyleAccum *a)                                  /* 0x56d710 */
@@ -254,6 +268,7 @@ void style_misc_init(StyleMisc *s)                                      /* 0x56c
     memset(s, 0, sizeof *s);
     s->clean[0] = s->clean[1] = s->clean[2] = 1;
     s->coll_kind = -1;
+    s->nm_id = -1;
 }
 void style_misc_collision(StyleMisc *s, StyleAccum *a, float imp, int t_made,
                           int wall, int other_traffic, int racing, float up_z)   /* 0x56fb20 */
@@ -267,7 +282,7 @@ void style_misc_collision(StyleMisc *s, StyleAccum *a, float imp, int t_made,
     s->coll_traffic = 0;
     if (wall) s->coll_kind = 3;
     else {
-        if (other_traffic) {
+        if (other_traffic && !s->finished) {                            /* 0x5ee250 == 0 */
             float x = imp / 40.0f;                                      /* 0x79db28 */
             if (1.0f < x) x = 1.0f;
             if (a && a->m[0x10] && a->m[0x10]->active) style_moment_add(a->m[0x10], x, 0);
@@ -278,6 +293,186 @@ void style_misc_collision(StyleMisc *s, StyleAccum *a, float imp, int t_made,
     }
     s->t_coll = g_now;
     s->coll_imp = imp;
+}
+
+/* ---- MiscStyleManager::Update (0x56ff30) ----------------------------- */
+int style_race_mask(int drift, int drag, int sprint, int streetx, int url)   /* 0x56ebe0 */
+{
+    if (drift) return STYLE_RT_DRIFT;
+    if (drag) return STYLE_RT_DRAG;
+    if (sprint) return STYLE_RT_SPRINT;
+    if (streetx) return STYLE_RT_STREETX;
+    if (url) return STYLE_RT_URL;
+    return STYLE_RT_NORMAL;
+}
+/* 0x56ed10: feed moment i if this race type has it and it is active */
+static StyleMoment *mom(StyleAccum *a, int i) { return a && a->m[i] && a->m[i]->active ? a->m[i] : NULL; }
+static void trig(StyleAccum *a, int i, float v, int p2) { StyleMoment *m = mom(a, i); if (m) style_moment_add(m, v, p2); }
+void style_trigger(StyleAccum *a, int i, float v, int p2) { trig(a, i, v, p2); }
+static void reset_mult(StyleAccum *a, int i) { StyleMoment *m = mom(a, i); if (m) m->mult = 1.0f; }
+static float since_coll(const StyleMisc *s)                             /* 0x56cfd0 */
+{
+    return unset(s->t_coll) ? 99999.9f : since(s->t_coll);              /* 0x79dc18 */
+}
+static void clean_run(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in)   /* 0x56eee0 */
+{
+    if (!in->newcp || s->latch_cp) s->latch_cp = in->newcp != 0;
+    else {
+        s->latch_cp = 1;
+        if (!s->clean[0]) { s->clean[0] = 1; reset_mult(a, 18); }
+        else trig(a, 18, 1.0f, 0);                                      /* CLEAN SECTION */
+    }
+    if (!in->newlap || s->latch_lap) s->latch_lap = in->newlap != 0;
+    else {
+        s->latch_lap = 1;
+        if (!s->clean[1]) { s->clean[1] = 1; reset_mult(a, 19); }
+        else trig(a, 19, 1.0f, 0);                                      /* CLEAN LAP */
+        if (in->leader) trig(a, 17, 1.0f, 0);                           /* LEAD LAP */
+        else reset_mult(a, 17);
+    }
+}
+static void air_time(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in)    /* 0x56f020 */
+{
+    StyleMoment *m = a ? a->m[35] : NULL;
+    float tc = since_coll(s);
+    int ok = !(!in->racing || in->finished || !m || in->hyd_on || in->wheels != 0 || in->body_flag
+               || (in->up_z <= 0.8f && m->state != 0)                   /* 0x7850ec */
+               || (tc <= 0.3f && m->state != 0));                       /* 0x79db24 */
+    if (ok && 0.75f < in->air && m->active) style_moment_add(m, 1.0f, 0);   /* 0x79db40, HANG TIME */
+}
+static void power_slide(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in) /* 0x56f4c0 */
+{
+    float v = 1.0f, sl = fabsf(in->slip);
+    int ok = 0;
+    if (5.0f * 0.0174533f < sl && 17.88109f < in->speed && in->wheels == 4) {   /* 0x79db34, 0x79db38 */
+        v = in->speed * sl / 20.0f;                                     /* 0x79db3c */
+        if (1.0f < v) v = 1.0f;
+        ok = !in->body_flag;
+    }
+    float tc = since_coll(s);
+    if (!(tc < 0.1f) || s->coll_imp <= 5.0f) {                          /* 0x79db20, 0x79db30 */
+        if (ok) trig(a, 34, v, in->dist_m);                             /* POWER SLIDE */
+    } else {
+        StyleMoment *m = mom(a, 34);
+        if (m && (m->state == 0 || m->state == 1)) m_fail(m, 1);        /* 0x56d5c0 */
+    }
+}
+static float ang_diff(float x, float y)                                 /* 0x56d020 */
+{
+    float d = fabsf(x - y), e = 360.0f - d;
+    return d < e ? d : e;
+}
+static void spin360(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in)     /* 0x56f620 */
+{
+    float h = (float)in->heading * 0.0054931640625f;                    /* 0x784248 */
+    float y = fabsf(in->yaw_rate);
+    int st = s->s360;
+    if (in->wheels != 4 || ((st != 0 || y <= 2.0f) && (st < 1 || y <= 1.0f)))   /* 0x79db44, 0x79db48 */
+        s->s360 = 0;
+    else if (st == 0) { s->h360 = h; s->s360 = 1; }
+    else if (0 < st && st < 3 && 170.0f <= ang_diff(h, s->h360)) {     /* 0x79dc34 */
+        s->s360 = (int8_t)(st + 1);
+        s->h360 = h;
+    }
+    if (s->s360 == 3) { trig(a, 22, 1.0f, 0); s->s360 = 0; }            /* 360 */
+}
+static const StyleNear *near_find(const StyleMiscIn *in, int id)
+{
+    for (int i = 0; i < in->nnear; i++) if (in->near[i].id == id) return &in->near[i];
+    return NULL;
+}
+static void near_miss(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in)   /* 0x56f170 */
+{
+    float tc = since_coll(s);
+    if (in->blink || in->speed <= 13.410818f || tc <= 0.2f) {           /* 0x79db5c, 0x79db60 */
+        s->nm_id = -1;
+        s->nm_state = 0;                                                /* (falls to the end: +0x1d = 0) */
+    } else if (s->nm_state == 0) {
+        s->nm_cleared = 0; s->nm_id = -1;
+        for (int i = 0; i < in->nnear; i++) {
+            const StyleNear *p = &in->near[i];
+            if (!p->ok || p->dist <= 0.001f) continue;             /* 0x592e60, 0x598730 (+0x14) */
+            if (in->wheels == 0) {
+                if (p->center_dist < 3.0f && 1.0f < in->z - p->other_z) {    /* 0x79db4c, 0x79db50 */
+                    s->nm_cleared = 1; s->nm_id = p->id; break;
+                }
+            } else if (p->dist < 1.5f && 35.76218f < p->relv) {        /* 0x79db54, 0x79db58 */
+                s->nm_cleared = 0; s->nm_id = p->id; break;
+            }
+        }
+        if (s->nm_id >= 0) s->nm_state++;
+    } else if (s->nm_state == 1) {
+        const StyleNear *p = near_find(in, s->nm_id);                   /* 0x593050 */
+        if (!p) s->nm_state++;
+        else if (!p->touch) {
+            if (!p->ok || 1.5f * 1.25f < p->dist) s->nm_state++;        /* 0x592e60, 0x7862e8 */
+        } else s->nm_state = 0;
+    }
+    if (s->nm_state == 2) {
+        trig(a, s->nm_cleared ? 27 : 21, 1.0f, 0);                      /* CLEARED / AVOIDED ACCIDENT */
+        s->nm_state = 0; s->nm_cleared = 0; s->nm_id = -1;
+    }
+}
+static void misc(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in)        /* 0x56f720 */
+{
+    if (in->race_mode != 0 && in->racing && 1 < in->nracers
+        && in->race_time < 1.5f && 1.0f < in->race_time                 /* 0x79db6c, 0x79db68 */
+        && in->rank == 1 && 2.2351363f < in->speed)                     /* 0x79db64 */
+        trig(a, 24, 1.0f, 0);                                           /* HEAD START */
+    if (1.5f < in->race_time) {
+        static const int GAINED[6] = { 0, 32, 31, 30, 29, 28 };         /* GAINED 1ST .. 5TH */
+        if (s->best_rank == 0) s->best_rank = in->rank;
+        if (1 < s->best_rank && in->rank < s->best_rank && in->rank < 5) {
+            s->best_rank = in->rank;
+            if (in->rank >= 0) trig(a, GAINED[in->rank], 1.0f, 0);
+        }
+    }
+    if (20.0f < in->speed && 0.25f < in->draft) trig(a, 36, in->draft, 0);   /* 0x79db80, 0x79db84: DRAFTING */
+    if (in->fwd_speed < -17.88109f) trig(a, 37, 1.0f, 0);              /* 0x79db74: REVERSE */
+    StyleMoment *m = mom(a, 37);
+    if (since_coll(s) < 0.3f && 3.0f < s->coll_imp && m && (m->state == 0 || m->state == 1))   /* 0x79db24, 0x79db70 */
+        m_fail(m, 1);
+}
+static void jturn(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in)       /* 0x56fa60 */
+{
+    if (in->wheels != 4 || since_coll(s) <= 0.1f) s->jturn = 0;
+    else if (s->jturn == 0) { if (in->fwd_speed < -13.410818f) s->jturn = 1; }   /* 0x79db78 */
+    else if (s->jturn == 1) {
+        if (!(in->speed < 8.940545f)) { if (8.940545f < in->fwd_speed) s->jturn = 2; }   /* 0x79db7c */
+        else s->jturn = 0;
+    }
+    if (s->jturn == 2) { trig(a, 25, 1.0f, 0); s->jturn = 0; }         /* J-TURN */
+}
+static void hydraulics(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in)  /* 0x56f9b0 */
+{
+    (void)s;
+    if (1 < in->bounce_n) trig(a, 33, 1.0f, 0);                         /* Bounce */
+    if (0 < in->hydros_n && !in->hyd_on) trig(a, 38, (float)in->hydros_n * 0.25f, 0);   /* Hydros */
+}
+void style_misc_update(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in)   /* 0x56ff30 */
+{
+    s->finished = in->finished != 0;
+    /* (!replay 0x5f00f0 || stage 4): no replays here */
+    clean_run(s, a, in);
+    air_time(s, a, in);
+    power_slide(s, a, in);
+    spin360(s, a, in);
+    near_miss(s, a, in);
+    misc(s, a, in);
+    if (in->shortcut) trig(a, 20, 1.0f, 0);                             /* 0x56f960 SHORTCUT */
+    jturn(s, a, in);
+    hydraulics(s, a, in);
+}
+void style_burnout_tick(float *st, StyleAccum *a, int racing, int race_mode,
+                        float race_time, float avg_slip, float dist)    /* 0x5f7410 */
+{
+    if (!(*st == 0.0f || *st == -1.0f) || !racing || race_mode == 7) return;
+    if (*st == -1.0f && race_time < 5.0f) {                             /* 0x7843e8 */
+        if (0.5f < avg_slip) *st = 0.0f;                                /* 0x7a5694 */
+    } else if (*st == 0.0f && avg_slip < 0.5f) {
+        *st = dist;
+        if (a) trig(a, 26, dist, 0);                                    /* BURNOUT */
+    }
 }
 
 /* ---- the drift scorer ----------------------------------------------- */

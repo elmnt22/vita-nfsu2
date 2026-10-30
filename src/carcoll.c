@@ -1,5 +1,6 @@
 /* carcoll.c — the retail NFSU2 car-vs-world collision manager (see carcoll.h). */
 #include "carcoll.h"
+#include "acid.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -84,6 +85,50 @@ static CarColl *hull_finish(CarColl *c, const char *car)
     printf("carcoll: %s collision hull %s, %d vertices\n", car, c->name, c->nv);
     return c;
 }
+/* RideInfo 0x61c320: the hull is the fitted body part's "CV" attribute --
+   in the parts database a body kit (group 5) names <CAR>_CV and a wide body
+   kit KITW0n (group 6, +0x5a8 with byte 5 >> 5 > 0, ride +0x83e set by
+   default) <CAR>_W0n_CV; without it the car's own (0x610310) */
+static void hull_name(char *want, size_t n, const char *car, int wide)
+{
+    if (wide > 1) snprintf(want, n, "%s_W%02d_CV", car, wide - 1);
+    else snprintf(want, n, "%s_CV", car);
+}
+CarColl *carcoll_load_kit(const char *geometry_bin, const char *car, int wide)
+{
+    if (wide > 1) {
+        char want[48];
+        hull_name(want, sizeof want, car, wide);
+        FILE *f = fopen(geometry_bin, "rb");
+        CarColl *c = (CarColl *)calloc(1, sizeof *c);
+        snprintf(c->name, sizeof c->name, "%s", want);
+        long off = 0;
+        unsigned char h[8];
+        while (f && fseek(f, off, SEEK_SET) == 0 && fread(h, 1, 8, f) == 8 && !c->nv) {
+            uint32_t id = rd32(h), sz = rd32(h + 4);
+            if (id == 0x80034020u && sz < (32u << 20)) {
+                unsigned char *d = (unsigned char *)malloc(sz);
+                if (d && fread(d, 1, sz, f) == sz) hull_scan(c, d, (long)sz, off + 8, want);
+                free(d);
+            }
+            off += 8 + (long)sz;
+        }
+        if (f) fclose(f);
+        if (c->nv) return hull_finish(c, car);
+        free(c);
+    }
+    return carcoll_load(geometry_bin, car);
+}
+CarColl *carcoll_load_mem_kit(const unsigned char *geo, long len, const char *car, int wide)
+{
+    if (wide > 1) {
+        char want[48];
+        hull_name(want, sizeof want, car, wide);
+        CarColl *c = carcoll_load_named(geo, len, want);
+        if (c) { printf("carcoll: %s collision hull %s, %d vertices\n", car, c->name, c->nv); return c; }
+    }
+    return carcoll_load_mem(geo, len, car);
+}
 CarColl *carcoll_load(const char *geometry_bin, const char *car)
 {
     char want[48];
@@ -124,6 +169,21 @@ CarColl *carcoll_load_mem(const unsigned char *geo, long len, const char *car)
     return hull_finish(c, car);
 }
 
+CarColl *carcoll_load_named(const unsigned char *bun, long len, const char *name)
+{
+    CarColl *c = (CarColl *)calloc(1, sizeof *c);
+    snprintf(c->name, sizeof c->name, "%s", name);
+    for (long off = 0; bun && off + 8 <= len && !c->nv; ) {
+        uint32_t id = rd32(bun + off), sz = rd32(bun + off + 4);
+        if ((long)sz > len - off - 8) break;
+        if (id == 0x80034020u) hull_scan(c, bun + off + 8, (long)sz, off + 8, name);
+        off += 8 + (long)sz;
+    }
+    if (!c->nv) { free(c); return NULL; }
+    c->com[0] = 1e30f;
+    return c;
+}
+
 CarColl *carcoll_clone(const CarColl *src)
 {
     if (!src) return NULL;
@@ -146,6 +206,7 @@ void carcoll_free(CarColl *c)
 }
 
 int carcoll_vertex_count(const CarColl *c) { return c ? c->nv : 0; }
+float carcoll_radius(const CarColl *c) { return c ? c->rad : 0.0f; }
 
 /* 0x5ae520: bounds of the hull about the centre of mass */
 static void hull_bounds(CarColl *c, const float com[3])
@@ -628,6 +689,9 @@ typedef struct {
     int   count;              /* +0x240 resolutions this frame */
     GBlk  g;                  /* +0x40 the distance routine's points */
     int   prism;              /* +0x221 the polygon's prism state the points are for */
+    int   tested;             /* the distance below is from this run */
+    float dist;               /* +0x10 the last distance test's result (t = 0) */
+    int   touch;              /* +0x244 a contact this run (distance <= 0.001) */
 } CPair;
 typedef struct {
     int   pair;
@@ -643,7 +707,12 @@ typedef struct {
     CPair *pairs; int npairs;
 } World;
 
-static N2Body body_of(const CarCollCar *k) { N2Body b; n2sim_body(k->s, &b); return b; }
+static N2Body body_of(const CarCollCar *k)
+{
+    N2Body b;
+    if (k->ops) k->ops->body(k->obj, &b); else n2sim_body(k->s, &b);
+    return b;
+}
 
 /* pose at time t back from now (0x593280): linear between the start and the
    end of the step, matrix element by element */
@@ -733,10 +802,15 @@ static int narrow(World *W, int pi, Contact *k)
     memset(k, 0, sizeof *k);
     k->pair = pi;
     float dist = test_pair(W, p, 0, NULL, NULL, 0, k->wa, k->wb);
+    p->tested = 1; p->dist = dist;
     if (!(dist <= 0.001f)) return 0;
+    p->touch = 1;
     /* +0x140 crash time: walls (0x592ed0), and both cars of a car contact */
-    if (p->b < 0) { if (W->poly[p->a][p->poly].flags & 2) n2sim_collision(A->s); }
-    else { n2sim_collision(A->s); n2sim_collision(W->cars[p->b].s); }
+    if (p->b < 0) { if ((W->poly[p->a][p->poly].flags & 2) && !A->ops) n2sim_collision(A->s); }
+    else {
+        if (!A->ops) n2sim_collision(A->s);
+        if (!W->cars[p->b].ops) n2sim_collision(W->cars[p->b].s);
+    }
     if (!(dist <= 1e-5f)) return 1;                       /* touching now: t = 0 */
     float span = A->c->span;
     if (p->b >= 0 && W->cars[p->b].c->span < span) span = W->cars[p->b].c->span;
@@ -769,7 +843,7 @@ static void rewind_car(CarCollCar *K, float t, const float *sep, float sgn)
         P[i] = v * b.mass;
         pos[i] += sgn * sep[i];
     }
-    n2sim_body_pose(K->s, pos, R, P);
+    if (K->ops) K->ops->pose(K->obj, pos, R, P); else n2sim_body_pose(K->s, pos, R, P);
 }
 /* 0x5a9f10 / vt+0x2c: the car runs again for the time it was put back */
 static void advance_car(CarCollCar *K, float t)
@@ -778,27 +852,103 @@ static void advance_car(CarCollCar *K, float t)
     N2Body b = body_of(K);
     memcpy(c->ppos, b.pos, 12); memcpy(c->pR, b.R, 64); memcpy(c->pv, b.v, 12);
     c->span = t;
-    if (t > 0) n2sim_step(K->s, t);
+    if (t > 0) { if (K->ops) K->ops->advance(K->obj, t); else n2sim_step(K->s, t); }
 }
 /* 0x593a40: inverse inertia in use x 0.4 (x 1 in crash mode, car +0x38 == 1) */
-static void inv_inertia_arm(const N2Body *b, const float *r, const float *N, float *out)
+static void inv_inertia_arm(const N2Body *b, const float *r, const float *N, float *out, float k)
 {
     float rn[3], irn[3];
     cross3(rn, r, N);
     rowmul(irn, rn, b->Iinv);
-    irn[0] *= 0.4f; irn[1] *= 0.4f; irn[2] *= 0.4f;
+    irn[0] *= k; irn[1] *= k; irn[2] *= k;
     cross3(out, irn, r);
 }
 /* 0x593a00: the solver treats a car as at least 1.85 t */
 static float solver_invmass(const N2Body *b) { return b->invmass > 1.0f / 1.85f ? 1.0f / 1.85f : b->invmass; }
-/* 0x5a0b00: impulse on a car, scaled as if it weighed at least 1.85 t */
+/* a prop's GetMassInverse is its own (0 while anchored, smokeable.c) */
+static float body_invmass(const CarCollCar *K, const N2Body *b) { return K->ops ? b->invmass : solver_invmass(b); }
+/* 0x5a0b00: impulse on a car, scaled as if it weighed at least 1.85 t; the
+   angular part x 0.4, whole in crash mode (car +0x38 == 1) */
+static float car_ang(const CarCollCar *K) { return K->ops || n2sim_dampen(K->s) == 1 ? 1.0f : 0.4f; }
 static void apply_car(CarCollCar *K, const float *I, const float *r)
 {
+    if (K->ops) { K->ops->impulse(K->obj, I, r); return; }
     N2Body b = body_of(K);
     float sc = 1.0f;
     if (b.invmass > 1.0f / 1.85f) sc = (1.0f / 1.85f) / b.invmass;
     float J[3] = { I[0] * sc, I[1] * sc, I[2] * sc };
-    n2sim_body_impulse(K->s, J, r, 0.4f);
+    acid_car_impulse(K->s, J, r);                                    /* AddDamage 0x593bf0 (acid.c) */
+    n2sim_body_impulse(K->s, J, r, car_ang(K));
+}
+
+static void norm3(float *v)                                          /* 0x43cf10 */
+{
+    float l = sqrtf(dot3(v, v));
+    if (l > 0) { v[0] /= l; v[1] /= l; v[2] /= l; }
+}
+/* the world random 0x5ea4e0 (*0x890080), here the port's own */
+static unsigned wild_rng = 0x2545f491u;
+static unsigned wild_rand(unsigned n) { wild_rng = wild_rng * 1103515245u + 12345u; return (wild_rng >> 16) % n; }
+
+/* Collision::CheckForWildCollision 0x59fb70, from AddImpulse 0x5a9620 with
+   the impulse on A (I), both bodies cars: an impulse of 30 t m/s or more
+   (|I| capped at 40) puts a car not yet crashing into crash mode
+   (SetDampenMode 1, contact event +0x10) and kicks it: a head-on hit
+   (impulse against the travel, cos < -0.97) gets a flat sideways shove of
+   |cos| x 0.2 x J, and every hit a lift of |cos| x 0.1 x J x 1.1 (1.2 in a
+   drag race), capped at 4.1 x that factor, at the contact moved in the
+   car's plane: head-on randomly mirrored front / back (x -1.1) with the
+   side offset x 0.2 past 0.13 m; otherwise the side offset x 1.19 kept
+   within half the front track x 1.19. Returns a bit per car that crashed
+   (the drag race totalling and the jump cam are the caller's). */
+static int wild_collision(CarCollCar *A, CarCollCar *B, const float *pt, const float *I)
+{
+    if (A->ops || !B || B->ops) return 0;
+    float J = sqrtf(dot3(I, I));
+    if (!(J < 40.0f)) J = 40.0f;                                     /* 0x7a1858 */
+    if (J < 30.0f) return 0;                                         /* 0x7a1868 */
+    int fired = 0;
+    for (int k = 0; k < 2; k++) {
+        CarCollCar *K = k ? B : A;
+        if (n2sim_dampen(K->s) == 1) continue;
+        fired |= 1 << k;
+        n2sim_set_dampen(K->s, 1);
+        N2Body b = body_of(K);
+        float r[3] = { pt[0] - b.pos[0], pt[1] - b.pos[1], pt[2] - b.pos[2] };
+        float n[3] = { k ? -I[0] : I[0], k ? -I[1] : I[1], k ? -I[2] : I[2] };
+        float f[3] = { b.v[0], b.v[1], b.v[2] };
+        norm3(n); norm3(f);
+        float c = dot3(n, f);
+        int head = c < -0.97f;                                       /* 0x7a1854 */
+        if (head) {
+            float t[3] = { n[0] - f[0] * c, n[1] - f[1] * c, n[2] - f[2] * c };
+            norm3(t);
+            float q = -(fabsf(c) * 0.2f * J);                        /* 0x7a1838 */
+            t[0] *= q; t[1] *= q; t[2] = 0;
+            apply_car(K, t, r);
+        }
+        b = body_of(K);
+        r[0] = pt[0] - b.pos[0]; r[1] = pt[1] - b.pos[1]; r[2] = pt[2] - b.pos[2];
+        float rl[3] = { dot3(r, b.R), dot3(r, b.R + 4), 0 };
+        if (head) {
+            if (wild_rand(100) >= 50) rl[0] = -(rl[0] * 1.1f);       /* 0x7a184c */
+            if (fabsf(rl[1]) > 0.13f) rl[1] *= 0.2f;                 /* 0x7a1850, 0x784554 */
+        } else {
+            float w = fabsf(n2sim_param(K->s, 0x14) - n2sim_param(K->s, 0x44)) * 1.19f * 0.5f;
+            rl[1] *= 1.19f;                                          /* 0x7a1844 */
+            if (rl[1] > w) rl[1] = w;
+            else if (rl[1] < -w) rl[1] = -w;
+            rl[0] *= 1.0f;                                           /* 0x7a1848 */
+        }
+        for (int i = 0; i < 3; i++) r[i] = rl[0] * b.R[i] + rl[1] * b.R[4 + i] + rl[2] * b.R[8 + i];
+        float kd = n2sim_drag(K->s) ? 1.2f : 1.1f, lim = 4.1f * kd;  /* 0x7a1860 / 0x7a185c, 0x7a183c */
+        float z = fabsf(c) * 0.1f * J * kd;                          /* 0x7a1840 */
+        if (z > lim) z = lim; else if (z < -lim) z = -lim;
+        printf("carcoll: crash mode (impulse %.1f, cos %.2f%s, lift %.2f)\n", J, c, head ? " head-on" : "", z);
+        float up[3] = { 0, 0, z };
+        apply_car(K, up, r);
+    }
+    return fired;
 }
 
 /* 0x5b2610 + 0x5af0e0 for one contact; 1 when an impulse was applied (the
@@ -810,7 +960,7 @@ static int resolve(World *W, const Contact *k, CarCollHit *hit, CarCollWake wake
     const WCollPoly *poly = B ? NULL : &W->poly[p->a][p->poly];
     /* vt+0x48 (0x593940) on both, each with the other: a car touched by a
        human player's car may switch to the full simulation */
-    if (wake) {
+    if (wake && !A->ops && (!B || !B->ops)) {
         wake(user, p->a, B ? p->b : -1);
         if (B) wake(user, p->b, p->a);
     }
@@ -848,38 +998,73 @@ static int resolve(World *W, const Contact *k, CarCollHit *hit, CarCollWake wake
     int applied = 0;
     if (vn < 0) {
         float vt[3] = { dv[0] - N[0] * vn, dv[1] - N[1] * vn, dv[2] - N[2] * vn };
-        float e, mu, invm = solver_invmass(&ba), K, t3[3];
+        float e, mu, invm = body_invmass(A, &ba), K, t3[3];
+        float ka = car_ang(A);
         if (!B) {
-            float anz = fabsf(poly->n[2]);
-            e = anz < 0.1f ? 0.05f : 0.1f;                          /* 0x5a0c90 */
-            if (anz > 0.7f) {                                       /* 0x5a0be0 */
-                mu = ((float)(4 - ba.wheels_down) * 0.17f + 1.0f) * 0.3f;
-                if (mu > 1.0f) mu = 1.0f;
-            } else mu = anz < 0.1f ? 0.3f * 0.3f : 0.3f;
-            inv_inertia_arm(&ba, rA, N, t3);
+            if (A->ops) {                       /* a prop: the max with the polygon's 0.001 (0x5941c0) */
+                e = A->ops->bounce > 0.001f ? A->ops->bounce : 0.001f;
+                mu = A->ops->friction > 0.001f ? A->ops->friction : 0.001f;
+            } else {
+                float anz = fabsf(poly->n[2]);
+                e = anz < 0.1f ? 0.05f : 0.1f;                      /* 0x5a0c90 */
+                if (anz > 0.7f) {                                   /* 0x5a0be0 */
+                    mu = ((float)(4 - ba.wheels_down) * 0.17f + 1.0f) * 0.3f;
+                    if (mu > 1.0f) mu = 1.0f;
+                } else mu = anz < 0.1f ? 0.3f * 0.3f : 0.3f;
+            }
+            inv_inertia_arm(&ba, rA, N, t3, ka);
             K = invm + dot3(t3, N);
         } else {
-            float invmb = solver_invmass(&bb), t4[3];
-            e = 0.1f; mu = 0.3f;                                    /* max of both sides */
-            inv_inertia_arm(&ba, rA, N, t3);
-            inv_inertia_arm(&bb, rB, N, t4);
+            float invmb = body_invmass(B, &bb), t4[3];
+            /* a car's own against another body is 0.1 / 0.3; the max of both sides */
+            float ea = A->ops ? A->ops->bounce : 0.1f, eb = B->ops ? B->ops->bounce : 0.1f;
+            float ma = A->ops ? A->ops->friction : 0.3f, mb = B->ops ? B->ops->friction : 0.3f;
+            e = ea > eb ? ea : eb; mu = ma > mb ? ma : mb;
+            inv_inertia_arm(&ba, rA, N, t3, ka);
+            inv_inertia_arm(&bb, rB, N, t4, car_ang(B));
             K = invm + invmb + dot3(t3, N) + dot3(t4, N);
             if (invmb > invm) invm = invmb;
         }
+        if (!(K > 1e-9f) || !(invm > 0)) {     /* two immovable bodies */
+            advance_car(A, k->t);
+            if (B) advance_car(B, k->t);
+            return 0;
+        }
         float j = -(e + 1.0f) * vn / K, jmin = 0.3f / invm;        /* 0x7fbf24 */
         if (j < jmin) j = jmin;
-        /* vt+0x4c of a car is 1: the impulse is taken whole */
+        /* vt+0x4c ConsiderImpulse on both (a car's is 1): the normal impulse
+           is scaled by the smaller (an anchored prop breaking loose) */
+        if (A->ops || (B && B->ops)) {
+            float Jn[3] = { N[0] * j, N[1] * j, N[2] * j }, mJn[3] = { -Jn[0], -Jn[1], -Jn[2] };
+            float sb = B && B->ops ? fabsf(B->ops->consider(B->obj, Jn, rB)) : 1.0f;
+            float sa = A->ops ? fabsf(A->ops->consider(A->obj, mJn, rA)) : 1.0f;
+            j *= sa < sb ? sa : sb;
+        }
         float lt = sqrtf(dot3(vt, vt)), fr = mu * j;
         if (lt < 1.0f) fr = fr / 1.0f * lt;                        /* 0x7fbf30 */
         float Ft[3] = { 0, 0, 0 };
         if (lt > 1e-5f) { float q = -1.0f / lt * fr; Ft[0] = vt[0] * q; Ft[1] = vt[1] * q; Ft[2] = vt[2] * q; }
         float I[3] = { N[0] * j + Ft[0], N[1] * j + Ft[1], N[2] * j + Ft[2] };
-        /* 0x5a9620 effects (sparks, sounds) are the caller's, from the hits.
-           The grounded-car arm flattening needs contact-event +0x10, which
-           only the network code sets. */
+        /* 0x5a9620 effects (sparks, sounds) are the caller's, from the hits;
+           its CheckForWildCollision here */
         float mI[3] = { -I[0], -I[1], -I[2] };
+        int wild = wild_collision(A, B, pt, mI);
+        if (wild) {
+            /* contact event +0x10: a car on all four wheels takes the
+               impulse at an arm without its up part (car +0xb0) */
+            CarCollCar *Ks[2] = { A, B };
+            float *rs[2] = { rA, rB };
+            for (int q = 0; q < 2; q++) {
+                N2Body cb = body_of(Ks[q]);
+                if (cb.wheels_down != 4) continue;
+                float u = dot3(rs[q], cb.R + 8);
+                for (int i = 0; i < 3; i++) rs[q][i] -= cb.R[8 + i] * u;
+            }
+        }
         if (B) apply_car(B, I, rB);
         apply_car(A, mI, rA);
+        if (A->ops) A->ops->touch(A->obj, B && !B->ops);
+        if (B && B->ops) B->ops->touch(B->obj, !A->ops);
         if (hit) {
             memcpy(hit->point, pt, 12);
             hit->impulse[0] = -I[0]; hit->impulse[1] = -I[1]; hit->impulse[2] = -I[2];
@@ -890,6 +1075,7 @@ static int resolve(World *W, const Contact *k, CarCollHit *hit, CarCollWake wake
             hit->car = p->a; hit->other = p->b;
             hit->poly = B ? -1 : poly->id;
             hit->poly_nz = B ? 0 : poly->n[2];
+            hit->wild = wild;
         }
         applied = 1;
     }
@@ -904,6 +1090,13 @@ void carcoll_begin(CarColl *c, const N2Sim *s, float dt)
     n2sim_body(s, &b);
     hull_bounds(c, b.com);
     memcpy(c->ppos, b.pos, 12); memcpy(c->pR, b.R, 64); memcpy(c->pv, b.v, 12);
+    c->span = dt;
+}
+
+void carcoll_begin_body(CarColl *c, const N2Body *b, float dt)
+{
+    hull_bounds(c, b->com);
+    memcpy(c->ppos, b->pos, 12); memcpy(c->pR, b->R, 64); memcpy(c->pv, b->v, 12);
     c->span = dt;
 }
 
@@ -942,7 +1135,8 @@ static void broadphase(World *W, int ci)
     CarCollCar *K = &W->cars[ci];
     N2Body b = body_of(K);
     CarColl *c = K->c;
-    if (W->w && K->wc) {
+    int sleeper = K->ops && K->ops->asleep;
+    if (W->w && K->wc && !sleeper) {
         float mn[2] = { b.pos[0] - c->rad, b.pos[1] - c->rad }, mx[2] = { b.pos[0] + c->rad, b.pos[1] + c->rad };
         static WCollPoly cand[160];
         int n = wcoll_gather(W->w, K->wc, b.pos, mn, mx, cand, 160);
@@ -961,6 +1155,8 @@ static void broadphase(World *W, int ci)
     if (K->nocollide) return;
     for (int o = 0; o < W->n; o++) {
         if (o == ci || W->cars[o].nocollide) continue;
+        if (sleeper && W->cars[o].ops && W->cars[o].ops->asleep) continue;
+        if ((K->noprops && W->cars[o].ops) || (K->ops && W->cars[o].noprops)) continue;
         int have = 0;
         for (int j = 0; j < W->npairs && !have; j++)
             have = W->pairs[j].b >= 0 && ((W->pairs[j].a == ci && W->pairs[j].b == o) || (W->pairs[j].a == o && W->pairs[j].b == ci));
@@ -991,6 +1187,17 @@ int carcoll_pairs(int (*out)[3], int max)
     for (int i = 0; i < g_npairs && n < max; i++, n++) {
         out[n][0] = g_pairs[i].a; out[n][1] = g_pairs[i].b;
         out[n][2] = g_pairs[i].b < 0 ? g_polys[g_pairs[i].a][g_pairs[i].poly].id : -1;
+    }
+    return n;
+}
+
+int carcoll_car_pairs(int (*ab)[2], float *dist, int *touch, int max)
+{
+    int n = 0;
+    for (int i = 0; i < g_npairs && n < max; i++) {
+        const CPair *p = &g_pairs[i];
+        if (p->b < 0 || !p->tested) continue;
+        ab[n][0] = p->a; ab[n][1] = p->b; dist[n] = p->dist; touch[n] = p->touch; n++;
     }
     return n;
 }

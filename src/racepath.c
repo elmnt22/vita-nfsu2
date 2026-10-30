@@ -335,7 +335,7 @@ static void locate(const RacePath *p, RpLoc *l, const float *q, int hint)   /* 0
 }
 void racepath_locate(const RacePath *p, RpLoc *l, const float pos[3])   /* 0x5da330 */
 {
-    if (!p) return;
+    if (!p || !p->sec) return;
     if (l->thresh <= fabsf(pos[0] - l->pos[0]) + fabsf(pos[1] - l->pos[1])) locate(p, l, pos, -1);
 }
 static float locate_at(const RacePath *p, const float *q)               /* 0x5ded90 */
@@ -659,7 +659,10 @@ static int build(RacePath *p, const unsigned char *evr)                 /* 0x5e5
     return 1;
 }
 
-RacePath *racepath_load(const char *path, int event, int reversed)
+static RacePath *load(const char *path, int event, int reversed, int zones_only);
+RacePath *racepath_load(const char *path, int event, int reversed) { return load(path, event, reversed, 0); }
+RacePath *racepath_load_zones(const char *path) { return load(path, 0, 0, 1); }
+static RacePath *load(const char *path, int event, int reversed, int zones_only)
 {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -686,6 +689,10 @@ RacePath *racepath_load(const char *path, int event, int reversed)
         else if (id == 0x3414a) { p->zones = d + body; p->nzones = (long)sz; }
         o = next;
         while (o >= end && depth > 0) { o = end; end = stack[--depth]; }
+    }
+    if (zones_only) {                       /* free roam: no route (0x5d9a60 ClearConnectionTree) */
+        if (!p->zones) { racepath_free(p); return NULL; }
+        return p;
     }
     const unsigned char *evr = NULL;
     for (int i = 0; i < nev; i++) if (rdu16(evs + i * 0x110) == (unsigned)event) { evr = evs + i * 0x110; break; }
@@ -763,6 +770,24 @@ const unsigned char *racepath_zone(const RacePath *p, const float pos[2], int ty
         o += sz;
     }
     return NULL;
+}
+const unsigned char *racepath_zone_next(const RacePath *p, const unsigned char *prev)
+{
+    if (!p || !p->zones) return NULL;
+    long o = 0;
+    if (prev) {
+        int sz = (int16_t)(prev[0x42] | prev[0x43] << 8);
+        if (sz <= 0) return NULL;
+        o = (long)(prev - p->zones) + sz;
+    }
+    return o >= 0 && o + 0x44 <= p->nzones && (int16_t)(p->zones[o + 0x42] | p->zones[o + 0x43] << 8) > 0
+           ? p->zones + o : NULL;
+}
+int racepath_zone_holds(const unsigned char *z, const float pos[2])
+{
+    return z && rdf(z + 0x20) <= pos[0] && pos[0] <= rdf(z + 0x28) &&
+           rdf(z + 0x24) <= pos[1] && pos[1] <= rdf(z + 0x2c) &&
+           poly_in(pos, z + 0x44, (int16_t)(z[0x40] | z[0x41] << 8));
 }
 
 /* ---- checkpoints, laps and standings ------------------------------------------ */

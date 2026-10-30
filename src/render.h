@@ -97,6 +97,12 @@ typedef struct {
 int    render_refl_begin(int w, int h, const float clear_rgb[3]);
 void   render_refl_end(int screen_w, int screen_h);
 GLuint render_refl_texture(void);
+/* the rear-view mirror's target (eView 3) and its composite (0x5cbf40) */
+int    render_rvm_begin(int w, int h, const float clear_rgb[3]);
+void   render_rvm_end(int screen_w, int screen_h);
+GLuint render_rvm_texture(void);
+void   render_rvm_composite(GpuMesh *quad, GLuint over, GLuint mask, int x, int y, int w, int h,
+                             int screen_w, int screen_h);
 /* debug: draw `tex` into the screen rectangle (x, y from bottom-left) */
 void   render_debug_texture(GLuint tex, GpuMesh *quad, int x, int y, int w, int h,
                             int screen_w, int screen_h);
@@ -202,6 +208,9 @@ RProg    render_program(void);          /* compile+link the shader, fetch unifor
 void     render_world_lite_program(const RProg *main_prog);   /* Vita: cheap world FS */
 #endif
 GpuMesh *upload_scene(N2Scene *s);      /* VBO/NBO/IBO per mesh, normals computed */
+/* same-state meshes marked in ok[] merged into one draw each (render.c) */
+GpuMesh *upload_scene_merged(const N2Scene *s, const GpuMesh *gm, const unsigned char *ok,
+                             short *lead, int *nout);
 /* Re-upload one mesh's positions and normals through a row-vector matrix
    (an opening hood / door, partanim.c); NULL puts the mesh back as loaded. */
 void render_mesh_repose(GpuMesh *g, const N2Mesh *m, const float *mat);
@@ -214,6 +223,8 @@ void     draw_gpumesh(GpuMesh *g);
  * and plastic suppress metallic lighting. All touched uniforms, texture,
  * alpha, blend and depth state are restored. Missing textures stay opaque. */
 void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode);
+void render_wheel_mesh_n(const RProg *r, GpuMesh *mesh, GLuint texture, int mode,
+                         int n, const float (*mvp)[16], const float (*world)[16], GLint uMVP);
 /* Sort the four instances of a library's material slices by view depth.
  * order has space for 4 * scene->count entries (hub * count + slice). */
 void render_wheel_order(const N2Scene *scene, const float mvp[4][16], int *order);

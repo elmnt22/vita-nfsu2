@@ -1,6 +1,7 @@
 #ifndef WORLD_SCENERY_H
 #define WORLD_SCENERY_H
 #include "world_group_reader.h"
+#include <stdio.h>
 
 /* Conservative load-time preview, NOT decoded retail activation flags.
  * Only exclusive membership in numeric event groups is suppressible. Unknown,
@@ -12,14 +13,30 @@ typedef struct {
 typedef struct { WGSelected *items; size_t count; } WGSelection;
 enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4, WG_LOCK=8 };
 
-/* Career progression walls: the translucent blue panes that seal districts
- * until the career opens them (BARRIERS_CAREER0..4), plus the demo build's
- * (BARRIERS_DEMO). The port has no career, so the whole city is open, as
- * after the career: placements belonging only to these groups are hidden.
- * TEMPORARY, for testing: when career progress exists, show each
- * BARRIERS_CAREER<n> until that stage is reached (BARRIERS_DEMO stays hidden). */
+/* Career scenery groups (GC TrackLoader::InitTopologyAndSceneryGroups
+ * 80196cb8). The retail loader enables, only when not racing (race params
+ * +0x14 == 0): in career mode (FEDatabase mode 1) "FREE_ROAM" (stage > 0), else
+ * "FREE_ROAM_STAGE0" once a career car is owned (PlayerCareerState +0x7e2c,
+ * CommitChooseCar / CommitSwitchToOwnedCar), else "FREE_ROAM_STAGE0A"; and
+ * always "BARRIERS_CAREER<stage>" (solid too, EnableBarriers(.., 1)).
+ * Everything else here stays disabled: races show none of them, and
+ * BARRIERS_DEMO is a demo-build group.
+ * g_wg_career_stage < 0 = no career (the port's own debug free roam): the
+ * city stays fully open as before (lock walls hidden, FREE_ROAM* shown). */
+extern int g_wg_career_stage, g_wg_career_owns_car;
 static int wg_lock_group(const char *name) {
     return !strncmp(name,"BARRIERS_CAREER",15) || !strcmp(name,"BARRIERS_DEMO");
+}
+static int wg_roam_group(const char *name) { return !strncmp(name,"FREE_ROAM",9); }
+/* For a career or free-roam group: 1 enabled, 0 disabled, -1 not one of them. */
+static int wg_career_group_on(const char *name,int event) {
+    int lock=wg_lock_group(name), roam=wg_roam_group(name);
+    if(!lock&&!roam)return -1;
+    if(g_wg_career_stage<0)return roam;            /* no career: unchanged */
+    if(event!=-1)return 0;                           /* racing / previews */
+    char want[24];
+    if(lock){ snprintf(want,sizeof want,"BARRIERS_CAREER%d",g_wg_career_stage); return !strcmp(name,want); }
+    return !strcmp(name,g_wg_career_stage?"FREE_ROAM":g_wg_career_owns_car?"FREE_ROAM_STAGE0":"FREE_ROAM_STAGE0A");
 }
 
 /* Runtime policy remains deliberately narrower than retail semantics. Normal
@@ -89,7 +106,8 @@ static int wg_selection_open(const WGTable *table,int event,WGSelection *out) {
     for(size_t p=0;p<table->group_bytes;) {
         const unsigned char *g=table->groups+p;
         int id=wg_event_id((const char *)g+8);
-        unsigned bits=id?WG_EVENT:wg_lock_group((const char *)g+8)?WG_LOCK:WG_OTHER;
+        int cg=wg_career_group_on((const char *)g+8,event);
+        unsigned bits=id?WG_EVENT:cg>0?WG_OTHER:cg==0?WG_LOCK:WG_OTHER;
         if(id>0&&id==event){bits|=WG_ACTIVE;found=1;}
         uint32_t refs=wg_u32(g+48);
         for(uint32_t j=0;j<refs;j++)items[wg_u16(g+52+2*(size_t)j)].membership|=(unsigned char)bits;

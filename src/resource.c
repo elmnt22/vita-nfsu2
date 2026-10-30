@@ -249,16 +249,17 @@ static long pin_build(int fd, long flen, unsigned char *out, ResPixStub *stub, i
 /* On-card cache of the compact copy, so only the first boot pays for the
    ~12k small reads of building it. Keyed by the bundle's file size. */
 #define PIN_MAGIC "OUG2CB02"
+#define PIN_STRIP_MAGIC "OUG2CS01"   /* the compact copy less what world tiles replace */
 static void pin_cache_path(const char *path, char *out, size_t cap) {
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
     snprintf(out, cap, "ux0:data/OpenUG2/cache/%s.compact", base);
 }
-static int pin_cache_load(const char *cpath, const char *path, long flen) {
+static int pin_cache_load(const char *cpath, const char *path, long flen, const char *want) {
     int fd = open(cpath, O_RDONLY);
     if (fd < 0) return 0;
     char magic[8]; long hdr[3];   /* source length, compact length, stub count */
-    int ok = read(fd, magic, 8) == 8 && !memcmp(magic, PIN_MAGIC, 8) &&
+    int ok = read(fd, magic, 8) == 8 && !memcmp(magic, want, 8) &&
              read(fd, hdr, sizeof hdr) == (int)sizeof hdr && hdr[0] == flen &&
              hdr[1] > 0 && hdr[2] >= 0;
     unsigned char *data = ok ? (unsigned char *)malloc((size_t)hdr[1]) : NULL;
@@ -274,14 +275,14 @@ static int pin_cache_load(const char *cpath, const char *path, long flen) {
     printf("bundle pinned from cache: %s (%ld MB)\n", cpath, hdr[1] >> 20);
     return 1;
 }
-static void pin_cache_save(const char *cpath, long flen) {
+static void pin_cache_save(const char *cpath, long flen, const char *magic) {
     mkdir("ux0:data/OpenUG2/cache", 0777);
     char tmp[1110]; snprintf(tmp, sizeof tmp, "%s.tmp", cpath);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return;
     long hdr[3] = { flen, g_pin.len, g_pin.nstub };
     long sn = g_pin.nstub * (long)sizeof *g_pin.stub;
-    int ok = write(fd, PIN_MAGIC, 8) == 8 && write(fd, hdr, sizeof hdr) == (int)sizeof hdr &&
+    int ok = write(fd, magic, 8) == 8 && write(fd, hdr, sizeof hdr) == (int)sizeof hdr &&
              (!sn || write(fd, g_pin.stub, (size_t)sn) == sn);
     for (long got = 0; ok && got < g_pin.len; ) {
         long want = g_pin.len - got > (4L << 20) ? (4L << 20) : g_pin.len - got;
@@ -336,6 +337,12 @@ static void pin_strip(void) {
     free(g_pin.data);
     g_pin.data = out; g_pin.len = q; g_pin.nstub = kept_stubs;
     free(g_tpk_memo); g_tpk_memo = NULL; g_tpk_memo_n = 0;   /* offsets into the old copy */
+    {   /* the stripped copy on the card too: later loads read 1 MB, not 57 */
+        char spath[1100];
+        pin_cache_path(g_pin.path, spath, sizeof spath);
+        snprintf(spath + strlen(spath), sizeof spath - strlen(spath), ".strip");
+        pin_cache_save(spath, g_pin_flen, PIN_STRIP_MAGIC);
+    }
 }
 void res_pin_strip(void) { g_pin_strip_req = 1; pin_strip(); }
 
@@ -351,7 +358,14 @@ unsigned char *res_bundle(const char *path, long *len) {
     long flen = (long)lseek(fd, 0, SEEK_END);
     char cpath[1100];
     pin_cache_path(path, cpath, sizeof cpath);
-    if (pin_cache_load(cpath, path, flen)) {
+    if (g_pin_strip_req) {   /* world tiles: the stripped copy is all that is wanted */
+        char spath[1110]; snprintf(spath, sizeof spath, "%s.strip", cpath);
+        if (pin_cache_load(spath, path, flen, PIN_STRIP_MAGIC)) {
+            close(fd);
+            *len = g_pin.len; return g_pin.data;
+        }
+    }
+    if (pin_cache_load(cpath, path, flen, PIN_MAGIC)) {
         close(fd);
         if (g_pin_strip_req) pin_strip();
         *len = g_pin.len; return g_pin.data;
@@ -371,7 +385,7 @@ unsigned char *res_bundle(const char *path, long *len) {
     g_pin_flen = flen; g_pin_gen++;
     printf("bundle pinned: %s %ld MB -> %ld MB in memory (%d pixel blocks on demand)\n",
            path, flen >> 20, size >> 20, nstub);
-    pin_cache_save(cpath, flen);   /* the full copy: a later conversion needs it */
+    pin_cache_save(cpath, flen, PIN_MAGIC);   /* the full copy: a later conversion needs it */
     if (g_pin_strip_req) pin_strip();
     *len = g_pin.len;
     return g_pin.data;

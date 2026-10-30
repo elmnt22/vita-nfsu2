@@ -70,6 +70,18 @@ typedef struct {
     int   ptrec;            /* its 0x7f3338 record (audio_player_turbo_rec) */
     float pload, pthr;      /* engine load and throttle, 0..100 */
     float prpm;             /* engine rpm */
+    /* the player's wheels, for CARSFX_RoadNoise (SFXCTL_Wheel 0x8008f9d4) */
+    int   pwheels;          /* the fields below are filled */
+    float pspeed;           /* car +0x430, m/s */
+    int   pcontact[4];      /* car +0x390 (FL FR RR RL) */
+    int   psurface[4];      /* car +0x394: retail surface id per wheel */
+    float pslipv[4][2];     /* car +0x3b4 */
+    float pfric[4];         /* car +0x3d4 = tire +0x170 friction use */
+    float pupz;             /* car +0xb8: the body's up axis, z (CARSFX_BottomOut) */
+    int   pbottom;          /* car sound event 5 (0x5f5d8f) param, 0..32767; 0 none */
+    int   pgear;            /* car +0x434 (0 R, 1 N, 2 first ..) */
+    int   pjumpcam;         /* the nearest view (0x459ac0) is in camera zone 6, the jump cam (+0x58) */
+    int   pspark;           /* car sound event 9 (0x5f6049, the neutral rev flame) this frame */
 } CarSfxListener;
 
 /* a car in a collision, as the collision sound reads it */
@@ -84,6 +96,10 @@ typedef struct {
 
 /* Parse the four mixmaps (MAPOUTPUT, DFT, DRG, URL). Returns maps read. */
 int  carsfx_init(const char *dataroot);
+/* the player's car changed (audio row): its SWTN_CAR_xx_MB.abk -- the
+   CAR_Sputter patch and its samples (inside audio_hold or before
+   audio_init). Returns 1 when the patch loaded. */
+int  carsfx_player_car(const char *dataroot, int row);
 /* the SOUND/TURBO banks the AI racers need (0x7f3338 indexes, one per
    distinct bank); valid after carsfx_race_begin. Returns how many. */
 int  carsfx_ai_turbo_banks(int tbank[CARSFX_AI_MAX]);
@@ -108,6 +124,16 @@ void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int n
    (it takes the camera from there). */
 void carsfx_coll_hit(int src, int a, int b, int poly, const float point[3], const float impulse[3],
                      float slide, const CarSfxCollCar *ca, const CarSfxCollCar *cb);
+/* A contact of a smokeable prop (kind 2, stSmokableCollision 0x47a960): a, b,
+   poly as for carsfx_coll_hit in the caller's own numbering for src; car: the
+   car in it (NULL: the prop against the world or another prop); prop: a
+   stable id of the prop (one hit sound per prop at a time); cat: its
+   SmokeableCategory (the sound material). */
+void carsfx_coll_prop(int src, int a, int b, int poly, const float point[3], const float impulse[3],
+                      const CarSfxCollCar *car, int prop, int cat);
+/* The water drum's slosh (0x46ae00): claim(prop) answers whether a WATER_DRUM
+   prop sloshes at this hit (once in its life; smk_slosh_claim). */
+void carsfx_set_slosh_claim(int (*claim)(int prop));
 /* After each run of src: the pairs {a, b, poly} it still has. A contact's
    sound state lives while its pair does (0x5ae470). */
 void carsfx_coll_pairs(int src, const int (*pairs)[3], int n);

@@ -253,10 +253,56 @@ static void n2_mod_audio(const char *root,const unsigned char *data,long len,
     printf("car: trunk audio level %d: %d of %d components, %d meshes\n",level,n,12,added);
 }
 
+/* SyncVisualPartsWithPhysics 0x6399d0: FRONT_BRAKE (slot 0x1b) is the
+ * BRAKES library part of the brake upgrade level (BRAKE_STYLE0n), in place
+ * of the car's own front brakes; the mesh sits at the origin like those and
+ * is placed per wheel by the brake mount. model: the part's model name
+ * without the LOD letter (shop_upgrade_model); keys: the car's textures. */
+static int n2_mod_brakes(const char *root,const char *model,const uint32_t *keys,int nkeys,N2Scene *car) {
+    const char *st=model?strstr(model,"STYLE"):NULL;
+    int style=st?atoi(st+5):0;
+    if(!root || style<1)return 0;
+    char path[1024];long bytes=0;
+    snprintf(path,sizeof path,"%s/CARS/BRAKES/GEOMETRY.BIN",root);
+    unsigned char *d=n2_read_file(path,&bytes);if(!d)return 0;
+    N2CarConfig cfg={.hood_style=style};N2Scene part={0};
+    n2_walk_car(d,0,bytes,&part,keys,nkeys,&cfg,0);
+    size_t ml=strlen(model);int kept=0;
+    for(int i=0;i<part.count;i++) {
+        N2Mesh *m=part.meshes+i;char name[64];long off=m->car_source;
+        name[0]=0;if(off>=8 && off<=bytes)n2_car_mesh_name(d,off,off+n2_u32(d+off-4),name);
+        if(strncmp(name,model,ml) || (name[ml] && name[ml]!='_')){n2_mesh_geometry_release(m);continue;}
+        part.meshes[kept++]=*m;
+    }
+    part.count=kept;free(d);n2_car_dedupe_lod(&part);
+    if(!part.count){n2_free_scene(&part);printf("car: brakes %s: no meshes\n",model);return 0;}
+    int n=0;
+    for(int i=0;i<car->count;i++) {   /* the car's own front brakes go */
+        N2Mesh *m=car->meshes+i;
+        if(m->car_mount==N2_MOUNT_FRONT_BRAKE){n2_mesh_geometry_release(m);continue;}
+        car->meshes[n++]=*m;
+    }
+    car->count=n;
+    N2Mesh *grown=(N2Mesh *)realloc(car->meshes,(size_t)(n+part.count)*sizeof *grown);
+    if(!grown){n2_free_scene(&part);return 0;}
+    car->meshes=grown;car->cap=n+part.count;
+    for(int i=0;i<part.count;i++) {
+        N2Mesh *dst=car->meshes+car->count++;
+        *dst=part.meshes[i];dst->inst=0;dst->car_source=0;dst->famkey=0;dst->car_part=0;
+        dst->car_anim=0;dst->car_mount=N2_MOUNT_FRONT_BRAKE;dst->cat=N2_CAR_MECH;
+    }
+    part.count=0;n2_free_scene(&part);   /* the slices moved to the car */
+    printf("car: front brakes %s: %d meshes\n",model,car->count-n);
+    return 1;
+}
+
+static int g_mod_fail_part=-1,g_mod_fail_value;   /* the part n2_mod_assemble gave up on */
 static int n2_mod_assemble(const char *root,const unsigned char *data,long len,
                            const N2CarConfig *cfg,N2Scene *car) {
+    g_mod_fail_part=-1;
     for(int p=0;p<N2_PART_COUNT;p++) {
         int value=cfg->parts[p];if(!value)continue;
+        g_mod_fail_part=p;g_mod_fail_value=value;
         if(value>=1000) {if(!n2_mod_attach(root,data,len,p,value,car))return 0;}
         else {
             if(value<1 || value>200)return 0;
@@ -268,6 +314,7 @@ static int n2_mod_assemble(const char *root,const unsigned char *data,long len,
             if(!found)return 0;
         }
     }
+    g_mod_fail_part=-1;
     n2_mod_audio(root,data,len,cfg,car);
     return 1;
 }

@@ -68,7 +68,10 @@ static void decode_def(AcidDef *o, const unsigned char *r)
 /* aligned table of a 0x35020/0x35021 chunk (0x491c70): +8 version, +0xc count */
 static const unsigned char *table(const unsigned char *bundle, long chunk, long size, unsigned *ver, unsigned *n)
 {
-    long a = ((chunk + 0x17) & ~0xfL);
+    /* the table sits 16-aligned in the file, after 0x11111111 filler; the
+       port's compact bundle copies move chunks, so skip the filler instead */
+    long a = chunk + 8;
+    while (a + 4 <= chunk + 8 + size && rd32(bundle + a) == 0x11111111u) a += 4;
     if (a + 0x10 > chunk + 8 + size) return NULL;
     *ver = rd32(bundle + a + 8); *n = rd32(bundle + a + 0xc);
     return bundle + a + 0x10;
@@ -752,6 +755,18 @@ void acid_car_fire(AcidCar *c, int id, float intensity, int param3,
 
 /* ---- 0x5f5730 ----------------------------------------------------------- */
 static float clamp01(float x) { return x > 0 ? (x > 1 ? 1 : x) : 0; }
+/* test aid (simulator): OPENUG2_FXLOG logs the car effects as they fire,
+   at most once a second per effect and car */
+static void fx_log(AcidCar *c, int id, float k)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OPENUG2_FXLOG") != NULL;
+    if (!on || id < 0 || id >= CARFX_COUNT) return;
+    static unsigned n[CARFX_COUNT];
+    if (c->fxlog[id]-- > 0) return;
+    c->fxlog[id] = 60;
+    printf("carfx: car %p fires %d at %.2f (#%u)\n", (void *)c, id, k, ++n[id]);
+}
 
 void acid_car_frame(AcidCar *c, const AcidCarFrame *f)
 {
@@ -812,11 +827,152 @@ void acid_car_frame(AcidCar *c, const AcidCarFrame *f)
             if (a > 0) acid_car_fire(c, CARFX_DRIVE_OVER, a, t, f->pos, f->mat, f->vel);
             if (b > 0) acid_car_fire(c, CARFX_DRIVE_OVER2, b, t, f->pos, f->mat, f->vel);
         }
+        /* bottoming out: this frame's bump-stop impulses over the surface's
+           range (the car sound's event 5 at the same strength is audio's) */
+        if (S->hi[4] != S->lo[4]) {
+            float k = clamp01((f->bottom - S->lo[4]) / (S->hi[4] - S->lo[4]));
+            if (k > 0) { acid_car_fire(c, CARFX_BOTTOM_OUT, k, t, f->pos, f->mat, f->vel); fx_log(c, CARFX_BOTTOM_OUT, k); }
+        }
     }
+    /* damage smoke (0x5f5e75): the engine past 0.9, the radiator past 0.65
+       with the last breakable fully broken */
+    if (c->dmg_on) {
+        float d = acid_damage(c);
+        if (d > 0.9f) { acid_car_fire(c, CARFX_DAM_ENGINE, 1.0f, 0, f->pos, f->mat, f->vel); fx_log(c, CARFX_DAM_ENGINE, d); }
+        else if ((c->dmg_flags & 0x30000000u) == 0x30000000u && d > 0.65f) {
+            acid_car_fire(c, CARFX_DAM_RADIATOR, 1.0f, 0, f->pos, f->mat, f->vel); fx_log(c, CARFX_DAM_RADIATOR, d);
+        }
+    }
+    /* nitrous: the flame while driving on it, the blow-off when it burns
+       standing still or off the gas (0x5f5f04) */
     if (f->nitrous) {
-        int id = (f->throttle >= 0.001f || mph >= 5.0f) ? CARFX_NITRO : CARFX_NOS_BLOWOFF;
+        int id = (f->throttle > 0.001f && mph >= 5.0f) ? CARFX_NITRO : CARFX_NOS_BLOWOFF;
         acid_car_fire(c, id, 1.0f, 0, f->pos, f->mat, f->vel);
+        fx_log(c, id, 1.0f);
     }
+    /* revving in neutral (0x5f5f4f): with turbo parts of level 2 or more
+       (+0.5 for the junkman turbo), the revs falling to half the band arm it and climbing back past
+       three quarters spits one exhaust flame, level / 3.5 strong (the car
+       sound's backfire, event 9, is audio's) */
+    if (f->gear == 1 && f->flame >= 2.0f) {
+        if (!c->flame_armed) {
+            if (f->rpm <= f->rpm_range * 0.5f) c->flame_armed = 1;
+        } else if (f->rpm >= f->rpm_range * 0.75f) {
+            acid_car_fire(c, CARFX_NITRO, f->flame * 0.2857143f, f->gear, f->pos, f->mat, f->vel);
+            c->flame_armed = 0;
+            c->fxlog[CARFX_NITRO] = 0; fx_log(c, CARFX_NITRO, -f->flame * 0.2857143f);   /* negative: the shift flame */
+        }
+    }
+}
+
+/* ---- CarDamage (0x63a360 .. 0x637c70) ------------------------------------- */
+int acid_damage_enabled = 1;
+void (*acid_impulse_cb)(const void *sim, const float J[3], const float r[3]);
+/* the breakable items (0x8036ec, 0x24 B each: window flag, slot, name, index,
+   marker hash, the level thresholds 0x610ea0 tests) */
+static const struct { uint32_t hash; float thr[4]; } k_break[15] = {
+    { 0xc4ec23c8u, { 0, 0.25f, 0.5f, 0.75f } },
+    { 0x0bea251bu, { 0, 0.25f, 0.5f, 0.75f } },  /* Side Mirror Left */
+    { 0xaa35c17fu, { 0, 0.25f, 0.5f, 0.75f } },  /* Side Mirror Right */
+    { 0xc805f7e0u, { 0, 0.25f, 0.5f, 0.75f } },  /* License Plate Rear */
+    { 0x9db90133u, { 0, 0.25f, 0.35f, 0.5f } },  /* License Plate Front */
+    { 0xd09091c6u, { 0, 0.25f, 0.35f, 0.5f } },  /* Headlight Left */
+    { 0x31a66786u, { 0, 0.25f, 0.45f, 0.65f } }, /* Headlight Right */
+    { 0xbf700a79u, { 0, 0.25f, 0.45f, 0.65f } }, /* Brakelight Left */
+    { 0x6ec7e79fu, { 0, 0.15f, 0.3f, 0.45f } },  /* Brakelight Right */
+    { 0x3f68f920u, { 0, 0.05f, 0.1f, 0.15f } },  /* windows */
+    { 0x3df28f69u, { 0, 0.05f, 0.1f, 0.15f } },
+    { 0xe898cfaau, { 0, 0.05f, 0.1f, 0.15f } },
+    { 0x64b0bb1cu, { 0, 0.05f, 0.1f, 0.15f } },
+    { 0x2f96d0fdu, { 0, 0.05f, 0.1f, 0.15f } },
+    { 0x68100815u, { 0, 0.7f, 0.85f, 0.95f } },
+};
+/* 0x60c1d0: the sector (0..31) of a car-space point, round the box's edge */
+static int dmg_sector(const float p[2], const float mn[2], const float mx[2])
+{
+    float u = (p[0] - mn[0]) / (mx[0] - mn[0]), v = (p[1] - mn[1]) / (mx[1] - mn[1]);
+    int iu = (int)lrintf(u * 8.0f), iv = (int)lrintf(v * 8.0f);   /* ftol */
+    iu = iu < 0 ? 0 : iu > 7 ? 7 : iu;
+    iv = iv < 0 ? 0 : iv > 7 ? 7 : iv;
+    if (u > v) return u > 1.0f - v ? 8 - iv : 16 - iu;
+    return u > 1.0f - v ? 24 + iu : 16 + iv;
+}
+float acid_damage(const AcidCar *c)
+{
+    return c && c->dmg_on && acid_damage_enabled ? (float)c->dmg_sum * (1.0f / 4096.0f) : 0.0f;
+}
+void acid_damage_repair(AcidCar *c)
+{
+    if (!c) return;
+    memset(c->dmg, 0, sizeof c->dmg); c->dmg_sum = 0; c->dmg_flags = 0;
+}
+void acid_damage_setup(AcidCar *c, const float bbmin[2], const float bbmax[2],
+                       const AcidMarker *mk, int nmk)
+{
+    if (!c || !(bbmax[0] > bbmin[0]) || !(bbmax[1] > bbmin[1])) return;
+    c->dmg_on = 1;
+    c->dmg_min[0] = bbmin[0]; c->dmg_min[1] = bbmin[1];
+    c->dmg_max[0] = bbmax[0]; c->dmg_max[1] = bbmax[1];
+    memset(c->dmg_item, -1, sizeof c->dmg_item);                     /* ctor: -1 */
+    acid_damage_repair(c);
+    for (int i = 0; i < nmk; i++)                                     /* 0x610e00 */
+        for (int k = 0; k < 15; k++)
+            if (mk[i].hash == k_break[k].hash) {
+                c->dmg_item[k] = (signed char)dmg_sector(mk[i].pos, c->dmg_min, c->dmg_max);
+                break;
+            }
+}
+/* BodyDamage::SetDamage 0x610a70 */
+static void dmg_set(AcidCar *c, int s, float f)
+{
+    f = f > 1.0f ? 1.0f : f < 0.0f ? 0.0f : f;
+    int b = (int)lrintf(f * 128.0f);
+    c->dmg_sum += b - c->dmg[s];
+    c->dmg[s] = (unsigned char)b;
+}
+/* RecalculateBreakableDamage 0x610ea0 */
+static unsigned dmg_breakables(const AcidCar *c)
+{
+    unsigned fl = 0;
+    for (int k = 0; k < 15; k++) {
+        if (c->dmg_item[k] < 0) continue;
+        float d = acid_damage_enabled ? c->dmg[(int)c->dmg_item[k]] * (1.0f / 128.0f) : 0.0f;
+        int lv = 3;
+        while (lv > 0 && d < k_break[k].thr[lv]) lv--;
+        fl |= (unsigned)lv << (2 * k);
+    }
+    return fl;
+}
+/* AddDamageToSector 0x610f30: a change in the breakables' levels only
+   sticks from a hit of 0.2 or more, else the sector keeps its old value */
+static void dmg_sector_add(AcidCar *c, int s, float add, float hit)
+{
+    float cur = c->dmg[s] * (1.0f / 128.0f), nw = cur + add;
+    nw = nw > 0.0f ? (nw > 1.0f ? 1.0f : nw) : 0.0f;
+    if (cur == nw) return;
+    dmg_set(c, s, nw);
+    unsigned fl = dmg_breakables(c);
+    if (fl == c->dmg_flags) return;
+    if (hit > 0.2f) c->dmg_flags = fl;
+    else dmg_set(c, s, cur);
+}
+/* CarCollisionBody::AddDamage 0x593bf0 -> CarDamage::AddDamage 0x637c70 */
+void acid_damage_hit(AcidCar *c, const float local[3], float jmag)
+{
+    if (!c || !c->dmg_on || !acid_damage_enabled) return;
+    float a = jmag * 0.013f;                                         /* 0x7fbeec */
+    if (!(a >= 0.05f)) return;                                       /* 0x7a677c */
+    int s = dmg_sector(local, c->dmg_min, c->dmg_max);
+    dmg_sector_add(c, s, a, a);
+    float k = a;
+    for (int i = 1; i <= 4; i++) {                                   /* x 0.5 each step out */
+        k *= 0.5f;
+        dmg_sector_add(c, (s + i) & 31, k, a);
+        dmg_sector_add(c, (s - i) & 31, k, a);
+    }
+    if (getenv("OPENUG2_FXLOG"))
+        printf("cardamage: car %p hit %.3f sector %d -> damage %.3f flags %08x\n",
+               (void *)c, a, s, acid_damage(c), c->dmg_flags);
 }
 
 /* ---- collisions (0x5a9620 -> 0x5dc4c0) ------------------------------------ */
@@ -933,6 +1089,82 @@ const AcidSurface acid_surfaces[29] = {
     { "CHAINLINK",   S7("",15,100, "",50,100, "",2,100, "",5,100, "",0.6f,3, "",50,100, "",50,100) },
     { "CAR",         S7("",15,100, "",50,100, "",2,100, "",5,100, "",0.6f,3, "XECI_CAR",10,15, "",2,4) },
 };
+
+/* ---- emitters owned by others (the smokeables) ----------------------- */
+AcidEmitter *acid_clones(uint32_t group) { return clones_of(group); }
+void acid_free_clones(AcidEmitter *list) { free_list(list); }
+AcidEmitter *acid_copy(const AcidEmitter *t)            /* afxCopyEmitter 0x48b830, state 1 */
+{
+    AcidEmitter *e = t ? clone(t) : NULL;
+    if (e) e->state = 1;
+    return e;
+}
+void acid_auto_add(AcidEmitter *e) { if (e) world_add(e); }
+void acid_auto_remove(AcidEmitter *e)                   /* RemoveAutoEmitter, then the delete */
+{
+    if (!e) return;
+    for (AcidEmitter **pp = &g_world; *pp; pp = &(*pp)->next)
+        if (*pp == e) { *pp = e->next; break; }
+    if (e->group && e->group->em == e) e->group->em = NULL;
+    free(e);
+}
+
+/* KillActiveParticlesForEmitter: every group the emitter fills, and its particles */
+static void kill_emitter(AcidEmitter *e)
+{
+    pools_init();
+    for (AcidGroup *g = g_ghead.next, *gn; g != &g_ghead; g = gn) {
+        gn = g->next;
+        if (g->em != e) continue;
+        for (int l = 0; l < 2; l++)
+            for (AcidParticle *p = g->head[l].next, *pn; p != &g->head[l]; p = pn) { pn = p->next; particle_free(g, l, p); }
+        group_free(g);
+    }
+}
+void acid_trigger_init(AcidTrigger *t, const char *group)
+{
+    memset(t, 0, sizeof *t);
+    t->tmpl = clones_of(bhash(group));
+}
+void acid_trigger_off(AcidTrigger *t)
+{
+    if (!t->on) return;
+    for (int i = 0; i < t->nlive; i++) { kill_emitter(t->live[i]); acid_auto_remove(t->live[i]); }
+    t->nlive = 0;
+    t->pos[0] = t->pos[1] = t->pos[2] = 0;
+    t->on = 0;
+}
+void acid_trigger_free(AcidTrigger *t)
+{
+    acid_trigger_off(t);
+    free_list(t->tmpl);
+    memset(t, 0, sizeof *t);
+}
+int acid_trigger_place(AcidTrigger *t, const float pos[3], int (*ground)(float x, float y, float *z))
+{
+    if (t->on) {
+        if (!(fabsf(t->pos[0] - pos[0]) <= 0.001f && fabsf(t->pos[1] - pos[1]) <= 0.001f &&
+              fabsf(t->pos[2] - pos[2]) <= 0.001f))                      /* bEqual(.., 0.001) */
+            acid_trigger_off(t);
+        if (t->on) return 1;
+    }
+    if (t->tmpl) {
+        float p[3] = { pos[0], pos[1], pos[2] };
+        if (p[2] == 0.0f && !(ground && ground(p[0], p[1], &p[2]))) return 0;   /* GetElevation */
+        for (AcidEmitter *e = t->tmpl; e && t->nlive < 8; e = e->next) {
+            AcidEmitter *c = acid_copy(e);
+            if (!c) break;
+            memset(c->m, 0, sizeof c->m);                                /* identity, at p */
+            c->m[0] = c->m[5] = c->m[10] = c->m[15] = 1.0f;
+            c->m[12] = p[0]; c->m[13] = p[1]; c->m[14] = p[2];
+            acid_auto_add(c);
+            t->live[t->nlive++] = c;
+        }
+    }
+    memcpy(t->pos, pos, sizeof t->pos);
+    t->on = 1;
+    return 1;
+}
 
 void acid_shutdown(void)
 {

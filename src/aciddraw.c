@@ -21,7 +21,88 @@ static struct {
     AVert *v; int cap;
     int ready;
     GLuint white;
+    GLuint ftex[3]; int fblend[3];          /* light flare textures 0x82cc10 */
+    struct { float p[3]; int type; } fq[32]; int nfq;
 } A;
+
+/* SingleLightFlareParameters (0x7f3a30.., 0x2c bytes) per flare type, two
+   slots (0x7f3cc8): size at intensity 0 / 1, r g b a (0..255) at intensity
+   1, pow exponent (flag 4), pull toward the eye, depth-scale clamp, texture */
+typedef struct { float s0, s1, r, g, b, a, pw, pull, cmin, cmax; int tex; } FlareParm;
+static const FlareParm k_fp_head[2] = {
+    { 0, 64, 100, 120, 170, 80, 1.45f, 0.8f, 0.01f, 0.048f, 0 },
+    { 28, 28, 100, 120, 140, 20, 3.0f, 0.8f, 0.01f, 0.015f, 1 } };
+static const FlareParm k_fp[15] = {
+    { 0 }, { 20, 30, 128, 25, 25, 120, 0.45f, 0.2f, 0.01f, 0.03f, 2 },
+    { 20, 20, 255, 255, 255, 128, 1.2f, 0.2f, 0.005f, 0.01f, 2 }, { 20, 20, 128, 128, 128, 128, 1, 0.2f, 0.005f, 0.01f, 2 },
+    { 30, 40, 128, 64, 64, 128, 1, 1, 0.01f, 0.02f, 0 }, { 30, 40, 64, 64, 128, 128, 1, 1, 0.01f, 0.02f, 0 },
+    { 30, 40, 128, 128, 128, 128, 1, 1, 0.01f, 0.02f, 0 }, { 0 }, { 0 },
+    { 30, 30, 110, 100, 75, 110, 1, 4, 0.001f, 0.1f, 2 }, { 10, 10, 110, 75, 0, 150, 1, 2.7f, 0.001f, 0.1f, 2 },
+    { 10, 10, 110, 0, 0, 150, 1, 4, 0.001f, 0.1f, 2 }, { 10, 10, 0, 0, 120, 150, 1, 4, 0.001f, 0.1f, 2 },
+    { 30, 30, 110, 75, 0, 150, 1, 4, 0.001f, 0.1f, 2 }, { 1, 10, 105, 26.5f, 0, 70, 1, 1, 0.07f, 0.07f, 2 } };
+
+void aciddraw_light_flare(const float pos[3], int type)
+{
+    if (A.nfq >= 32 || type < 0 || type > 14) return;
+    memcpy(A.fq[A.nfq].p, pos, sizeof A.fq[0].p);
+    A.fq[A.nfq++].type = type;
+}
+
+static void flush(GLuint tex, int blend, int nq);
+static float clamp255(float c);
+/* 0x494280 -> eRenderLightFlare 0x490920 with intensity 1, flare type 3/4
+   (the reflection pass, type 2, is not drawn: no wet-road mirror here).
+   Flags +0x2d bits 1 / 4 (offset, pow) are 0 on the flares the port adds. */
+static int light_flares(const float V[16], float proj)
+{
+    int nq = 0, drawn = 0; GLuint btex = 0; int bblend = 0;
+    const float R[3] = { V[0], V[4], V[8] }, U[3] = { V[1], V[5], V[9] };
+    float eye[3];
+    for (int j = 0; j < 3; j++) eye[j] = -(V[4 * j] * V[12] + V[4 * j + 1] * V[13] + V[4 * j + 2] * V[14]);
+    for (int i = 0; i < A.nfq; i++) {
+        const float *P = A.fq[i].p;
+        int ty = A.fq[i].type;
+        float depth = -(V[2] * P[0] + V[6] * P[1] + V[10] * P[2] + V[14]);
+        if (depth <= 0.0f) continue;                    /* 0x5bc450: inside the view's planes (near only here) */
+        float d[3] = { eye[0] - P[0], eye[1] - P[1], eye[2] - P[2] };
+        float d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if (d2 > 40000.0f) continue;                    /* 0x78d79c, squared */
+        float fade = d2 > 32000.0f ? 1.0f - (d2 - 32000.0f) / 8000.0f : 1.0f;
+        float il = d2 > 0 ? 1.0f / sqrtf(d2) : 0.0f;
+        for (int j = 0; j < 3; j++) d[j] *= il;         /* 0x4870b0: toward the eye, unit */
+        float ds = depth / proj;                        /* view z / view +0xc */
+        for (int s = 0; s < 2; s++) {
+            const FlareParm *f = ty == 0 || ty == 7 || ty == 8 ? &k_fp_head[s] : s ? NULL : &k_fp[ty];
+            if (!f || f->tex < 0 || f->tex > 2 || !A.ftex[f->tex]) continue;
+            float size = f->s1;                         /* (s1 - s0) * 1 + s0 */
+            if (size <= 0.0f) continue;
+            float sc = ds < f->cmin ? f->cmin : ds > f->cmax ? f->cmax : ds;
+            size *= sc;
+            unsigned char col[4] = { (unsigned char)clamp255(f->r), (unsigned char)clamp255(f->g),
+                                     (unsigned char)clamp255(f->b), (unsigned char)clamp255(f->a * fade * 2.0f) };
+            if (A.ftex[f->tex] != btex || A.fblend[f->tex] != bblend) {
+                flush(btex, bblend, nq); drawn += nq; nq = 0;
+                btex = A.ftex[f->tex]; bblend = A.fblend[f->tex];
+            }
+            float c[3], r[3], u[3];
+            for (int j = 0; j < 3; j++) { c[j] = P[j] + d[j] * f->pull; r[j] = R[j] * size; u[j] = U[j] * size; }
+            AVert *o = A.v + 4 * nq;
+            for (int j = 0; j < 3; j++) {
+                o[0].p[j] = c[j] - r[j] - u[j];
+                o[1].p[j] = c[j] + r[j] - u[j];
+                o[2].p[j] = c[j] + r[j] + u[j];
+                o[3].p[j] = c[j] - r[j] + u[j];
+            }
+            o[0].uv[0] = 0; o[0].uv[1] = 1; o[1].uv[0] = 1; o[1].uv[1] = 1;
+            o[2].uv[0] = 1; o[2].uv[1] = 0; o[3].uv[0] = 0; o[3].uv[1] = 0;
+            for (int k = 0; k < 4; k++) memcpy(o[k].c, col, 4);
+            nq++;
+        }
+    }
+    flush(btex, bblend, nq); drawn += nq;
+    A.nfq = 0;
+    return drawn;
+}
 
 static GLuint tex_from(const unsigned char *b, long len, N2Tpk *tk, uint32_t key, int *blend)
 {
@@ -75,6 +156,12 @@ int aciddraw_init(const char *dataroot, const unsigned char *glob, long globlen)
         free(tk.blk);
         if (f == 0) free(b);
     }
+    {   /* the light flare textures 0x4908f0: hashes 0x7f39cc (GLOBALB) */
+        static const uint32_t k[3] = { 0x8868656fu, 0x88d8e8a2u, 0x3394fe62u };   /* HEADLIGHTFLAREINNER / OUTER, HEADLIGHTGLOW */
+        N2Tpk tk = n2_tpk_open(glob, globlen);
+        for (int i = 0; i < 3; i++) A.ftex[i] = tex_from(glob, globlen, &tk, k[i], &A.fblend[i]);
+        free(tk.blk);
+    }
     int have = 0, want = 0;
     for (int i = 0; i < acid_ndefs(); i++) { want += acid_def_at(i)->tex != 0; have += acid_def_at(i)->gltex != 0; }
     printf("particles: %d emitter definitions, textures %d of %d\n", acid_ndefs(), have, want);
@@ -93,6 +180,7 @@ void aciddraw_free(void)
             glDeleteTextures(1, &t);
         }
     }
+    for (int i = 0; i < 3; i++) if (A.ftex[i]) glDeleteTextures(1, &A.ftex[i]);
     if (A.vbo) glDeleteBuffers(1, &A.vbo);
     if (A.ibo) glDeleteBuffers(1, &A.ibo);
     free(A.v);
@@ -126,7 +214,7 @@ int aciddraw_draw(const float V[16], const float PV[16], float proj, const AcidO
 {
     if (!A.ready || !A.prog) return 0;
     AcidGroup *first = acid_group_first();
-    if (!first) return 0;
+    if (!first && !A.nfq) return 0;
     if (A.cap < 4 * 1000) {
         free(A.v); A.v = (AVert *)malloc(sizeof(AVert) * 4 * 1000);
         if (!A.v) { A.cap = 0; return 0; }
@@ -178,6 +266,8 @@ int aciddraw_draw(const float V[16], const float PV[16], float proj, const AcidO
                 cubic(d->size, t, sz);
                 float depth = -(V[2] * p->pos[0] + V[6] * p->pos[1] + V[10] * p->pos[2] + V[14]);
                 float size = sz[0];
+                /* port (Vita budget): a quad wholly behind the eye cannot show */
+                if (depth < -(size > 0 ? size : -size)) continue;
                 float scr = size > 0 && depth > 0 ? size / depth * proj : 0.0f;
                 if (scr > maxs) size = depth / proj * maxs;
                 int asp = p->typ >> 4;
@@ -241,6 +331,7 @@ int aciddraw_draw(const float V[16], const float PV[16], float proj, const AcidO
         }
         flush(btex, bblend, nq); drawn += nq;
     }
+    drawn += light_flares(V, proj);   /* the eLightFlare pool after the particles (0x494280) */
     glDisableVertexAttribArray(RENDER_PARTICLE_COLOR_LOC);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE); glDisable(GL_BLEND);

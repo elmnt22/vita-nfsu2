@@ -1299,6 +1299,9 @@ Nis *nis_load(const char *dataroot, unsigned hash, int variant)
         char t[32]; snprintf(t, sizeof t, "IntroNis%02d", i);
         if (nis_hash(t) == hash) snprintf(name, sizeof name, "%s", t);
     }
+    /* the career start scene (ChooseAnim 800464ac type 4, IsFirstTimeInCareer):
+       NIS/Scene_CareerNis1_BundleB.bun, header type 4, 405 frames */
+    if (!name[0] && nis_hash("CareerNis1") == hash) snprintf(name, sizeof name, "CareerNis1");
     if (!name[0]) return NULL;
     char p[1024];
     snprintf(p, sizeof p, "%s/NIS/Scene_%s_BundleB.bun", dataroot, name);

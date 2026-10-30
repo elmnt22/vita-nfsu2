@@ -1,7 +1,8 @@
 /* carfx.c -- see carfx.h. Everything here is decoded from SPEED2.EXE:
  *   material params   0x5bd4a0 (from the GLOBALB light-material payload +0x30)
  *   light context     0x48f7a0 -> 0x48f600 -> 0x48ed60
- *   rig               .data 0x7f3e10 (the in-game car rig, 3 white lights)
+ *   rig               .data 0x7f3e10 (the in-game car rig, 3 white lights);
+ *                     front-end shaper rigs: FrontB chunk 0x0003B700
  *   track lights      0x48e3d0 / 0x4893a0 (<= 10, weighted by r_in/r_out)
  *   SH accumulation   0x489af0 / 0x4895e0 (+ a -0.05 back light per light) */
 #include "carfx.h"
@@ -125,27 +126,156 @@ static void sh_light(float sh[10][4], float r, float g, float b, float dx, float
     sh_add(sh, back, -dx, -dy, -dz);
 }
 
+/* A 2D grid over the track lights (cell -> lights whose r_out circle touches
+   it), rebuilt when the light list changes; the per-car pick then reads one
+   cell's few lights instead of all ~2000. */
+static struct {
+    const void *lights; int n, stride; unsigned gen; int ok;
+    float x0, y0, inv; int w, h;
+    int *start, *list;
+} g_lg;
+static unsigned g_lights_gen;
+void carfx_lights_changed(void) { g_lights_gen++; }
+static int light_grid(const void *lights, int n, int stride) {
+    if (g_lg.lights == lights && g_lg.n == n && g_lg.stride == stride && g_lg.gen == g_lights_gen)
+        return g_lg.ok;
+    free(g_lg.start); free(g_lg.list);
+    memset(&g_lg, 0, sizeof g_lg);
+    g_lg.lights = lights; g_lg.n = n; g_lg.stride = stride; g_lg.gen = g_lights_gen;
+    const unsigned char *base = (const unsigned char *)lights;
+    float mn[2] = { 1e30f, 1e30f }, mx[2] = { -1e30f, -1e30f };
+    int any = 0;
+    for (int i = 0; i < n; i++) {
+        const CarFxLight *L = (const CarFxLight *)(base + (size_t)i * (size_t)stride);
+        float r = fabsf(L->r_out);
+        if (!(r > 0) || !isfinite(L->pos[0]) || !isfinite(L->pos[1]) || !isfinite(r)) continue;
+        any = 1;
+        for (int a = 0; a < 2; a++) {
+            if (L->pos[a] - r < mn[a]) mn[a] = L->pos[a] - r;
+            if (L->pos[a] + r > mx[a]) mx[a] = L->pos[a] + r;
+        }
+    }
+    if (!any) { g_lg.ok = 1; g_lg.w = g_lg.h = 0; g_lg.start = NULL; return 1; }   /* every query: none */
+    float cell = 64.0f;
+    while ((mx[0] - mn[0]) / cell > 512.0f || (mx[1] - mn[1]) / cell > 512.0f) cell *= 2.0f;
+    g_lg.x0 = mn[0]; g_lg.y0 = mn[1]; g_lg.inv = 1.0f / cell;
+    g_lg.w = (int)((mx[0] - mn[0]) * g_lg.inv) + 1; g_lg.h = (int)((mx[1] - mn[1]) * g_lg.inv) + 1;
+    int ncell = g_lg.w * g_lg.h;
+    g_lg.start = (int *)calloc((size_t)ncell + 1, sizeof(int));
+    if (!g_lg.start) return 0;
+    int *cur = NULL;
+    for (int pass = 0; pass < 2; pass++) {               /* count, then fill (index order) */
+        for (int i = 0; i < n; i++) {
+            const CarFxLight *L = (const CarFxLight *)(base + (size_t)i * (size_t)stride);
+            float r = fabsf(L->r_out);
+        if (!(r > 0) || !isfinite(L->pos[0]) || !isfinite(L->pos[1]) || !isfinite(r)) continue;
+            int x0 = (int)floorf((L->pos[0] - r - g_lg.x0) * g_lg.inv);
+            int x1 = (int)floorf((L->pos[0] + r - g_lg.x0) * g_lg.inv);
+            int y0 = (int)floorf((L->pos[1] - r - g_lg.y0) * g_lg.inv);
+            int y1 = (int)floorf((L->pos[1] + r - g_lg.y0) * g_lg.inv);
+            if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+            if (x1 >= g_lg.w) x1 = g_lg.w - 1; if (y1 >= g_lg.h) y1 = g_lg.h - 1;
+            for (int y = y0; y <= y1; y++)
+                for (int x = x0; x <= x1; x++) {
+                    int c = y * g_lg.w + x;
+                    if (pass == 0) g_lg.start[c + 1]++;
+                    else g_lg.list[cur[c]++] = i;
+                }
+        }
+        if (pass == 0) {
+            for (int c = 0; c < ncell; c++) g_lg.start[c + 1] += g_lg.start[c];
+            g_lg.list = (int *)malloc((size_t)(g_lg.start[ncell] ? g_lg.start[ncell] : 1) * sizeof(int));
+            cur = (int *)malloc((size_t)ncell * sizeof(int));
+            if (!g_lg.list || !cur) {
+                free(g_lg.list); free(cur); free(g_lg.start);
+                g_lg.list = NULL; g_lg.start = NULL; return 0;
+            }
+            memcpy(cur, g_lg.start, (size_t)ncell * sizeof(int));
+        }
+    }
+    free(cur);
+    g_lg.ok = 1;
+    return 1;
+}
+
+/* Shaper light rigs: {flag, heading, pitch, r, g, b, intensity} x 3.
+   0x7f3e10 is the in-game rig (the default of the lookup 0x48a2d0); the
+   front end's come from the 0x0003B700 chunk (0x48a280, 0x74-byte records:
+   name hash, 0x1c pad, 3 lights of 0x1c) in FrontB. */
+static const CarFxRig k_rig_ingame = { 0, { {1, 149, 100, 1, 1, 1, 0.2f}, {1, 303, 36, 1, 1, 1, 0.2f},
+                                            {1, 76, 22, 1, 1, 1, 0.2f} } };
+static CarFxRig *g_rigs; static int g_nrigs;
+static const CarFxRig *g_rig;
+int carfx_load_rigs(const unsigned char *d, long len) {
+    int n = (int)(len / 0x74);
+    free(g_rigs); g_rigs = NULL; g_nrigs = 0; g_rig = NULL;
+    if (n <= 0) return 0;
+    g_rigs = (CarFxRig *)calloc((size_t)n, sizeof *g_rigs);
+    if (!g_rigs) return 0;
+    for (int i = 0; i < n; i++) {
+        const unsigned char *r = d + (long)i * 0x74;
+        g_rigs[i].hash = rd32(r);
+        for (int j = 0; j < 3; j++) {
+            const unsigned char *q = r + 0x20 + j * 0x1c;
+            g_rigs[i].l[j][0] = rd32(q) ? 1.0f : 0.0f;
+            for (int k = 1; k < 7; k++) memcpy(&g_rigs[i].l[j][k], q + 4 * k, 4);
+        }
+    }
+    g_nrigs = n;
+    return n;
+}
+int carfx_use_rig(uint32_t hash) {
+    g_rig = NULL;
+    for (int i = 0; hash && i < g_nrigs; i++)
+        if (g_rigs[i].hash == hash) { g_rig = &g_rigs[i]; return 1; }
+    return 0;
+}
+uint32_t carfx_rig_hash(const char *name) {
+    char u[64]; int i = 0;
+    for (; name[i] && i < 63; i++) u[i] = (char)(name[i] >= 'a' && name[i] <= 'z' ? name[i] - 32 : name[i]);
+    u[i] = 0;
+    return cfx_hash(u);
+}
+
 int carfx_sh(float sh[10][4], const float pos[3], const float camfwd[3],
              const void *lights, int nlights, int stride) {
     memset(sh, 0, sizeof(float) * 40);
-    /* rig 0x7f3e10: {on, heading, pitch, r, g, b, intensity}, colours x255
-       then /255 again in 0x48ed60, so 0.2 white each. Turned with the camera
-       (the rig is rotated by the view before the track lights join it). */
-    static const float rig[3][3] = { {149.0f, 100.0f, 0.2f}, {303.0f, 36.0f, 0.2f},
-                                     {76.0f, 22.0f, 0.2f} };
+    /* the shaper rig (carfx_use_rig): 0x48ed60 turns each light's
+       {heading, pitch} by 0x48a310 into r = (cos p cos(h+180),
+       cos p sin(h+180), sin p); a light with its flag set is in camera
+       space and goes to world as -r.y right - r.z down + r.x forward
+       (right = (0,0,-1) x fwd, down = fwd x right, as 0x444de0 builds the
+       view), a flag-0 light is r in world space. Colour = rgb * intensity. */
     float fx = camfwd[0], fy = camfwd[1], fl = sqrtf(fx * fx + fy * fy);
     if (fl < 1e-4f) { fx = 1.0f; fy = 0.0f; } else { fx /= fl; fy /= fl; }
     float rx = fy, ry = -fx;   /* camera right, horizontal */
+    const CarFxRig *rig = g_rig ? g_rig : &k_rig_ingame;
     for (int i = 0; i < 3; i++) {
-        float h = rig[i][0] * 0.0174532925f, p = rig[i][1] * 0.0174532925f;
+        const float *L = rig->l[i];
+        float h = L[1] * 0.0174532925f, p = L[2] * 0.0174532925f;
         float ch = cosf(h), shh = sinf(h), cp = cosf(p), sp = sinf(p);
-        float dx = cp * (ch * fx + shh * rx), dy = cp * (ch * fy + shh * ry), dz = sp;
-        sh_light(sh, rig[i][2], rig[i][2], rig[i][2], dx, dy, dz);
+        float dx, dy, dz = sp;
+        if (L[0] != 0.0f) { dx = cp * (shh * rx - ch * fx); dy = cp * (shh * ry - ch * fy); }
+        else { dx = -cp * ch; dy = -cp * shh; }
+        sh_light(sh, L[3] * L[6], L[4] * L[6], L[5] * L[6], dx, dy, dz);
     }
+    if (!lights) return 0;
     /* track lights: the 10 nearest that reach the car (0x4893a0 weight) */
     int best[10], nb = 0; float bestd[10];
     const unsigned char *base = (const unsigned char *)lights;
-    for (int i = 0; lights && i < nlights; i++) {
+    /* only the lights whose reach covers pos's grid cell, in index order,
+       so the pick (ties included) is the full scan's */
+    const int *cand = NULL; int ncand = nlights;
+    if (lights && isfinite(pos[0]) && isfinite(pos[1]) && light_grid(lights, nlights, stride)) {
+        int cx = (int)floorf((pos[0] - g_lg.x0) * g_lg.inv), cy = (int)floorf((pos[1] - g_lg.y0) * g_lg.inv);
+        if (cx < 0 || cy < 0 || cx >= g_lg.w || cy >= g_lg.h) ncand = 0;   /* no light reaches */
+        else {
+            int c = cy * g_lg.w + cx;
+            cand = g_lg.list + g_lg.start[c]; ncand = g_lg.start[c + 1] - g_lg.start[c];
+        }
+    }
+    for (int ci = 0; lights && ci < ncand; ci++) {
+        int i = cand ? cand[ci] : ci;
         const CarFxLight *L = (const CarFxLight *)(base + (size_t)i * (size_t)stride);
         float dx = pos[0] - L->pos[0], dy = pos[1] - L->pos[1], dz = pos[2] - L->pos[2];
         float d2 = dx * dx + dy * dy + dz * dz;

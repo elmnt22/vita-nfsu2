@@ -193,6 +193,9 @@ typedef struct {                       /* DriveTrain, 0xf4 B, vtable 0x7a2508 */
     float drivew;                      /* +0x4c driveline speed at the engine */
     float semi_t; int req;             /* +0x50 +0x54 */
     float prevdiff, shift_t;           /* +0x58 +0x5c */
+    int   mode;                        /* +0x60 the controller's transmission (0x407280): 3 = the clutch pedal drives
+                                          state/engage (0x594910), anything else the clutch FSM */
+    float disrpm;                      /* +0x6c engine rpm while engaged (clutch-pedal mode: the upshift grade's rpm) */
     float sum;                         /* +0x70 */
     int   neutral;                     /* +0x74 */
     float rnd[3];                      /* +0x78 +0x7c +0x80 */
@@ -253,11 +256,17 @@ struct N2Sim {
     int   trans, gear_req, rflag, held; /* +0x2c0 mode, +0x1e4 gear request, +0x2f0 reverse wanted, +0x2b4 */
     float hbtimer, ctl_t;              /* +0x2bc, clock (0x86518c / 4000) */
     int   launch;                      /* +0x2cc the drag launch timer, 1/4000 s (0x577310) */
+    float clutch;                      /* +0x2f4 the clutch pedal, 1 = released (engaged), 0 = floored */
+    unsigned trkflags;                 /* the track record's flags (GLOBALB 0x34201 +0x94, *0x883dac) */
     int   sliding;                     /* steering +0x10 */
     Avg   st_in, st_flick;             /* steering +0x14 (0.55 s), +0x48 (0.15 s) */
     float st_max, st_prev;             /* steering +0x80 +0x84 */
     float in_dt, vtop;                 /* last frame step; 0x5b5930 top speed */
     double hit_time;                   /* carstate+0x3c -> +0x140, last crash */
+    int   dampen;                      /* car +0x38 DampenMode: 0 normal, 1 crash, 2 airborne */
+    float draft;                       /* car +0x4dc (0x5ebd80, World::DoTimestep) */
+    int   nos_spray;                   /* a purge press since the last n2sim_nos_spray */
+    int   dampen_on; float dampen_t;   /* car +0x54c: time on four wheels since */
     float nos_cap, nos_left, nos_stock[2]; /* carstate +0x414 +0x41c; stock P+0x2a0 +0x2ac */
     double nos_start;                  /* carstate +0x420 */
     int   nos_burn, nos_stage, nos_pkg; /* burning, engine +0x84, fitted level */
@@ -266,6 +275,7 @@ struct N2Sim {
     double time;                       /* 0x86518c / 4000 */
     /* carstate */
     float cs_speed, cs_absv, cs_tach;  /* +0x3ec +0x3f0 +0x400 */
+    float cs_bottom[4];     /* +0x330: bump-stop impulses this frame (0x5abb00, zeroed by 0x5b72d0) */
     int   cs_wheels, cs_contact[4], cs_surf[4];
     unsigned rng;
     struct { int valid, ok, surf; float x, y, z, n[3]; } gc[4];   /* ground, once per frame */
@@ -302,6 +312,11 @@ struct N2Sim {
     float hyd_bounce[4], hyd_extend[4], hyd_h[4];
     int   hyd_code[4];
     unsigned char hyd_hit[4];
+    /* PhysicsMover dyno mode (+0x84, SetDynoMode 0x599200): the spot the
+       body is held on (+0x90), its tethered virtual position (+0xe0) and
+       velocity (+0xf0) */
+    int   dyno;
+    float dy_spot[3], dy_pos[3], dy_vel[3];
 };
 
 #define PF(o) (s->P[(o)/4])            /* float at P+o */
@@ -638,12 +653,31 @@ static int nos_stage(N2Sim *s)                                          /* 0x59f
     nos_stop(s);
     return 0;
 }
-static void nos_start(N2Sim *s)                                         /* 0x59faf0 */
+static int nos_start(N2Sim *s)                                          /* 0x59faf0 */
 {
-    if (s->nos_burn) return;                                            /* 0x59faa0 */
+    if (s->nos_burn) return 0;                                          /* 0x59faa0 */
     float f = nos_fraction(s);
     for (int i = 2; i >= 0; i--)
-        if (NOS_STEP[i] < f) { s->nos_start = s->time; s->nos_burn = 1; return; }
+        if (NOS_STEP[i] < f) { s->nos_start = s->time; s->nos_burn = 1; return 1; }
+    return 0;
+}
+/* The nitrous press (Player 0x6034b6): StartNitrous succeeded, then
+   0x5ecdb0 -- the gas (driver +0x20c) within 0.001 of 0 or the car under
+   5 mph (+0x430 x 2.237), and a burn stage (0x59fa30) -- is a purge: SPRAY
+   SHOW (15) instead of the nitrous sound (0x4022c0) and +0x225. The online
+   test (0x5f00f0 / 0x890118 == 4) is false offline. */
+static void nos_press(N2Sim *s)
+{
+    if (!nos_start(s)) return;
+    if ((fabsf(s->eff.throttle) <= 0.001f || len3(s->b.v) * 2.237f < 5.0f)   /* 0x78435c, 0x78426c, 0x7a5660 */
+        && nos_stage(s))
+        s->nos_spray = 1;
+}
+int n2sim_nos_spray(N2Sim *s)
+{
+    int r = s && s->nos_spray;
+    if (s) s->nos_spray = 0;
+    return r;
 }
 void n2sim_nitrous_refill(N2Sim *s)                                     /* 0x591cd0 */
 {
@@ -656,6 +690,42 @@ void n2sim_nitrous_refill(N2Sim *s)                                     /* 0x591
 void n2sim_nitrous_add(N2Sim *s, float amount)
 {
     if (amount > 0) s->nos_left += amount * s->nos_cap;
+}
+/* FillNitrous 0x592640: the exact retail top-up. The bottle level in
+   seconds (+0x41c) is kept in 1/4000 s ticks (ftol(x * 4000 + 0.5)); the
+   level fraction f comes from 0x5925b0 (burn-adjusted) while the sum adds to
+   the stored +0x41c. Below a full bottle the amount fills at 1 bottle per
+   unit; above it the overflow (up to 2 bottles) at 0x7a178c = 1.0 per unit.
+   A negative amount drains the same two bands down to empty. */
+static float nos_ticks(float sec)
+{
+    float x = sec * 4000.0f + 0.5f;                                     /* 0x784264, 0x784260 */
+    return (float)(int)x / 4000.0f;
+}
+void n2sim_nitrous_fill(N2Sim *s, float amount)                         /* 0x592640 */
+{
+    float cap = s->nos_cap, f = nos_fraction(s);
+    if (amount > 0) {
+        if (f < 1.0f) {
+            float a = 1.0f - f < amount ? 1.0f - f : amount;
+            s->nos_left = nos_ticks(a * cap + s->nos_left);
+            f += a; amount -= a;
+        }
+        if (amount > 0) {
+            float b = 2.0f - f < amount ? 2.0f - f : amount;
+            s->nos_left = nos_ticks(1.0f * b * cap + s->nos_left);      /* 0x7a178c */
+        }
+    } else {
+        if (f > 1.0f) {
+            float x = 1.0f - f > amount ? 1.0f - f : amount;
+            s->nos_left = nos_ticks(1.0f * x * cap + s->nos_left);
+            f += x; amount -= x;
+        }
+        if (amount < 0) {
+            float y = -f > amount ? -f : amount;
+            s->nos_left = nos_ticks(y * cap + s->nos_left);
+        }
+    }
 }
 /* Performance package, category 2 (chunk 0x34a15): one part per level worth
    1/3, 2/3, 1 of the way from the stock record to the upgrade targets; the
@@ -672,7 +742,7 @@ void n2sim_set_nitrous(N2Sim *s, int level)
     p[0x2ac/4] = s->nos_stock[1];
     if (x != 0) {
         p[0x2a0/4] = (p[0x580/4] - s->nos_stock[0]) * x + s->nos_stock[0];
-        p[0x2ac/4] = p[0x58c/4];
+        p[0x2ac/4] = p[0x58c/4] + p[0x33c/4];   /* + the junkman nitrous (perf_build) */
     }
     s->nos_pkg = level;
     n2sim_nitrous_refill(s);
@@ -864,6 +934,17 @@ static void drive_post(N2Sim *s)                                         /* 0x5a
 {
     Drive *d = &s->d; Engine *e = &s->e;
     d->drivew = drive_speed(s);
+    if (d->mode == 3) {
+        /* clutch-pedal transmission: 0x594910 sets state and engage from the
+           pedal; here only the bookkeeping. Engaged: the rpm for the next
+           upshift's grade, the graded boost start; disengaged (1) mid-shift:
+           the gear goes in. */
+        e->thrmul = 1.0f;
+        if (d->state == 3) {
+            d->disrpm = e->w * RPM;                                     /* 0x7a1d28 */
+            if (0 < d->q && d->shift_t0 == 0) d->shift_t0 = (float)s->time;
+        } else if (d->state == 1 && d->shifting) { d->shifting = 0; d->gear = d->target; }
+    } else
     switch (d->state) {
     case 0:
         e->thrmul = d->neutral ? 1.0f : 0.0f;
@@ -1109,6 +1190,48 @@ static void hydraulics_phys(N2Sim *s)
         s->hyd_hit[i] = 1;                                    /* car +0x3c8 */
     }
 }
+/* PhysicsMover::ResolveDynoForces (GC 801c2cb0, the end of ResolveForces): the
+   car on the rollers. The body keeps its momentum -- the tyres see the road
+   move under them, the engine loads up as on the street -- but its x / y are
+   the virtual position, tethered to the dyno spot by a spring (150) and a
+   damper (-15); the last substep's force (RB +0x130) pushes it only while it
+   accelerates the car (F . v > 0). The non-driven wheels turn at the virtual
+   speed along the car (|v| < 0.03 -> 0, Wheel::SetState). */
+static void dyno_forces(N2Sim *s)
+{
+    Body *b = &s->b;
+    float F[3] = { 0, 0, 0 }, h = s->h;
+    if (b->lastF[0] * b->v[0] + b->lastF[1] * b->v[1] + b->lastF[2] * b->v[2] > 0.0f)
+        memcpy(F, b->lastF, sizeof F);
+    for (int i = 0; i < 3; i++) {
+        F[i] += 150.0f * (s->dy_spot[i] - s->dy_pos[i]) - 15.0f * s->dy_vel[i];
+        s->dy_vel[i] += F[i] * (b->invmass * h);
+        s->dy_pos[i] += s->dy_vel[i] * h;
+    }
+    s->dy_pos[2] = b->pos[2];
+    b->pos[0] = s->dy_pos[0]; b->pos[1] = s->dy_pos[1];
+    /* GUESS (not in ResolveDynoForces): no yaw on the rollers. With the
+       undriven axle gripless (TuneWheelParams) nothing holds the car's heading
+       and the port's car turned on the spot within a few seconds */
+    b->L[2] = 0; b->w[2] = 0;
+    float sp = s->dy_vel[0] * b->R[0] + s->dy_vel[1] * b->R[1] + s->dy_vel[2] * b->R[2];
+    if (fabsf(sp) < 0.03f) sp = 0;
+    for (int i = 0; i < 4; i++) {
+        int driven = i < 2 ? front_driven(&s->d) : rear_driven(&s->d);   /* CarState::IsDriveWheel */
+        if (!driven && W_R(&s->wh[i]) > 0) s->wh[i].w = sp / W_R(&s->wh[i]);
+    }
+}
+void n2sim_set_dyno(N2Sim *s, int on)                                    /* 0x599200 */
+{
+    if (!s) return;
+    if (on && !s->dyno) {
+        memcpy(s->dy_spot, s->b.pos, sizeof s->dy_spot);
+        memcpy(s->dy_pos, s->b.pos, sizeof s->dy_pos);
+        memset(s->dy_vel, 0, sizeof s->dy_vel);
+    }
+    s->dyno = on != 0;
+}
+int n2sim_dyno(const N2Sim *s) { return s && s->dyno; }
 static void force_pass(N2Sim *s)                                         /* 0x5b0520 */
 {
     Body *b = &s->b;
@@ -1128,6 +1251,7 @@ static void force_pass(N2Sim *s)                                         /* 0x5b
     }
     if (s->driftlike) drift_assist(s);
     hydraulics_phys(s);                                      /* 0x5a51b0 */
+    if (s->dyno) dyno_forces(s);                             /* GC 801c1508 */
 }
 
 /* ---- rest detection 0x5992b0 / 0x5a5e20 ----------------------------------- */
@@ -1187,7 +1311,7 @@ static void post_hook(N2Sim *s)                                          /* 0x5b
     int again = rest_apply(s);                               /* 0x5abb00 */
     if (!again)
         for (int i = 0; i < 4; i++)
-            if (s->su[i].x == s->su[i].rec[5]) { susp_bumpstop(s, &s->su[i]); again = 1; }
+            if (s->su[i].x == s->su[i].rec[5]) { s->cs_bottom[i] += susp_bumpstop(s, &s->su[i]); again = 1; }
     if (again) { s->h = 0; post_all(s); }
     force_pass(s);
 }
@@ -1201,7 +1325,8 @@ static void substep(N2Sim *s, float h)
         float r = d->gb[7] * d->rate;
         if (0 < d->q) r *= d->q + 1.0f;
         else if (d->q < 0 && 2 < d->target) r *= 0.35f;                 /* 0x7a18d4 */
-        dd = r * CLUTCH_RATE[d->state]; }
+        dd = r * CLUTCH_RATE[d->state];
+        if (d->mode == 3) dd = 0; }                                     /* the pedal sets it (0x594910) */
     float *st = s->b.pos;
     for (int i = 0; i < 32; i++) st[i] += h * db[i];
     for (int i = 0; i < 4; i++) { s->wh[i].angle += h * dw[i][0]; s->wh[i].w += h * dw[i][1]; }
@@ -1224,6 +1349,20 @@ static void steer_geometry(N2Sim *s, unsigned short ang)                /* 0x59d
     ident(m); m[0] = sin16(a + 1.5708f); m[4] = -sin16(a); m[1] = sin16(a); m[5] = m[0];
     m = s->steer_m[1];
     ident(m); m[0] = sin16(b + 1.5708f); m[4] = -sin16(b); m[1] = sin16(b); m[5] = m[0];
+}
+/* 0x5aa960, the clutch-pedal box (drivetrain +0x60 == 3) asked for a gear
+   it is not in: with the clutch down (state 1) the shift starts and goes in
+   when the pedal comes up (0x5a1400); with it up the box refuses: 0.45 s
+   throttle cut (+0x5c, "Missed Shift!") and the request falls back to the
+   gear (the return value goes back to the controller, vt+0x28) */
+static void drive_pedal_shift(N2Sim *s, int req)
+{
+    Drive *d = &s->d;
+    int g = d->gear;
+    if (d->state != 1) { d->shifting = 0; d->shift_t = (float)s->time; s->gear_req = g; return; }
+    if (d->shifting) return;
+    d->shifting = 1; d->target = req;
+    if (req > g && g >= 1 && s->drag) d->q = shift_grade(s, d->disrpm, g, 1);   /* 0x5a1700(+0x6c) */
 }
 static void frame_setup(N2Sim *s, float dt)
 {
@@ -1254,15 +1393,25 @@ static void frame_setup(N2Sim *s, float dt)
         for (int i = 0; i < 4; i++) if (s->cs_contact[i]) sd += SURF(s->cs_surf[i])->drag;
         sd /= (float)s->cs_wheels;
     }
-    b->damp_on = b->angdrag_on = 1; b->gravity = 9.8f;
-    a->on = 1; a->surfdrag = sd;
+    int yawI = s->cs_wheels != 0;
+    if (s->dampen == 1) {
+        /* crash mode (car +0x38 == 1, CheckForWildCollision): no damping,
+           gravity 11 (0x7fc084), no aero but full surface drag, no yaw
+           inertia hold, the throttle held to 0.4 (0x5eb910) */
+        b->damp_on = b->angdrag_on = 0; b->gravity = 11.0f;
+        a->on = 0; a->surfdrag = 1.0f;
+        if (s->eff.throttle > 0.4f) s->eff.throttle = 0.4f;
+        yawI = 0;
+    } else {
+        b->damp_on = b->angdrag_on = 1; b->gravity = 9.8f;
+        a->on = 1; a->surfdrag = sd;
+    }
     /* in-game (*0x890118 == 4): no settle damping under power or on a slope */
     if (s->eff.throttle > 0.3f || (s->cs_wheels == 4 && fabsf(b->R[2]) > 0.15f)) b->damp_on = 0;
-    int yawI = s->cs_wheels != 0;
     if (b->yawI_on != yawI) { if (!yawI) b->L[2] /= PF(0x160); b->yawI_on = yawI; }
     /* 0x599170 with car +0x468, the AI catch-up (1 for the player): engine,
        body top speed, aero speed scale and every wheel's grip */
-    s->e.power = b->power = a->speedscale = s->catchup; a->scale = 1.0f;
+    s->e.power = b->power = a->speedscale = s->catchup; a->scale = 1.0f - s->draft;
     for (int i = 0; i < 4; i++) s->wh[i].power = s->catchup;
     b->yaw_clamp = PF(0x288);
     b->top_speed = PF(0x290);
@@ -1275,6 +1424,7 @@ static void frame_setup(N2Sim *s, float dt)
     steer_geometry(s, s->steer_u16);
     s->e.thr = thr;
     if (req < 0) drive_auto(s, s->cs_tach);
+    else if (d->mode == 3 && req != d->gear) drive_pedal_shift(s, req);  /* 0x5aa960, clutch pedal */
     else if (req != d->gear && req != d->target) {                     /* 0x5aa960 manual path */
         int g = d->gear;
         d->target = req;
@@ -1317,6 +1467,13 @@ static void frame_setup(N2Sim *s, float dt)
             g = ((r - 1.0f) * s->hbramp + 1.0f) * grip;
         }
         if (s->nos_stage > 0) g *= NOS_GRIP[s->nos_stage];   /* 0x5a50ff */
+        /* 0x5a5114: on the dyno, at full throttle (controller +0x20c == 1), the
+           wheels that are not driven (rear bias P+0x1c0 > 0.8: the fronts,
+           < 0.2: the rears) lose their grip */
+        if (s->dyno && in->throttle == 1.0f) {
+            float rb = PF(0x1c0);
+            if ((rb < 0.2f && i >= 2) || (rb > 0.8f && i < 2)) g = 0;
+        }
         w->grip = g;
         w->wobble = 0;
     }
@@ -1355,6 +1512,7 @@ static const float DRIVE_TUNE4[3] = { 1.0f, 1.2f, 1.1f };              /* 0x7fc2
 #define MELLO_HMAX 0.0142857f          /* 0x7fc040 */
 #define MELLO_CAP  4.0f                /* 0x7a1970 */
 #define MELLO_CAP_SX 2.0f              /* 0x7a1974, street X (0x5a38e0) */
+#define MELLO_CAP_URL 3.2f             /* 0x7a1978, track flag 0x2000 (0x5a38e0) */
 
 static float mello_ratio(const N2Sim *s, int g) { return PF(0x1d0 + g * 4); }
 
@@ -1498,10 +1656,13 @@ static void mello_forces(N2Sim *s)                                       /* 0x5a
         float W[3];
         vmul(W, F, b->R);
         if (m->contact[i]) {
-            /* 0x5a38e0: 4, 2 in street X; 3.2 (0x7a1978) on a road section with
-               flag 0x2000 (0x883dac +0x94) -- that rule is NOT ported */
+            /* 0x5a38e0: 4, 2 in street X, 3.2 (0x7a1978) when the loaded
+               track's record (*0x883dac, GLOBALB 0x34201) has flag 0x2000 at
+               +0x94 -- the URL speedways (L4RG 4701-4716), in any race type */
+            float cmax = s->streetx ? MELLO_CAP_SX : MELLO_CAP;
+            if (s->trkflags & 0x2000) cmax = MELLO_CAP_URL;
             float pm = sqrtf(W[0] * W[0] + W[1] * W[1]),
-                  cap = (s->streetx ? MELLO_CAP_SX : MELLO_CAP) * m->load[i] * m->gripm;
+                  cap = cmax * m->load[i] * m->gripm;
             if (cap < pm) { W[0] *= cap / pm; W[1] *= cap / pm; }
             float e = m->mult - 1.0f, f = e > 0 ? e * 2.5f + 1.0f : 1.0f;
             W[0] *= f; W[1] *= f;
@@ -1669,10 +1830,15 @@ static void mello_frame(N2Sim *s, float dt)                              /* 0x5a
         for (int i = 0; i < 4; i++) if (s->cs_contact[i]) sd += SURF(s->cs_surf[i])->drag;
         sd /= (float)s->cs_wheels;
     }
-    /* owner +0x38 = 0, normal driving */
-    b->damp_on = b->angdrag_on = 1; b->gravity = 9.8f;
-    a->on = 1; a->surfdrag = sd;
     int yawI = s->cs_wheels != 0;
+    if (s->dampen == 1) {                /* owner +0x38 == 1, crash mode */
+        b->damp_on = b->angdrag_on = 0; b->gravity = 11.0f;
+        a->on = (float)s->cs_wheels * 0.25f; a->surfdrag = 1.0f;
+        yawI = 0;
+    } else {
+        b->damp_on = b->angdrag_on = 1; b->gravity = 9.8f;
+        a->on = 1; a->surfdrag = sd;
+    }
     if (b->yawI_on != yawI) { if (!yawI) b->L[2] /= PF(0x160); b->yawI_on = yawI; }
     memcpy(b->com, s->P, 12);                                /* 0x5a29a0 */
     memcpy(s->m.hyd, s->hyd_h, sizeof s->m.hyd);             /* car +0x3b8 -> +0x1e8 */
@@ -1684,7 +1850,7 @@ static void mello_frame(N2Sim *s, float dt)                              /* 0x5a
     s->nos_stage = nos_stage(s);
     a->thr = m->thr; a->ground = (float)s->cs_wheels * 0.25f;
     /* 0x5a3380: catch-up (0x7fc0a0 = 1) */
-    a->speedscale = s->catchup; a->scale = 1.0f;             /* 1 - car +0x4dc */
+    a->speedscale = s->catchup; a->scale = 1.0f - s->draft;  /* 1 - car +0x4dc */
     b->power = s->catchup;
     m->gripm = s->catchup;                                   /* x 0x7a1990 = 1 above 30 mph */
     m->mult = s->catchup;
@@ -2203,7 +2369,14 @@ void n2sim_controls(N2Sim *s, const N2Controls *c)
     s->eff.steer = 0;
     s->gear_req = c->gear_req;
     s->d.neutral = c->clutch_kick != 0;
-    if (c->nitrous) nos_start(s); else nos_stop(s);
+    if (c->nitrous) nos_press(s); else nos_stop(s);
+}
+void n2sim_stop_nitrous(N2Sim *s) { nos_stop(s); }   /* 0x592500 */
+void n2sim_controller_begin(N2Sim *s)
+{
+    s->held = 0;
+    s->gear_req = s->trans == 1 || s->trans == 3 ? 2 : -1;
+    memset(&s->eff, 0, sizeof s->eff);
 }
 
 void n2sim_set_perf(N2Sim *s, float level)
@@ -2225,6 +2398,7 @@ void n2sim_set_drag(N2Sim *s, int drag, int klass, float shift_win, float clutch
 }
 void n2sim_set_race_state(N2Sim *s, int state) { s->race_state = state; }
 void n2sim_set_streetx(N2Sim *s, int on) { s->streetx = on != 0; }
+void n2sim_set_track_flags(N2Sim *s, unsigned flags) { s->trkflags = flags; }
 float n2sim_engine_heat(const N2Sim *s) { return s->e.heat; }
 int n2sim_engine_blown(const N2Sim *s) { return s->e.heat == 2.0f; }        /* 0x5942c0 */
 float n2sim_shift_grade(const N2Sim *s, float rpm) { return shift_grade(s, rpm, s->d.gear, 0); }
@@ -2312,10 +2486,14 @@ void n2sim_debug(const N2Sim *s)
    steps: the pedal layer 0x407a30 turns the raw pedals into the throttle,
    brake and handbrake the car reads, and asks for reverse; then the pad
    steering 0x41dfc0 -> 0x416bb0 (0x405dc0 maximum angle, 0x4060e0 rate)
-   moves the wheels. Event-mode branches (drag, drift, street X, the
-   0x89e7d8/0x890100..0x890114 flags), the steering-wheel path 0x4061c0,
-   force feedback 0x406460, hydraulics 0x407400 and the clutch-pedal
-   transmission (modes 3/4, 0x594910) are not ported. */
+   moves the wheels; then the clutch-pedal box (modes 3/4, 0x594910) and
+   the drift clutch kick (0x401950). The event-mode branches that matter
+   offline are the drag ones (launch boost, neutral rate limit) and the
+   drift ones (steering tables, clutch kick); street X has none here. The
+   0x89e7e2 / 0x890100 / 0x890110 branches and the 0x5f00f0 race-end coast
+   are online-only (see n2sim_input). Not ported: the steering-wheel path
+   0x4061c0, force feedback 0x406460, hydraulics 0x407400 (in main.c),
+   sport mode 2 (request -2). */
 
 static void avg_init(Avg *a, float window)                              /* 0x579f80 */
 {
@@ -2341,29 +2519,52 @@ static void avg_push(Avg *a, float v, float t)                          /* 0x576
     if (++a->idx >= a->n) a->idx = 0;
 }
 
-/* 0x5b5930: the car's top speed, the first 1.34108 m/s step at which drag
-   outgrows the drive force, capped by the record's limiter. The retail one
-   reads a force-per-speed table built by 0x5b4fc0; here the same balance is
-   taken from the engine torque curve through each gear. */
+/* 0x5b5930 GetTheoreticalTopSpeed: the first 1.34108 m/s step at which
+   drag/mass outgrows the drive acceleration table, capped by the record's
+   limiter (mph). The table is RidePhysicsInfo+0x55c (64 points), built by
+   0x5b5ab0 inside RebuildPhysicsInfo 0x5b4dc0: */
 static float top_speed(N2Sim *s)
 {
-    const Drive *d = &s->d; const Engine *e = &s->e;
-    int rear = rear_driven(d);
-    float R = W_R(&s->wh[rear ? 2 : 0]), fin = d->gb[rear ? 3 : 2];
+    const Drive *d = &s->d; const float *er = s->e.rec;
+    const float *P = s->P;
+    float shift[16] = { 0 }, down[16];
+    int gears = GB_GEARS(d), g;
+    if (gears < 1 || gears > 7) gears = 6;
+    shift_points(d->gb, er, shift, down);              /* 0x5ac7d0 */
+    /* 0x5b5ab0 */
+    Curve tq; curve_init(&tq, 9, er[0], er[2], er + 4);   /* raw record curve, no power scale */
+    float r = d->gb[4], fr = 1.0f - r;
+    float fin = r * d->gb[3] + fr * d->gb[2];
+    float invR = 1.0f / (fr * P[0x20/4] + r * P[0x80/4]);
+    float mass = P[0x110/4];
+    static float tmp[0x5c];
     float v = 0;
-    for (; v < 160.0f; v += 1.34108f) {
-        float best = 0;
-        for (int g = 2; g <= GB_GEARS(d) + 1; g++) {
-            float rpm = v / R * fin * GB_RATIO(d, g) * RPM;
-            if (rpm > e->rec[2]) continue;
-            if (rpm < e->rec[0]) rpm = e->rec[0];
-            float f = curve(&e->torque, rpm) * GB_RATIO(d, g) * fin / R;
-            if (f > best) best = f;
+    int k = 0;
+    g = 2;
+    do {
+        float rpm = invR * v * GB_RATIO(d, g) * fin * RPM;
+        if (shift[g] <= rpm) {          /* torque at this rpm, through the next gear */
+            g++;
+            if (g >= gears + 2) break;
         }
-        if (v * v * s->a.rec[0] > best) break;
+        k++;
+        tmp[k - 1] = curve(&tq, rpm) * GB_RATIO(d, g) * fin * invR / mass;
+        v += 1.3410819f;
+    } while (k < 0x5c);
+    for (int i = k - 1; i < 0x5c; i++) tmp[i] = 0;   /* the last entry written is cleared too */
+    Curve tc = { k, 0, v, (float)(k - 1) / v, tmp };
+    static float tab[64];
+    for (int i = 0; i < 64; i++) tab[i] = curve(&tc, (float)i * v / 63.0f);
+    Curve ac = { 64, 0, v, 63.0f / v, tab };
+    /* 0x5b5930 */
+    float drag = s->a.rec[0], x = ac.x0;
+    if (x < ac.x1)
+        while (x * drag * x / mass <= curve(&ac, x) && (x += 1.3410819f) < ac.x1) {}
+    if (P[0x290/4] > 0) {
+        float lim = P[0x290/4] * 0.44702727f;
+        if (lim < x) return lim;
     }
-    if (PF(0x290) > 0 && PF(0x290) < v) v = PF(0x290);
-    return v;
+    return x;
 }
 
 /* 0x405dc0: the largest wheel angle the stick may ask for, degrees. Shrinks
@@ -2458,6 +2659,30 @@ static void steer_pad(N2Sim *s, float stick, float dt)
 void n2sim_collision(N2Sim *s) { s->hit_time = s->time; }
 void n2sim_ground_exact(N2Sim *s, int on) { s->ground_exact = on; }
 
+/* 0x594910 DriveTrain::SetManualClutchEngaged: the clutch pedal (1 up,
+   0 floored) drives the clutch state directly: past 0.95 engaged (3), under
+   0.05 out (1), else coming up (2) or going down (0) by its direction */
+static void clutch_pedal(N2Sim *s, float c)
+{
+    Drive *d = &s->d;
+    d->mode = 3;
+    if (0.95f < c) { d->state = 3; d->engage = 1.0f; return; }           /* 0x78a7dc */
+    if (c < 0.05f) { d->state = 1; d->engage = 0; return; }              /* 0x7844f4 */
+    if (c == 1.0f) { d->state = 3; d->engage = c; return; }
+    if (c == 0) { d->state = 1; d->engage = c; return; }
+    d->state = d->engage < c ? 2 : 0;
+    d->engage = c;
+}
+/* 0x407310 RealDriver::SetLowGear (vt+0x30): manual and clutch-pedal
+   boxes take first (a drag race starts the 0.25 s launch boost), any other
+   mode drives (-1) */
+static void low_gear(N2Sim *s)
+{
+    if (s->trans != 1 && s->trans != 3) { s->gear_req = -1; return; }
+    s->gear_req = 2;
+    if (s->drag) s->launch = 1000;                                      /* (int)(0.25 * 4000 + 0.5) */
+}
+
 void n2sim_input(N2Sim *s, const N2Input *in)
 {
     static const float NGAS[12] = { 0,0, 0.575f,0.437f, 0.797f,0.62f, 0.894f,0.746f, 0.95f,0.866f, 1,1 }; /* 0x7ea004 */
@@ -2465,13 +2690,27 @@ void n2sim_input(N2Sim *s, const N2Input *in)
     float dt = s->in_dt > 0 ? s->in_dt : 1.0f / 60.0f;
     s->in = *in;
     s->ctl_t = (float)s->time + 1.0f;
-    /* transmission mode, 0x407280: manual starts in the gear the car is in */
-    int mode = in->manual ? 1 : 0;
-    if (mode != s->trans) { s->trans = mode; s->gear_req = mode ? d->gear : -1; }
-    /* shift buttons, 0x407fc0 / 0x4080b0 (manual): never out of R, never
-       below N, R comes and goes with the pedals */
+    /* transmission mode, 0x407280 RealDriver::SetTransmission: manual (1)
+       and clutch pedal (3) start in the gear the car is in, auto -1; the
+       drivetrain's +0x60 takes the mode. 4 is the clutch-pedal box handing
+       a shift into or out of R/N to the clutch FSM (0x41e2c0 below). */
+    int mode = in->manual == 3 ? 3 : in->manual ? 1 : 0;
+    if (mode != (s->trans == 4 ? 3 : s->trans)) {
+        s->trans = mode; s->gear_req = mode ? d->gear : -1;
+        if (s->mover == N2_MOVER_PHYSICS) d->mode = mode;
+    }
+    /* clutch pedal +0x2f4 (0x408180): digital press 0 / release 1; analog
+       1 - min(v * 1.07, 255) / 255 (0x783b1c, 0x784548) */
+    {   float c = in->clutch_pedal * 1.07f;
+        s->clutch = 1.0f - (c < 1.0f ? (c > 0 ? c : 0) : 1.0f); }
+    /* shift buttons, 0x407fc0 / 0x4080b0. Manual: never out of R, never
+       below N, R comes and goes with the pedals. Clutch pedal: from the gear
+       the car is in, never out of R, up to top, down to N. Nothing in mode 4
+       (or 2, sport, not ported). */
     if (s->trans == 1 && in->shift > 0 && s->gear_req != 0 && s->gear_req < GB_GEARS(d) + 1) s->gear_req++;
     if (s->trans == 1 && in->shift < 0 && s->gear_req != 0 && s->gear_req >= 2) s->gear_req--;
+    if (s->trans == 3 && in->shift > 0 && s->gear_req != 0) s->gear_req = d->gear < GB_GEARS(d) + 1 ? d->gear + 1 : d->gear;
+    if (s->trans == 3 && in->shift < 0 && s->gear_req != 0) s->gear_req = d->gear >= 2 ? d->gear - 1 : d->gear;
     /* raw pedals (0x416de0: in neutral the gas pedal is eased in) */
     float gas = in->throttle, brk = in->brake, hbr = in->handbrake;
     if (d->gear == 1) gas = graph(NGAS, 6, gas);
@@ -2508,28 +2747,38 @@ void n2sim_input(N2Sim *s, const N2Input *in)
             if (0.6f < gas && s->cs_tach < s->e.rec[0] + 1000.0f && th < 0.6f) th = 0.6f;
         }
         s->eff.throttle = th > 0 ? (th > 1 ? 1 : th) : 0;
-        if (s->gear_req == 0) {                                         /* vt+0x30, 0x407310 */
-            s->gear_req = s->trans == 1 ? 2 : -1;
-            if (s->trans == 1 && s->drag) s->launch = 1000;             /* 0.25 s (0x783b04) */
-        }
+        if (s->gear_req == 0) low_gear(s);                              /* vt+0x30, 0x407310 */
     }
+    /* 0x407e5f: 0x5f00f0 (0x89cf69 / 0x8669f4 / 0x866a14, the online game
+       flags) && *0x8900d8 == 6 -> throttle 0, brake 0.5, the online race-end
+       coast. Never true offline (and not in the GC build): not ported. The
+       0x89e7e2 / 0x890100 / 0x890110 branches above (speed / (|+0x118| * 4
+       + 1), throttle curve, rate limit) are dead offline too: 0x89e7e2 is
+       set only by 0x526720, quick race type 11, which only a network packet
+       (0x601d20) selects. */
     s->eff.steer = in->steer;
-    if (in->nitrous) nos_start(s);      /* 0x420877 press; release stops (0x42ad55) */
+    if (in->nitrous) nos_press(s);      /* 0x420877 press; release stops (0x42ad55) */
     else nos_stop(s);
     if (in->steer_ai) { s->steer_u16 = in->steer_u16; s->eff.steer = 0; }
     else steer_pad(s, in->steer, dt);
-    /* 0x41e2c0 -> 0x401950: in a drift-type race the drivetrain's clutch
-       kick (+0x74) follows the handbrake past 0.6 */
-    if (s->driftlike) s->d.neutral = 0.6f < s->eff.handbrake;          /* 0x784564 */
     /* +0x2b4, the start-line hold: neutral and full brake, so the gas only
        revs the engine; on release the box takes first (the drop-in is the
-       launch). What the race code calls at GO is not decoded: auto goes back
-       to -1, manual to 1st. */
+       launch). GO = SetStartLineState(false) (0x410430, vt+0x1c) ->
+       SetLowGear (vt+0x30): auto -1, manual / clutch pedal 1st. */
     if (in->hold) { s->gear_req = 1; s->eff.brake = 1.0f; s->held = 1; }
-    else if (s->held) {                                                 /* 0x410430 -> vt+0x30 */
-        s->held = 0; s->gear_req = s->trans == 1 ? 2 : -1;
-        if (s->trans == 1 && s->drag) s->launch = 1000;
-    }
+    else if (s->held) { s->held = 0; low_gear(s); }                     /* 0x410430 -> vt+0x30 */
+    if (s->mover != N2_MOVER_PHYSICS) return;                           /* car +0x28 == 1 */
+    /* 0x41e2c0, clutch-pedal box: a shift into or out of R / N (either gear
+       below 2) goes to the clutch FSM (mode 4, drivetrain +0x60 = 0) until
+       it is done (0x5ecd70: +0x48 shifting clear), then back to the pedal */
+    if (s->trans == 3) {
+        if (d->gear != s->gear_req && (d->gear < 2 || s->gear_req < 2)) { s->trans = 4; d->mode = 0; }
+    } else if (s->trans == 4 && !d->shifting) { s->trans = 3; d->mode = 3; }
+    if (s->trans == 3) { d->mode = 3; clutch_pedal(s, s->clutch); return; }   /* 0x594910(+0x2f4) */
+    /* 0x401950: in a drift-type race (!drag && !0x890108 && (0x890114 ||
+       drift || 0x890104)) the drivetrain's clutch kick (+0x74) follows the
+       handbrake past 0.6 */
+    if (s->driftlike) s->d.neutral = 0.6f < s->eff.handbrake;          /* 0x784564 */
 }
 
 void n2sim_reset(N2Sim *s, const float pos[3], float heading)
@@ -2562,7 +2811,9 @@ void n2sim_reset(N2Sim *s, const float pos[3], float heading)
     s->steer_u16 = 0; s->sliding = 0;
     avg_init(&s->st_in, 0.55f); avg_init(&s->st_flick, 0.15f);    /* 0x405c60 */
     s->st_max = 45.0f; s->st_prev = 0; s->hbtimer = 0; s->rflag = 0; s->hit_time = 0;
+    s->dampen = 0; s->dampen_on = 0; s->dampen_t = 0; s->draft = 0; s->nos_spray = 0;
     s->trans = 0; s->gear_req = -1; s->held = 0; s->launch = 0;
+    s->clutch = 1.0f; s->d.mode = 0;                                    /* ctor: +0x2f4 = 1 */
     memset(&s->in, 0, sizeof s->in); s->eff = s->in;
     s->vtop = top_speed(s);
     for (int i = 0; i < 4; i++) {
@@ -2590,12 +2841,90 @@ void n2sim_reset(N2Sim *s, const float pos[3], float heading)
     }
 }
 
+/* Car::ResetDampenMode 0x5fc050 (each Car::Move): crash mode ends after
+   0.1 s (0x7a565c) on four wheels; airborne mode with four wheels down. The
+   mode 0 -> 2 switch needs car +0x3c -> +0x18, which the port does not keep
+   (0). The original times from the clock (+0x54c, 0 = unset); this sums
+   the steps. */
+static void reset_dampen(N2Sim *s, float dt)
+{
+    if (s->dampen == 2) { if (s->cs_wheels == 4) s->dampen = 0; }
+    else if (s->dampen == 1) {
+        if (s->cs_wheels != 4) s->dampen_on = 0;
+        else if (!s->dampen_on) { s->dampen_on = 1; s->dampen_t = 0; }
+        else if ((s->dampen_t += dt) >= 0.1f) s->dampen = 0;
+    }
+}
+/* Car::SetDampenMode 0x5f6be0 */
+void n2sim_set_dampen(N2Sim *s, int mode)
+{
+    s->dampen = mode;
+    if (mode == 1) s->dampen_on = 0;
+}
+int n2sim_dampen(const N2Sim *s) { return s ? s->dampen : 0; }
+int n2sim_drag(const N2Sim *s) { return s && s->drag; }
+
+/* 0x5ebc20: the draft car o gives s -- o at 1 m/s or more (car +0x430),
+   within the graph 0x89cf30's distance for its speed (0 below 1 m/s, 10 m at
+   5, 60 m at 150; never past 60) and inside the 0.95 cone behind its travel
+   (0x7a55b8); then the curve 0x8023f0 over the distance's share */
+static float draft_from(const N2Sim *s, const N2Sim *o)
+{
+    static const float DIST[8] = { 0, 0, 1, 0, 5, 10, 150, 60 };          /* 0x8023d0 */
+    static const float FALL[6] = { 1.0f, 0.9f, 0.75f, 0.55f, 0.3f, 0 };
+    static const Curve FC = { 6, 0, 1, 5, FALL };                         /* 0x8023f0 */
+    float sp = len3(o->b.v);
+    if (sp < 1.0f) return 0;                                              /* 0x8023d8 */
+    float d[3] = { o->b.pos[0] - s->b.pos[0], o->b.pos[1] - s->b.pos[1], o->b.pos[2] - s->b.pos[2] };
+    float dist = len3(d), c = dist > 1e-5f ? dist : 1e-5f;
+    if (60.0f < c) c = 60.0f;                                             /* 0x8023ec */
+    if (dist != c) return 0;
+    float f[3] = { o->b.v[0] / sp, o->b.v[1] / sp, o->b.v[2] / sp };
+    float k = ((f[0] * d[0] + f[1] * d[1] + f[2] * d[2]) / dist - 0.95f) / (1.0f - 0.95f);
+    if (k < 0) return 0;
+    float r = graph(DIST, 4, sp) * k;
+    if (r < 1e-5f) return 0;
+    float x = dist / r;
+    return curve(&FC, x < 0 ? 0 : x > 1 ? 1 : x);
+}
+/* 0x5ebd80: the drafts of every other car in the world, at most 0.9
+   (0x7a55bc); World::DoTimestep 0x609ef8 stores it in car +0x4dc before
+   each car moves */
+float n2sim_draft(const N2Sim *s, N2Sim *const *cars, int n)
+{
+    float sum = 0;
+    for (int i = 0; i < n; i++) {
+        if (!cars[i] || cars[i] == s) continue;
+        sum += draft_from(s, cars[i]);
+        if (!(sum < 0.9f)) return 0.9f;
+    }
+    return sum;
+}
+void n2sim_set_draft(N2Sim *s, float d) { s->draft = d; }
+float n2sim_get_draft(const N2Sim *s) { return s ? s->draft : 0; }
+/* MiscStyleManager 0x56f9b0's hydraulics inputs: the wheels whose bounce
+   fired this step (car +0x408 = carstate +0x3c8, cleared at the step's
+   start 0x5b72d0) and the wheels moving (0x5ed470: mover +0x74 in {2, 3},
+   the full simulation only) */
+void n2sim_hyd_counts(const N2Sim *s, int *bounced, int *moving)
+{
+    int b = 0, m = 0;
+    for (int i = 0; s && i < 4; i++) {
+        b += s->hyd_hit[i] != 0;
+        m += s->mover == N2_MOVER_PHYSICS && (s->hyd_code[i] == 2 || s->hyd_code[i] == 3);
+    }
+    *bounced = b; *moving = m;
+}
+
 void n2sim_step(N2Sim *s, float dt)                                    /* 0x5b72d0 */
 {
     if (dt <= 0) return;
     if (dt > 0.1f) dt = 0.1f;
     s->in_dt = dt;
+    reset_dampen(s, dt);
+    memset(s->hyd_hit, 0, sizeof s->hyd_hit);                          /* carstate +0x3c8[4] */
     for (int i = 0; i < 4; i++) s->gc[i].valid = 0;
+    for (int i = 0; i < 4; i++) s->cs_bottom[i] = 0;          /* 0x5b730b */
     if (s->mover == N2_MOVER_MELLO) { mello_frame(s, dt); return; }
     if (s->mover == N2_MOVER_NIS) { nis_frame(s, dt); return; }
     if (s->mover == N2_MOVER_TRAFFIC) { tm_frame(s, dt); return; }
@@ -2647,6 +2976,8 @@ void n2sim_state(const N2Sim *s, N2State *o)
     o->nos_frac = nos_fraction(s); o->nos_on = s->nos_stage > 0; o->nos_cap = s->nos_cap;
     o->gear = s->d.gear; o->gears = GB_GEARS(&s->d);
     o->wheels_down = s->cs_wheels;
+    o->bottom = s->cs_bottom[0] + s->cs_bottom[1] + s->cs_bottom[2] + s->cs_bottom[3];
+    o->engaged = s->mover != N2_MOVER_PHYSICS || s->d.state == 3;   /* 0x5a592b; MellowMover 0x5a2da1: 1 */
     o->vtop = s->vtop;
     o->mover = s->mover;
     if (s->mover == N2_MOVER_MELLO || s->mover == N2_MOVER_TRAFFIC || s->mover == N2_MOVER_NIS) {
@@ -2721,6 +3052,10 @@ void n2sim_state(const N2Sim *s, N2State *o)
         o->wheel_surface[i] = w->surf;
         o->wheel_slipv[i][0] = w->slipv[0]; o->wheel_slipv[i][1] = w->slipv[1];
         o->wheel_skid[i] = o->wheel_skid_w[i] = 0;
+        if (s->dyno) {   /* 0x5a5833: on the dyno no friction use / slip; 0x5b74e9: no tyre marks */
+            o->wheel_slip[i] = 0; o->wheel_slipv[i][0] = o->wheel_slipv[i][1] = 0;
+            continue;
+        }
         float vl = sqrtf(w->vel[0] * w->vel[0] + w->vel[1] * w->vel[1]);
         o->wheel_latv[i] = fabsf(w->world[4] * w->vel[0] + w->world[5] * w->vel[1] + w->world[6] * w->vel[2]);
         if ((w->sliding || w->sratio * w->load > 8.0f) && w->contact && vl > 1.0f) {
@@ -2869,4 +3204,80 @@ void n2sim_body_impulse(N2Sim *s, const float J[3], const float r[3], float ang)
     if (l > 10.0f) { l = 10.0f / l; t[0] *= l; t[1] *= l; t[2] *= l; }
     b->L[0] += t[0] * ang; b->L[1] += t[1] * ang; b->L[2] += t[2] * ang;
     body_refresh(b);
+}
+
+/* ---- smokeable props ------------------------------------------------------ */
+struct N2Prop { Body b; };
+
+N2Prop *n2prop_new(float mass, const float inertia[3], const float cg[3])
+{
+    N2Prop *p = (N2Prop *)calloc(1, sizeof *p);
+    if (!p) return NULL;
+    Body *b = &p->b;
+    ident(b->R); ident(b->world); ident(b->Iinv); ident(b->Iinv2);
+    b->mass = mass;
+    b->invmass = mass > 0 ? 1.0f / mass : 0.0f;
+    for (int k = 0; k < 3; k++)
+        b->Iinv[k * 5] = b->Iinv2[k * 5] = inertia[k] > 0 ? 1.0f / inertia[k] : 0.0f;
+    memcpy(b->com, cg, 12);
+    b->gravity = 9.8f;                 /* rb +0x160 default */
+    b->damp_on = 1;                    /* Smokeable::Move sets +0x150 every frame */
+    return p;
+}
+void n2prop_free(N2Prop *p) { free(p); }
+
+void n2prop_place(N2Prop *p, const float pos[3], const float R[16])
+{
+    Body *b = &p->b;
+    memcpy(b->pos, pos, 12); memcpy(b->R, R, 64);
+    b->R[3] = b->R[7] = b->R[11] = 0; b->R[12] = b->R[13] = b->R[14] = 0; b->R[15] = 1;
+    memset(b->p, 0, sizeof b->p); memset(b->L, 0, sizeof b->L);
+    memset(b->F, 0, 12); memset(b->T, 0, 12);
+    b->settle = 0;
+    body_post(b);
+}
+void n2prop_body(const N2Prop *p, N2Body *o)
+{
+    const Body *b = &p->b;
+    memcpy(o->pos, b->pos, 12); memcpy(o->R, b->R, 64);
+    memcpy(o->p, b->p, 12); memcpy(o->L, b->L, 12);
+    memcpy(o->v, b->v, 12); memcpy(o->w, b->w, 12);
+    o->mass = b->mass; o->invmass = b->invmass;
+    o->Iinv = b->Iinv;
+    memcpy(o->com, b->com, 12);
+    o->wheels_down = 0;
+}
+void n2prop_body_pose(N2Prop *p, const float pos[3], const float R[16], const float P[3])
+{
+    Body *b = &p->b;
+    memcpy(b->pos, pos, 12); memcpy(b->R, R, 64); memcpy(b->p, P, 12);
+    body_refresh(b);
+}
+void n2prop_impulse(N2Prop *p, const float J[3], const float r[3])
+{
+    body_impulse(&p->b, J, r);                                 /* 0x59bc60 */
+    body_refresh(&p->b);
+}
+void n2prop_substep(N2Prop *p, float h)
+{
+    Body *b = &p->b;
+    float db[32];
+    body_deriv(b, db);
+    float *st = b->pos;
+    for (int i = 0; i < 32; i++) st[i] += h * db[i];
+    body_post(b);
+    orthonormalize(b->R);                                     /* eOrthonormalizeMatrix */
+}
+void n2prop_damp(N2Prop *p, int state)
+{
+    Body *b = &p->b;
+    if (state == 1) {
+        for (int i = 0; i < 3; i++) { b->p[i] *= 0.95f; b->L[i] *= 0.95f; }
+        b->gravity = 9.8f;
+        body_refresh(b);
+    } else if (state == 2) {
+        memset(b->p, 0, sizeof b->p); memset(b->L, 0, sizeof b->L);
+        b->gravity = 0;
+        body_refresh(b);
+    } else b->gravity = 9.8f;
 }

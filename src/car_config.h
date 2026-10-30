@@ -79,6 +79,11 @@ typedef struct {
        model AUDIO) as the part's database hash, 0 none; installing a trunk
        layout puts its "NO COMPONENTS" part in every slot (0x5474a0) */
     unsigned int audio_comp[12];
+    /* the junkman ("unique") performance parts, per ePhysicsUpgradePath
+       (PhysicsUpgradeSpecification +0x28, FECarConfig +0x2f4: 0 weight,
+       1 transmission, 2 nitrous, 3 engine, 4 turbo, 5 suspension, 6 brakes,
+       7 ECU, 8 tires, 9 -); [10], [11] unused (no padding, memcmp) */
+    unsigned char junk[12];
 } N2CarConfig;
 
 /* The side mirrors' library of a car, 6 MIRRORS_BODY, 7 MIRRORS_POST,

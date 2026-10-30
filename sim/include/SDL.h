@@ -30,6 +30,7 @@ int  sim_PollEvent(SDL_Event *e);
 const Uint8 *sim_GetKeyboardState(int *numkeys);
 int  sim_SetRelativeMouseMode(SDL_bool on);
 int  sim_NumJoysticks(void);
+int  sim_PushEvent(SDL_Event *e);
 
 #ifndef SIM_NO_SDL_REDIRECT
 #define SDL_Init                sim_Init
@@ -44,6 +45,7 @@ int  sim_NumJoysticks(void);
 #define SDL_GetKeyboardState    sim_GetKeyboardState
 #define SDL_SetRelativeMouseMode sim_SetRelativeMouseMode
 #define SDL_NumJoysticks        sim_NumJoysticks
+#define SDL_PushEvent           sim_PushEvent
 #endif
 
 /* ---- the Vita extras (vita/include/SDL.h) ---- */

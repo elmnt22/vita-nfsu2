@@ -59,20 +59,27 @@ const char *options_port_str(unsigned int hash) {
     }
 }
 
+/* the retail defaults: OptionsSettings::Default 0x5025b0 on the block at
+   0x83aa04 (GC Default__15OptionsSettings 80130c78 and its Video / Audio /
+   Gameplay / PlayerSettings parts agree) */
 void options_defaults(N2Options *o) {
     memset(o, 0, sizeof *o);
     o->master = o->speech = o->fe_music = o->ig_music = o->sfx = o->engine = o->tire = 1.0f;
-    o->stereo = 1;                    /* 0x515aa0: +0x70 = FUN_0040cb20 (the device: stereo) */
-    o->jump_cam = 1;
-    o->kmh = 0;                       /* English: imperial */
-    o->race_map = 2; o->explore_map = 2;
+    o->fe_music = 0.7f;               /* 0x83aa30 = 0x3f333333 (GC AudioSettings [2] 0.7) */
+    o->stereo = 1;                    /* 0x83aa50 = 1 (0x515aa0: +0x70 = FUN_0040cb20, the device) */
+    o->jump_cam = 1;                  /* 0x83aa20 = 127.5 (on) */
+    o->mirror = 1;                    /* 0x83aa18 = 1 */
+    o->kmh = 0;                       /* 0x83aa1a = (0x7f70d0 != 0): English imperial */
+    o->race_map = 2; o->explore_map = 2;   /* 0x83aa1b / 0x83aa1c = 2 Rotate */
     o->career_diff = 1;
-    o->save_on = 1; o->autosave = 1;
-    o->shuffle = 0;                   /* bss 0x83aa58: Sequential */
-    OptPlayer *p = &o->p[0];
-    p->gauges = p->race_pos = p->lap_info = p->score = p->leaderboard = 1;
-    p->camera = 3;                    /* the port's chase camera started at Far */
-    p->split = 0;
+    o->save_on = 1; o->autosave = 0;    /* 0x515aa0: prompts on, autosave off */
+    o->shuffle = 1;                   /* Random (user 10-29; bss 0x83aa58 is 0, Sequential) */
+    OptPlayer *p = &o->p[0];          /* 0x83aa64: +0..+6 = 1, camera +0x10 = 3, the rest 0 */
+    p->gauges = p->race_pos = p->lap_info = p->score = p->feedback = p->leaderboard = 1;
+    p->ask_trans = 1;                 /* +0x06 = 1 */
+    p->camera = 3;                    /* Far */
+    p->split = 0;                     /* Leader */
+    p->stability_off = 1;             /* +0x16 = 1: shows OFF (0x4b76f0: 0 "ON" 0x63c, 1 "OFF" 0xccfa) */
     o->rear_touch = 1; o->touch_sens = 1;   /* Medium */
     options_ctl_preset(o, 0);   /* the original's pad layout */
 }

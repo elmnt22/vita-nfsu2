@@ -181,11 +181,15 @@ static void set_state(PartAnims *pa, int part, int want, float now) {
     }
 }
 
-void partanim_request(PartAnims *pa, int part, int open, int style, int flag, float now) {   /* 0x433e20 */
+void partanim_request(PartAnims *pa, int part, int open, int style, int flag, float now) {
+    partanim_request_speed(pa, part, open, style, flag, 1.0f, now);
+}
+void partanim_request_speed(PartAnims *pa, int part, int open, int style, int flag, float speed,
+                            float now) {   /* 0x433e20: +8 = the speed AnimateCarPart passes */
     if (!pa || part < 0 || part >= PA_PARTS) return;
     PartState *S = &pa->st[part];
     if (open ? (S->state == 2 || S->state == 0) : (S->state == 3 || S->state == 1)) return;
-    S->speed = 1.0f;
+    S->speed = speed > 0.0f ? speed : 1.0f;
     S->flag = flag;
     if (part == PA_LEFT_DOOR || part == PA_RIGHT_DOOR) {   /* closing plays the style it opened with */
         if (open && S->state == 1) S->door_style = style;

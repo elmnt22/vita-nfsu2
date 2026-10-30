@@ -4,9 +4,15 @@
 #include "music.h"
 #include "options.h"
 #include "feng.h"
+#include "hud.h"
 #include "perfparts.h"
 #include "vinyl.h"
 #include "n2sim.h"
+#include "profile.h"
+#include "career.h"
+#include "airace.h"
+#include "movie.h"
+#include "mplay.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -14,9 +20,9 @@
 #include <string.h>
 
 #ifdef __vita__
-#define SHOP_CACHE "ux0:data/OpenUG2/cache/shop_v22.bin"
+#define SHOP_CACHE "ux0:data/OpenUG2/cache/shop_v32.bin"
 #else
-#define SHOP_CACHE "cache/shop_v22.bin"
+#define SHOP_CACHE "cache/shop_v33.bin"
 #endif
 
 /* ------------------------------------------------------------ game tables */
@@ -24,7 +30,8 @@
 /* Packages (FRONTEND/FrontB.lzc). */
 enum { PK_CATEGORY, PK_PERFORMANCE, PK_PARTS, PK_RIMBRAND, PK_RIMS, PK_SPLASH, PK_MAIN, PK_LOADING,
        PK_QR_MODE, PK_QR_TRACK, PK_QR_OPTIONS, PK_QR_CAR, PK_OPT_MAIN, PK_OPTIONS, PK_CTL, PK_JUKE, PK_CREDITS, PK_PAINT, PK_PERF_PKG, PK_PERF_BUY,
-       PK_VLAYER, PK_DECAL, PK_DECALOV, PK_DLG_S, PK_DLG_M, PK_DLG_L, PK_CHUD, PK_CHUDOV, PK_REP, PK_COUNT };
+       PK_VLAYER, PK_DECAL, PK_DECALOV, PK_DLG_S, PK_DLG_M, PK_DLG_L, PK_CHUD, PK_CHUDOV, PK_REP, PK_HELP_S, PK_HELP_M,
+       PK_PROFILE, PK_MC, PK_MC_LIST, PK_KEYBOARD, PK_START_CAREER, PK_CAREER_LOT, PK_CRIB, PK_CRIB_CARSEL, PK_CRIB_SPONSORS, PK_UNIQUE, PK_CRIB_WMAP, PK_MAG_REWARD, PK_MAG_BACK, PK_CRIB_REWARDS, PK_MAG_SELECT, PK_MAG_VIEW, PK_BRAND, PK_COUNT };
 static const char *const k_pk_name[PK_COUNT] = {
     "UI_ChooseCustomizeCategory.fng",       /* Car Shop, Body/Graphics/Specialties */
     "UI_ChoosePerformanceCategory.fng",     /* Performance Shop */
@@ -55,6 +62,25 @@ static const char *const k_pk_name[PK_COUNT] = {
     "UI_ChooseCustomHUD.fng",               /* Car Specialties: Custom Gauges, the gauge preview + colours */
     "UI_CustomHUDOverlay.fng",              /* ... the styles' list over it */
     "UI_Menu_Asset_Reputation.fng",         /* the Visual Rating box (0x557ec0) */
+    "HelpDialog_SMALL.fng",                 /* a screen's Help: its controls (0x526c40) */
+    "HelpDialog_MED.fng",                   /* ... more than 4 lines of them */
+    "UI_ProfileManager.fng",                /* Profile Manager (0x4c58b0) */
+    "MC_Main.fng",                          /* the save / load host: its messages and questions (0x4fd570) */
+    "MC_List.fng",                          /* ... the profiles to load or delete (0x4d7070) */
+    "UI_VirtualKeyboard.fng",               /* ... the name entry (FEKeyboard 0x4e3300) */
+    "UI_StartCareer.fng",                   /* Career: Resume / New / Load (800d1f7c) */
+    "UI_CareerCarLot.fng",                  /* Career: the Car Lot (UICareerCarLot 800d34bc) */
+    "UI_CareerCrib.fng",                    /* Career: the crib, the career's main menu (uiCareerCrib 800d2268) */
+    "UI_CareerCarSelect.fng",               /* Career: the crib's car select (UICareerCribCarSelect 800d4b80) */
+    "UI_RewardsSponsor.fng",                /* Career: the crib's signed sponsors (uiCribReward_Sponsors 800d2ef0) */
+    "UI_ChooseUniquePart.fng",              /* Career: a world challenge's unique parts (UniquesBrowser 8016cc14) */
+    "UI_CareerWorldMap.fng",                /* Career: the crib's World Map, the event replay (CribWorldMapScreen 0x4ee690) */
+    "UI_MagazineReward.fng",                /* Career: a front-end showcase's cover (UIMagazineReward 801868fc) */
+    "UI_MagazineBack.fng",                  /* ... its background, under the car (UIMagazineBack 80187200) */
+    "UI_CribRewardOptionsMain.fng",         /* Career: the PC crib's reward options (Setup 0x4afb70) */
+    "UI_MagazineSelect.fng",                /* ... Show Magazines / Show DVDs (UIMagazineSelect, PC create 0x55b520) */
+    "UI_MagazineView.fng",                  /* ... one saved cover photo (UIMagazineView, PC ctor 0x553be0) */
+    "UI_PerformanceBrandSelect.fng",        /* Performance Shop: a bought part's brand (ChooseBrandsScreen 0x550330) */
 };
 
 /* One scroller entry: language hash, icon TPK key, what it opens. Both hashes
@@ -104,6 +130,19 @@ static const ShopEntry k_perf_shop[] = {
     { 0xaa8959adu, 0xbaa23a28u, 6 }, { 0x758d5e3cu, 0xea57d2c4u, 0 },   /* Brakes, Weight Reduction */
     { 0xabd0ff14u, 0x06ef789cu, 4 },                                     /* Turbo */
 };
+/* Setup__18ChoosePerfCategory 80171f20: career with a city shop's entry
+   (gCarCustomizeManager+0x18 == 0) adds a Test Track IconOption (tex
+   7a9b397a, str 8513f2c0, PerfMenuStartTuning) after the nine categories;
+   its 0x34dc1bec -> DoStartTuning 801720f0 -> BeginCarTuning(0, car, entry 1) */
+#define PERF_TEST_TRACK 0x7e
+static const ShopEntry k_perf_shop_career[] = {
+    { 0x026eea5eu, 0xc15c94e6u, 3 }, { 0xa7884765u, 0x502abeedu, 7 },
+    { 0x73ad2f72u, 0x01a29ffau, 1 }, { 0x9c34c75fu, 0x178475e7u, 5 },
+    { 0xa7886f38u, 0x9701bde4u, 2 }, { 0xabca6aefu, 0x06e8e477u, 8 },
+    { 0xaa8959adu, 0xbaa23a28u, 6 }, { 0x758d5e3cu, 0xea57d2c4u, 0 },
+    { 0xabd0ff14u, 0x06ef789cu, 4 },
+    { 0x8513f2c0u, 0x7a9b397au, PERF_TEST_TRACK },
+};
 /* a category's packages (0x556e60): label, icon, type -- 0 Choose
    Individual Parts, 1..3 the package level (PERFORMANCE_PACKAGE_%d /
    PERFORMANCE_ICON_PACKAGE_%d), PP_STOCK Return To Stock */
@@ -117,6 +156,10 @@ static const ShopEntry k_perf_pkg[5] = {
 static const ShopEntry k_graphics_shop[] = {
     { 0x6a4c46a6u, 0x550681a4u, 0 }, { 0x78deea1cu, 0x55778e5au, 0 },   /* Paint, Vinyls */
     { 0x4e933e83u, 0xda1dae54u, 0 }, { 0xd132a6feu, 0x911a4edeu, 0 },   /* Decals, Install Setup (career: Purchase Setup 0x920dbb02) */
+};
+static const ShopEntry k_graphics_shop_career[] = {
+    { 0x6a4c46a6u, 0x550681a4u, 0 }, { 0x78deea1cu, 0x55778e5au, 0 },   /* Paint, Vinyls */
+    { 0x4e933e83u, 0xda1dae54u, 0 }, { 0x920dbb02u, 0x911a4edeu, 0 },   /* Decals, Install Setup (career: Purchase Setup 0x920dbb02) */
 };
 /* Decals (UI_DecalMain, 0x5530f0 / tree 0x5469f0): what each level of the
    location menu holds. group: a decal slot (car slot 0x61 + loc*8 + n,
@@ -241,17 +284,63 @@ static const RimBrand k_rims_suv[] = {
 
 /* Main menu (fn ~0x4aee66; the PC list, so Online and LAN are in it).
    group: what confirming it does in this port (0 = not built yet). */
-enum { MM_NONE, MM_QUICK_RACE, MM_CUSTOMIZE, MM_OPTIONS };
+enum { MM_NONE, MM_QUICK_RACE, MM_CUSTOMIZE, MM_OPTIONS, MM_PROFILE, MM_CAREER };
 static const ShopEntry k_main_menu[] = {
-    { 0x5e7e1192u, 0x03704f3du, MM_NONE },        /* Career          MAIN_ICON_CAREER */
+    { 0x5e7e1192u, 0x03704f3du, MM_CAREER },      /* Career          MAIN_ICON_CAREER */
     { 0x24909fd7u, 0x4e6fbb02u, MM_QUICK_RACE },  /* Quick Race      MAIN_ICON_QUICK_RACE */
     { 0x7b63ff85u, 0x771849a5u, MM_NONE },        /* Online          MAIN_ICON_GO_ONLINE */
     { 0x7294434cu, 0xd13a2e66u, MM_NONE },        /* LAN             MAIN_ICON_LAN */
     { 0xa53039a3u, 0xb0c46023u, MM_CUSTOMIZE },   /* Customize       MAIN_ICON_CUSTOMIZE_CAR */
-    { 0xbcb18f38u, 0x6b303856u, MM_NONE },        /* Profile Manager MAIN_ICON_PROFILE_MANAG */
+    { 0xbcb18f38u, 0x6b303856u, MM_PROFILE },     /* Profile Manager MAIN_ICON_PROFILE_MANAG */
     { 0xed1f0b2cu, 0x3058fe37u, MM_OPTIONS },     /* Options         MAIN_ICON_OPTIONS */
 };
 #define STR_MAIN_MENU  0x1398f642u   /* UI_MAIN_TITLE */
+
+/* EnterMemcard (0x4a3100) flags: the mode (1 an overlay), the operation,
+   0x200 always confirm a save, 0x1000 a cancel while named is a success,
+   0x2000 keep the setup, 0x4000 a forced save; 0x200000 the create
+   question was asked (DoSaveFlow 0x4e8d30) */
+enum { MCOP_LOAD = 0x10, MCOP_BOOT = 0x20, MCOP_DELETE = 0x30, MCOP_SAVE_CHECK = 0x40,
+       MCOP_SAVE_CUR = 0x50, MCOP_CREATE = 0x60 };
+#define MCF_CONFIRM   0x200
+#define MCF_CANCEL_OK 0x1000
+#define MCF_FORCE     0x4000
+#define MCF_ASKED     0x200000
+/* Profile Manager (Setup 0x4c58b0: 0x51f670(icon, label), added Create,
+   Load, Save, Delete); group: its EnterMemcard flags */
+static const ShopEntry k_profile_menu[] = {
+    { 0x55423473u, 0x56026748u, 0x861 },    /* Create */
+    { 0x0018ecffu, 0x2287e063u, 0xc11 },    /* Load */
+    { 0x001c8aceu, 0x228b7e32u, 0x4a51 },   /* Save: locked while unnamed (0x4a9360) */
+    { 0x56b00632u, 0xb9929709u, 0x831 },    /* Delete */
+};
+#define STR_PROFILE_MANAGER 0xbcb18f38u   /* SAVELOAD_PROFILE_MANAGER */
+/* UI_StartCareer (GC Setup 800d1f7c: IconOption(icon, text), shown here as
+   {text, icon}); group: the option's class */
+enum { CS_RESUME, CS_NEW, CS_LOAD };
+/* uiCareerCrib::Setup PC 0x4af820 (GC 800d26ac): IconOption(icon, text) in
+   this order; the world map only past stage 1. The PC's sixth option is the
+   reward options (vtable 0x790d24, React 0x4af6e0), where the GC has
+   CCViewSponsors; the sponsors are inside it on the PC */
+enum { CR_PLAY, CR_WORLD_MAP, CR_CAR_SELECT, CR_PARTS, CR_TEST_TRACK, CR_REWARDS, CR_SAVE, CR_MAIN };
+static const ShopEntry k_crib[] = {
+    { 0x194efa7au, 0xa230cd88u, CR_PLAY },        /* CCEnterGameplay */
+    { 0x9c07ca52u, 0x22f2ceabu, CR_WORLD_MAP },   /* CCViewWorldMap -> UI_CareerWorldMap */
+    { 0x451879e2u, 0xa964095bu, CR_CAR_SELECT },  /* CCarSel -> UI_CareerCarSelect */
+    { 0xabb24bbcu, 0x511f9d75u, CR_PARTS },       /* CCChangeParts -> BeginCarCustomize(1) */
+    { 0x8513f2c0u, 0x7a9b397au, CR_TEST_TRACK },  /* CCTestTrack -> BeginCarTuning */
+    { 0xce62c0bfu, 0x49d2e3deu, CR_REWARDS },     /* -> UI_CribRewardOptionsMain (no lock) */
+    { 0x03ec7395u, 0x8ada6fd4u, CR_SAVE },        /* CCSaveMemcard: EnterMemcard 0xc41 */
+    { 0x046e7d84u, 0xfc39853fu, CR_MAIN },        /* CCBackToMain */
+};
+static const ShopEntry k_start_career[] = {
+    { 0x97b1dcdau, 0x3cb92e26u, CS_RESUME },   /* named, not started: the New icon/text acting as CSResume */
+    { 0xe072db21u, 0xa230cd88u, CS_RESUME },   /* CSResume */
+    { 0x97b1dcdau, 0x3cb92e26u, CS_NEW },      /* CSNew "Start New Career" */
+    { 0xaa3f09d8u, 0x72c87f3cu, CS_LOAD },     /* CSLoad "Load Game" */
+};
+#define STR_CAREER 0x5e7e1192u   /* the title FEPrintf(0x42adb44c, "Career") */
+#define STR_NO_PROFILE      0xcf4f80c2u   /* STRING_NO_PROFILE "No Profile" */
 
 /* Options (UI_OptionsMain 0x4e3560, icons 0x4b6230: 0x51f670(icon, label);
    picking one sets the category 0x83aa04 (0x49a620..) and 0x4b6080 opens
@@ -337,6 +426,9 @@ static const ShopEntry k_qr_modes[] = {
 #define O_QR_FILTER      0x3e81de59u
 #define O_QR_RACE_MODE   0xa9205bd8u   /* the "Race Mode:" box */
 #define O_QR_CUSTOMIZE   0xa936c3a2u   /* help bar "Customize" (car select -> Car Shop: not ported) */
+#define O_QR_CUST_BTN    0x89782734u   /* its button icon */
+#define O_QR_MODE_BOX    0x2043aba0u   /* the race mode box's group */
+#define STR_QR_CUST_TITLE 0x61032ce5u  /* QR_TITLE_CUSTOMIZE "Customize Car Select" */
 #define K_GENERIC_PLACEHOLDER 0xc8e80d1fu
 #define K_MENU_ARROW     0x367b3e04u   /* U2_Menu_Arrow: the option rows' arrows (0x54ef30) */
 /* car stat sliders: backing, handle, fill (U2 names hashed upper) */
@@ -460,6 +552,8 @@ typedef struct {
     int  level, price;
     int  available;         /* the renderer can fit it on this car */
     uint32_t hash;          /* the database part (vinyls) */
+    int  ent, lvl;          /* career: MapCarPartToUnlockable 8012e8bc, the record's level (+5 >> 5) */
+    uint32_t okey;          /* career: the inventory key, the part's name hash (0 = never owned) */
 } ShopPart;
 #define SHOP_MAX_PARTS 200
 
@@ -467,12 +561,13 @@ enum { SC_CAR_SHOP, SC_BODY, SC_PERFORMANCE, SC_GRAPHICS, SC_SPECIALTIES, SC_PAR
        SC_RIM_BRAND, SC_RIMS, SC_SPLASH, SC_MAIN, SC_LOADING,
        SC_QR_MODE, SC_QR_TRACK, SC_QR_OPTIONS, SC_QR_CAR, SC_OPT_MAIN, SC_OPT, SC_CTL, SC_JUKE, SC_CREDITS, SC_PAINT, SC_PERF_PKG,
        SC_VLAYER, SC_VCAT, SC_VLIST, SC_DLOC, SC_DPICK, SC_TINT, SC_BULB, SC_CARBON,
-       SC_NEON, SC_NEON_LIST, SC_HUD, SC_HUD_COL, SC_SPEC, SC_ICE };
+       SC_NEON, SC_NEON_LIST, SC_HUD, SC_HUD_COL, SC_SPEC, SC_ICE, SC_PROFILE, SC_START_CAREER, SC_MOVIE, SC_CAREER_LOT, SC_CRIB, SC_CRIB_CARSEL, SC_CRIB_SPONSORS, SC_UNIQUES, SC_CRIB_WMAP, SC_MAG_REWARD, SC_CRIB_REWARDS, SC_MAG_SELECT, SC_MAG_VIEW };
 
 /* one settings record (0x83aac4 + type * 20, ctor 0x52a220) */
 typedef struct { int opp, diff, traffic, catchup, ev, laps, dir, ko; } QrSet;
 /* An image the code changes: its texture, place, size or alpha, or hidden. */
-typedef struct { uint32_t hash; GLuint tex; int hide, geom; float x, y, w, h, alpha; uint32_t col; /* 0xAARRGGBB, 0 authored */ } ObjOv;
+typedef struct { uint32_t hash; GLuint tex; int hide, geom; float x, y, w, h, alpha; uint32_t col; /* 0xAARRGGBB, 0 authored */
+                 int uvo; float uv[4];   /* the code's texture through this uv window */ } ObjOv;
 
 #define QR_NTYPE 11
 #define QR_MAX_TRACKS 64
@@ -518,6 +613,24 @@ struct Shop {
     float part_scroll;
     float debounce; int pending;             /* preview after the cursor rests */
     int exit_req;
+    /* the career's CarCustomizeManager: the unlock filter (GetPartUnlockFilter
+       8017107c: 0 = outside the career, the port's unlock-all; 2 the crib's
+       Change Parts, owned parts only; 6 a shop, owned or unlocked), the entry
+       point (0x803d84e0: 1 crib, 0 a shop) and the shop (0x803d84e4); each
+       entity's UnlockablePartData levels (GCareer 0x34A1C: +4 the rule,
+       +8 its argument) and the player / cash swap (SetAlternatingPlayerCash) */
+    int career, cust_entry, cust_shop, tt_req;
+    unsigned char unl_type[96][3]; uint32_t unl_arg[96][3];
+    float alt_t;
+    /* SetAlternatingText 80151df0 / AlternateTheText 80151ed8: per MenuScreen
+       (restarted when the screen changes) the current text (1 the name,
+       2 the cash, 0 off), its countdown in 1/4000 s, the switch count and ms
+       since the switch; alt_anim runs FADE_IN / FADE_OUT on the two objects
+       of the package that shows them */
+    int alt_cur, alt_timer, alt_screen, alt_gen, alt_bgen, alt_ms, alt_bound, alt_scripts;
+    FengAnim *alt_anim;
+    int buy_after;                /* career_gate: the install after the buy */
+    const unsigned char *cshop;   /* the engaged shop (PlayerCareerState +0x7df8): CC_MEGALOW's prices */
     int gfx_cancel;                          /* GFX_* the Square dialog cancels */
     float dim;                               /* a dialog's DIM over the screen, 0..1 */
     /* the Visual Rating box: installed / preview ratings and what they were taken from */
@@ -534,7 +647,10 @@ struct Shop {
     /* a style's sizes for the car's OUTER_RADIUS, in database order (0x55f340
        groups them under one entry); the size list (0x55fb00, +0x214) */
     unsigned char rim_sizes[SHOP_MAX_PARTS][8], rim_nsizes[SHOP_MAX_PARTS];
+    uint32_t rim_skey[SHOP_MAX_PARTS][8];    /* each size's own CarPart: its name hash (the owned key) */
+    unsigned char rim_slvl[SHOP_MAX_PARTS][8];   /* and its level (+5 >> 5) */
     int size_mode, size_sel; float size_scroll;
+    int rim_from_parts;   /* the rim brands opened from the parts browser's Rims category */
     /* front end */
     Scroller main; int front_end, fe_action; float blink;
     char ls_line1[96], ls_line2[96], ls_line3[96];   /* PC_Loading text in place of "LOADING" (shop_loading_text) */
@@ -544,7 +660,7 @@ struct Shop {
     QrSet set[QR_NTYPE];
     int qr_type;                                 /* the mode picked */
     Scroller qr_mode, qr_track;
-    ShopEntry qr_track_e[QR_MAX_TRACKS]; short qr_track_rec[QR_MAX_TRACKS];
+    ShopEntry qr_track_e[QR_MAX_TRACKS]; short qr_track_rec[QR_MAX_TRACKS]; unsigned char qr_track_lock[QR_MAX_TRACKS];
     int qr_row[QR_ROWS_SHOWN], qr_nrow, qr_rsel; /* option rows (QO_*) and the cursor */
     FengAnim *qr_anim; int qr_anim_ms;           /* UI_QRModeOptions with its scripts */
     float map_wait; int map_ev, map_want; GLuint map_tex; float map_alpha;
@@ -553,7 +669,8 @@ struct Shop {
     char qr_car_cur[32];
     int qr_car_pending; float qr_car_debounce;
     int qr_go;
-    ObjOv ov[16]; int nov;                       /* draw_package's image overrides */
+    int qr_cust, cust_go;                        /* Customize Car Select (game mode 0x20), its accept */
+    ObjOv ov[24]; int nov;                       /* draw_package's image overrides */
     unsigned char qr_rowobj[FENG_MAX_OBJ];       /* options: 1 a row object, 2 an arrow */
     uint32_t row_arrow;                          /* the rows' arrow texture */
     /* options */
@@ -579,6 +696,7 @@ struct Shop {
     unsigned hud_pal[12]; int hud_npal, hud_layer, hud_csel;
     unsigned hud_pick[3];
     int paint_mode;                              /* +0x188: 1 choosing a colour */
+    int spk_screen;                              /* the last screen told to the FE speech (+1) */
     uint32_t paint_brand;                        /* +0x174 */
     uint32_t paint_hash[60]; int paint_obj[60];  /* the swatches (+0x158) */
     int paint_n, paint_sel;
@@ -596,6 +714,11 @@ struct Shop {
     /* Carbon Fiber: its strip (0x545d30), whether a parts list is the
        carbon one (0x545700's last argument) */
     Scroller cfm; ShopEntry cfm_e[6]; int cf_mode;
+    /* SC_UNIQUES (UniquesBrowser): the world challenge's unique parts
+       (GetUniquesPartsList 8012d688) -- a car slot's part, or a junkman path */
+    Scroller uqs; ShopEntry uq_e[64];
+    struct { int slot, value, path, ent; uint32_t hash, okey; char folder[16], name[64]; } uq[64];
+    int uq_perf, uq_done;
     int spec_slot;             /* SC_SPEC: the Specialties slot being browsed */
     int spec_open;             /* SC_SPEC: Square opened the hood / doors (0x568d30 0xc519bfc0) */
     int spec_ret;              /* SC_SPEC: where Back / Install return (the Specialties or SC_ICE) */
@@ -604,11 +727,17 @@ struct Shop {
     int perf_cat;                                /* DAT_00838994 */
     int perf_shown;                              /* the contents shown (PackageFadeIn) */
     uint32_t perf_row_name[4], perf_row_price[4]; int perf_nrow;
+    char perf_row_cash[4][16], perf_cost_txt[3][48];   /* career: the rows' prices, the discount label / amount, the cost */
 #define BUY_MAX 12
     FengAnim *buy_anim;                          /* UI_BuyPerformanceParts */
     int buy_idx[BUY_MAX]; uint32_t buy_name[BUY_MAX];
     int buy_n, buy_sel, buy_top, buy_focus;
     char buy_txt[2][32];                         /* the torque / power gains */
+    /* ChooseBrandsScreen (UI_PerformanceBrandSelect) over the package
+       screen: a bought package's parts (or the one part) and their brands */
+    FengAnim *brand_anim;
+    int brand_on, brand_pkg, brand_part, brand_n, brand_sel;
+    struct { int part, nb, cur, arrows; uint32_t name, b[8]; } brand_w[4];
     /* credits */
     FengAnim *cred_anim;
     char **cred_line; int cred_n, cred_cur;      /* the text's lines (wrapped), the last one rolled */
@@ -618,14 +747,69 @@ struct Shop {
        one or two buttons, the cursor, what its first button does */
     FengAnim *dlg_anim;
     int dlg_pk, dlg_nbtn, dlg_sel, dlg_act, dlg_act2;   /* act2: the second button's, when it does something */
+    int dlg_back;                                /* the cancel message's, when it does something */
     uint32_t dlg_b1, dlg_b2;
-    char dlg_text[512];
+    char dlg_text[1024];
+    /* options: the save settings when the category opened (0x4b6010, 0x49c690) */
+    unsigned char opt_save0, opt_auto0;
+    /* profiles: UI_ProfileManager's strip; the memcard flow over the screen
+       (MC_Main 0x4fd570, DoSaveFlow 0x4e8d30): its operation and flags, what
+       shows (MCV_*), the question up (MCD_*), its buttons and the cursor,
+       the screen it returns to; the list (MC_List) and the name entry */
+    Scroller prof;
+    int mc_op, mc_flags, mc_view, mc_dlg, mc_nbtn, mc_sel, mc_ret, mc_changed, mc_backup, mc_then;
+    uint32_t mc_b[2];
+    char mc_text[512];
+    FengAnim *mc_anim, *mcl_anim, *kb_anim;
+    char mc_names[PROFILE_LIST_MAX][PROFILE_NAME_MAX + 1];
+    int mc_n, mc_lsel, mc_ltop;
+    char kb_text[PROFILE_NAME_MAX + 1];
+    int kb_sel, kb_fresh, kb_ms;   /* focus (-1 none yet), "NAME" untouched, time open */
+    /* career: UI_StartCareer's options, the full-screen movie (IG_PlayMovie)
+       and StartCareerFreeRoam for main.c (1 + the start NIS) */
+    Scroller scar;
+    Scroller crib; ShopEntry crib_e[8];
+    int platform;             /* PlatformNameMap index, 0 = the default (SHOWROOM) */
+    int crib_from_main;       /* uiCareerCrib::bCameFromCareerMain: BACK asks for the main menu, not gameplay */
+    int crib_play;            /* the memcard save is CheckMemory's: gameplay after it */
+    /* uiCribReward_Sponsors: the stages' chosen sponsors, the current one,
+       its contract terms broken into lines and the CTextScroller's top line */
+    const unsigned char *csp[8]; int csp_n, csp_sel, csp_top, csp_nl;
+    /* UIMagazineReward: the cover art (back, mast, chick, extra), the car
+       setup's anim flags and its garage camera view */
+    GLuint mag_tex[4]; int mag_flags, mag_cam_ok; float mag_cam[12];
+    uint32_t mag_rig; char mag_env[16];
+    const unsigned char *mag_sc; int mag_shot;               /* the showcase on the cover, frames to its photo */
+    Scroller crw; ShopEntry crw_e[3]; int crw_seen;          /* uiCribRewardOptionsMain */
+    Scroller msel; ShopEntry msel_e[32]; int msel_mode, msel_seen;   /* UIMagazineSelect: 1 magazines, 2 DVDs */
+    GLuint mview_tex; int mview_idx;                         /* UIMagazineView: the photo, its showcase */
+    Scroller cwm;                                /* CribWorldMapScreen: the ThumbnailScroller (+0x138) */
+    const unsigned char *cwm_ev[72];             /* its nodes' events (NULL: the region item) */
+    int cwm_stage, cwm_nst;                      /* +0x224 the region; the completed stages */
+    float map_t;                                 /* TrackMapScroller: time since the map came in (the zoom) */
+    const unsigned char *fe_event;               /* SHOP_ACT_CAREER_EVENT */
+    char csp_ln[48][160];
+    ShopEntry scar_e[3];
+    struct MPlay *mv;
+    int career_go;
+    /* the career Car Lot (UICareerCarLot): its state (+0x50), the unlocked /
+       empty slot counts taken at Setup (+0x7c / +0x78), the list (+0x54: car
+       type and FECarRecord handle; filter 1 stock, 4 career), the current
+       entry (+0x5c), the stock car remembered for the browse (+0x68), the
+       scroll bar's index (+0x88, 1-based, not reset by a rebuild) and what
+       RefreshHeader last put up (logos, sliders, scroll bar) */
+    int lot_state, lot_unlocked, lot_empty;
+    struct { int type; uint32_t handle; int kind; } lot[QR_MAX_CARS];   /* kind: the crib's 0 car, 1 open, 2 locked */
+    int lot_n, lot_sel, lot_bar;
+    uint32_t lot_new;
+    struct { int type, n, idx, first, last, kind; } lot_hdr;
 };
 
 static void make_program(Shop *s);
 static void credits_free(Shop *s);
 static void credits_enter(Shop *s);
 static void credits_tick(Shop *s, int ms);
+static void movie_stop(Shop *s);
 
 /* -------------------------------------------------------------- strings */
 
@@ -706,6 +890,8 @@ static void load_db(Shop *s) {
                             s->price[idx][l] = pr;
                             memcpy(&pr, c + r + 4 + 12 * l, 2);
                             s->rep[idx][l] = pr;
+                            s->unl_type[idx][l] = c[r + 4 + 12 * l + 4];
+                            s->unl_arg[idx][l] = n2_u32(c + r + 4 + 12 * l + 8);
                         }
                     }
                 o += 8 + cs;
@@ -802,9 +988,121 @@ static int part_value(const char *car, int group, uint32_t hash) {
     return -1;
 }
 
+/* part_value of a database part: a library's "none" entry (e.g. NO ROOF
+   SCOOP; lib = the part's model is a library, not the car) is the stock look */
+static int part_value_lib(const char *car, int group, uint32_t hash, int lib, int upg) {
+    int v = part_value(car, group, hash);
+    if (v < 0 && lib && (upg & 0xff) == 0) v = 0;
+    return v;
+}
+/* a Body Shop part (value) into a configuration's slot, as the parts
+   browser fits it: a carbon hood (from the Carbon Fiber lists, the parts
+   with CARBONFIBRE) is the same hood, carbon */
+static void body_put(N2CarConfig *c, int slot, int value, int carbon) {
+    c->parts[slot] = value;
+    if (slot == N2_PART_HOOD) c->carbon = carbon ? c->carbon | 1u : c->carbon & ~1u;
+}
+/* InstallPart 8016e4bc: a CARBONFIBRE hood (0x721aff7c) takes the "Hoods"
+   vinyls off (UninstallHoodVinyls 8016ea7c: a layer 0x40..0x43 whose vinyl
+   group is 0x14); a hood above upgrade level 0 takes the hood's decals off
+   (UninstallHoodDecals 8016eaec: slots 0x61..0x68) */
+static void hood_installed(N2CarConfig *c, int level) {
+    if (c->carbon & 1u)
+        for (int l = 0; l < 4; l++) {
+            const VinylPart *v = c->vinyl[l] ? vinyl_find(c->vinyl[l]) : NULL;
+            if (!v || v->group != 0x14) continue;
+            printf("shop: carbon hood fitted -- hood vinyl on layer %d off\n", l + 1);
+            c->vinyl[l] = 0; memset(c->vinyl_col[l], 0, sizeof c->vinyl_col[l]);
+        }
+    if (level > 0) {
+        for (int n = 0; n < 8; n++)
+            if (c->decal[0][n]) { printf("shop: hood level %d fitted -- hood decals off\n", level); break; }
+        memset(c->decal[0], 0, sizeof c->decal[0]);
+    }
+}
+
 static int menu_has(const N2PartMenu *m, int value) {
     for (int i = 0; i < m->count; i++) if (m->options[i].value == value) return 1;
     return 0;
+}
+
+/* ---- the career's UnlockSystem (CAREER.md "C6: shops") ---------------- */
+/* CalculateIfUnlocked 8012dfb0 (filter 4): a level's UnlockablePartData rule
+   -- 1 the shop (handle) is enterable, 2 / 3 / 4 the stage (arg >> 16) has
+   that many world / URL / sponsor races won; level 0 is always open, 4 never */
+static int calc_unlocked(const Shop *s, int ent, int lvl) {
+    if (lvl == 4) return 0;
+    if (lvl == 0 || lvl > 3 || ent <= 0 || ent >= 96) return 1;
+    int t = s->unl_type[ent][lvl - 1];
+    uint32_t a = s->unl_arg[ent][lvl - 1];
+    int st = (int)((int32_t)a >> 16), need = (int)(a & 0xffffu);
+    const CareerStage *cs = st >= 0 && st < 8 ? &g_career.st[st] : NULL;
+    switch (t) {
+    case 1: { const unsigned char *sh = career_shop_by_handle(a); return sh && career_shop_enterable(sh); }
+    case 2: return cs && need <= cstage_world_done(cs);
+    case 3: return cs && need <= cstage_url_done(cs);
+    case 4: return cs && need <= cstage_sponsor_done(cs);
+    default: return 1;
+    }
+}
+/* UnlockSystem::IsCarPartUnlocked 8012fc3c -> CareerUnlocker 8012f530 with the
+   shop's filter: 2 = level 0 or owned, 4 = CalculateIfUnlocked */
+/* IsUnlockedByEnteringShop 8012df58: the level's rule is 1 (a shop) */
+static int unl_by_shop(const Shop *s, int ent, int lvl) {
+    return lvl >= 1 && lvl <= 3 && ent > 0 && ent < 0x57 && s->unl_type[ent][lvl - 1] == 1;
+}
+/* CareerUnlocker filter 4: entity 0x3d (manufacturer vinyls) asks only the
+   IsManufacturerVinylUnlocked easter egg (never on), not CalculateIfUnlocked */
+static int calc_part(const Shop *s, int ent, int lvl) { return ent != 0x3d && calc_unlocked(s, ent, lvl); }
+static int part_open(const Shop *s, int ent, int lvl, uint32_t key) {
+    if (!s->career)   /* outside the career: QuickRaceUnlocker::IsCarPartUnlocked 8012f088 (filter 1) */
+        return lvl == 0 || calc_part(s, ent, lvl) ||
+               (career_completed_career() && (lvl == 4 || unl_by_shop(s, ent, lvl)));
+    int ok = 0;
+    if (s->career & 2) ok = lvl == 0 || career_owns_part(ent, key);
+    if (s->career & 4) ok = ok || calc_part(s, ent, lvl);
+    return ok;
+}
+/* GetWordToSetBitFor 80135610 / OwnsCarPart 801358bc: every part is owned
+   by its own bit (regions or bit idx of the entity's word), keyed here by
+   the part's name hash; the CarSlots 0x3f, 0x44..0x47, 0x49 are never owned
+   (0: charged, nothing recorded) */
+static uint32_t own_key(int slot, uint32_t hash) {
+    if (slot == 0x3f || (slot >= 0x44 && slot <= 0x47) || slot == 0x49) return 0;
+    return hash ? hash : 1u;
+}
+/* InitUnlockablesMap 8012e544: MapCarSlotToUnlockable, a CarSlot's
+   unlockable entity (MapCarPartToUnlockable 8012e8bc's default) */
+static const unsigned char k_slot_ent[0xaa] = {
+    0x00, 0x12, 0x11, 0x13, 0x13, 0x00, 0x16, 0x14, 0x00, 0x0b, 0x00, 0x10, 0x0c, 0x00, 0x0f, 0x0e,
+    0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x0d, 0x21,
+    0x13, 0x00, 0x1e, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x28, 0x50, 0x4f, 0x4e, 0x52, 0x4d, 0x51, 0x53, 0x54, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0x00, 0x00,
+    0x56, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c,
+    0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c,
+    0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c,
+    0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x4c, 0x20, 0x19, 0x1a, 0x1b, 0x1c, 0x1b, 0x18,
+    0x23, 0x24, 0x1d, 0x17, 0x17, 0x17, 0x17, 0x00, 0x00, 0x00,
+};
+static int slot_ent(int slot) { return slot >= 0 && slot < (int)sizeof k_slot_ent ? k_slot_ent[slot] : 0; }
+/* a list part's entity, level, owned key and GetCarPartCost 801294f4 /
+   0x514280 price: level 4 free, level 0 free except a decal (entity 0x4c),
+   which costs the level-1 price */
+static int ent_price(const Shop *s, int ent, int lvl) {
+    if (lvl == 0 && ent == 0x4c) lvl = 1;
+    int c = lvl >= 1 && lvl <= 3 && ent > 0 && ent < 96 ? s->price[ent][lvl - 1] : 0;
+    return c < 0 ? 0 : c;
+}
+static void part_cost(const Shop *s, ShopPart *q, int ent, int lvl, uint32_t okey) {
+    q->ent = ent; q->lvl = lvl; q->okey = okey;
+    q->price = ent_price(s, ent, lvl);
+}
+/* the part costs money: in the career, not bought and not level 0
+   (PartSelectionScreen 0x9f00f07 vs 0x51123592) */
+static int part_to_buy(const Shop *s, const ShopPart *q) {
+    return s->career && q && q->lvl != 0 && !career_owns_part(q->ent, q->okey);
 }
 
 /* The part list for one Body Shop group, in database order: the car's own
@@ -842,13 +1140,19 @@ static void build_parts(Shop *s, int group) {
             ShopPart *q = &s->parts[s->nparts];
             const char *nmstr = s->db_str ? (const char *)s->db + s->db_str + soff * 4L : "?";
             snprintf(q->name, sizeof q->name, "%s", nmstr);
-            q->value = part_value(s->car, group, hash);
-            /* a library's "none" entry (e.g. NO ROOF SCOOP) is the stock look */
-            if (q->value < 0 && mi > 0 && (upg & 0xff) == 0) q->value = 0;
+            q->value = part_value_lib(s->car, group, hash, mi > 0, upg);
             int lvl = (upg >> 5) & 7;
             q->level = lvl > 3 ? 3 : lvl;
-            q->price = q->level > 0 && row > 0 ? s->price[row][q->level - 1] : 0;
+            /* MapCarPartToUnlockable: the carbon hood / roof / spoiler / mirrors
+               are their own entities; GetUnlockablePartCost 8012e228 */
+            int ent = row;
+            if (db_has_attr(s, aoff, 0x721AFF7Cu))
+                ent = group == G_HOOD ? 0x4b : group == G_ROOF ? 0x46 : group == G_SPOILER ? 0x4a :
+                      group == G_LEFT_MIRROR ? 0x45 : row;
+            q->ent = ent; q->lvl = lvl; q->okey = own_key(slot, hash);
+            q->price = q->level > 0 && ent > 0 ? s->price[ent][q->level - 1] : 0;
             if (q->price < 0) q->price = 0;
+            if (!part_open(s, ent, lvl, q->okey)) continue;   /* GetPartsList 8015e1d4: IsPartAvailable */
             q->available = q->value == 0 || (q->value > 0 && slot >= 0 &&
                                              menu_has(&s->menus[slot], q->value));
             if (!q->available) { hidden++; continue; }   /* no geometry on this car */
@@ -918,6 +1222,73 @@ static int rim_part_parse(const char *folder, uint32_t hash, int *style, int *in
 
 static unsigned char g_shop_rec[N2_REC_SIZE]; static int g_shop_rec_ok;   /* the car record (shop_set_car_rec) */
 
+/* A rim part's model: LoadedWheel 80247cec (0x633650) takes the wheel's
+   models from the part (GetModelNameHash) and reads its attribute 0x10c98090
+   (GetAppliedAttributeUParam 0x4951f0), which in the data is the hash of
+   "<MODEL>_STYLEnn" -- the folder's own name for most brands, but the NFSU
+   set ships as SPARCO_STYLE01, STARK_STYLE01, ... (NFSU_STYLE03 = SPARCO).
+   Every WHEELS part (group 28) of the database, by name hash, once. */
+typedef struct { uint32_t hash, base; } RimBase;
+static int rim_base_cmp(const void *a, const void *b) {
+    uint32_t x = ((const RimBase *)a)->hash, y = ((const RimBase *)b)->hash;
+    return x < y ? -1 : x > y;
+}
+uint32_t shop_rim_base(const char *dataroot, const char *folder, int value) {
+    static RimBase *tab; static int n, tried;
+    if (!tried) {
+        tried = 1;
+        char path[600]; uint32_t sz = 0;
+        snprintf(path, sizeof path, "%s/GLOBAL/GLOBALB.BUN", dataroot);
+        FILE *f = fopen(path, "rb");
+        long at = f ? find_chunk_in_file(f, 0x80034602u, &sz) : -1;
+        unsigned char *db = at >= 0 && sz < (8u << 20) ? (unsigned char *)malloc(sz) : NULL;
+        if (db && (fseek(f, at, SEEK_SET) || fread(db, 1, sz, f) != sz)) { free(db); db = NULL; }
+        if (f) fclose(f);
+        long po = -1, pl = 0, ao = -1, oo = -1;
+        for (long o = 0; db && o + 8 <= (long)sz; ) {
+            uint32_t id = n2_u32(db + o), cs = n2_u32(db + o + 4);
+            if (o + 8 + (long)cs > (long)sz) break;
+            if (id == 0x00034604u) { po = o + 8; pl = cs; }
+            else if (id == 0x00034605u) ao = o + 8;
+            else if (id == 0x0003460Cu) oo = o + 8;
+            o += 8 + cs;
+        }
+        if (po >= 0 && ao >= 0 && oo >= 0) tab = (RimBase *)malloc((size_t)(pl / 14 + 1) * sizeof *tab);
+        for (long p = po; tab && p + 14 <= po + pl; p += 14) {
+            const unsigned char *rec = db + p;
+            unsigned aoff = rec[10] | rec[11] << 8;
+            if (rec[4] != G_WHEEL || aoff == 0xffffu) continue;
+            const unsigned char *o = db + oo + aoff * 2L;
+            unsigned na = o[0] | o[1] << 8;
+            for (unsigned k = 0; k < na && k < 64; k++) {
+                unsigned ai = o[2 + 2 * k] | o[3 + 2 * k] << 8;
+                if (n2_u32(db + ao + ai * 8L) == 0x10c98090u) {
+                    tab[n].hash = n2_u32(rec); tab[n++].base = n2_u32(db + ao + ai * 8L + 4);
+                }
+            }
+        }
+        free(db);
+        if (tab) qsort(tab, n, sizeof *tab, rim_base_cmp);
+        printf("shop: %d rim model names\n", n);
+    }
+    if (!tab || !folder || !folder[0]) return 0;
+    char pre[48];
+    snprintf(pre, sizeof pre, "%s_STYLE%02d_", folder, RIM_STYLE(value));
+    uint32_t h0 = hash_more(0xffffffffu, pre);
+    for (int a = RIM_IN_LO; a <= RIM_IN_HI; a++) {   /* every size of a style shares the model */
+        if (RIM_INNER(value) && a != RIM_INNER(value)) continue;
+        char t[16]; snprintf(t, sizeof t, "%d_", a);
+        uint32_t h1 = hash_more(h0, t);
+        for (int b = RIM_OUT_LO; b <= RIM_OUT_HI; b++) {
+            char u[8]; snprintf(u, sizeof u, "%d", b);
+            RimBase key = { hash_more(h1, u), 0 };
+            const RimBase *r = (const RimBase *)bsearch(&key, tab, n, sizeof *tab, rim_base_cmp);
+            if (r) return r->base;
+        }
+    }
+    return 0;
+}
+
 /* One entry per rim style of a brand, in database order, named and priced
    as the game does (0x55f340): the parts of the brand whose OUTER_RADIUS is
    the car's (record +0xdc, 0x539b70), parts of one style grouped as one
@@ -930,6 +1301,7 @@ static void build_rims(Shop *s, int b) {
         ShopPart *q = &s->parts[s->nparts++];
         snprintf(q->name, sizeof q->name, "%s", str_get(s, 0x25b9eb23u));   /* KIT00_FRONT_WHEEL */
         q->value = STOCK_RIM_STYLE; q->level = 0; q->price = 0; q->available = 1;
+        q->ent = 13; q->lvl = 0; q->okey = 1u;
         s->rim_nsizes[0] = 0;
         return;
     }
@@ -961,19 +1333,44 @@ static void build_rims(Shop *s, int b) {
         int dup = -1;
         for (int k = 0; k < s->nparts; k++) if (s->parts[k].value == style) dup = k;
         if (dup >= 0) {
-            if (s->rim_nsizes[dup] < 8) s->rim_sizes[dup][s->rim_nsizes[dup]++] = (unsigned char)inner;
+            int z = s->rim_nsizes[dup];
+            if (z < 8) {
+                s->rim_sizes[dup][z] = (unsigned char)inner; s->rim_skey[dup][z] = hash;
+                s->rim_slvl[dup][z] = (unsigned char)((upg >> 5) & 7); s->rim_nsizes[dup]++;
+            }
             continue;
         }
         if (s->nparts >= SHOP_MAX_PARTS) continue;
         s->rim_sizes[s->nparts][0] = (unsigned char)inner; s->rim_nsizes[s->nparts] = 1;
+        s->rim_skey[s->nparts][0] = hash; s->rim_slvl[s->nparts][0] = (unsigned char)((upg >> 5) & 7);
         ShopPart *q = &s->parts[s->nparts++];
         snprintf(q->name, sizeof q->name, "%s", s->db_str ? (const char *)s->db + s->db_str + soff * 4L : "?");
         q->value = style;
         int lvl = (upg >> 5) & 7; q->level = lvl > 3 ? 3 : lvl;
-        q->price = q->level > 0 ? s->price[13][q->level - 1] : 0;
-        if (q->price < 0) q->price = 0;
+        part_cost(s, q, 13, lvl, hash);
         q->available = 1;
     }
+    /* IsRimAvailable 8015e9a0: a style stays when one of its size parts is
+       open (level 0, owned or unlocked); the style row prices / owns the
+       fitted size when it is this style, else the first size (rim_preview's) */
+    int kept = 0;
+    for (int k = 0; k < s->nparts; k++) {
+        int open = 0;
+        for (int z = 0; z < s->rim_nsizes[k] && !open; z++) open = part_open(s, 13, s->rim_slvl[k][z], s->rim_skey[k][z]);
+        if (!open) continue;
+        if (kept != k) {
+            s->parts[kept] = s->parts[k]; s->rim_nsizes[kept] = s->rim_nsizes[k];
+            memcpy(s->rim_sizes[kept], s->rim_sizes[k], sizeof s->rim_sizes[k]);
+            memcpy(s->rim_skey[kept], s->rim_skey[k], sizeof s->rim_skey[k]);
+            memcpy(s->rim_slvl[kept], s->rim_slvl[k], sizeof s->rim_slvl[k]);
+        }
+        int z0 = 0;
+        if (!strcmp(s->rim_folder, r->folder) && RIM_STYLE(s->rim_style) == s->parts[kept].value)
+            for (int z = 0; z < s->rim_nsizes[kept]; z++) if (s->rim_sizes[kept][z] == RIM_INNER(s->rim_style)) z0 = z;
+        part_cost(s, &s->parts[kept], 13, s->rim_slvl[kept][z0], s->rim_skey[kept][z0]);
+        kept++;
+    }
+    s->nparts = kept;
     if (!strcmp(s->rim_folder, r->folder))
         for (int k = 0; k < s->nparts; k++) if (s->parts[k].value == RIM_STYLE(s->rim_style)) s->part_sel = k;
     s->part_scroll = (float)s->part_sel;
@@ -996,6 +1393,20 @@ static void rim_preview(Shop *s, float debounce) {
     if (!strcmp(s->prev_folder, folder) && s->prev_style == v) return;
     snprintf(s->prev_folder, sizeof s->prev_folder, "%s", folder);
     s->prev_style = v; s->rim_pending = 1; s->rim_debounce = debounce;
+}
+/* the CarPart the rim browser prices and buys (0x567a50 / 0x55fb00
+   IsPartPurchased(0x1d, part)): in the size list the size under the cursor,
+   on a style row the part build_rims chose (fitted size or first size) */
+static const ShopPart *rim_cur(const Shop *s) {
+    static ShopPart t;
+    if (!s->nparts) return NULL;
+    const ShopPart *q = &s->parts[s->part_sel];
+    if (!s->size_mode || !s->rim_nsizes[s->part_sel]) return q;
+    int z = s->size_sel;
+    if (z < 0 || z >= s->rim_nsizes[s->part_sel]) return q;
+    t = *q;
+    part_cost(s, &t, 13, s->rim_slvl[s->part_sel][z], s->rim_skey[s->part_sel][z]);
+    return &t;
 }
 
 /* ------------------------------------------------------------ cache build */
@@ -1044,6 +1455,32 @@ static int icon_keys(uint32_t *k, int cap) {
     for (int i = 0; i < NELEM(k_rims_suv) && n < cap; i++) k[n++] = k_rims_suv[i].tex;
     for (int i = 0; i < NELEM(k_main_menu) && n < cap; i++) k[n++] = k_main_menu[i].tex;
     for (int i = 0; i < NELEM(k_opt_main) && n < cap; i++) k[n++] = k_opt_main[i].tex;
+    for (int i = 0; i < NELEM(k_profile_menu) && n < cap; i++) k[n++] = k_profile_menu[i].tex;
+    for (int i = 1; i < NELEM(k_start_career) && n < cap; i++) k[n++] = k_start_career[i].tex;
+    for (int i = 0; i < NELEM(k_crib) && n < cap; i++) k[n++] = k_crib[i].tex;
+    if (n < cap) k[n++] = 0xda665928u;   /* the crib car select's open slot */
+    static const uint32_t crw_icons[] = { 0xff293517u, 0x597df2a7u, 0x0878ffdfu };   /* reward options: magazines, DVDs, sponsors */
+    for (int i = 0; i < NELEM(crw_icons) && n < cap; i++) k[n++] = crw_icons[i];
+    static const uint32_t uq_icons[] = { 0x945e9bc5u, 0x74ce8c0bu,   /* UniquesBrowser: the slots' (8016ce1c) */
+        0xea57d2c4u, 0x01a29ffau, 0x9701bde4u, 0xc15c94e6u, 0x06ef789cu, 0x178475e7u, 0xbaa23a28u, 0x502abeedu, 0x06e8e477u };
+    for (int i = 0; i < NELEM(uq_icons) && n < cap; i++) k[n++] = uq_icons[i];
+    static const char *const decal_icon[] = {   /* DECAL_ICON_<sponsor> (GLOBALB), the signed sponsors' icons */
+        "ALPINE", "BILSTEIN", "BREMBO", "BRIDE", "EDELBROCK", "ENKEI", "EUROLITE", "GREDDY", "KENWOOD", "KONIG",
+        "NEUSPEED", "NITROUS_EXPR", "NITROUS_EXPRESS", "NOS", "OZ_WHEELS", "PIAA", "PLASMAGLOW", "SPARCO", "STILLEN",
+        "STREETGLOW", "TOYO", "YOKOHAMA" };
+    for (int i = 0; i < NELEM(decal_icon) && n < cap; i++) {
+        char di[40]; snprintf(di, sizeof di, "DECAL_ICON_%s", decal_icon[i]);
+        k[n++] = feng_tex_key(di);
+    }
+    static const char *const brand_icon[] = {   /* DECAL_ICON_<brand>: the perf parts' brands (GLOBALB 0x34a14) */
+        "EUROLITE", "TURBONETICS", "HPRACING", "STILLEN", "NITROUS_EXPRESS", "WILWOOD", "AROSPEED", "JACKSON", "DC",
+        "ACT", "AEM", "HKS", "KVR", "NOS", "APEX", "KONI", "TOYO", "APEXI", "BORLA", "HANDR", "INJEN", "KUMHO",
+        "NFSU2", "NIZMO", "VENOM", "NEUSPEED", "BILSTEIN", "YOKOHAMA", "5ZIGEN", "BREMBO", "EIBACH", "GREDDY",
+        "CLUTCHMASTERS", "SKUNK2", "SPARCO" };
+    for (int i = 0; i < NELEM(brand_icon) && n < cap; i++) {
+        char di[40]; snprintf(di, sizeof di, "DECAL_ICON_%s", brand_icon[i]);
+        k[n++] = feng_tex_key(di);
+    }
     for (int i = 0; i < NELEM(k_paint_cat) && n < cap; i++) k[n++] = k_paint_cat[i].tex;
     for (int i = 0; i < NELEM(k_perf_pkg) && n < cap; i++) k[n++] = k_perf_pkg[i].tex;
     for (int i = 0; i < N_VCAT && n < cap; i++) k[n++] = k_vinyl_cat[i].tex;
@@ -1135,7 +1572,7 @@ static int build_cache(const char *dataroot) {
     FILE *f = fopen(SHOP_CACHE, "wb");
     int ok = 0;
     if (f) {
-        fwrite("OUSHOP01", 1, 8, f);
+        fwrite("OUSHOP02", 1, 8, f);
         put32(f, PK_COUNT);
         for (int i = 0; i < PK_COUNT; i++) {
             put32(f, 0x00030203u); put32(f, (uint32_t)pkl[i]);
@@ -1158,6 +1595,10 @@ static int build_cache(const char *dataroot) {
     return ok;
 }
 
+/* the PC converter writes the cache ahead of the first shop (converter/) */
+const char *shop_cache_file(void) { return SHOP_CACHE; }
+int shop_build_cache(const char *dataroot) { return build_cache(dataroot); }
+
 /* ------------------------------------------------------------ cache load */
 
 static GLuint upload_rgba(int w, int h, const unsigned char *px) {
@@ -1178,10 +1619,31 @@ static const ShopTex *tex_find(const Shop *s, uint32_t key) {
     return NULL;
 }
 
+/* The PC packages park the console help bar (the "Help" prompt
+   $JOY_EVENT_FENG_HELP$ and the screen's own prompts, with the bottom box
+   they sit on) below the 480-high screen, y 285..305, for its mouse bar;
+   the console screens have it at y 205 (UI_Main, the Car Shop). Every top
+   level group or string down there moves up to 205 with what hangs off
+   it. */
+static void help_bar_lift(FengPackage *pk) {
+    int hi = -1;
+    for (int i = 0; i < pk->nobj && hi < 0; i++)
+        if (pk->obj[i].type == FENG_STRING && !strcmp(pk->obj[i].text, "$JOY_EVENT_FENG_HELP$")) hi = i;
+    if (hi < 0 || pk->obj[hi].ay <= 240.0f) return;
+    float dy = 205.0f - pk->obj[hi].ay;
+    for (int r = 0; r < pk->nobj; r++) {
+        FengObj *g = &pk->obj[r];
+        if (g->parent >= 0 || g->ay <= 240.0f || g->ay >= 340.0f || g->type == FENG_IMAGE) continue;   /* not the parked icon pools */
+        g->pos[1] += dy;
+        float y; memcpy(&y, &g->data[8], 4); y += dy; memcpy(&g->data[8], &y, 4);
+        for (int i = 0; i < pk->nobj; i++) if (pk->obj[i].root == r) pk->obj[i].ay += dy;
+    }
+}
+
 static int load_cache(Shop *s) {
     long len = 0;
     unsigned char *d = n2_read_file(SHOP_CACHE, &len);
-    if (!d || len < 16 || memcmp(d, "OUSHOP01", 8)) { free(d); return 0; }
+    if (!d || len < 16 || memcmp(d, "OUSHOP02", 8)) { free(d); return 0; }
     long o = 8;
     uint32_t npk = n2_u32(d + o); o += 4;
     long bun = o;
@@ -1192,6 +1654,7 @@ static int load_cache(Shop *s) {
         if (s->pk[i] && !feng_load_package(d + bun, bunlen, k_pk_name[i], s->pk[i])) {
             free(s->pk[i]); s->pk[i] = NULL;
         }
+        if (s->pk[i]) help_bar_lift(s->pk[i]);
     }
     uint32_t nt = o + 4 <= len ? n2_u32(d + o) : 0; o += 4;
     s->tex = (ShopTex *)calloc(nt ? nt : 1, sizeof *s->tex);
@@ -1287,8 +1750,36 @@ static void anim_fadein(FengAnim *a) {
 enum { DA_NONE, DA_PAINT_ADD, DA_PART, DA_RIM, DA_PERF_PKG, DA_PERF_STOCK, DA_PERF_PART, DA_CTL_RESET,
        DA_VINYL_ADD, DA_VINYL_CHANGE, DA_VINYL_REMOVE, DA_VINYL_UNIQUE,
        DA_DECAL_LAYOUT, DA_DECAL_ADD, DA_DECAL_REMOVE, DA_DECAL_CLEAR, DA_TINT, DA_BULB, DA_CF_TRUNK, DA_CF_KIT, DA_NEON,
-       DA_HUD, DA_SPEC, DA_GFX_INSTALL, DA_GFX_LEAVE, DA_GFX_DISCARD, DA_GFX_CANCEL };
+       DA_HUD, DA_SPEC, DA_GFX_INSTALL, DA_GFX_LEAVE, DA_GFX_DISCARD, DA_GFX_CANCEL, DA_OPT_LEAVE,
+       DA_LOT_BUY, DA_LOT_TRADE, DA_LOT_BROWSE, DA_LOT_EXIT,
+       DA_CRIB_PLAY, DA_CRIB_MAIN, DA_CRIB_TEST, DA_CRIB_SWITCH,
+       DA_PART_BUY, DA_RIM_BUY, DA_SHOP_LEAVE, DA_PERF_PKG_BUY, DA_PERF_PART_BUY, DA_GEN_BUY,
+       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
 static void dlg_act(Shop *s, int act);
+static void dialog(Shop *s, int pk, int nbtn, uint32_t msg, int act, uint32_t b1, uint32_t b2);
+/* PartSelectionScreen 801615f8 in the career: a part to buy -- too little
+   cash 0xd1ac60be (SMALL), else "purchase this part?" 0x44b7167f whose yes
+   (0x9f00f07) buys it and runs the install (after). 0: not to buy. */
+static int setup_part_cost(const Shop *s, int slot, uint32_t hash);
+static int gfx_setup_price(const Shop *s);
+/* the paint setup's buys (ChoosePaintScreen 80177658, DoVinylsButtonPress
+   80163710, ChooseDecalScreen 801685cc): in the career a part whose price
+   with the setup's total is more than the wallet is "insufficient funds"
+   (0xd1ac60be); nothing is charged until Purchase Setup */
+static int setup_short(Shop *s, int price) {
+    if (!s->career || g_career.cash >= price + gfx_setup_price(s)) return 0;
+    dialog(s, PK_DLG_S, 1, 0xd1ac60beu, DA_NONE, 0, 0);
+    return 1;
+}
+static int career_gate(Shop *s, const ShopPart *q, int pkg, int after) {
+    if (!part_to_buy(s, q)) return 0;
+    if (g_career.cash < q->price) dialog(s, PK_DLG_S, 1, 0xd1ac60beu, DA_NONE, 0, 0);
+    else { s->buy_after = after; dialog(s, pkg, 2, 0x44b7167fu, DA_GEN_BUY, 0, 0); }
+    return 1;
+}
+static void lot_dlg(Shop *s, int act);
+static void mc_enter(Shop *s, int flags, int ret);
+static void opt_leave(Shop *s);
 
 static int dlg_open(const Shop *s) { return s->dlg_pk >= 0; }
 static void dlg_focus(Shop *s) {
@@ -1306,9 +1797,12 @@ static void dlg_focus(Shop *s) {
 }
 /* pk: PK_DLG_S / _M / _L, or DLG_AUTO; nbtn 2: Yes / No (b1 / b2 when
    given), 1: OK; act: what the first button does */
+static void dialog_text(Shop *s, int pk, int nbtn, const char *t, int act, uint32_t b1, uint32_t b2);
 static void dialog(Shop *s, int pk, int nbtn, uint32_t msg, int act, uint32_t b1, uint32_t b2) {
-    const char *t = str_get(s, msg);
-    snprintf(s->dlg_text, sizeof s->dlg_text, "%s", t);
+    dialog_text(s, pk, nbtn, str_get(s, msg), act, b1, b2);
+}
+static void dialog_text(Shop *s, int pk, int nbtn, const char *t, int act, uint32_t b1, uint32_t b2) {
+    if (t != s->dlg_text) snprintf(s->dlg_text, sizeof s->dlg_text, "%s", t);
     if (pk == DLG_AUTO) {
         float m = (float)strlen(s->dlg_text) * 32.0f;
         pk = m < 2561.0f ? PK_DLG_S : m < 5122.0f ? PK_DLG_M : PK_DLG_L;
@@ -1320,7 +1814,7 @@ static void dialog(Shop *s, int pk, int nbtn, uint32_t msg, int act, uint32_t b1
     const FengPackage *p = s->pk[pk];
     feng_anim_init(a, p);
     anim_fadein(a);
-    s->dlg_pk = pk; s->dlg_nbtn = nbtn; s->dlg_act = act; s->dlg_act2 = DA_NONE;
+    s->dlg_pk = pk; s->dlg_nbtn = nbtn; s->dlg_act = act; s->dlg_act2 = DA_NONE; s->dlg_back = DA_NONE;
     s->dlg_b1 = nbtn == 1 ? STR_OK : b1 ? b1 : STR_YES; s->dlg_b2 = b2 ? b2 : STR_NO;
     s->dlg_sel = 1;
     int o;
@@ -1348,11 +1842,12 @@ static void dlg_input(Shop *s, int key) {
     } else if (key == SHOP_KEY_OK || key == SHOP_KEY_BACK || key == SHOP_KEY_TRI) {
         int yes = key == SHOP_KEY_OK && s->dlg_nbtn == 2 && s->dlg_sel == 0;
         audio_fe_play(key == SHOP_KEY_OK ? FE_SND_SELECT : FE_SND_BACK);
-        int act = s->dlg_act;
+        int act = s->dlg_act, act2 = s->dlg_act2, back = s->dlg_back;
         s->dlg_pk = -1;
         printf("shop: dialog answered %s\n", s->dlg_nbtn == 1 ? "OK" : yes ? "yes" : "no");
         if (yes) dlg_act(s, act);
-        else if (key == SHOP_KEY_OK && s->dlg_nbtn == 2 && s->dlg_act2) dlg_act(s, s->dlg_act2);
+        else if (key == SHOP_KEY_OK && s->dlg_nbtn == 2 && act2) dlg_act(s, act2);
+        else if (key != SHOP_KEY_OK && back) dlg_act(s, back);
     }
 }
 
@@ -1382,9 +1877,13 @@ static void prepare_package(Shop *s, int p) {
         if (p == PK_LOADING && o->hash >= 0x50d98304u && o->hash <= 0x50d98308u) {
             c[3] = 1.0f; memcpy(s->rgba[p][i], c, sizeof c);
         }
+        if (p == PK_MAG_VIEW && o->hash == 0xd1cc9c37u) hidden = 0;   /* MagImage: FEngSetVisible once loaded */
         if (hidden || c[3] <= 0.0f) continue;
-        /* pools and templates the code clones sit far off screen */
-        if (fabsf(o->ax) > 330.0f || fabsf(o->ay) > 250.0f) continue;
+        /* pools and templates the code clones sit far off screen; the cover
+           screens' U2_magazine_texture masks are centred off it but reach in */
+        if (p == PK_MAG_VIEW || p == PK_MAG_REWARD || p == PK_MAG_BACK) {
+            if (fabsf(o->ax) - fabsf(o->size[0]) * 0.5f > 320.0f || fabsf(o->ay) - fabsf(o->size[1]) * 0.5f > 240.0f) continue;
+        } else if (fabsf(o->ax) > 330.0f || fabsf(o->ay) > 250.0f) continue;
         int k = s->ndraw[p]++;
         while (k > 0 && pk->obj[s->draw[p][k - 1]].az < o->az) { s->draw[p][k] = s->draw[p][k - 1]; k--; }
         s->draw[p][k] = (short)i;
@@ -1466,7 +1965,7 @@ static int load_cache_loading(Shop *s) {
     unsigned char h[12];
     int ok = 0;
     unsigned char *bun = NULL;
-    if (fread(h, 1, 12, f) == 12 && !memcmp(h, "OUSHOP01", 8)) {
+    if (fread(h, 1, 12, f) == 12 && !memcmp(h, "OUSHOP02", 8)) {
         uint32_t npk = n2_u32(h + 8);
         long at = 12, bunlen = 0;
         for (uint32_t i = 0; i < npk; i++) {   /* the packages' extent */
@@ -1558,10 +2057,16 @@ void shop_close(Shop **sp) {
                        glDeleteTextures(6, (*sp)->chud_tex); memset((*sp)->chud_tex, 0, sizeof (*sp)->chud_tex);
                        free((*sp)->perf_anim); (*sp)->perf_anim = NULL;
                        free((*sp)->buy_anim); (*sp)->buy_anim = NULL;
-                       free((*sp)->dlg_anim); (*sp)->dlg_anim = NULL; }
+                       free((*sp)->dlg_anim); (*sp)->dlg_anim = NULL;
+                       free((*sp)->mc_anim); (*sp)->mc_anim = NULL;
+                       free((*sp)->mcl_anim); (*sp)->mcl_anim = NULL;
+                       free((*sp)->kb_anim); (*sp)->kb_anim = NULL;
+                       movie_stop(*sp); }
     if (!sp || !*sp) return;
     Shop *s = *sp;
     for (int i = 0; i < s->ntex; i++) if (s->tex[i].tex) glDeleteTextures(1, &s->tex[i].tex);
+    glDeleteTextures(4, s->mag_tex);
+    if (s->mview_tex) glDeleteTextures(1, &s->mview_tex);
     for (int f = 0; f < s->nfont; f++) if (s->font[f].tex) glDeleteTextures(1, &s->font[f].tex);
     if (s->qb_vbo) glDeleteBuffers(1, &s->qb_vbo);
     if (s->qb_nbo) glDeleteBuffers(1, &s->qb_nbo);
@@ -1654,6 +2159,14 @@ void shop_main_menu(Shop *s) {
     s->screen = SC_MAIN;                        /* no title screen */
 }
 
+static void qr_enter_cars(Shop *s);
+void shop_customize_cars(Shop *s) {
+    if (!s) return;
+    s->main.sel = 4; s->main.scroll = 4.0f;     /* Customize, for Back */
+    s->qr_cust = 1;
+    qr_enter_cars(s);
+}
+
 void shop_preview_result(Shop *s, const N2CarConfig *shown) {
     if (!s || !shown) return;
     s->preview = *shown;
@@ -1669,18 +2182,122 @@ static void parts_cursor(Shop *s, int step) {
     const ShopPart *q = &s->parts[s->part_sel];
     int slot = group_slot(s->part_group);
     N2CarConfig next = s->fitted;
-    if (slot >= 0 && q->available) next.parts[slot] = q->value;
-    if (slot == N2_PART_HOOD && q->available)   /* a carbon hood is the same hood, carbon */
-        next.carbon = s->cf_mode ? next.carbon | 1u : next.carbon & ~1u;
+    if (slot >= 0 && q->available) body_put(&next, slot, q->value, s->cf_mode);
     printf("shop: cursor on %s (value %d%s)\n", q->name, q->value, q->available ? "" : ", not fitted");
     if (memcmp(&next, &s->preview, sizeof next)) { s->preview = next; request_preview(s); }
 }
 
+/* IsCarbonPartConverterAvailable 801711f4: slot 0x5d -> entity 0x55, 0x60 ->
+   0x56, level 3, with GetPartUnlockFilter (2 in the crib: never) */
+static int cf_converter_ok(const Shop *s, int slot) {
+    return (!s->career || (s->career & 4)) && calc_unlocked(s, slot == G_CF_KIT ? 0x55 : 0x56, 3);
+}
+/* GetPartsList's count of one Body Shop group (build_parts, carbon or not) */
+static int body_count(Shop *s, int group, int carbon) {
+    int cf = s->cf_mode;
+    s->cf_mode = carbon;
+    build_parts(s, group);
+    s->cf_mode = cf;
+    int n = s->nparts;
+    s->nparts = 0; s->part_sel = 0; s->part_group = -1;
+    return n;
+}
+/* the four carbon categories (AddCategory with its carbon flag: locked when
+   GetPartsList finds none) and the converters (IsCarbonPartConverterAvailable) */
+static void cf_locks(Shop *s, unsigned char lk[6]) {
+    static const int g[4] = { G_HOOD, G_SPOILER, G_ROOF, G_LEFT_MIRROR };
+    for (int i = 0; i < 4; i++) lk[i] = body_count(s, g[i], 1) <= 0;
+    lk[4] = !cf_converter_ok(s, G_CF_TRUNK);
+    lk[5] = !cf_converter_ok(s, G_CF_KIT);
+}
+/* PartsCategoryRimsIsLocked 8015ea90 / 0x539c20: outside the crib open with
+   two available slot 0x1d parts -- the car's stock rim and one WHEELS rim.
+   In the crib (filter 2) it returns AreAnyRimsOwnedInCareerMode 8012fc0c
+   (AnyOwned(0x1d) = the rims region, rims and spinners; PC: car +0x5a0 != 0)
+   as is: the category is LOCKED once the car owns a rim (GC and PC agree) */
+static int rims_locked(Shop *s) {
+    int model = db_model(s, "WHEELS");
+    if (s->career == 2) return career_any_owned(slot_ent(0x1d)) || career_any_owned(0x21);
+    if (!s->db || model < 0) return 0;
+    int rim_outer = g_shop_rec_ok ? (signed char)g_shop_rec[0xdc] : 0;
+    for (long p = s->db_parts; p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
+        const unsigned char *rec = s->db + p;
+        uint32_t hash = n2_u32(rec);
+        unsigned soff = rec[8] | rec[9] << 8, aoff = rec[10] | rec[11] << 8;
+        if (!hash && !soff) break;
+        if (rec[7] != model || rec[4] != G_WHEEL || db_has_attr(s, aoff, 0xF7934316u)) continue;
+        if (rim_outer) {
+            int st, in, out;
+            const char *fold = NULL;
+            for (int k = 0; k < s->nrb && !fold; k++)
+                if (s->rb[k].folder && rim_part_parse(s->rb[k].folder, hash, &st, &in, &out)) fold = s->rb[k].folder;
+            if (!fold || out != rim_outer) continue;
+        }
+        if (part_open(s, 13, (rec[5] >> 5) & 7, hash)) return 0;
+    }
+    return 1;
+}
+/* SetupBodyShop: AddCategory locks a category when GetPartsList has at most
+   the stock part; Rims / Carbon Fiber by their own tests */
+static void body_locks(Shop *s) {
+    for (int i = 0; i < N_BODY; i++) {
+        int g = k_body_shop[i].group;
+        s->body.locked[i] = group_slot(g) < 0 && g != G_WHEEL && g != G_CARBON;   /* set_locks */
+        if (s->body.locked[i]) continue;
+        if (g == G_WHEEL) s->body.locked[i] = rims_locked(s);
+        else if (g == G_CARBON) {   /* PartsCategoryCarbonIsLocked 8015ec10 */
+            unsigned char lk[6]; cf_locks(s, lk);
+            s->body.locked[i] = lk[0] && lk[1] && lk[2] && lk[3] && lk[4] && lk[5];
+        } else s->body.locked[i] = body_count(s, g, 0) <= 1;
+    }
+}
 static void open_parts(Shop *s) {
     int g = k_body_shop[s->body.sel].group;
     s->cf_mode = 0;
     build_parts(s, g);
     s->screen = SC_PARTS;
+}
+static int spec_locked(Shop *s, int slot);
+static int neon_all_locked(Shop *s);
+/* the Car Shop's categories (UI_ChooseCustomizeCategory's next screens) */
+static void car_shop_open(Shop *s, int cat) {
+    static const int to[CAT_COUNT] = { SC_BODY, SC_PERFORMANCE, SC_GRAPHICS, SC_SPECIALTIES };
+    s->screen = to[cat];
+    if (s->screen == SC_BODY) body_locks(s);
+    if (s->screen == SC_PERFORMANCE) {
+        if (s->career && s->cust_entry == 0) scroller_set(&s->cat, k_perf_shop_career, NELEM(k_perf_shop_career));
+        else scroller_set(&s->cat, k_perf_shop, NELEM(k_perf_shop));
+    }
+    if (s->screen == SC_GRAPHICS) {
+        /* Setup__23ChoosePaintShopCategory 801765e0: career "Purchase Setup" */
+        scroller_set(&s->cat, s->career ? k_graphics_shop_career : k_graphics_shop, NELEM(k_graphics_shop));
+        s->gfx_base = s->fitted;
+    }
+    if (s->screen == SC_SPECIALTIES) {
+        scroller_set(&s->cat, k_special_shop, NELEM(k_special_shop));
+        for (int i = 0; i < s->cat.n; i++)   /* Setup__18IceSelectionScreen: IceCategoryIsLocked each, Neon IsNeonCompletelyLocked */
+            s->cat.locked[i] = s->cat.e[i].group == 0x9e ? neon_all_locked(s) : spec_locked(s, s->cat.e[i].group);
+        char lk[64] = ""; int o = 0;
+        for (int i = 0; i < s->cat.n && o < 56; i++) o += snprintf(lk + o, sizeof lk - o, " %x%s", s->cat.e[i].group, s->cat.locked[i] ? "L" : "");
+        printf("shop: specialties locks%s\n", lk);
+    }
+}
+/* BACK on a shop's category screen: the Car Shop, or in a city shop (entry 0:
+   CalcPrevScreen gives "") "Are you sure you wish to exit back to Explore
+   Mode?" (0xd76e0b5a, Yes 0xd05fc3a3 / No 0x1fab5998) */
+static void cust_up(Shop *s) {
+    if (s->career && !s->cust_entry) dialog(s, DLG_AUTO, 2, 0xd76e0b5au, DA_SHOP_LEAVE, STR_YES, STR_NO);
+    else s->screen = SC_CAR_SHOP;
+}
+/* the rim browser's accept (0x567a50 / 0x55fb00): fitted -> "already
+   installed", in the career not enough cash / buy, else install */
+static void rim_accept(Shop *s) {
+    const ShopPart *q = rim_cur(s);
+    if (!strcmp(s->prev_folder, s->rim_folder) && s->prev_style == s->rim_style)
+        dialog(s, PK_DLG_S, 1, 0xda15d7e5u, DA_NONE, 0, 0);
+    else if (part_to_buy(s, q) && g_career.cash < q->price) dialog(s, PK_DLG_S, 1, 0xd1ac60beu, DA_NONE, 0, 0);
+    else if (part_to_buy(s, q)) dialog(s, PK_DLG_S, 2, 0x44b7167fu, DA_RIM_BUY, 0, 0);
+    else dialog(s, PK_DLG_S, 2, 0xf5ac2b2au, DA_RIM, 0, 0);
 }
 
 /* ---------------------------------------------------------------- carbon fibre */
@@ -1702,6 +2319,7 @@ static void cf_menu(Shop *s, int keep) {
     s->cfm_e[5] = (s->fitted.carbon & 2) ? (ShopEntry){ 0xe170f115u, 0x2bdb0653u, G_CF_KIT }
                                          : (ShopEntry){ 0xb229fa7eu, 0x246de0cbu, G_CF_KIT };
     scroller_set(&s->cfm, s->cfm_e, 6);
+    cf_locks(s, s->cfm.locked);
     s->cfm.sel = sel;
     s->screen = SC_CARBON;
 }
@@ -1726,7 +2344,7 @@ static int cf_kit_blocked(const Shop *s) {
 static void cf_input(Shop *s, int key) {
     if (key == SHOP_KEY_LEFT) scroller_move(&s->cfm, -1);
     else if (key == SHOP_KEY_RIGHT) scroller_move(&s->cfm, 1);
-    else if (key == SHOP_KEY_OK) {
+    else if (key == SHOP_KEY_OK && !s->cfm.locked[s->cfm.sel]) {
         int g = s->cfm.e[s->cfm.sel].group;
         if (g == G_CF_TRUNK)
             dialog(s, DLG_AUTO, 2, (s->fitted.carbon & 4) ? 0xa645a29eu : 0x2b950c36u, DA_CF_TRUNK, 0, 0);
@@ -1810,20 +2428,28 @@ static void qr_map_request(Shop *s) {
     s->map_want = ev; s->map_wait = 0.3f;      /* shown once the cursor rests (0x4cdd40) */
 }
 
-/* 0x4cded0: the mode's tracks in database order (locked ones would follow;
-   the port is unlock-all, 0x838464) */
+/* 0x4cded0: the mode's tracks in database order, the locked ones after
+   (AddTrack 0x4b4c10: UnlockSystem::IsTrackUnlocked(1, race) 0x5156f0 ->
+   IsTrackUnlockedForQuickRace; the sort 0x4987a0) with the lock icon
+   (CalcIconHash 0x4984b0: f05704ac); a saved pick that is locked falls back
+   to the first track. Accept on a locked one does nothing (800e4b5c). */
 static void qr_build_tracks(Shop *s) {
-    int t = s->qr_type, bit = qr_bit(t), n = 0, sel = 0;
-    for (int i = 0; i < s->ntrk && n < QR_MAX_TRACKS; i++) {
-        const unsigned char *r = s->trk + (long)i * 0x128;
-        if (r[0x88] || !(n2_u32(r + 0x94) & (1u << bit))) continue;
-        s->qr_track_rec[n] = (short)i;
-        s->qr_track_e[n].str = 0;
-        s->qr_track_e[n].tex = qr_track_icon(t, r);
-        s->qr_track_e[n].group = rec_ev(r);
-        if (rec_ev(r) == s->set[t].ev) sel = n;
-        n++;
-    }
+    int t = s->qr_type, bit = qr_bit(t), n = 0, sel = -1;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < s->ntrk && n < QR_MAX_TRACKS; i++) {
+            const unsigned char *r = s->trk + (long)i * 0x128;
+            if (r[0x88] || !(n2_u32(r + 0x94) & (1u << bit))) continue;
+            int locked = !career_qr_track_unlocked(rec_ev(r));
+            if (locked != pass) continue;
+            s->qr_track_rec[n] = (short)i;
+            s->qr_track_lock[n] = (unsigned char)locked;
+            s->qr_track_e[n].str = 0;
+            s->qr_track_e[n].tex = locked ? 0xf05704acu : qr_track_icon(t, r);
+            s->qr_track_e[n].group = rec_ev(r);
+            if (rec_ev(r) == s->set[t].ev && !locked) sel = n;
+            n++;
+        }
+    if (sel < 0) sel = 0;
     scroller_set(&s->qr_track, s->qr_track_e, n);
     s->qr_track.sel = sel; s->qr_track.scroll = (float)sel;
     s->set[t].ev = n ? s->qr_track_e[sel].group : 0;      /* 0 = the first entry */
@@ -2025,14 +2651,14 @@ static void opt_row_change(int r, int step) {
     case OR_CAREER_DIFF: g_opt.career_diff = wrapi(g_opt.career_diff + step, 0, 2); break;
     case OR_EXPLORE_MAP: g_opt.explore_map = (unsigned char)wrapi(g_opt.explore_map + step, 0, 2); break;
     case OR_RACE_MAP: g_opt.race_map = (unsigned char)wrapi(g_opt.race_map + step, 0, 2); break;
-    case OR_SAVE:       /* 0x49b170 (the memory card check 0x502fe0 always passes) */
+    case OR_SAVE:       /* 0x49b170: Autosave only for a named profile (0x502fe0) */
         if (step > 0) {
             if (g_opt.autosave) { g_opt.save_on = 1; g_opt.autosave = 0; }
             else if (g_opt.save_on) g_opt.save_on = 0;
-            else { g_opt.save_on = 1; g_opt.autosave = 1; }
+            else { g_opt.save_on = 1; g_opt.autosave = (unsigned char)profile_named(); }
         } else {
             if (g_opt.autosave) { g_opt.save_on = 0; g_opt.autosave = 0; }
-            else if (g_opt.save_on) g_opt.autosave = 1;
+            else if (g_opt.save_on) { g_opt.autosave = (unsigned char)profile_named(); g_opt.save_on = g_opt.autosave; }
             else g_opt.save_on = 1;
         }
         break;
@@ -2223,9 +2849,16 @@ static void opt_layout(Shop *s) {
 }
 
 /* 0x4cf750 / 0x4b8470: the title, and the objects the category hides */
+/* a category opening: the profile as it is (AllocBackupDB 0x52a460) and
+   the save settings, for the questions on the way out */
+static void opt_mark(Shop *s) {
+    profile_snapshot();
+    s->opt_save0 = g_opt.save_on; s->opt_auto0 = g_opt.autosave;
+}
 static void opt_enter(Shop *s, int cat) {
     const FengPackage *pk = s->pk[PK_OPTIONS];
     s->opt_cat = cat;
+    opt_mark(s);
     opt_build_rows(s);
     s->screen = SC_OPT;
     if (!pk) return;
@@ -2373,6 +3006,7 @@ static void ctl_scripts(Shop *s, int restart) {
 static void ctl_enter(Shop *s) {
     const FengPackage *pk = s->pk[PK_CTL];
     s->screen = SC_CTL;
+    opt_mark(s);
     s->ctl_sel = 0; s->ctl_col = 0; s->ctl_top = 0; s->ctl_cap = 0;
     s->ctl_instr = STR_CTL_CONFIG;
     if (!pk) return;
@@ -2428,8 +3062,7 @@ static void ctl_input(Shop *s, int key) {
         dialog(s, PK_DLG_S, 2, 0x2bbcca6bu, DA_CTL_RESET, STR_OK, STR_CANCEL);
         return;
     } else if (key == SHOP_KEY_BACK) {
-        options_save();
-        s->screen = SC_OPT_MAIN;
+        opt_leave(s);
         return;
     } else return;
     ctl_layout(s);
@@ -2483,6 +3116,7 @@ static void juke_scripts(Shop *s, int restart) {
 static void juke_enter(Shop *s) {
     const FengPackage *pk = s->pk[PK_JUKE];
     s->screen = SC_JUKE;
+    opt_mark(s);
     s->juke_sel = 0; s->juke_top = 0; s->juke_grab = 0;
     if (!g_opt.playlist_set) music_default_playlist(g_opt.pl_song, g_opt.pl_mode);
     if (!pk) return;
@@ -2568,8 +3202,7 @@ static void juke_input(Shop *s, int key) {
            music carries on (0x480c30(-1): already in state 1) */
         if (s->juke_grab) { s->juke_grab = 0; juke_grab_script(s, s->juke_sel - s->juke_top, 0); }
         juke_apply();
-        options_save();
-        s->screen = SC_OPT_MAIN;
+        opt_leave(s);
     }
 }
 
@@ -2649,7 +3282,7 @@ static const unsigned char *db_part(const Shop *s, uint32_t hash) {
    their slot (spoiler 0xc, exhaust 0x10, rims 0x1d, roof 7, mirrors 0x20),
    not carbon fibre; spinners also a rim that takes them (0x931ff82e) */
 static int paint_can(const Shop *s, int slot) {
-    PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit);
+    PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit); memcpy(pp.junk, s->fitted.junk, sizeof pp.junk);
     if (slot >= 0x4d && slot < 0x5d) return 1;   /* a vinyl's colours */
     switch (slot) {
     case 0x3f: return 1;
@@ -2695,6 +3328,25 @@ static void paint_preview(Shop *s) {
     request_preview(s);
 }
 
+/* IsPaintAvailable 80179654: the swatch's BRAND picks the unlockable
+   entity (gloss 0x25 by default); VINYL_PAINT is always there. The filter is
+   4 in a career shop (CalculateIfUnlocked), 2 in the crib (nothing), 1 outside
+   the career (QuickRaceUnlocker -> filter 4 again) */
+static int paint_avail(const Shop *s, uint32_t brand, int lvl) {
+    int ent;
+    switch (brand) {
+    case 0x3e871f1u: return 1;
+    case 0x3437a52u: ent = 0x26; break;
+    case 0x16bdceu:  ent = 0x28; break;
+    case 0xda27u:    ent = 0x4d; break;
+    case 0x3797533u: ent = 0x27; break;
+    case 0x66350f0u: ent = 0x4e; break;
+    case 0xd6640dffu: ent = 0x4f; break;
+    default:         ent = 0x25; break;
+    }
+    return (!s->career || (s->career & 4)) && calc_unlocked(s, ent, lvl);
+}
+
 /* 0x548630: the swatches of the category's brand, in database order */
 static void paint_build(Shop *s) {
     const FengPackage *pk = s->pk[PK_PAINT];
@@ -2713,6 +3365,7 @@ static void paint_build(Shop *s) {
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
         if (r[4] != pgroup || !db_attr(s, aoff, 0xebb03e66u, &br) || br != s->paint_brand) continue;
+        if (!paint_avail(s, br, r[5] >> 5)) continue;   /* BuildPaintList: IsPaintAvailable 80179654 */
         int o = pk ? paint_swatch_obj(s, s->paint_n + 1) : -1;
         if (o < 0) break;
         if (hash == inst) s->paint_sel = s->paint_n;
@@ -2745,9 +3398,11 @@ static void paint_strip_update(Shop *s) {
     int slot = paint_slot(s), base = slot == 0x3f || slot == 0x45 || slot == 0x4b || slot == 0x4c, o;
     if ((o = feng_find(pk, 0x9de5ba07u)) >= 0) feng_anim_hide(a, o, !base);
     if ((o = feng_find(pk, 0x7a1ff30du)) >= 0) feng_anim_hide(a, o, !base);
-    /* Customize, not the career: no cost (0x545460) */
-    if ((o = feng_find(pk, 0x9ff84a88u)) >= 0) { feng_anim_hide(a, o, 1); feng_anim_set(a, o, feng_hash_upper("HIDE"), 1); }
-    if ((o = feng_find(pk, 0x0013c45eu)) >= 0) feng_anim_hide(a, o, 1);   /* the colour's price: career only (0x55d0d0) */
+    /* Customize, not the career: no cost (0x545460); the career shows the
+       setup's Total Cost and, browsing, the colour's price (0x55d0d0) */
+    int car = s->career != 0;
+    if ((o = feng_find(pk, 0x9ff84a88u)) >= 0) { feng_anim_hide(a, o, !car); feng_anim_set(a, o, feng_hash_upper(car ? "SHOW" : "HIDE"), 1); }
+    if ((o = feng_find(pk, 0x0013c45eu)) >= 0) feng_anim_hide(a, o, !car || s->vmode >= 0);
 }
 
 static void paint_enter_with(Shop *s, const ShopEntry *e, int n, int vmode) {
@@ -2907,6 +3562,7 @@ static void paint_input(Shop *s, int key) {
     } else if (key == SHOP_KEY_OK) {
         /* 0x55d410: "Add this paint to your current selection?" */
         if (!s->paint_n) return;
+        if (s->vmode < 0 && setup_short(s, setup_part_cost(s, paint_slot(s), s->paint_hash[s->paint_sel]))) return;
         /* a vinyl's: "Choose this vinyl color?" */
         dialog(s, PK_DLG_S, 2, s->vmode >= 0 ? 0x2a2c6aefu : 0xc4c5d271u, DA_PAINT_ADD, 0, 0);
     } else if (key == SHOP_KEY_BACK) {
@@ -3000,8 +3656,12 @@ static void vcat_enter(Shop *s) {
     scroller_set(&s->vcat, s->vcat_e, N_VCAT);
     int first = -1;
     for (int i = 0; i < N_VCAT; i++) {
-        int n = 0;
-        for (int k = 0; k < vinyl_count() && !n; k++) n = vinyl_at(k)->group == k_vinyl_cat[i].group;
+        int n = 0, row = vinyl_price_row(k_vinyl_cat[i].group);   /* AddVinylCategory 80163ec4: locked if */
+        for (int k = 0; k < vinyl_count() && !n; k++) {           /* GetPartsList finds no available vinyl */
+            const VinylPart *v = vinyl_at(k);
+            n = v->group == k_vinyl_cat[i].group &&
+                part_open(s, row < 96 ? row : 0, v->level, own_key(0x40, v->hash));
+        }
         s->vcat.locked[i] = !n;
         if (n && first < 0) first = i;
     }
@@ -3042,8 +3702,8 @@ static void vlist_build(Shop *s) {
         snprintf(q->name, sizeof q->name, "%s", nm[0] ? nm : v->name);
         q->value = i; q->hash = v->hash; q->available = 1;
         q->level = v->level;
-        q->price = v->level >= 1 && v->level <= 3 && row < 96 ? s->price[row][v->level - 1] : 0;
-        if (q->price < 0) q->price = 0;
+        part_cost(s, q, row < 96 ? row : 0, v->level, own_key(0x40, v->hash));
+        if (!part_open(s, q->ent, v->level, q->okey)) continue;
         if (v->hash == s->fitted.vinyl[s->vlayer]) s->part_sel = s->nparts;
         s->nparts++;
     }
@@ -3078,7 +3738,7 @@ static void vinyl_colours_enter(Shop *s, const VinylPart *v) {
 static void vinyl_colours_done(Shop *s) {
     s->vmode = -1;
     s->screen = SC_VLIST;
-    dialog(s, PK_DLG_M, 2, 0x31fbc167u, DA_VINYL_ADD, 0, 0);
+    if (!setup_short(s, s->parts[s->part_sel].price)) dialog(s, PK_DLG_M, 2, 0x31fbc167u, DA_VINYL_ADD, 0, 0);
 }
 
 static void vinyl_install(Shop *s) {   /* 0x547570 */
@@ -3151,6 +3811,7 @@ static void vinyl_input(Shop *s, int key) {
         } else if (key == SHOP_KEY_OK && s->nparts > 0) {
             const VinylPart *v = vinyl_find(s->parts[s->part_sel].hash);
             if (!v) break;
+            if (setup_short(s, s->parts[s->part_sel].price)) break;
             if (v->remap) { vinyl_colours_enter(s, v); break; }
             if (v->hash == s->fitted.vinyl[s->vlayer]) { dialog(s, PK_DLG_S, 1, 0xda15d7e5u, DA_NONE, 0, 0); break; }
             int others = 0;
@@ -3171,7 +3832,9 @@ static void vinyl_input(Shop *s, int key) {
    the cursor. A part's value is its light material (0x6ba02c05); the
    stock one (WINDSHIELD) is the car's own glass, 0. */
 #define G_WINDOW_TINT 53
-static uint32_t tint_of(const ShopPart *q) { return q && q->hash != 0x471a1dcau /* WINDSHIELD */ ? q->hash : 0; }
+/* a WINDOW_TINT part's light material as N2CarConfig.tint keeps it */
+static uint32_t tint_value(uint32_t mat) { return mat != 0x471a1dcau /* WINDSHIELD */ ? mat : 0; }
+static uint32_t tint_of(const ShopPart *q) { return q ? tint_value(q->hash) : 0; }
 static void tint_preview(Shop *s) {
     N2CarConfig next = s->fitted;
     if (s->nparts > 0) next.tint = tint_of(&s->parts[s->part_sel]);
@@ -3196,6 +3859,8 @@ static void tint_enter(Shop *s) {
         q->hash = mat; q->available = 1;
         int lvl = ((r[5] | r[6] << 8) >> 5) & 7;
         q->level = lvl > 3 ? 3 : lvl;
+        part_cost(s, q, slot_ent(0x99), lvl, own_key(0x99, hash));
+        if (!part_open(s, q->ent, lvl, q->okey)) continue;   /* GetPartsList: IsPartAvailable */
         if (tint_of(q) == s->fitted.tint) s->part_sel = s->nparts;
         s->nparts++;
     }
@@ -3210,7 +3875,7 @@ static void tint_input(Shop *s, int key) {
         tint_preview(s);
     } else if (key == SHOP_KEY_OK && s->nparts > 0) {   /* as the parts browser: 0x566490 */
         if (tint_of(&s->parts[s->part_sel]) == s->fitted.tint) dialog(s, DLG_AUTO, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-        else dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_TINT, 0, 0);
+        else if (!career_gate(s, &s->parts[s->part_sel], DLG_AUTO, DA_TINT)) dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_TINT, 0, 0);
     } else if (key == SHOP_KEY_BACK) {
         if (memcmp(&s->preview, &s->fitted, sizeof s->preview)) {
             s->preview = s->fitted; request_preview(s); s->debounce = 0.0f;
@@ -3226,6 +3891,15 @@ static void tint_input(Shop *s, int key) {
    A part's value is its colour packed as 0x634800 packs it for the
    headlight (RED | GREEN << 8 | BLUE << 16); STOCK is 0. */
 #define G_HEADLIGHT_BULB 56
+/* a HEADLIGHT_BULB part's N2CarConfig.bulb: RED | GREEN << 8 | BLUE << 16, STOCK 0 */
+static uint32_t bulb_value(const Shop *s, unsigned aoff) {
+    uint32_t red = 0, green = 0, blue = 0, lang = 0;
+    db_attr(s, aoff, 0x0000d99au, &red);
+    db_attr(s, aoff, 0x02ddc8f0u, &green);
+    db_attr(s, aoff, 0x00136707u, &blue);
+    db_attr(s, aoff, 0x4732da07u, &lang);
+    return lang == 0x03b83203u ? 0 : (red & 0xff) | (green & 0xff) << 8 | (blue & 0xff) << 16;   /* STOCK: 0 */
+}
 static void bulb_preview(Shop *s) {
     N2CarConfig next = s->fitted;
     if (s->nparts > 0) next.bulb = s->parts[s->part_sel].hash;
@@ -3240,19 +3914,18 @@ static void bulb_enter(Shop *s) {
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
         if (r[4] != G_HEADLIGHT_BULB || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
-        uint32_t red = 0, green = 0, blue = 0, lang = 0;
-        db_attr(s, aoff, 0x0000d99au, &red);
-        db_attr(s, aoff, 0x02ddc8f0u, &green);
-        db_attr(s, aoff, 0x00136707u, &blue);
+        uint32_t lang = 0;
         db_attr(s, aoff, 0x4732da07u, &lang);
         ShopPart *q = &s->parts[s->nparts];
         memset(q, 0, sizeof *q);
         const char *nm = lang ? str_get(s, lang) : "";
         snprintf(q->name, sizeof q->name, "%s", nm[0] ? nm : s->db_str ? (const char *)s->db + s->db_str + soff * 4L : "?");
-        q->hash = lang == 0x03b83203u ? 0 : (red & 0xff) | (green & 0xff) << 8 | (blue & 0xff) << 16;   /* STOCK: 0 */
+        q->hash = bulb_value(s, aoff);
         q->available = 1;
         int lvl = ((r[5] | r[6] << 8) >> 5) & 7;
         q->level = lvl > 3 ? 3 : lvl;
+        part_cost(s, q, slot_ent(0x9f), lvl, own_key(0x9f, hash));
+        if (!part_open(s, q->ent, lvl, q->okey)) continue;
         if (q->hash == s->fitted.bulb) s->part_sel = s->nparts;
         s->nparts++;
     }
@@ -3267,7 +3940,7 @@ static void bulb_input(Shop *s, int key) {
         bulb_preview(s);
     } else if (key == SHOP_KEY_OK && s->nparts > 0) {
         if (s->parts[s->part_sel].hash == s->fitted.bulb) dialog(s, DLG_AUTO, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-        else dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_BULB, 0, 0);
+        else if (!career_gate(s, &s->parts[s->part_sel], DLG_AUTO, DA_BULB)) dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_BULB, 0, 0);
     } else if (key == SHOP_KEY_BACK) {
         if (memcmp(&s->preview, &s->fitted, sizeof s->preview)) {
             s->preview = s->fitted; request_preview(s); s->debounce = 0.0f;
@@ -3379,6 +4052,14 @@ static void spec_put(Shop *s, N2CarConfig *c, int slot, const ShopPart *q) {
         break;
     }
 }
+/* a part's ShopPart value in the lists below (not the hood / spinner
+   ones): the door style its ANIMSTYLE, the rest their level */
+static int spec_value(const Shop *s, int slot, const unsigned char *r) {
+    int upg = r[5] | r[6] << 8;
+    uint32_t v = 0;
+    if (slot == 0xa0) { db_attr(s, r[10] | r[11] << 8, 0x38A30E75u, &v); return (int)v; }   /* ANIMSTYLE */
+    return (upg >> 5) & 7;
+}
 /* the list of one slot; returns the count (also the lock test's) */
 static int spec_build(Shop *s, int slot) {
     s->nparts = 0; s->part_sel = 0;
@@ -3396,7 +4077,7 @@ static int spec_build(Shop *s, int slot) {
         if (!hash && !soff) break;
         if (r[4] != group || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
         if (model >= 0 && r[7] != model) continue;
-        uint32_t lang = 0, v = 0;
+        uint32_t lang = 0;
         db_attr(s, aoff, 0x4732da07u, &lang);
         ShopPart *q = &s->parts[s->nparts];
         memset(q, 0, sizeof *q);
@@ -3421,31 +4102,84 @@ static int spec_build(Shop *s, int slot) {
                        ? s->rim_style : RIM_VALUE(style, inner);
             break;
         }
-        case 0xa1: q->value = (upg >> 5) & 7; break;
-        case 0x22: q->value = (upg >> 5) & 7; break;
-        case 0xa0: db_attr(s, aoff, 0x38A30E75u, &v); q->value = (int)v; break;   /* ANIMSTYLE */
-        default: q->value = (upg >> 5) & 7; break;
+        default: q->value = spec_value(s, slot, r); break;
         }
         const char *nm = lang ? str_get(s, lang) : "";
         snprintf(q->name, sizeof q->name, "%s", nm[0] ? nm : s->db_str ? (const char *)s->db + s->db_str + soff * 4L : "?");
         int lvl = (upg >> 5) & 7;
         q->level = lvl > 3 ? 3 : lvl;
+        /* MapCarPartToUnlockable: the split hood 0x22, spinners 0x21 (own each), else the slot's */
+        /* the owned key: the part's own (spinners: the size part shown, the fitted one or the style's first) */
+        uint32_t key = hash;
+        if (slot == 0x1d && RIM_INNER(q->value)) {
+            int st = 0, in = 0, out = 0;
+            rim_part_parse(SPINNER_FOLDER, hash, &st, &in, &out);
+            char nmk[48];
+            snprintf(nmk, sizeof nmk, "%s_STYLE%02d_%d_%d", SPINNER_FOLDER, RIM_STYLE(q->value), RIM_INNER(q->value), out);
+            uint32_t kh = feng_hash(nmk);
+            const unsigned char *kr = db_part(s, kh);
+            if (kr) { key = kh; upg = kr[5] | kr[6] << 8; }
+        }
+        lvl = (upg >> 5) & 7; q->level = lvl > 3 ? 3 : lvl;
+        part_cost(s, q, slot == 9 ? 0x22 : slot == 0x1d ? 0x21 : slot_ent(slot), lvl, own_key(slot, key));
+        if (!part_open(s, q->ent, lvl, q->okey)) continue;
         q->available = 1;
         s->nparts++;
     }
     return s->nparts;
 }
-/* 0x539d00 */
-static int spec_locked(Shop *s, int slot) {
-    if (spec_group(slot) < 0) return 1;
-    if (slot == 0xa2) {                   /* a nitrous package, level 1 or 2 (0x52a110) */
-        PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit);
-        if (perf_cat_level(&pp, 2) < 1) return 1;
+static int perf_unlocked(const Shop *s, int cat, int lvl);
+/* GetIcePartsList 8015e708's count for the slots with their own browsers
+   (Window Tint 0x99, Neon 0x9a..0x9d, Lights 0x9f, Custom Gauges 0xa3):
+   the slot's parts IsPartAvailable passes, as those browsers list them */
+static int ice_count(const Shop *s, int slot) {
+    int group = slot == 0x99 ? G_WINDOW_TINT : slot == 0x9f ? 56 /* HEADLIGHT_BULB */ :
+                slot == 0xa3 ? 64 /* CUSTOM_HUD */ : 54 /* NEON */;
+    int n = 0;
+    if (!s->db || !s->db_parts) return 0;
+    for (long p = s->db_parts; p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
+        const unsigned char *r = s->db + p;
+        uint32_t hash = n2_u32(r), mat = 0;
+        unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
+        if (!hash && !soff) break;
+        if (r[4] != group || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
+        if (slot == 0x99 && !db_attr(s, aoff, 0x6ba02c05u, &mat)) continue;
+        if (part_open(s, slot_ent(slot), ((r[5] | r[6] << 8) >> 5) & 7, own_key(slot, hash))) n++;
     }
-    int n = spec_build(s, slot);
-    s->nparts = 0;
-    return n <= (slot == 9 ? 0 : 1);
+    return n;
 }
+/* IceCategoryIsLocked 8015ecb0 / 0x539d00 (every IceSelectionThing, ctor
+   801693b8): nitrous purge needs a nitrous package of level 1 or 2 open,
+   engine neon the engine package level 3 (IsPerfPackageAvailable 0x52a110 =
+   the shop's unlock filter, not what is fitted), trunk neon the first level-3
+   neon part available as trunk audio (slot 0x22); then the slot's parts
+   list: locked at <= 1 part for 0x1d, 0x22, 0x99, 0x9a, 0x9b, 0x9c, 0x9d,
+   0x9f..0xa1, 0xa3, at <= 0 for the rest (split hoods 9, purge, the trunk
+   audio slots 0x23..) */
+static int spec_locked(Shop *s, int slot) {
+    int n;
+    if (slot == 0xa2 && !perf_unlocked(s, 2, 1) && !perf_unlocked(s, 2, 2)) return 1;
+    if (slot == 0x9b && !perf_unlocked(s, 3, 3)) return 1;
+    if (slot == 0x9d) {   /* GetCarPart(0x9d, 3) && IsPartAvailable(0x22, it) */
+        int ok = 0;
+        for (long p = s->db_parts; s->db && p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
+            const unsigned char *r = s->db + p;
+            uint32_t hash = n2_u32(r);
+            if (!hash && !(r[8] | r[9] << 8)) break;
+            if (r[4] != 54 || ((r[5] | r[6] << 8) >> 5 & 7) != 3) continue;
+            ok = part_open(s, slot_ent(0x22), 3, own_key(0x22, hash));
+            break;
+        }
+        if (!ok) return 1;
+    }
+    if (slot == 0x99 || (slot >= 0x9a && slot <= 0x9d) || slot == 0x9f || slot == 0xa3) n = ice_count(s, slot);
+    else if (spec_group(slot) < 0) return 1;
+    else { n = spec_build(s, slot); s->nparts = 0; }
+    int one = slot == 0x1d || slot == 0x22 || (slot >= 0x99 && slot <= 0x9d) || (slot >= 0x9f && slot <= 0xa1) || slot == 0xa3;
+    return n <= one;
+}
+/* IsNeonCompletelyLocked 8015f050 */
+static int neon_all_locked(Shop *s) { return spec_locked(s, 0x9a) && spec_locked(s, 0x9d) && spec_locked(s, 0x9b); }
 static void spec_preview(Shop *s) {
     if (!s->nparts) return;
     const ShopPart *q = &s->parts[s->part_sel];
@@ -3488,10 +4222,18 @@ static void spec_input(Shop *s, int key) {
         spec_preview(s);
     } else if (key == SHOP_KEY_OK && s->nparts > 0) {   /* as the parts browser: 0x566490 */
         if (spec_is_fitted(s, &s->parts[s->part_sel])) dialog(s, DLG_AUTO, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-        else if (s->spec_slot == 0x22)   /* 0x56a300: from STOCK / none; to a layout; to STOCK */
-            dialog(s, DLG_AUTO, 2, ice_layout_level(&s->fitted) == 0 ? 0x113eab80u :
-                   s->parts[s->part_sel].value ? 0x8e4312b0u : 0x266131ceu, DA_SPEC, 0, 0);
-        else dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, s->spec_slot == 0x1d ? DA_RIM : DA_SPEC, 0, 0);
+        else if (s->spec_slot == 0x22) {   /* 0x56a300 (IcePartsBrowser 0x406415e3): install / buy by
+                                              IsStockPartInstalled(0x22) and the target's level */
+            const ShopPart *q = &s->parts[s->part_sel];
+            int stock = ice_layout_level(&s->fitted) == 0;
+            if (part_to_buy(s, q) && g_career.cash < q->price) dialog(s, PK_DLG_S, 1, 0xd1ac60beu, DA_NONE, 0, 0);
+            else if (part_to_buy(s, q)) {
+                s->buy_after = DA_SPEC;
+                dialog(s, DLG_AUTO, 2, stock ? 0xf58c0cd9u : q->lvl == 0 ? 0x266131ceu : 0x4fafb114u, DA_GEN_BUY, 0, 0);
+            } else dialog(s, DLG_AUTO, 2, stock ? 0x113eab80u : q->lvl == 0 ? 0x266131ceu : 0x8e4312b0u, DA_SPEC, 0, 0);
+        }
+        else if (!career_gate(s, &s->parts[s->part_sel], DLG_AUTO, s->spec_slot == 0x1d ? DA_RIM : DA_SPEC))
+            dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, s->spec_slot == 0x1d ? DA_RIM : DA_SPEC, 0, 0);
     } else if (key == SHOP_KEY_SQ && (s->spec_slot == 9 || s->spec_slot == 0xa0 || s->spec_slot == 0xa2)) {
         /* 0x568d30 0xc519bfc0: Split Hoods / Doors open or close the part
            (browser +0x54: 0 the hood, 2 both doors -> 0x521040); Nitrous
@@ -3506,6 +4248,7 @@ static void spec_input(Shop *s, int key) {
 }
 static void spec_install(Shop *s) {
     spec_put(s, &s->fitted, s->spec_slot, &s->parts[s->part_sel]);
+    if (s->spec_slot == 9) hood_installed(&s->fitted, s->parts[s->part_sel].level);
     s->preview = s->fitted; request_preview(s); s->debounce = 0.0f;
     printf("shop: specialties slot 0x%x = %s (purge %08x hydraulics %u doors %u hood %d)\n", s->spec_slot,
            s->parts[s->part_sel].name, (unsigned)s->fitted.purge, s->fitted.hydraulics, s->fitted.doors,
@@ -3529,6 +4272,8 @@ static void ice_menu(Shop *s, int mode) {
             if (ice_slot_ok(s->car, lvl, slot)) s->ice_e[n++] = (ShopEntry){ STR_ICE_SLOT, ICE_SLOT_ICON, slot };
         scroller_set(&s->icem, s->ice_e, n);
     }
+    for (int i = 0; i < s->icem.n; i++)   /* IceSelectionThing ctor: IceCategoryIsLocked (Audio Components: 0x23) */
+        s->icem.locked[i] = spec_locked(s, s->icem.e[i].group == ICE_GROUP_COMP ? 0x23 : s->icem.e[i].group);
     s->screen = SC_ICE;
 }
 static void ice_audio_enter(Shop *s) {                                   /* 0x55bfb0 */
@@ -3541,7 +4286,7 @@ static void ice_audio_enter(Shop *s) {                                   /* 0x55
 static void ice_input(Shop *s, int key) {
     if (key == SHOP_KEY_LEFT) scroller_move(&s->icem, -1);
     else if (key == SHOP_KEY_RIGHT) scroller_move(&s->icem, 1);
-    else if (key == SHOP_KEY_OK && s->icem.n) {
+    else if (key == SHOP_KEY_OK && s->icem.n && !s->icem.locked[s->icem.sel]) {
         int g = s->icem.e[s->icem.sel].group;
         if (g == ICE_GROUP_COMP) ice_menu(s, 4);
         else { s->spec_ret = SC_ICE; spec_enter(s, g); }
@@ -3574,9 +4319,18 @@ static const char *ice_slot_label(Shop *s, int slot) {
    their alpha between the two). Installing goes back to the strip
    (0x9f00f07 -> 0x6691c08e). */
 #define G_NEON 54
+/* a NEON part's two colours as N2CarConfig.neon[] keeps them (0x61fc20) */
+static void neon_value(const Shop *s, unsigned aoff, uint32_t col[2]) {
+    static const uint32_t ak[8] = { 0x0000d99au, 0x02ddc8f0u, 0x00136707u, 0x026e1ac5u,     /* RED GREEN BLUE ALPHA */
+                                    0x001c0d0cu, 0x5e96e722u, 0x02804819u, 0x50317397u };   /* RED2 .. ALPHA2 */
+    col[0] = col[1] = 0;
+    for (int i = 0; i < 8; i++) { uint32_t c = 0; db_attr(s, aoff, ak[i], &c); col[i / 4] |= (c & 0xff) << (8 * (i % 4)); }
+}
 static void neon_menu(Shop *s, int keep) {
     int sel = keep ? s->neonm.sel : 0;
     scroller_set(&s->neonm, k_neon_shop, NELEM(k_neon_shop));
+    for (int i = 0; i < s->neonm.n; i++)   /* 0x53bc90 per entry: IceCategoryIsLocked(0x9a / 0x9b / 0x9d) */
+        s->neonm.locked[i] = spec_locked(s, 0x9a + s->neonm.e[i].group);
     s->neonm.sel = sel;
     s->screen = SC_NEON;
 }
@@ -3601,10 +4355,8 @@ static void neon_enter(Shop *s) {
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
         if (r[4] != G_NEON || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
-        static const uint32_t ak[8] = { 0x0000d99au, 0x02ddc8f0u, 0x00136707u, 0x026e1ac5u,     /* RED GREEN BLUE ALPHA */
-                                        0x001c0d0cu, 0x5e96e722u, 0x02804819u, 0x50317397u };   /* RED2 .. ALPHA2 */
-        uint32_t c[8], lang = 0, col[2] = { 0, 0 };
-        for (int i = 0; i < 8; i++) { c[i] = 0; db_attr(s, aoff, ak[i], &c[i]); col[i / 4] |= (c[i] & 0xff) << (8 * (i % 4)); }
+        uint32_t lang = 0, col[2];
+        neon_value(s, aoff, col);
         db_attr(s, aoff, 0x4732da07u, &lang);
         ShopPart *q = &s->parts[s->nparts];
         memset(q, 0, sizeof *q);
@@ -3614,6 +4366,8 @@ static void neon_enter(Shop *s) {
         q->available = 1;
         int lvl = ((r[5] | r[6] << 8) >> 5) & 7;
         q->level = lvl > 3 ? 3 : lvl;
+        part_cost(s, q, slot_ent(0x9a + slot), lvl, own_key(0x9a + slot, hash));
+        if (!part_open(s, q->ent, lvl, q->okey)) continue;
         if (q->hash == s->fitted.neon[slot][0] && (unsigned)q->value == s->fitted.neon[slot][1]) s->part_sel = s->nparts;
         s->nparts++;
     }
@@ -3626,9 +4380,9 @@ static void neon_input(Shop *s, int key) {
     if (s->screen == SC_NEON) {
         if (key == SHOP_KEY_LEFT) scroller_move(&s->neonm, -1);
         else if (key == SHOP_KEY_RIGHT) scroller_move(&s->neonm, 1);
-        else if (key == SHOP_KEY_OK) {
+        else if (key == SHOP_KEY_OK && !s->neonm.locked[s->neonm.sel]) {
             int slot = neon_slot(s);
-            PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit);
+            PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit); memcpy(pp.junk, s->fitted.junk, sizeof pp.junk);
             if (slot == 1 && perf_cat_level(&pp, 3) < 3) dialog(s, DLG_AUTO, 1, 0xd649be08u, DA_NONE, 0, 0);
             else if (slot == 3 && (s->fitted.parts[N2_PART_AUDIO] > 0 ? s->fitted.parts[N2_PART_AUDIO] - 1 : 0) < 3)
                 dialog(s, DLG_AUTO, 1, 0xa9e966d7u, DA_NONE, 0, 0);
@@ -3644,7 +4398,7 @@ static void neon_input(Shop *s, int key) {
         int slot = neon_slot(s);
         if (q->hash == s->fitted.neon[slot][0] && (unsigned)q->value == s->fitted.neon[slot][1])
             dialog(s, DLG_AUTO, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-        else dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_NEON, 0, 0);
+        else if (!career_gate(s, &s->parts[s->part_sel], DLG_AUTO, DA_NEON)) dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_NEON, 0, 0);
     } else if (key == SHOP_KEY_BACK) {
         if (memcmp(&s->preview, &s->fitted, sizeof s->preview)) {
             s->preview = s->fitted; request_preview(s); s->debounce = 0.0f;
@@ -3681,6 +4435,13 @@ static const uint32_t k_chud_obj[6] = { 0x05d19f25u, 0x6d5fe871u, 0x1d9051aau, 0
 static const char *const k_chud_art[6] = { "TACH_FILL", "3RDPERSON_TURBOFILL", "3RDPERSON_10500LINES",
                                            "3RDPERSON_TURBOLINES", "3RDPERSON_RPMDIAL", "3RDPERSON_TURBODIAL" };
 static int hud_style_sel(const Shop *s) { return s->nparts ? s->parts[s->part_sel].value : 0; }
+/* a CUSTOM_HUD_PAINT part's colour as N2CarConfig.hud_col[] keeps it:
+   0x01RRGGBB of its RED GREEN BLUE */
+static uint32_t hud_paint_value(const Shop *s, unsigned aoff) {
+    uint32_t c[3] = { 0, 0, 0 };
+    db_attr(s, aoff, 0x0000d99au, &c[0]); db_attr(s, aoff, 0x02ddc8f0u, &c[1]); db_attr(s, aoff, 0x00136707u, &c[2]);
+    return 0x01000000u | (c[0] & 255) << 16 | (c[1] & 255) << 8 | (c[2] & 255);
+}
 
 /* the style's six textures, from its pack */
 static void chud_load_style(Shop *s, int style) {
@@ -3764,10 +4525,8 @@ static void hud_enter(Shop *s) {
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
         if ((r[4] != G_CUSTOM_HUD && r[4] != G_CUSTOM_HUD_PAINT) || db_has_attr(s, aoff, 0xF7934316u)) continue;
-        if (r[4] == G_CUSTOM_HUD_PAINT) {   /* RED GREEN BLUE */
-            uint32_t c[3] = { 0, 0, 0 };
-            db_attr(s, aoff, 0x0000d99au, &c[0]); db_attr(s, aoff, 0x02ddc8f0u, &c[1]); db_attr(s, aoff, 0x00136707u, &c[2]);
-            if (s->hud_npal < 12) s->hud_pal[s->hud_npal++] = 0x01000000u | (c[0] & 255) << 16 | (c[1] & 255) << 8 | (c[2] & 255);
+        if (r[4] == G_CUSTOM_HUD_PAINT) {   /* HUD_Customizer::IsColorAvailable 8017c418: entity 0x17 (filter 6 / 1) */
+            if (s->hud_npal < 12 && calc_unlocked(s, 0x17, r[5] >> 5)) s->hud_pal[s->hud_npal++] = hud_paint_value(s, aoff);
             continue;
         }
         if (s->nparts >= SHOP_MAX_PARTS) continue;
@@ -3781,6 +4540,8 @@ static void hud_enter(Shop *s) {
         q->value = (int)idx; q->available = 1;
         int lvl = ((r[5] | r[6] << 8) >> 5) & 7;
         q->level = lvl > 3 ? 3 : lvl;
+        part_cost(s, q, slot_ent(0xa3), lvl, own_key(0xa3, hash));
+        if (!part_open(s, q->ent, lvl, q->okey)) continue;
         if ((unsigned)q->value == s->fitted.hud) s->part_sel = s->nparts;
         s->nparts++;
     }
@@ -3819,7 +4580,7 @@ static void hud_input(Shop *s, int key) {
             memset(s->hud_pick, 0, sizeof s->hud_pick);
             if (s->fitted.hud == 0 && !memcmp(s->hud_pick, s->fitted.hud_col, sizeof s->hud_pick))
                 dialog(s, DLG_AUTO, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-            else dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_HUD, 0, 0);
+            else if (!career_gate(s, &s->parts[s->part_sel], DLG_AUTO, DA_HUD)) dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_HUD, 0, 0);
         } else if (key == SHOP_KEY_OK && s->nparts > 0 && s->hud_npal > 0) {
             hud_layer_open(s, 0);
         } else if (key == SHOP_KEY_BACK) {
@@ -3837,7 +4598,7 @@ static void hud_input(Shop *s, int key) {
         if (s->hud_layer < 2) hud_layer_open(s, s->hud_layer + 1);
         else if (hud_style_sel(s) == (int)s->fitted.hud && !memcmp(s->hud_pick, s->fitted.hud_col, sizeof s->hud_pick))
             dialog(s, DLG_AUTO, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-        else dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_HUD, 0, 0);
+        else if (!career_gate(s, &s->parts[s->part_sel], DLG_AUTO, DA_HUD)) dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_HUD, 0, 0);
     } else if (key == SHOP_KEY_BACK) {
         if (s->hud_layer > 0) hud_layer_open(s, s->hud_layer - 1);
         else { s->screen = SC_HUD; chud_palette(s, 0); chud_paint(s); }
@@ -3864,6 +4625,20 @@ static int decal_layout_of(int id, int *loc) {
     case 0x20008: *loc = 6; return 1; case 0x20009: *loc = 6; return 2;
     }
     return 0;
+}
+/* the car's layout part of a location (DB group 37 + loc = slot 0x34 + loc,
+   upgrade group 1 SMALL, 0 MEDIUM), NULL when the car has none */
+static const unsigned char *decal_layout_rec(const Shop *s, int loc, int small) {
+    int model = s->db ? db_model(s, s->car) : -1;
+    const unsigned char *any = NULL;
+    for (long p = s->db_parts; model >= 0 && p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
+        const unsigned char *r = s->db + p;
+        if (!n2_u32(r) && !(r[8] | r[9] << 8)) break;
+        if (r[4] != 37 + loc || r[7] != model) continue;
+        if ((r[5] & 0x1f) == (small ? 1 : 0)) return r;
+        if (!any) any = r;
+    }
+    return any;
 }
 /* the location a menu entry stands for, -1 none */
 static int decal_entry_loc(int group) {
@@ -3917,19 +4692,28 @@ static void dpick_enter(Shop *s, int slot) {   /* 0x560250 */
     snprintf(q->name, sizeof q->name, "%s", str_get(s, 0x2b5abcf4u));   /* "No Decal" */
     q->available = 1;
     uint32_t cur = s->fitted.decal[decal_loc_of(slot)][decal_n_of(slot)];
+    int nbrand = 0;
     for (int i = 0; i < decal_count() && s->nparts < SHOP_MAX_PARTS; i++) {
         const DecalPart *d = decal_at(i);
+        /* CarCustomizeManager::IsDecalAvailable (GC 80170d5c) -> CareerUnlocker::IsDecalBrandUnlocked
+           8012f94c (Quick Race asks the same): a brand a perf package part comes in is open only once a
+           career car owns it (bought with that brand) */
+        if (d->name != cur && !career_decal_brand_unlocked(d->brand)) { nbrand++; continue; }
         q = &s->parts[s->nparts];
         memset(q, 0, sizeof *q);
         const char *nm = d->lang ? str_get(s, d->lang) : "";
         snprintf(q->name, sizeof q->name, "%s", nm[0] ? nm : d->dbg);
         q->hash = d->name; q->value = i; q->available = 1;
+        const unsigned char *r = db_part(s, d->hash);   /* the slot's entity (0x4c), the record's level */
+        int lvl = r ? ((r[5] | r[6] << 8) >> 5) & 7 : 0;
+        part_cost(s, q, slot_ent(slot), lvl, own_key(slot, d->hash));
+        if (!part_open(s, q->ent, lvl, q->okey)) continue;
         if (cur && d->name == cur) s->part_sel = s->nparts;
         s->nparts++;
     }
     s->part_scroll = (float)s->part_sel;
     s->screen = SC_DPICK;
-    printf("shop: decal slot %02x: %d decals\n", slot, s->nparts - 1);
+    printf("shop: decal slot %02x: %d decals (%d of perf brands not owned)\n", slot, s->nparts - 1, nbrand);
     dpick_preview(s);
 }
 static void decal_revert(Shop *s) {
@@ -3989,7 +4773,8 @@ static void decal_input(Shop *s, int key) {
                 if (!cur) dialog(s, PK_DLG_S, 1, 0x091bb4eau, DA_NONE, 0, 0);       /* already empty */
                 else dialog(s, PK_DLG_S, 2, 0x74e34714u, DA_DECAL_REMOVE, 0, 0);    /* remove this decal? */
             } else if (want == cur) dialog(s, PK_DLG_S, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-            else dialog(s, PK_DLG_S, 2, 0xf5ac2b2au, DA_DECAL_ADD, 0, 0);
+            else if (!setup_short(s, s->parts[s->part_sel].price))
+                dialog(s, PK_DLG_S, 2, s->career ? 0x44b7167fu : 0xf5ac2b2au, DA_DECAL_ADD, 0, 0);
         } else if (key == SHOP_KEY_BACK) {
             decal_revert(s);
             s->screen = SC_DLOC;
@@ -4032,14 +4817,21 @@ static int view_vinyl(uint32_t part) {
     const VinylPart *v = vinyl_find(part);
     return 0x40 | (v ? (v->group + 1) << 16 : 0);
 }
-unsigned shop_part_attrs(const char *dataroot, uint32_t part, const uint32_t *keys, int n, uint32_t *vals) {
-    static Shop *db;   /* the database alone, loaded on first use */
-    if (!db) {
-        db = (Shop *)calloc(1, sizeof *db);
-        if (!db) return 0;
-        snprintf(db->dataroot, sizeof db->dataroot, "%s", dataroot);
-        load_db(db);
+/* the database alone (no screens), loaded on first use and kept: the
+   lookups below work without an open shop */
+static Shop *g_db_only;
+static const Shop *db_only(const char *dataroot) {
+    if (!g_db_only) {
+        g_db_only = (Shop *)calloc(1, sizeof *g_db_only);
+        if (!g_db_only) return NULL;
+        snprintf(g_db_only->dataroot, sizeof g_db_only->dataroot, "%s", dataroot);
+        load_db(g_db_only);
     }
+    return g_db_only;
+}
+unsigned shop_part_attrs(const char *dataroot, uint32_t part, const uint32_t *keys, int n, uint32_t *vals) {
+    const Shop *db = db_only(dataroot);
+    if (!db) return 0;
     const unsigned char *r = db_part(db, part);
     if (!r) return 0;
     unsigned aoff = r[10] | r[11] << 8, mask = 0;
@@ -4050,16 +4842,14 @@ unsigned shop_part_attrs(const char *dataroot, uint32_t part, const uint32_t *ke
    0x3460a, 0x24 bytes: u16 1 = string names, u16 base, u32 names[4] of
    model 0, names[4] of model 1 at +0x14), without the LOD letter: the
    part's model (+7, when +6 is 1) or the car, + base + names[model]. */
-static Shop *g_db_only;
+static int rec_model(const Shop *db, const unsigned char *r, int model, const char *car, char *out, int cap);
 int shop_part_model(const char *dataroot, uint32_t part, int model, char *out, int cap) {
-    if (!g_db_only) {
-        g_db_only = (Shop *)calloc(1, sizeof *g_db_only);
-        if (!g_db_only) return 0;
-        snprintf(g_db_only->dataroot, sizeof g_db_only->dataroot, "%s", dataroot);
-        load_db(g_db_only);
-    }
-    const Shop *db = g_db_only;
-    const unsigned char *r = db_part(db, part);
+    const Shop *db = db_only(dataroot);
+    if (!db) return 0;
+    return rec_model(db, db_part(db, part), model, NULL, out, cap);
+}
+/* car: the car type whose own models (e.g. its engine styles) may be named, NULL generic models only */
+static int rec_model(const Shop *db, const unsigned char *r, int model, const char *car, char *out, int cap) {
     long tab = -1, tlen = 0;
     for (long o = 0; db->db && o + 8 <= db->dblen; ) {   /* the model table */
         uint32_t id = n2_u32(db->db + o), cs = n2_u32(db->db + o + 4);
@@ -4072,16 +4862,679 @@ int shop_part_model(const char *dataroot, uint32_t part, int model, char *out, i
     unsigned base = db->db[m + 2] | db->db[m + 3] << 8, nm = n2_u32(db->db + m + 4 + (model ? 0x10 : 0));
     if (!nm || r[7] >= db->nmodels) return 0;
     char lib[32] = "";   /* the 0x3460b entry is a hash: the generic models by name */
-    static const char *const names[] = { "AUDIO", "WHEELS", "SPOILER", "SPOILER_HATCH", "SPOILER_SUV", "EXHAUST", "ROOF" };
+    static const char *const names[] = { "AUDIO", "WHEELS", "SPOILER", "SPOILER_HATCH", "SPOILER_SUV", "EXHAUST", "ROOF", "BRAKES" };
+    uint32_t mh = n2_u32(db->db + db->db_models + 4L * r[7]);
     for (int i = 0; i < NELEM(names); i++)
-        if (feng_hash(names[i]) == n2_u32(db->db + db->db_models + 4L * r[7])) snprintf(lib, sizeof lib, "%s", names[i]);
+        if (feng_hash(names[i]) == mh) snprintf(lib, sizeof lib, "%s", names[i]);
+    if (!lib[0] && car && feng_hash(car) == mh) snprintf(lib, sizeof lib, "%s", car);
     if (!lib[0]) return 0;
     snprintf(out, (size_t)cap, "%s%s%s", lib, (const char *)db->db + db->db_str + base * 4L,
              (const char *)db->db + db->db_str + nm * 4L);
     return 1;
 }
+/* ---------------------------------------------------------------- preset rides */
+
+/* The preset rides (FEPresetCar, GLOBALB chunk 0x30220, 0x338 bytes each):
+   +8 the model (the car type's name), +0x28 the preset's name (found by its
+   FEHashUpper, FindFEPresetCar 0x61c460), +0x48 a performance level (-1:
+   the per-part flags +0x2f4), +0x4c a part hash per car slot 0..0xa9
+   (0 none, 1 leave the part there). */
+#define PRESET_SIZE 0x338
+#define PRESET_SLOTS 0xaa
+/* The database group a car slot takes (the CarSlotId names: 0x1b / 0x1c
+   FRONT / REAR_BRAKE, 0x1d / 0x1e FRONT / REAR_WHEEL, 0x20 WING_MIRROR,
+   0x21 LICENSE_PLATE, 0x22 TRUNK_AUDIO, 0x23.. TRUNK_AUDIO_COMP_n, 0x34..
+   0x3e the decal locations, 0x3f BASE_PAINT, 0x40.. VINYL_LAYERn, 0x44..
+   0x4c PAINT_*, 0x4d.. VINYL_COLOURl_c, 0x5d.. KIT / HOOD / DOOR / TRUNK_
+   CARBON, 0x61.. DECAL_*_TEXn, 0x99 WINDOW_TINT, 0x9a.. NEON*, 0x9e
+   CABIN_NEON_FRAME, 0x9f HEADLIGHT_BULB, 0xa0 DOOR_STYLE, 0xa1 HYDRAULICS,
+   0xa2 NOS_PURGE, 0xa3 CUSTOM_HUD, 0xa4.. HUD_BACKING / NEEDLE / CHARACTER_
+   COLOUR): parts that share a hash (e.g. every "STOCK") are told apart by
+   it, as NewGetCarPart(type, slot, hash) only looks at the slot's parts.
+   -1: any. */
+static int preset_slot_group(int slot) {
+    if (slot <= 0x1a) return slot;
+    if (slot <= 0x1c) return 27;                       /* BRAKE */
+    if (slot <= 0x1e) return G_WHEEL;
+    if (slot == 0x20) return G_LEFT_MIRROR;
+    if (slot == 0x21) return 31;
+    if (slot == 0x22) return G_TRUNK_AUDIO;
+    if (ice_comp_slot(slot)) return 61 + ice_size(slot);
+    if (slot >= 0x34 && slot <= 0x3e) return slot - 0x34 + 37;
+    if (slot == 0x3f || (slot >= 0x44 && slot <= 0x4c)) return 48;   /* PAINT */
+    if (slot >= 0x40 && slot <= 0x43) return 50;       /* VINYL */
+    if (slot >= 0x4d && slot <= 0x5c) return 49;       /* VINYL_PAINT */
+    if (slot >= 0x5d && slot <= 0x60) return 51;       /* CARBON_FIBRE */
+    if (slot >= 0x61 && slot <= 0x98) return 52;       /* DECAL_TEXTURE */
+    if (slot == 0x99) return G_WINDOW_TINT;
+    if (slot >= 0x9a && slot <= 0x9d) return G_NEON;
+    if (slot >= 0x9e && slot <= 0xa2) return 55 + slot - 0x9e;   /* CABIN_NEON_FRAME .. NOS_PURGE */
+    if (slot == 0xa3) return G_CUSTOM_HUD;
+    if (slot >= 0xa4 && slot <= 0xa6) return G_CUSTOM_HUD_PAINT;
+    if (slot == 0xa9) return 68;
+    return -1;
+}
+/* the database part a preset puts in a slot (NewGetCarPart 0x61b980): NULL
+   when the hash names no part of the slot's group -- the game then fits
+   nothing there, as for hash 0 */
+static const unsigned char *preset_part(const Shop *db, int slot, uint32_t hash) {
+    int grp = preset_slot_group(slot);
+    for (long q = db->db_parts; db->db && q + 14 <= db->db_parts + db->db_parts_len; q += 14) {
+        const unsigned char *r = db->db + q;
+        if (!n2_u32(r) && !(r[8] | r[9] << 8)) break;
+        if (n2_u32(r) == hash && (grp < 0 || r[4] == grp)) return r;
+    }
+    return NULL;
+}
+static const char *preset_part_name(const Shop *db, const unsigned char *r) {
+    return db->db_str ? (const char *)db->db + db->db_str + (r[8] | r[9] << 8) * 4L : "?";
+}
+/* a part our N2CarConfig has no place for: said when it is not the stock
+   one (an upgrade level above 0) */
+static void preset_unported(const Shop *db, const char *preset, int slot, const unsigned char *r) {
+    if (r && (r[5] >> 5 & 7) > 0)
+        printf("shop: preset %s: slot 0x%02x %s not ported\n", preset, slot, preset_part_name(db, r));
+}
+/* the rim folder of a BRAND_NAME (the Rims brands, then SPINNER), NULL none */
+static const char *preset_rim_folder(uint32_t brand) {
+    if (brand == 0xc8d1a75eu) return SPINNER_FOLDER;
+    for (int i = 0; i < NELEM(k_rims_tuner); i++) if (k_rims_tuner[i].folder && k_rims_tuner[i].key == brand) return k_rims_tuner[i].folder;
+    for (int i = 0; i < NELEM(k_rims_suv); i++) if (k_rims_suv[i].folder && k_rims_suv[i].key == brand) return k_rims_suv[i].folder;
+    return NULL;
+}
+
+/* one slot of a RideInfo (its part record r, NULL none) into our
+   representation, as shop_preset_ride documents it; shared by the preset
+   and the random rides */
+typedef struct {
+    Shop *db; const char *car, *name; int car_model, wheels;
+    const unsigned char *loc_part[11]; uint32_t front_wheel;
+    char rim_folder[16]; int rim_style;
+} RideFill;
+static void ride_fill_init(RideFill *f, Shop *db, const char *car, const char *name, N2CarConfig *cfg) {
+    memset(f, 0, sizeof *f);
+    f->db = db; f->car = car; f->name = name;
+    f->car_model = db_model(db, car); f->wheels = db_model(db, "WHEELS");
+    snprintf(f->rim_folder, sizeof f->rim_folder, "%s", STOCK_RIM_FOLDER); f->rim_style = STOCK_RIM_STYLE;
+    vinyl_db_load(db->db, db->dblen);   /* the decal table */
+    memset(cfg, 0, sizeof *cfg);
+}
+static void ride_fill_slot(RideFill *f, N2CarConfig *cfg, int slot, const unsigned char *r) {
+    uint32_t ph = r ? n2_u32(r) : 0;
+    unsigned aoff = r ? (unsigned)(r[10] | r[11] << 8) : 0xffffu;
+    int upg = r ? r[5] | r[6] << 8 : 0;
+    int pi = -1;
+    for (int i = 0; i < N2_PAINT_COUNT; i++) if (k_paint_cat[i].group == slot) pi = i;
+    if (pi >= 0) { cfg->paint[pi] = ph; return; }
+    if (slot >= 0x40 && slot <= 0x43) { cfg->vinyl[slot - 0x40] = ph; return; }
+    if (slot >= 0x4d && slot <= 0x5c) { cfg->vinyl_col[(slot - 0x4d) / 4][(slot - 0x4d) % 4] = ph; return; }
+    if (slot >= 0x34 && slot <= 0x3e) { f->loc_part[slot - 0x34] = r; return; }
+    if (slot >= 0x61 && slot <= 0x98) {
+        uint32_t nm = 0;
+        for (int i = 0; r && i < decal_count(); i++) if (decal_at(i)->hash == ph) nm = decal_at(i)->name;
+        if (r && !nm) printf("shop: preset %s: decal %s has no texture\n", f->name, preset_part_name(f->db, r));
+        cfg->decal[decal_loc_of(slot)][decal_n_of(slot)] = nm;
+        return;
+    }
+    if (slot >= 0x9a && slot <= 0x9d) {
+        uint32_t col[2] = { 0, 0 };
+        if (r) neon_value(f->db, aoff, col);
+        cfg->neon[slot - 0x9a][0] = col[0]; cfg->neon[slot - 0x9a][1] = col[1];
+        return;
+    }
+    if (slot == 0x22 || ice_comp_slot(slot) || (slot >= 0xa0 && slot <= 0xa2)) {
+        if (r) {
+            ShopPart q; memset(&q, 0, sizeof q);
+            q.hash = ph; q.value = spec_value(f->db, slot, r);
+            spec_put(f->db, cfg, slot, &q);
+        } else if (slot == 0x22) cfg->parts[N2_PART_AUDIO] = 0;
+        else if (slot == 0xa0) cfg->doors = 0;
+        else if (slot == 0xa1) cfg->hydraulics = 0;
+        else if (slot == 0xa2) cfg->purge = 0;
+        else cfg->audio_comp[slot - 0x23] = 0;
+        return;
+    }
+    switch (slot) {
+    case 1: case 2: case 6: case 7: case 9: case 0xb: case 0xc: case 0xe: case 0xf: case 0x10: case 0x20: {
+        int group = preset_slot_group(slot), v = 0;
+        if (r) {
+            v = part_value_lib(f->car, group, ph, r[7] != f->car_model, upg);
+            if (v < 0) { printf("shop: preset %s: slot 0x%02x %s has no part value\n", f->name, slot, preset_part_name(f->db, r)); v = 0; }
+        }
+        body_put(cfg, group_slot(group), v, slot == 9 && r && db_has_attr(f->db, aoff, 0x721AFF7Cu));   /* CARBONFIBRE */
+        break;
+    }
+    case 0x1d: {
+        f->front_wheel = ph;
+        uint32_t brand = 0;
+        const char *folder = r && r[7] == f->wheels && db_attr(f->db, aoff, 0xEBB03E66u, &brand) ? preset_rim_folder(brand) : NULL;
+        int st, in, out;
+        if (folder && rim_part_parse(folder, ph, &st, &in, &out)) {
+            snprintf(f->rim_folder, 16, "%s", folder); f->rim_style = RIM_VALUE(st, in);
+        } else {
+            if (r && r[7] == f->wheels) printf("shop: preset %s: rim %s not found\n", f->name, preset_part_name(f->db, r));
+            snprintf(f->rim_folder, 16, "%s", STOCK_RIM_FOLDER); f->rim_style = STOCK_RIM_STYLE;
+        }
+        break;
+    }
+    case 0x1e:
+        if (ph != f->front_wheel) preset_unported(f->db, f->name, slot, r);
+        break;
+    case 0x5d: case 0x60: {
+        unsigned bit = slot == 0x5d ? 2u : 4u;
+        if (r && ph != 0xc8d313acu) cfg->carbon |= bit; else cfg->carbon &= ~bit;   /* CARBON FIBRE NONE */
+        break;
+    }
+    case 0x99: {
+        uint32_t mat = 0;
+        cfg->tint = r && db_attr(f->db, aoff, 0x6ba02c05u, &mat) ? tint_value(mat) : 0;
+        break;
+    }
+    case 0x9f: cfg->bulb = r ? bulb_value(f->db, aoff) : 0; break;
+    case 0xa3: {
+        uint32_t idx = 0;
+        if (r) db_attr(f->db, aoff, 0x311151f8u, &idx);   /* HUDINDEX */
+        cfg->hud = idx;
+        break;
+    }
+    case 0xa4: case 0xa5: case 0xa6:   /* backing, needle, character (the dial) */
+        cfg->hud_col[slot == 0xa4 ? 0 : slot == 0xa6 ? 1 : 2] = r ? hud_paint_value(f->db, aoff) : 0;
+        break;
+    case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0xa9:
+        break;   /* the wide body's */
+    default:
+        preset_unported(f->db, f->name, slot, r);
+        break;
+    }
+}
+static void ride_fill_done(RideFill *f, N2CarConfig *cfg) {
+    /* the decal layouts, from the locations in use (a wide body's doors and
+       quarters have their own) */
+    int wide = cfg->parts[N2_PART_WIDE] > 1;
+    for (int loc = 0; loc < 7; loc++) {
+        const unsigned char *r = f->loc_part[loc >= 3 && wide ? loc + 4 : loc];
+        int small = r && (r[5] & 0x1f) == 1;
+        cfg->decal_layout[loc] = (unsigned char)(small ? 2 : r && loc >= 5 ? 1 : 0);
+    }
+}
+
+/* RideInfo::FillWithPreset (0x637270, GC 80245bf8) into our representation:
+   from a never-customized car of the preset's model (all zero, the stock
+   rims -- Init + SetStockParts when the type changes) every slot takes its
+   part (hash 0 none, 1 the stock one, else the part of that hash), the way
+   the Car Shop's own install of that part writes it:
+     body parts (1, 2, 6, 7, 0xb, 0xc, 0xe..0x10, 0x20): part_value, a
+       library's "none" the stock look (build_parts); the hood (9) carbon
+       with a CARBONFIBRE part (parts_cursor / spec_put);
+     rims (0x1d FRONT_WHEEL): the brand's folder and RIM_VALUE(STYLEnn,
+       inner) of <FOLDER>_STYLEnn_<inner>_<outer> (build_rims / the size
+       list; SPINNER as the Spinners list); the car's own wheel = Stock;
+     paint (0x3f, 0x44..0x4c): paint[] = the part (k_paint_cat order);
+     vinyls (0x40..0x43) and their colours (0x4d..0x5c): the parts;
+     carbon: KIT_CARBON (0x5d) bit 2, TRUNK_CARBON (0x60) bit 4 unless
+       CARBON FIBRE NONE (cf_toggle);
+     decals: a location (0x34..0x3e; on a wide body its own 0x3b..0x3e) its
+       layout -- SMALL (upgrade 1) 2, a quarter panel's MEDIUM 1
+       (decal_layout_take); a slot 0x61 + loc*8 + n the DECAL_TEXTURE
+       part's NAME (dpick); 0x61..0x68 (the hood's) are never set by the PC
+       build (0x6372fe), nor 0x19 (HOOD_UNDER);
+     tint (0x99), neon (0x9a..0x9d), bulb (0x9f), custom HUD + colours
+       (0xa3..0xa6): tint_value / neon_value / bulb_value / HUDINDEX /
+       hud_paint_value;
+     doors / hydraulics / purge / trunk layout / components (0xa0..0xa2,
+       0x22..0x2e): spec_put (a layout first puts NO COMPONENTS everywhere);
+     performance: +0x48 -1 -> InstallPerfPart(i, flag != 0) (0x599680) of
+       each flag != -1 of +0x2f4 (0x44 of them), else
+       InstallAllPerfParts(level, -1) (0x5a64a0): every category to it.
+   Not ported (no place in N2CarConfig; printed when not the stock part):
+   0 BASE, 3 / 4 LEFT / RIGHT_SIDE_MIRROR, 5 BODY, 8 TOP (always the type's
+   default, 0x637346), 0xa TRUNK, 0xd ENGINE, 0x17 FENDER, 0x18 QUARTER,
+   0x1a TRUNK_UNDER, 0x1b / 0x1c the brakes, 0x1e REAR_WHEEL (ours has one
+   rim: said when it is not the front's), 0x1f, 0x21 LICENSE_PLATE,
+   0x2f..0x33 DAMAGE_*, 0x48 PAINT_AUDIO, 0x5e HOOD_CARBON, 0x5f
+   DOOR_CARBON, 0x9e CABIN_NEON_FRAME, 0xa7 / 0xa8. The wide body's doors,
+   panels and sills (0x11..0x16) and its collision volume (0xa9) follow the
+   wide body. A NULL body part (the game fits none) shows the stock one
+   here; a part without geometry on the car is not checked (the parts
+   browser hides those via n2_mod_catalog). */
+int shop_preset_ride(const char *dataroot, uint32_t preset_hash, char car[32], N2CarConfig *cfg,
+                     char rim_folder[16], int *rim_style) {
+    static unsigned char *pre; static uint32_t npre;   /* chunk 0x30220, read once */
+    Shop *db = (Shop *)db_only(dataroot);
+    if (!db || !db->db) return 0;
+    if (!pre) {
+        char path[600];
+        snprintf(path, sizeof path, "%s/GLOBAL/GLOBALB.BUN", dataroot);
+        FILE *f = fopen(path, "rb");
+        if (!f) return 0;
+        uint32_t sz = 0;
+        long at = find_chunk_in_file(f, 0x00030220u, &sz);
+        if (at >= 0 && sz >= PRESET_SIZE && sz < (1u << 20) && (pre = (unsigned char *)malloc(sz)) != NULL) {
+            if (fseek(f, at, SEEK_SET) == 0 && fread(pre, 1, sz, f) == sz) npre = sz / PRESET_SIZE;
+            else { free(pre); pre = NULL; }
+        }
+        fclose(f);
+        if (!pre) { printf("shop: no preset rides (GLOBALB 0x30220)\n"); return 0; }
+    }
+    const unsigned char *p = NULL;
+    for (uint32_t i = 0; i < npre && !p; i++)   /* FindFEPresetCar 0x61c460 */
+        if (feng_hash_upper((const char *)pre + i * PRESET_SIZE + 0x28) == preset_hash) p = pre + i * PRESET_SIZE;
+    if (!p) return 0;
+    char name[33];
+    memcpy(name, p + 0x28, 32); name[32] = 0;
+    memcpy(car, p + 8, 32); car[31] = 0;
+    RideFill fill;
+    ride_fill_init(&fill, db, car, name, cfg);
+    for (int slot = 0; slot < PRESET_SLOTS; slot++) {
+        uint32_t hash = n2_u32(p + 0x4c + 4 * slot);
+        if (hash == 1) continue;                                        /* the stock part stays */
+        if ((slot >= 0x61 && slot <= 0x68) || slot == 0x19) continue;   /* 0x6372fe: never set */
+        if (slot == 8) continue;   /* 0x637346: TOP is always the slot's first part (the stock one) */
+        ride_fill_slot(&fill, cfg, slot, hash ? preset_part(db, slot, hash) : NULL);
+    }
+    ride_fill_done(&fill, cfg);
+    snprintf(rim_folder, 16, "%s", fill.rim_folder); *rim_style = fill.rim_style;
+    /* performance */
+    if (!perf_ready()) {
+        char path[600]; long n = 0;
+        snprintf(path, sizeof path, "%s/GLOBAL/GLOBALB.BUN", dataroot);
+        unsigned char *g = n2_read_file(path, &n);
+        if (g) { perf_init(g, n); free(g); }
+    }
+    int level = (int)n2_u32(p + 0x48);
+    PerfParts pp; perf_clear(&pp);
+    if (level == -1) {
+        for (int i = 0; i < 0x44; i++) {
+            signed char fl = (signed char)p[0x2f4 + i];
+            if (fl != -1) perf_set_part(&pp, i, fl != 0);
+        }
+    } else perf_fit_level(&pp, -1, level);
+    memcpy(cfg->perf, pp.fit, sizeof cfg->perf);
+    printf("shop: preset %s = %s, rims %s %d, performance %d\n", name, car, rim_folder, *rim_style, level);
+    return 1;
+}
+
+/* ---------------------------------------------------------------- random rides */
+
+/* RideInfo::BuildRandomRide (0x6374b0, GC 802470a8) + BuildRandomSkin
+   (0x632ec0, GC 8024748c), reached from SyncVisualPartsWithPhysics(1, 1)
+   (0x6399d0) for the career's "RANDOM" opponents and the quick race's
+   (re-tools/out/career/PRESET_OPPONENTS.md sections 5, 6). */
+
+/* the part group of each CAR_SLOT_ID (0x802960, CarPartDatabase) */
+static const unsigned char k_slot_group[PRESET_SLOTS] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,   /* 0x00..0x1a */
+    27, 27, 28, 28, 29, 30, 31,                                                                         /* 0x1b..0x21 */
+    60, 61, 61, 62, 62, 63, 63, 61, 61, 61, 61, 62, 62,                                                 /* 0x22..0x2e */
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,                                     /* 0x2f..0x3e */
+    48, 50, 50, 50, 50,                                                                                 /* 0x3f..0x43 */
+    48, 48, 48, 48, 48, 48, 48, 48, 48,                                                                 /* 0x44..0x4c */
+    49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49,                                     /* 0x4d..0x5c */
+    51, 51, 51, 51,                                                                                     /* 0x5d..0x60 */
+    52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52,
+    52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52,   /* 0x61..0x98 */
+    53, 54, 54, 54, 54, 55, 56, 57, 58, 59, 64, 65, 65, 65, 66, 67, 68 };                              /* 0x99..0xa9 */
+
+/* RandomPartUpgrades (0x802c50, GC 80371694; NumRandomPartUpgrades 0x802dd8
+   = 14): the slot, whether no drawn level means the slot's first level-0
+   part (else none), and per row the chance in % of upgrade level 0..3. The
+   row is L (the mean level), path 9 for the kit / roof scoop / spoiler and
+   path 3 (engine) for the exhaust */
+typedef struct { unsigned char slot, first; signed char odds[4][4]; } RandomPartUpgrade;
+#define RPU_STD { { 60, 30, 10, 0 }, { 20, 60, 20, 0 }, { 0, 20, 60, 20 }, { 0, 10, 20, 70 } }
+static const RandomPartUpgrade k_random_part_upgrades[14] = {
+    { 0x09, 1, RPU_STD },   /* HOOD */
+    { 0x07, 1, RPU_STD },   /* ROOF (scoop) */
+    { 0x0c, 1, RPU_STD },   /* SPOILER */
+    { 0x10, 1, RPU_STD },   /* EXHAUST */
+    { 0x20, 1, RPU_STD },   /* WING_MIRROR */
+    { 0x0f, 1, RPU_STD },   /* BRAKELIGHT */
+    { 0x0e, 1, RPU_STD },   /* HEADLIGHT */
+    { 0x9f, 1, RPU_STD },   /* HEADLIGHT_BULB */
+    { 0x99, 0, RPU_STD },   /* WINDOW_TINT */
+    { 0x3f, 1, { { 0, 70, 30, 0 }, { 0, 70, 20, 10 }, { 0, 20, 60, 20 }, { 0, 10, 20, 70 } } },     /* BASE_PAINT */
+    { 0x49, 0, { { 70, 20, 10, 0 }, { 50, 30, 20, 0 }, { 20, 10, 60, 10 }, { 0, 10, 20, 70 } } },   /* rim paint */
+    { 0x4a, 0, { { 0, 70, 30, 0 }, { 0, 70, 20, 10 }, { 0, 20, 60, 20 }, { 0, 10, 20, 70 } } },     /* spinner paint */
+    { 0x9a, 0, { { 90, 10, 0, 0 }, { 40, 50, 10, 0 }, { 30, 20, 50, 0 }, { 30, 10, 30, 30 } } },    /* NEON */
+    { 0x01, 0, RPU_STD },   /* FRONT_BUMPER (the kit) */
+};
+#undef RPU_STD
+/* BuildRandomRide's rims, row by the tires level (path 8) */
+static const signed char k_random_wheel_odds[4][4] = { { 70, 20, 10, 0 }, { 50, 40, 10, 0 }, { 10, 20, 50, 20 }, { 0, 10, 20, 70 } };
+/* BuildRandomSkin: one full-body vinyl (groups 0x18, 0x1a, 0x1b, any level)
+   in % by L, else layers 0..2 with these level odds (row L) and groups */
+static const signed char k_random_vinyl_single[4] = { 0, 0, 5, 10 };
+static const signed char k_random_vinyl_odds[3][4][4] = {
+    { { 95, 0, 5, 0 }, { 90, 0, 10, 0 }, { 80, 0, 20, 0 }, { 65, 0, 35, 0 } },      /* layer 0: group 0x17 */
+    { { 80, 10, 10, 0 }, { 70, 15, 10, 5 }, { 55, 25, 15, 5 }, { 40, 20, 20, 20 } }, /* layer 1: 19 groups */
+    { { 95, 0, 0, 5 }, { 90, 0, 0, 10 }, { 80, 0, 0, 20 }, { 65, 0, 0, 35 } } };     /* layer 2: group 0x19 */
+static const unsigned char k_random_vinyl_single_groups[3] = { 0x18, 0x1a, 0x1b };
+static const unsigned char k_random_vinyl_groups1[19] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0x10, 0x11, 0x12, 0x13, 0x14 };
+/* RandomVinylPaintJobs (0x8a43c8, GC 8040b21c; built at startup by
+   0x77f520; NumRandomVinylJobs 0x802de0 = 5) */
+static const char *const k_random_vinyl_jobs[5][4] = {
+    { "VINYL_L1_COLOR01", "VINYL_L1_COLOR02", "VINYL_L2_COLOR11", "VINYL_L1_COLOR09" },
+    { "VINYL_L1_COLOR01", "VINYL_L1_COLOR02", "VINYL_L1_COLOR03", "VINYL_L1_COLOR04" },
+    { "VINYL_L1_COLOR02", "VINYL_L1_COLOR03", "VINYL_L1_COLOR04", "VINYL_L1_COLOR05" },
+    { "VINYL_L1_COLOR02", "VINYL_L3_COLOR12", "VINYL_L3_COLOR13", "VINYL_L3_COLOR14" },
+    { "VINYL_L1_COLOR02", "VINYL_L3_COLOR18", "VINYL_L3_COLOR19", "VINYL_L3_COLOR20" } };
+/* SetStockParts' vinyl colours, every layer (0x637040) */
+static const char *const k_stock_vinyl_colours[4] = { "VINYL_L1_COLOR09", "VINYL_L1_COLOR02", "VINYL_L2_COLOR11", "VINYL_L1_COLOR01" };
+/* RandomCarPaintJobs (0x8a4418, GC 8040b154; built at startup by 0x77f2d0;
+   NumRandomPaintJobs 0x802ddc = 5): a base paint, then the 5 colours its
+   spoiler (0x45) and muffler tip (0x47) paints are drawn from */
+static const char *const k_random_paint_jobs[5][6] = {
+    { "GLOSS_L1_COLOR02", "GLOSS_L1_COLOR02", "GLOSS_L1_COLOR07", "GLOSS_L2_COLOR02", "GLOSS_L2_COLOR07", "GLOSS_L2_COLOR13" },
+    { "GLOSS_L1_COLOR03", "GLOSS_L1_COLOR03", "GLOSS_L1_COLOR02", "GLOSS_L2_COLOR01", "GLOSS_L2_COLOR06", "GLOSS_L3_TEST07" },
+    { "GLOSS_L2_COLOR01", "GLOSS_L2_COLOR01", "GLOSS_L2_COLOR02", "GLOSS_L2_COLOR07", "GLOSS_L2_COLOR11", "GLOSS_L2_COLOR03" },
+    { "GLOSS_L2_COLOR17", "GLOSS_L2_COLOR17", "GLOSS_L1_COLOR02", "GLOSS_L1_COLOR04", "GLOSS_L2_COLOR01", "GLOSS_L2_COLOR07" },
+    { "METAL_L2_COLOR01", "METAL_L2_COLOR01", "GLOSS_L1_COLOR02", "GLOSS_L1_COLOR07", "METAL_L2_COLOR05", "METAL_L3_TEST04" } };
+
+/* bRandom 0x43c1c0: the old state mod n (0 when n <= 0), then the state
+   steps either way (as airace.c's) */
+static int rr_random(uint32_t *s, int n) {
+    unsigned v = n > 0 ? *s % (unsigned)n : 0;
+    uint32_t t = *s ^ 0x1d872b41u, u = t >> 5 ^ t;
+    *s = u << 27 ^ u ^ t;
+    return (int)v;
+}
+/* the first level j whose cumulative odds pass bRandom(100); 4 = none */
+static int rr_roll(uint32_t *rng, const signed char odds[4]) {
+    int r = rr_random(rng, 100), sum = 0, j;
+    for (j = 0; j < 4; j++) { sum += odds[j]; if (r < sum) break; }
+    return j;
+}
+
+/* GLOBALB 0x34607 (read by 0x6101e0): the two models of each slot (-1 the
+   car itself, 0 none), then per-car overrides {car, slot, model0, model1};
+   GLOBALB 0x34600: the car types (0x890 each after 0x11 alignment: +0 the
+   name, +0xdc OUTER_RADIUS, +0xdd / +0xde the INNER_RADIUS range) */
+static unsigned char *g_rr_models, *g_rr_types;
+static uint32_t g_rr_models_len, g_rr_types_len;
+static int rr_load(const char *dataroot) {
+    if (g_rr_models && g_rr_types) return 1;
+    char path[600];
+    snprintf(path, sizeof path, "%s/GLOBAL/GLOBALB.BUN", dataroot);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    for (int k = 0; k < 2; k++) {
+        uint32_t sz = 0, want = k ? 0x00034600u : 0x00034607u;
+        long at = find_chunk_in_file(f, want, &sz);
+        unsigned char *b = at >= 0 && sz > 0 && sz < (1u << 21) ? (unsigned char *)malloc(sz) : NULL;
+        if (b && (fseek(f, at, SEEK_SET) != 0 || fread(b, 1, sz, f) != sz)) { free(b); b = NULL; }
+        if (!b) continue;
+        if (k) {
+            uint32_t o = 0;
+            while (o + 4 <= sz && n2_u32(b + o) == 0x11111111u) o += 4;
+            memmove(b, b + o, sz - o); sz -= o;
+            free(g_rr_types); g_rr_types = b; g_rr_types_len = sz;
+        } else { free(g_rr_models); g_rr_models = b; g_rr_models_len = sz; }
+    }
+    fclose(f);
+    if (!g_rr_models || !g_rr_types || g_rr_models_len < 8 * PRESET_SLOTS) {
+        printf("shop: random rides: GLOBALB 0x34607 / 0x34600 missing\n");
+        return 0;
+    }
+    return 1;
+}
+static const unsigned char *rr_type(const char *car) {
+    for (uint32_t o = 0; o + 0x890 <= g_rr_types_len; o += 0x890)
+        if (!strncmp((const char *)g_rr_types + o, car, 0x20)) return g_rr_types + o;
+    return NULL;
+}
+
+typedef struct { Shop *db; uint32_t car_hash; const unsigned char *type; } RandRide;
+#define RR_MAX 2048
+/* 0x6101e0: the slot's two model hashes (0 none) */
+static void rr_slot_models(const RandRide *c, int slot, uint32_t m[2]) {
+    m[0] = n2_u32(g_rr_models + 8 * slot); m[1] = n2_u32(g_rr_models + 8 * slot + 4);
+    for (uint32_t o = 8 * PRESET_SLOTS; o + 16 <= g_rr_models_len; o += 16)
+        if (n2_u32(g_rr_models + o) == c->car_hash && (int)n2_u32(g_rr_models + o + 4) == slot) {
+            m[0] = n2_u32(g_rr_models + o + 8); m[1] = n2_u32(g_rr_models + o + 12);
+            break;
+        }
+    for (int i = 0; i < 2; i++) if (m[i] == 0xffffffffu) m[i] = c->car_hash;
+}
+/* GetCarPartDirect 0x61b670's test of one record: model, group, hash (0
+   any), EXCLUDE_UG2 (and EXCLUDE_SUV for the SUVs' own models), upgrade
+   level (-1 any) */
+static int rr_part_ok(const RandRide *c, const unsigned char *r, uint32_t model, int group, uint32_t hash, int level) {
+    const Shop *s = c->db;
+    if (r[7] >= s->nmodels || n2_u32(s->db + s->db_models + 4L * r[7]) != model) return 0;
+    if (r[4] != group || (hash && n2_u32(r) != hash)) return 0;
+    if (level != -1 && (r[5] >> 5) != level) return 0;
+    unsigned aoff = r[10] | r[11] << 8;
+    uint32_t v = 0;
+    /* guess: of the exclusion switches (0x610020 / 0x6100a0) the UG2 one is on and the UG1 one off, as for the Car Shop */
+    if (db_attr(s, aoff, 0xF7934316u, &v) && v) return 0;                      /* EXCLUDE_UG2 */
+    v = 0;
+    if ((model == 0x0219c94au || model == 0x6126dd4du || model == 0xcf704771u)   /* NAVIGATOR, HUMMER, ESCALADE */
+        && db_attr(s, aoff, 0xF7933C86u, &v) && v) return 0;                   /* EXCLUDE_SUV */
+    return 1;
+}
+/* NewGetCarPart 0x61b980 / NewGetNumCarParts 0x631a20: the slot's parts
+   that pass (model 0's, then model 1's), up to max */
+static int rr_parts(const RandRide *c, int slot, uint32_t hash, int level, const unsigned char **out, int max) {
+    const Shop *s = c->db;
+    uint32_t m[2];
+    int n = 0;
+    rr_slot_models(c, slot, m);
+    for (int mi = 0; mi < 2; mi++) {
+        if (!m[mi] || (mi && m[1] == m[0])) continue;
+        for (long p = s->db_parts; p + 14 <= s->db_parts + s->db_parts_len && n < max; p += 14) {
+            const unsigned char *r = s->db + p;
+            if (!n2_u32(r) && !(r[8] | r[9] << 8)) break;
+            if (rr_part_ok(c, r, m[mi], k_slot_group[slot], hash, level)) out[n++] = r;
+        }
+    }
+    return n;
+}
+static const unsigned char *rr_first(const RandRide *c, int slot, uint32_t hash, int level) {
+    const unsigned char *r = NULL;
+    return rr_parts(c, slot, hash, level, &r, 1) ? r : NULL;
+}
+/* RideInfo::GetRandomPart 0x631cb0: one of the slot's parts of that level
+   (no draw when there is none) */
+static const unsigned char *rr_random_part(const RandRide *c, int slot, int level, uint32_t *rng) {
+    static const unsigned char *t[RR_MAX];
+    int n = rr_parts(c, slot, 0, level, t, RR_MAX);
+    return n ? t[rr_random(rng, n)] : NULL;
+}
+/* GetRandomVinyl 0x61c4b0: a slot-0x40 vinyl of that level (-1 any) whose
+   group (upgrade byte & 0x1f) is listed */
+static const unsigned char *rr_random_vinyl(const RandRide *c, int level, const unsigned char *groups, int ng, uint32_t *rng) {
+    static const unsigned char *t[RR_MAX], *u[RR_MAX];
+    int n = rr_parts(c, 0x40, 0, level, t, RR_MAX), k = 0;
+    for (int i = 0; i < n; i++)
+        for (int g = 0; g < ng; g++) if ((t[i][5] & 0x1f) == groups[g]) { u[k++] = t[i]; break; }
+    return k ? u[rr_random(rng, k)] : NULL;
+}
+/* GetRandomWheel 0x632de0: up to 128 FRONT_WHEEL parts of that level whose
+   OUTER_RADIUS is the car type's (+0xdc) and INNER_RADIUS within
+   +0xdd..+0xde; one of them */
+static const unsigned char *rr_random_wheel(const RandRide *c, int level, uint32_t *rng) {
+    static const unsigned char *t[RR_MAX], *u[128];
+    int n = rr_parts(c, 0x1d, 0, level, t, RR_MAX), k = 0;
+    for (int i = 0; i < n && k < 128; i++) {
+        unsigned aoff = t[i][10] | t[i][11] << 8;
+        uint32_t in = 0, out = 0;
+        if (!db_attr(c->db, aoff, 0xeb0101e2u, &in) || !db_attr(c->db, aoff, 0xce7d8db5u, &out)) continue;   /* INNER / OUTER_RADIUS */
+        if ((int)out == c->type[0xdc] && c->type[0xdd] <= (int)in && (int)in <= c->type[0xde]) u[k++] = t[i];
+    }
+    return k ? u[rr_random(rng, k)] : NULL;
+}
+
+Shop *shop_part_db(const char *dataroot) { return (Shop *)db_only(dataroot); }
+
+/* SetUpgradePart 0x61bc80: the slot's first part (NewGetCarPart order) of
+   that upgrade level, and its model name as shop_part_model's (generic
+   libraries or the car's own models). 0 when there is none. */
+int shop_upgrade_model(const char *dataroot, const char *car, int slot, int level, char *out, int cap) {
+    const Shop *db = db_only(dataroot);
+    if (!db || !db->db || !db->db_parts || !car || !rr_load(dataroot)) return 0;
+    RandRide c = { (Shop *)db, feng_hash(car), rr_type(car) };
+    const unsigned char *r = rr_first(&c, slot, 0, level);
+    if (!r) return 0;
+    if (rec_model(db, r, 0, car, out, cap)) return 1;
+    if (r[6] == 0) {   /* no model record: the part hash is the model name's (BRAKE_STYLE01..03, <CAR>_KIT00_FRONT_BRAKE) */
+        char nm[64];
+        for (int k = 0; k < 10; k++) {
+            snprintf(nm, sizeof nm, "BRAKE_STYLE%02d", k);
+            if (feng_hash(nm) == n2_u32(r)) { snprintf(out, (size_t)cap, "%s", nm); return 1; }
+        }
+        snprintf(nm, sizeof nm, "%s_KIT00_FRONT_BRAKE", car);
+        if (feng_hash(nm) == n2_u32(r)) { snprintf(out, (size_t)cap, "%s", nm); return 1; }
+    }
+    printf("shop: upgrade %s slot %#x level %d: part %08x model %u kind %u unnamed\n", car, slot, level, n2_u32(r), r[7], r[6]);
+    return 0;
+}
+
+int shop_random_ride(Shop *s, const char *car, const int perf_lvl[10], uint32_t *rng, N2CarConfig *out,
+                     char *rim, int rimsz, int *rim_style) {
+    if (!s) s = g_db_only;
+    if (!s || !s->db || !s->db_parts || !car || !rng || !out) return 0;
+    if (!rr_load(s->dataroot)) return 0;
+    RandRide c = { s, feng_hash(car), rr_type(car) };
+    if (!c.type) { printf("shop: random ride: no car type %s\n", car); return 0; }
+    /* the RideInfo after Init + SetStockParts (0x637040): a slot not
+       touched below stays stock (our zero) */
+    const unsigned char *part[PRESET_SLOTS];
+    unsigned char touched[PRESET_SLOTS];
+    memset(part, 0, sizeof part); memset(touched, 0, sizeof touched);
+    int lv[10];
+    for (int i = 0; i < 10; i++) lv[i] = perf_lvl ? (perf_lvl[i] < 0 ? 0 : perf_lvl[i] > 3 ? 3 : perf_lvl[i]) : 0;
+    /* SyncVisualPartsWithPhysics re-matches path 9 (aero / the body kit)
+       with MatchUpgradeLevel (0x5a6880) to the mean normalized level of
+       paths 8 tires, 5 suspension and 0 weight before BuildRandomRide.
+       guess: path 9 = floor of that mean */
+    lv[9] = (lv[8] + lv[5] + lv[0]) / 3;
+    int sum = 0;
+    for (int i = 0; i < 10; i++) sum += lv[i];
+    int L = (int)(sum * 0.1f);   /* (int)(0.1 * the sum of the 10 levels) */
+    if (L > 3) L = 3;
+    /* RandomPartUpgrades */
+    for (int e = 0; e < 14; e++) {
+        const RandomPartUpgrade *u = &k_random_part_upgrades[e];
+        int row = u->slot == 1 || u->slot == 7 || u->slot == 0xc ? lv[9] : u->slot == 0x10 ? lv[3] : L;
+        int j = rr_roll(rng, u->odds[row]);
+        part[u->slot] = j < 4 ? rr_random_part(&c, u->slot, j, rng) : u->first ? rr_first(&c, u->slot, 0, 0) : NULL;
+        touched[u->slot] = 1;
+    }
+    /* the kit follows the front bumper: its KITnn rear bumper and skirt,
+       when the car has both */
+    if (!part[1]) {
+        part[1] = rr_first(&c, 1, 0, 0); part[2] = rr_first(&c, 2, 0, 0); part[0xb] = rr_first(&c, 0xb, 0, 0);
+        touched[2] = touched[0xb] = 1;
+    } else {
+        char nm[96];
+        int kit = part[1][5] & 0x1f;
+        snprintf(nm, sizeof nm, "%s_KIT%.2d_REAR_BUMPER", car, kit);
+        const unsigned char *rear = rr_first(&c, 2, feng_hash(nm), -1);
+        snprintf(nm, sizeof nm, "%s_KIT%.2d_SKIRT", car, kit);
+        const unsigned char *skirt = rr_first(&c, 0xb, feng_hash(nm), -1);
+        if (rear && skirt) { part[2] = rear; part[0xb] = skirt; touched[2] = touched[0xb] = 1; }
+    }
+    /* the rims, by the tires level, sized for the car */
+    {
+        int j = rr_roll(rng, k_random_wheel_odds[lv[8]]);
+        const unsigned char *w = j < 4 ? rr_random_wheel(&c, j, rng) : NULL;
+        if (w) { part[0x1d] = part[0x1e] = w; touched[0x1d] = touched[0x1e] = 1; }
+    }
+    /* BuildRandomSkin: SetStockParts' vinyl colours first */
+    for (int l = 0; l < 4; l++)
+        for (int j = 0; j < 4; j++) {
+            int slot = 0x4d + 4 * l + j;
+            part[slot] = rr_first(&c, slot, feng_hash(k_stock_vinyl_colours[j]), -1);
+            touched[slot] = 1;
+        }
+    touched[0x40] = touched[0x41] = touched[0x42] = touched[0x43] = 1;
+    if (rr_random(rng, 100) < k_random_vinyl_single[L]) {
+        const unsigned char *v = rr_random_vinyl(&c, -1, k_random_vinyl_single_groups, 3, rng);
+        if (v) part[0x40] = v;
+    } else {
+        static const unsigned char g0 = 0x17, g2 = 0x19;
+        /* guess: a layer whose drawn level has no vinyl of its groups (level 0: none exist) stays empty */
+        int j = rr_roll(rng, k_random_vinyl_odds[0][L]);
+        part[0x40] = j < 4 ? rr_random_vinyl(&c, j, &g0, 1, rng) : NULL;
+        j = rr_roll(rng, k_random_vinyl_odds[1][L]);
+        part[0x41] = j < 4 ? rr_random_vinyl(&c, j, k_random_vinyl_groups1, 19, rng) : NULL;
+        j = rr_roll(rng, k_random_vinyl_odds[2][L]);
+        part[0x42] = j < 4 ? rr_random_vinyl(&c, j, &g2, 1, rng) : NULL;
+        for (int l = 0; l < 3; l++) {
+            int perm[4] = { 0, 1, 2, 3 };
+            for (int i = 0; i < 4; i++) { int k = rr_random(rng, 4), t = perm[k]; perm[k] = perm[i]; perm[i] = t; }
+            int set = rr_random(rng, 5);
+            for (int k = 0; k < 4; k++) {
+                int slot = 0x4d + 4 * l + k;
+                part[slot] = rr_first(&c, slot, feng_hash(k_random_vinyl_jobs[set][perm[k]]), -1);
+            }
+        }
+    }
+    /* the base paint drawn again (RandomPartUpgrades[9]'s odds) */
+    {
+        const RandomPartUpgrade *u = &k_random_part_upgrades[9];
+        int j = rr_roll(rng, u->odds[L]);
+        part[0x3f] = j < 4 ? rr_random_part(&c, 0x3f, j, rng) : rr_first(&c, 0x3f, 0, 0);
+    }
+    /* RandomCarPaintJobs: a listed base paint gets its spoiler and muffler tip paints */
+    for (int e = 0; part[0x3f] && e < 5; e++) {
+        if (n2_u32(part[0x3f]) != feng_hash(k_random_paint_jobs[e][0])) continue;
+        int a = rr_random(rng, 5), b = rr_random(rng, 5);
+        part[0x45] = rr_first(&c, 0x45, feng_hash(k_random_paint_jobs[e][1 + a]), -1);
+        part[0x47] = rr_first(&c, 0x47, feng_hash(k_random_paint_jobs[e][1 + b]), -1);
+        touched[0x45] = touched[0x47] = 1;
+        break;
+    }
+    /* into our representation, as shop_preset_ride's slots */
+    RideFill fill;
+    ride_fill_init(&fill, s, car, "(random)", out);
+    for (int slot = 0; slot < PRESET_SLOTS; slot++)
+        if (touched[slot]) ride_fill_slot(&fill, out, slot, part[slot]);
+    ride_fill_done(&fill, out);
+    if (rim && rimsz > 0) snprintf(rim, (size_t)rimsz, "%s", fill.rim_folder);
+    if (rim_style) *rim_style = fill.rim_style;
+    return 1;
+}
+
 unsigned shop_purge_preview(Shop *s) {
     return s && s->screen == SC_SPEC && s->spec_open && s->spec_slot == 0xa2 ? s->preview.purge : 0;
+}
+/* 0x61f820: the hood part's upgrade group 5 = split, VERTSPLIT (attribute
+   0x7a8780) nonzero = front/back (4) else left/right (2); flag: the part is
+   <CAR>_STYLE22_HOOD or _CF (0x7a8770 / 0x7a875c seeded with the car hash) */
+static void hood_anim_style(const Shop *s, const char *car, int hv, int *style, int *flag) {
+    static int cache_v = -1, cache_style, cache_flag; static char cache_car[32];
+    *style = 0; *flag = 0;
+    if (hv <= 0 || !s || !s->db) return;
+    if (hv != cache_v || strcmp(cache_car, car)) {
+        int model = db_model(s, car);
+        cache_v = hv; snprintf(cache_car, sizeof cache_car, "%s", car);
+        cache_style = 0; cache_flag = 0;
+        for (long p = s->db_parts; model >= 0 && p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
+            const unsigned char *r = s->db + p;
+            uint32_t hash = n2_u32(r);
+            unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
+            if (!hash && !soff) break;
+            if (r[4] != G_HOOD || r[7] != model || ((r[5] | r[6] << 8) & 0x1f) != 5) continue;
+            if (part_value(car, G_HOOD, hash) != hv) continue;
+            uint32_t vs = 0;
+            cache_style = db_attr(s, aoff, 0x3da5adacu, &vs) && vs ? 4 : 2;   /* VERTSPLIT */
+            char nm[64]; snprintf(nm, sizeof nm, "%s_STYLE22_HOOD", car);
+            cache_flag = hash == feng_hash(nm) || hash == feng_hash(strcat(nm, "_CF"));
+            break;
+        }
+    }
+    *style = cache_style; *flag = cache_flag;
+}
+/* 0x61f820's styles for a fitted car (no shop: the database alone), as
+   shop_parts_open gives them */
+void shop_car_part_anim_styles(const char *dataroot, const char *car, const N2CarConfig *cfg,
+                               int *hood_style, int *hood_flag, int *door_style) {
+    *hood_style = 0; *hood_flag = 0; *door_style = 0;
+    if (!cfg) return;
+    hood_anim_style(db_only(dataroot), car, cfg->parts[N2_PART_HOOD], hood_style, hood_flag);
+    *door_style = (int)cfg->doors;
+    if (*door_style == 1 && cfg->parts[N2_PART_WIDE] > 1) *door_style = cfg->parts[N2_PART_WIDE] + 1;
 }
 int shop_parts_open(Shop *s, int *hood_style, int *hood_flag, int *door_style) {
     *hood_style = 0; *hood_flag = 0; *door_style = 0;
@@ -4091,30 +5544,13 @@ int shop_parts_open(Shop *s, int *hood_style, int *hood_flag, int *door_style) {
     if (s->screen == SC_SPEC && s->spec_open && s->spec_slot == 0xa0) m |= 4;
     if (s->screen == SC_SPEC && s->spec_slot >= 0x22 && s->spec_slot <= 0x2e) m |= 2;
     if (s->screen == SC_ICE) m |= 2;   /* UI_ICEMAIN modes 2..5: 0x4c1860(1, 1, 1.0) */
+    if (s->screen == SC_MAG_REWARD)    /* FEDoCarPartAnimNow: bit0 hood (0), bit3 trunk (1), bits 1/2 the doors (2 / 3) */
+        m |= (s->mag_flags & 1 ? 1 : 0) | (s->mag_flags & 8 ? 2 : 0) |   /* CarAnimLocation 2 = LEFT_DOOR, */
+             (s->mag_flags & 2 ? 8 : 0) | (s->mag_flags & 4 ? 16 : 0);   /* 3 = RIGHT_DOOR (0x433ad0): 8 / 16 */
     if (s->screen == SC_NEON_LIST && neon_slot(s) == 1) m |= 1;
     if (s->screen == SC_NEON_LIST && neon_slot(s) == 3) m |= 2;
     if ((shop_view(s) & 0xffff) == 0x44) m |= 1;
-    /* 0x61f820: the hood part's upgrade group 5 = split; VERTSPLIT front/back */
-    int hv = s->preview.parts[N2_PART_HOOD], model = hv > 0 ? db_model(s, s->car) : -1;
-    static int cache_v = -1, cache_style, cache_flag; static char cache_car[32];
-    if (hv > 0 && (hv != cache_v || strcmp(cache_car, s->car))) {
-        cache_v = hv; snprintf(cache_car, sizeof cache_car, "%s", s->car);
-        cache_style = 0; cache_flag = 0;
-        for (long p = s->db_parts; model >= 0 && p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
-            const unsigned char *r = s->db + p;
-            uint32_t hash = n2_u32(r);
-            unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
-            if (!hash && !soff) break;
-            if (r[4] != G_HOOD || r[7] != model || ((r[5] | r[6] << 8) & 0x1f) != 5) continue;
-            if (part_value(s->car, G_HOOD, hash) != hv) continue;
-            uint32_t vs = 0;
-            cache_style = db_attr(s, aoff, 0x3da5adacu, &vs) && vs ? 4 : 2;   /* VERTSPLIT */
-            char nm[64]; snprintf(nm, sizeof nm, "%s_STYLE22_HOOD", s->car);
-            cache_flag = hash == feng_hash(nm) || hash == feng_hash(strcat(nm, "_CF"));
-            break;
-        }
-    }
-    if (hv > 0) { *hood_style = cache_style; *hood_flag = cache_flag; }
+    hood_anim_style(s, s->car, s->preview.parts[N2_PART_HOOD], hood_style, hood_flag);
     *door_style = (int)s->preview.doors;
     if (*door_style == 1 && s->preview.parts[N2_PART_WIDE] > 1) *door_style = s->preview.parts[N2_PART_WIDE] + 1;
     return m;
@@ -4233,6 +5669,57 @@ static void perf_slider_place(Shop *s, int p, FengAnim *a, const uint32_t ob[5],
     }
 }
 
+/* ---- the career's performance parts (CAREER.md "C6: shops") ------------
+   MapPerfPackageToUnlockable 8012ed7c: the category's unlockable entity;
+   CareerUnlocker::IsPerfPackageUnlocked 8012f724 / IsPerfPartUnlocked
+   8012f650: filter 2 = a part of it owned, 4 = CalculateIfUnlocked; the
+   package price GetPerfPackageCost 80129648: the parts neither installed
+   nor bought (GetPackagePriceOfNotOwned), 90% of it for two or more (80%
+   in CC_MEGALOW, 0x7fc8d0d0, the engaged shop) */
+static const int k_perf_ent[PERF_NCAT] = { 6, 5, 4, 1, 9, 3, 8, 2, 7, 10 };
+static int perf_megalow(const Shop *s) {
+    return s->cshop && (s->cshop[0x38] | s->cshop[0x39] << 8 | s->cshop[0x3a] << 16 | (uint32_t)s->cshop[0x3b] << 24) == 0x7fc8d0d0u;
+}
+static int perf_bought(const Shop *s, int i) { return s->career && career_owns_perf(i); }   /* IsPerfPartPurchased */
+static int perf_unlocked(const Shop *s, int cat, int lvl) {
+    if (cat < 0 || cat >= PERF_NCAT) return 1;
+    if (!s->career) return calc_unlocked(s, k_perf_ent[cat], lvl);   /* QuickRaceUnlocker: CareerUnlocker filter 4 */
+    int ok = 0;
+    if (s->career & 2) {
+        int idx[4]; unsigned int nm[4];
+        int n = perf_pkg_parts(cat, lvl, idx, nm, NULL);
+        for (int j = 0; j < n && !ok; j++) ok = career_owns_perf(idx[j]);
+    }
+    if (s->career & 4) ok = ok || calc_unlocked(s, k_perf_ent[cat], lvl);
+    return ok;
+}
+static void perf_pkg_cost(const Shop *s, int cat, int lvl, int *cost, int *disc) {
+    int idx[4]; unsigned int nm[4]; int pr[4], sum = 0, cnt = 0;
+    int n = perf_pkg_parts(cat, lvl, idx, nm, pr);
+    for (int j = 0; j < n; j++)
+        if (!(idx[j] >= 0 && idx[j] < N2_PERF_PARTS && s->fitted.perf[idx[j]]) && !perf_bought(s, idx[j])) { sum += pr[j]; cnt++; }
+    *cost = sum; *disc = 0;
+    if (cnt < 2) return;
+    *cost = sum * (perf_megalow(s) ? 80 : 90) / 100;
+    *disc = sum - *cost;
+}
+static int perf_pkg_bought(const Shop *s, int cat, int lvl) {   /* IsPerfPackagePurchased 801713f8 */
+    int idx[4]; unsigned int nm[4];
+    int n = perf_pkg_parts(cat, lvl, idx, nm, NULL);
+    if (!n) return 0;
+    for (int j = 0; j < n; j++) if (!perf_bought(s, idx[j])) return 0;
+    return 1;
+}
+static int perf_part_price(int i) {   /* GetPerfPartCost 801295d8: the part's +8 */
+    for (int c = 0; c < PERF_NCAT; c++)
+        for (int l = 1; l <= 3; l++) {
+            int idx[4]; unsigned int nm[4]; int pr[4];
+            int n = perf_pkg_parts(c, l, idx, nm, pr);
+            for (int j = 0; j < n; j++) if (idx[j] == i) return pr[j];
+        }
+    return 0;
+}
+
 static int perf_obj(const Shop *s, const char *fmt, int n) {
     char nm[32]; snprintf(nm, sizeof nm, fmt, n);
     return feng_find(s->pk[PK_PERF_PKG], feng_hash_upper(nm));
@@ -4273,19 +5760,38 @@ static void perf_pkg_update(Shop *s) {
                 continue;
             }
             int inst = idx[n] >= 0 && idx[n] < N2_PERF_PARTS && s->fitted.perf[idx[n]];
+            int bought = !inst && perf_bought(s, idx[n]);
             s->perf_row_name[n] = name[n];
-            s->perf_row_price[n] = inst ? 0xed56be1fu : 0x4287206fu;   /* Installed / Not Installed */
+            /* PartInfoWidget::Draw 801721bc: Installed / career: Purchased or "%$d" / Not Installed */
+            s->perf_row_price[n] = inst ? 0xed56be1fu : bought ? 0x0371711cu : s->career ? 0 : 0x4287206fu;
+            hud_num(s->perf_row_cash[n], (int)sizeof s->perf_row_cash[n], price[n]);
             if (on >= 0) feng_anim_hide(a, on, 0);
             if (op >= 0) {
                 feng_anim_hide(a, op, 0);
-                feng_anim_set(a, op, feng_hash_upper(inst ? "Purchased" : "Init"), 1);
+                feng_anim_set(a, op, feng_hash_upper(inst || bought ? "Purchased" : "Init"), 1);
             }
             s->perf_nrow = n + 1;
         }
     }
-    /* outside the career: no cost, discount or total */
+    /* RefreshHeader 80172854: the discount's label and amount, the cost --
+       outside the career and in the crib's Change Parts none of them */
     static const uint32_t cost[4] = { 0x06e0c9a8u, 0xbe8693e1u, 0x0380b632u, 0x89ca4fdbu };
-    for (int i = 0; i < 4; i++) if ((o = feng_find(pk, cost[i])) >= 0) feng_anim_hide(a, o, 1);
+    int box = s->career && !s->cust_entry && show;
+    for (int i = 0; i < 4; i++) if ((o = feng_find(pk, cost[i])) >= 0) feng_anim_hide(a, o, !box);
+    if (box) {
+        int c, d;
+        perf_pkg_cost(s, cat, type, &c, &d);
+        {   /* FEPrintf: the label is a format ("10%% Discount:") */
+            const char *f = str_get(s, perf_megalow(s) ? 0x66559034u : 0x6da17a25u);
+            int k = 0;
+            for (; *f && k < (int)sizeof s->perf_cost_txt[0] - 1; f++) if (!(f[0] == '%' && f[1] == '%')) s->perf_cost_txt[0][k++] = *f;
+            s->perf_cost_txt[0][k] = 0;
+        }
+        if (d < 1) snprintf(s->perf_cost_txt[1], sizeof s->perf_cost_txt[1], "%s", str_get(s, 0xa4c02484u));
+        else hud_num(s->perf_cost_txt[1], (int)sizeof s->perf_cost_txt[1], d);
+        if (c < 1) snprintf(s->perf_cost_txt[2], sizeof s->perf_cost_txt[2], "%s", str_get(s, 0xa4c02484u));
+        else hud_num(s->perf_cost_txt[2], (int)sizeof s->perf_cost_txt[2], c);
+    }
     /* 0x54ff90: the sliders, the installed values under the preview */
     float cur[3], val[3];
     perf_stats_of(s->fitted.perf, cur);
@@ -4315,10 +5821,14 @@ static const uint32_t k_buy_slider[2][5] = {   /* 0x547e30: backing, -, current 
 
 static void buy_build(Shop *s) {                                          /* 0x562790 */
     s->buy_n = 0; s->buy_sel = 0; s->buy_top = 0;
-    for (int lvl = 1; lvl <= 3; lvl++) {
+    int top = s->career && perf_megalow(s) ? 2 : 3;   /* 0x562790: CC_MEGALOW stops at level 2 */
+    for (int lvl = 1; lvl <= top; lvl++) {
         int idx[4]; unsigned int name[4];
         int n = perf_pkg_parts(s->perf_cat, lvl, idx, name, NULL);
         for (int j = 0; j < n && s->buy_n < BUY_MAX; j++) {
+            if (!(s->career ? perf_bought(s, idx[j]) || ((s->career & 4) && calc_unlocked(s, k_perf_ent[s->perf_cat], lvl))
+                            : calc_unlocked(s, k_perf_ent[s->perf_cat], lvl)))   /* QR: filter 4 */
+                continue;   /* IsPerfPartAvailable */
             s->buy_idx[s->buy_n] = idx[j]; s->buy_name[s->buy_n] = name[j]; s->buy_n++;
         }
     }
@@ -4367,7 +5877,7 @@ static void buy_update(Shop *s) {
             case QP_BACK: feng_anim_pos(a, o, g.tl + 276.0f, g.tt + y + 10.0f); break;
             default: break;
             }
-            uint32_t sc = part == QP_DATA && buy_installed(s, k) ? pur : sel ? hi : un;
+            uint32_t sc = part == QP_DATA && (buy_installed(s, k) || perf_bought(s, s->buy_idx[k])) ? pur : sel ? hi : un;
             feng_anim_set(a, o, sc, 1);
         }
     }
@@ -4386,7 +5896,7 @@ static void buy_update(Shop *s) {
     float rb[2] = { 0, 0 }, nb[2] = { 0, 0 }, ra[2] = { 0, 0 }, na[2] = { 0, 0 };
     if (g_shop_rec_ok && perf_ready()) {
         static unsigned char built[N2_REC_SIZE];
-        PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit);
+        PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit); memcpy(pp.junk, s->fitted.junk, sizeof pp.junk);
         perf_build(g_shop_rec, &pp, built);
         perf_power(built, rb, nb);
         if (s->buy_n) perf_fit_part(&pp, s->buy_idx[s->buy_sel]);
@@ -4414,10 +5924,18 @@ static void buy_move(Shop *s, int step) {                                /* 0x72
 
 
 static void perf_pkg_enter(Shop *s, int cat) {
+    /* PerfCategoryThing::React 0xc407210 -> HandlePerformanceCategory */
+    static const unsigned char spk[9] = { 0x10, 0xc, 9, 7, 0xd, 10, 3, 6, 0xb };
+    if (s->career && cat >= 0 && cat < 9) career_speech_fe(spk[cat]);
     const FengPackage *pk = s->pk[PK_PERF_PKG];
     s->screen = SC_PERF_PKG;
     s->perf_cat = cat;
     scroller_set(&s->perfpkg, k_perf_pkg, NELEM(k_perf_pkg));
+    s->perfpkg.sel = 1;                        /* Setup 0x556e60: SetInitialPos(1), the first package */
+    for (int i = 0; i < s->perfpkg.n; i++) {   /* IsPerfPackageAvailable: the locked icon */
+        int g = k_perf_pkg[i].group;
+        s->perfpkg.locked[i] = g >= 1 && g <= 3 && !perf_unlocked(s, cat, g);
+    }
     s->perf_shown = -1;
     if (!pk) return;
     if (!s->perf_anim) s->perf_anim = (FengAnim *)malloc(sizeof *s->perf_anim);
@@ -4440,9 +5958,13 @@ static void perf_pkg_input(Shop *s, int key) {
         else if (key == SHOP_KEY_OK && s->buy_n) {
             /* 0x55a230: installed -> "already installed!", else "install
                this part now?" (worse than the fitted one: 0x521c10) */
-            PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit);
+            PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit); memcpy(pp.junk, s->fitted.junk, sizeof pp.junk);
             int i = s->buy_idx[s->buy_sel];
             if (perf_part_fitted(&pp, i)) dialog(s, DLG_AUTO, 1, 0xda15d7e5u, DA_NONE, 0, 0);
+            else if (s->career && !perf_bought(s, i)) {   /* career: GetPerfPartCost against the wallet */
+                if (g_career.cash < perf_part_price(i)) dialog(s, PK_DLG_S, 1, 0xd1ac60beu, DA_NONE, 0, 0);
+                else dialog(s, DLG_AUTO, 2, perf_part_worse(&pp, i) ? 0x3949abeeu : 0x44b7167fu, DA_PERF_PART_BUY, 0, 0);
+            }
             else dialog(s, DLG_AUTO, 2, perf_part_worse(&pp, i) ? 0xf1bd1a8au : 0xf5ac2b2au, DA_PERF_PART, 0, 0);
         } else if (key == SHOP_KEY_BACK) {   /* 0x34dc1bec: the focus back to the packages */
             s->buy_focus = 0;
@@ -4462,11 +5984,18 @@ static void perf_pkg_input(Shop *s, int key) {
            performance package?" (a part worse than a fitted one: 0x5303c0);
            Return To Stock 0x55a140: stock -> "already stock!", else
            "Re-Install Stock Parts?" */
-        PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit);
+        PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit); memcpy(pp.junk, s->fitted.junk, sizeof pp.junk);
+        if (s->perfpkg.locked[s->perfpkg.sel]) return;
         if (type == PP_STOCK) {
             if (!perf_cat_level(&pp, s->perf_cat)) dialog(s, DLG_AUTO, 1, 0x89d4e03fu, DA_NONE, 0, 0);
             else dialog(s, DLG_AUTO, 2, 0x5d336f96u, DA_PERF_STOCK, 0, 0);
         } else if (perf_pkg_fitted(&pp, s->perf_cat, type)) dialog(s, DLG_AUTO, 1, 0xb84a37fau, DA_NONE, 0, 0);
+        else if (s->career && !perf_pkg_bought(s, s->perf_cat, type)) {   /* career: GetPerfPackageCost against the wallet */
+            int c, d;
+            perf_pkg_cost(s, s->perf_cat, type, &c, &d);
+            if (g_career.cash < c) dialog(s, PK_DLG_S, 1, 0xd1ac60beu, DA_NONE, 0, 0);
+            else dialog(s, DLG_AUTO, 2, perf_pkg_worse(&pp, s->perf_cat, type) ? 0xfddd0c23u : 0x94f4c140u, DA_PERF_PKG_BUY, 0, 0);
+        }
         else dialog(s, DLG_AUTO, 2, perf_pkg_worse(&pp, s->perf_cat, type) ? 0x0217453fu : 0xf2d7ffabu, DA_PERF_PKG, 0, 0);
     } else if (key == SHOP_KEY_BACK) {
         s->screen = SC_PERFORMANCE;
@@ -4476,7 +6005,7 @@ static void perf_pkg_input(Shop *s, int key) {
 static void perf_pkg_yes(Shop *s) {
     int type = k_perf_pkg[s->perfpkg.sel].group;
     {
-        PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit);
+        PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit); memcpy(pp.junk, s->fitted.junk, sizeof pp.junk);
         if (type == PP_STOCK) perf_unfit_cat(&pp, s->perf_cat);
         else perf_fit_pkg(&pp, s->perf_cat, type);
         memcpy(s->fitted.perf, pp.fit, sizeof s->fitted.perf);
@@ -4488,7 +6017,7 @@ static void perf_pkg_yes(Shop *s) {
     }
 }
 static void perf_part_yes(Shop *s) {
-    PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit);
+    PerfParts pp; perf_clear(&pp); memcpy(pp.fit, s->fitted.perf, sizeof pp.fit); memcpy(pp.junk, s->fitted.junk, sizeof pp.junk);
     perf_fit_part(&pp, s->buy_idx[s->buy_sel]);
     memcpy(s->fitted.perf, pp.fit, sizeof s->fitted.perf);
     memcpy(s->preview.perf, pp.fit, sizeof s->preview.perf);
@@ -4496,6 +6025,170 @@ static void perf_part_yes(Shop *s) {
     printf("shop: performance part %d fitted\n", s->buy_idx[s->buy_sel]);
     buy_update(s);
     perf_pkg_update(s);
+}
+
+/* ---------------------------------------------------------------- brands */
+
+/* ChooseBrandsScreen (UI_PerformanceBrandSelect.fng, Setup 0x550330 /
+   GC 801742cc). A career buy's yes (0x9f00f07) on a package whose parts
+   have brands (0x500160 >= 1), or on a part with brands (part +0xc), pushes
+   it: one widget per part with brands (the first 4; package mode: arrows
+   only with more than one brand, "Change Selection" 0x6d017bc5 hidden
+   under two widgets; the one part: arrows always, no "Change Selection").
+   A widget (0x53b960) shows the part's name (part +4), its brand's display
+   name and DECAL_ICON_<brand>; left / right (0x521e90) step the brand with
+   a wrap, starting at the first. "Change Brand" 0xb34a6c2b shows only on a
+   part with two brands or more. Accept (0xe1fde1d1) = SetChosenBrands --
+   the brands stored by widget order (0, 1, .. as the parts with brands come,
+   not by part slot) -- then BuyPerfPackage / BuyPerfPart and the install. */
+#define O_BRAND_CHANGE 0xb34a6c2bu
+#define O_BRAND_SELECT 0x6d017bc5u
+static GLuint g_anim_tex[FENG_MAX_OBJ];          /* draw_anim_package: image overrides */
+static int brand_obj(const FengPackage *pk, int part, int n) {
+    if (part == QP_N) { char nm[32]; snprintf(nm, sizeof nm, "OPTION_IMAGE_%d", n); return feng_find(pk, feng_hash_upper(nm)); }
+    return qr_pool(pk, part, n);
+}
+static void brand_scripts(Shop *s, int restart) {
+    const FengPackage *pk = s->pk[PK_BRAND];
+    FengAnim *a = s->brand_anim;
+    if (!pk || !a) return;
+    uint32_t hi = feng_hash_upper("Highlight"), un = feng_hash_upper("UnHighlight");
+    for (int k = 0; k < s->brand_n; k++)
+        for (int part = 0; part <= QP_N; part++) {
+            int o = brand_obj(pk, part, k + 1);
+            if (o >= 0) feng_anim_set(a, o, k == s->brand_sel ? hi : un, restart);
+        }
+    int o = feng_find(pk, O_BRAND_CHANGE);
+    if (o >= 0 && s->brand_n) feng_anim_hide(a, o, s->brand_w[s->brand_sel].nb < 2);
+}
+/* 0x52dcc0 per widget, y = row x TITLE_MASTER height: the name at the
+   title's left, half the image down; the image centred on DATA_MASTER at its
+   top; the data under the image (+1); the arrows just outside DATA_MASTER,
+   half the image down; the backing at (+232, +64) */
+static void brand_marks(Shop *s) {   /* which objects are widget rows (not pinned; arrows U2_Menu_Arrow) */
+    const FengPackage *pk = s->pk[PK_BRAND];
+    memset(s->qr_rowobj, 0, sizeof s->qr_rowobj);
+    if (!pk) return;
+    for (int n = 1; n <= 4; n++)
+        for (int part = 0; part <= QP_N; part++) {
+            int o = brand_obj(pk, part, n);
+            if (o < 0) continue;
+            s->qr_rowobj[o] = part == QP_LEFT || part == QP_RIGHT ? 2 : 1;
+            for (int c = o + 1; c < pk->nobj; c++)
+                if (feng_inside(pk, c, o)) s->qr_rowobj[c] = 1;
+        }
+}
+static void brand_layout(Shop *s) {
+    const FengPackage *pk = s->pk[PK_BRAND];
+    FengAnim *a = s->brand_anim;
+    if (!pk || !a) return;
+    RowGeom g; row_geom(pk, &g);
+    for (int n = 1; n <= 4; n++) {
+        int k = n - 1, used = k < s->brand_n;
+        float y = (float)k * g.step;
+        int oi = brand_obj(pk, QP_N, n);
+        float ih = oi >= 0 ? fabsf(pk->obj[oi].size[1]) : 44.8f;
+        for (int part = 0; part <= QP_N; part++) {
+            int o = brand_obj(pk, part, n);
+            if (o < 0) continue;
+            int vis = used && !((part == QP_LEFT || part == QP_RIGHT) && !s->brand_w[k].arrows);
+            feng_anim_hide(a, o, !vis);
+            if (!vis) continue;
+            float aw = fabsf(pk->obj[o].size[0]), ah = fabsf(pk->obj[o].size[1]);
+            switch (part) {
+            case QP_NAME: feng_anim_pos(a, o, g.tl, g.tt + y + 0.5f * ih); break;
+            case QP_DATA: feng_anim_pos(a, o, g.dcx, g.dt + y + ih + 1.0f); break;
+            case QP_LEFT: feng_anim_pos(a, o, g.dcx - 0.5f * g.dw - 0.5f * aw, g.tt + y + 0.5f * ih + 0.5f * ah); break;
+            case QP_RIGHT: feng_anim_pos(a, o, g.dcx + 0.5f * g.dw + 0.5f * aw, g.tt + y + 0.5f * ih + 0.5f * ah); break;
+            case QP_BACK: feng_anim_pos(a, o, g.tl + 232.0f, g.tt + y + 64.0f); break;
+            case QP_N: feng_anim_pos(a, o, g.dcx, g.dt + y + 0.5f * ih); break;
+            }
+        }
+    }
+    int o;   /* 0x538080: no paging with four widgets at most */
+    if ((o = feng_find(pk, O_SCROLL_TAB)) >= 0) feng_anim_hide(a, o, 1);
+    if ((o = feng_find(pk, O_SCROLL_L)) >= 0) feng_anim_hide(a, o, 1);
+    if ((o = feng_find(pk, O_SCROLL_R)) >= 0) feng_anim_hide(a, o, 1);
+    if ((o = feng_find(pk, O_BRAND_SELECT)) >= 0) feng_anim_hide(a, o, s->brand_n < 2);
+    brand_scripts(s, 1);
+}
+/* the package's parts with brands (0x500160: their brand count summed) */
+static int brand_fill(Shop *s, int pkg) {
+    s->brand_n = 0; s->brand_sel = 0; s->brand_pkg = pkg;
+    if (pkg) {
+        int idx[4]; unsigned int nm[4]; int pr[4];
+        int n = perf_pkg_parts(s->perf_cat, k_perf_pkg[s->perfpkg.sel].group, idx, nm, pr);
+        for (int j = 0; j < n && s->brand_n < 4; j++) {
+            unsigned int b[8]; int nb = perf_part_brands(idx[j], b, 8);
+            if (!nb) continue;
+            int k = s->brand_n++;
+            s->brand_w[k].part = idx[j]; s->brand_w[k].name = nm[j]; s->brand_w[k].nb = nb;
+            s->brand_w[k].cur = 0; s->brand_w[k].arrows = nb > 1;
+            memcpy(s->brand_w[k].b, b, sizeof b);
+        }
+    } else if (s->buy_n) {
+        int i = s->buy_idx[s->buy_sel];
+        unsigned int b[8]; int nb = perf_part_brands(i, b, 8);
+        if (nb) {
+            s->brand_n = 1; s->brand_part = i;
+            s->brand_w[0].part = i; s->brand_w[0].name = s->buy_name[s->buy_sel]; s->brand_w[0].nb = nb;
+            s->brand_w[0].cur = 0; s->brand_w[0].arrows = 1;
+            memcpy(s->brand_w[0].b, b, sizeof b);
+        }
+    }
+    return s->brand_n;
+}
+static int brand_open(Shop *s, int pkg) {
+    if (!brand_fill(s, pkg) || !s->pk[PK_BRAND]) return 0;
+    if (!s->brand_anim) s->brand_anim = (FengAnim *)malloc(sizeof *s->brand_anim);
+    if (!s->brand_anim) return 0;
+    feng_anim_init(s->brand_anim, s->pk[PK_BRAND]);
+    anim_fadein(s->brand_anim);
+    s->brand_on = 1;
+    brand_layout(s);
+    printf("shop: brand select, %d part(s)\n", s->brand_n);
+    return 1;
+}
+/* BuyPerfPackage 80170fc4 (the chosen brands by slot), then installed */
+static void perf_pkg_buy(Shop *s, const uint32_t *chosen) {
+    int type = k_perf_pkg[s->perfpkg.sel].group, c, d;
+    int idx[4]; unsigned int nm[4]; int pr[4];
+    perf_pkg_cost(s, s->perf_cat, type, &c, &d);
+    career_spend(c);
+    int n = perf_pkg_parts(s->perf_cat, type, idx, nm, pr);
+    for (int j = 0; j < n; j++) if (!perf_bought(s, idx[j])) career_buy_perf(idx[j], pr[j], 0, chosen ? chosen[j] : 0);
+    printf("career shop: bought performance package %d/%d for $%d (discount $%d), $%d left\n",
+           s->perf_cat, type, c, d, g_career.cash);
+    perf_pkg_yes(s);
+}
+/* BuyPerfPart 80170f6c + InstallPerfPart */
+static void perf_part_buy(Shop *s, uint32_t brand) {
+    int i = s->buy_idx[s->buy_sel], c = perf_part_price(i);
+    career_buy_perf(i, c, 1, brand);
+    printf("career shop: bought performance part %d for $%d (brand %s), $%d left\n", i, c,
+           brand ? perf_brand_str(brand, 1) : "-", g_career.cash);
+    perf_part_yes(s);
+}
+static void brand_input(Shop *s, int key) {
+    if (!s->brand_n) { s->brand_on = 0; return; }
+    if (key == SHOP_KEY_UP || key == SHOP_KEY_DOWN) {
+        s->brand_sel = (s->brand_sel + (key == SHOP_KEY_UP ? -1 : 1) + s->brand_n) % s->brand_n;
+        brand_scripts(s, 0);
+    } else if (key == SHOP_KEY_LEFT || key == SHOP_KEY_RIGHT) {
+        /* 0x521e90: 0x9120409e (left) the next brand, 0xb5971bf1 (right) the one before */
+        __typeof__(s->brand_w[0]) *w = &s->brand_w[s->brand_sel];
+        if (!w->arrows) return;
+        w->cur = (w->cur + (key == SHOP_KEY_LEFT ? 1 : -1) + w->nb) % w->nb;
+        const FengPackage *pk = s->pk[PK_BRAND];
+        int o = pk ? brand_obj(pk, key == SHOP_KEY_LEFT ? QP_LEFT : QP_RIGHT, s->brand_sel + 1) : -1;
+        if (o >= 0) feng_anim_set(s->brand_anim, o, feng_hash_upper("Blink"), 1);
+    } else if (key == SHOP_KEY_OK) {
+        uint32_t chosen[4] = { 0, 0, 0, 0 };
+        for (int k = 0; k < s->brand_n; k++) chosen[k] = s->brand_w[k].b[s->brand_w[k].cur];   /* SetChosenBrands */
+        s->brand_on = 0;
+        if (s->brand_pkg) perf_pkg_buy(s, chosen);
+        else perf_part_buy(s, chosen[0]);
+    } else if (key == SHOP_KEY_BACK) s->brand_on = 0;
 }
 
 /* ---------------------------------------------------------------- credits */
@@ -4660,9 +6353,25 @@ static void opt_input(Shop *s, int key) {
         int o = pk && s->opt_anim ? qr_pool(pk, step < 0 ? QP_LEFT : QP_RIGHT, s->opt_rsel + 1) : -1;
         if (o >= 0) feng_anim_set(s->opt_anim, o, feng_hash_upper("Blink"), 1);   /* 0x51e6b0 */
     } else if (key == SHOP_KEY_BACK) {
-        options_save();
-        s->screen = SC_OPT_MAIN;
+        /* 0x49c690: save prompts turned off, or Autosave turned on, asks first;
+           No stays on the screen */
+        if (s->opt_save0 && !g_opt.save_on)
+            dialog(s, DLG_AUTO, 2, 0x22bc94afu, DA_OPT_LEAVE, 0, 0);   /* SAVELOAD_CONFIRM_NO_SAVEPOINT */
+        else if (!s->opt_auto0 && g_opt.autosave)
+            dialog(s, DLG_AUTO, 2, 0xf3568b86u, DA_OPT_LEAVE, 0, 0);   /* SAVELOAD_CONFIRM_TURN_AUTOSAVE_ON */
+        else opt_leave(s);
     }
+}
+
+/* Back to UI_OptionsMain (0x4b6010): with save prompts on, a profile that
+   changed (IsDirty 0x52a4c0) or prompts just turned on asks to save
+   (EnterMemcard 0x2042, back to the options after) */
+static void opt_leave(Shop *s) {
+    options_save();
+    s->screen = SC_OPT_MAIN;
+    int dirty = profile_dirty();
+    profile_drop_snapshot();
+    if (g_opt.save_on && (dirty || g_opt.save_on != s->opt_save0)) mc_enter(s, 0x2042, SC_OPT_MAIN);
 }
 
 /* the car select's list under the filter (0x4e22e0 / 0x4eed10, no sort) */
@@ -4670,12 +6379,17 @@ static void qr_build_cars(Shop *s) {
     int fid = k_qr_filters[s->qr_filter].id, n = 0, sel = 0;
     for (int i = 0; i < s->ncars && n < QR_MAX_CARS; i++) {
         if (fid == 2 && !s->cars[i].mine) continue;           /* My Cars */
+        /* 0x4e22e0: UnlockSystem::IsCarUnlocked(GetUnlockFilter 1) 0x534180 --
+           a stock car the profile's career has not unlocked is left out (a
+           customized one, "My Cars", always passes) */
+        if (!s->cars[i].mine && !career_qr_car_unlocked(airace_type_of(s->cars[i].folder))) continue;
         if (!strcmp(s->cars[i].folder, s->qr_car_cur)) sel = n;
         s->qr_car_list[n++] = (short)i;
     }
     s->qr_ncar = n; s->qr_car_sel = sel;
 }
 
+void garage_tt_request(int what, int dir);   /* main.c: the garage turntable */
 static void qr_car_moved(Shop *s) {
     if (!s->qr_ncar) return;
     const ShopCar *c = &s->cars[s->qr_car_list[s->qr_car_sel]];
@@ -4709,6 +6423,9 @@ static void qr_enter_cars(Shop *s) {
     s->screen = SC_QR_CAR;
     qr_build_cars(s);
     qr_car_moved(s);          /* a car not in the list: the list's first goes on the platform */
+    /* the screen's own SetRideInfo on entry: the car on the platform may be
+       UI_Main's DDAY_PLAYER_CAR preset (main.c puts the garage build back) */
+    if (s->qr_ncar && !s->qr_car_pending) { s->qr_car_pending = 1; s->qr_car_debounce = 0.0f; }
 }
 
 static void qr_input(Shop *s, int key) {
@@ -4730,7 +6447,7 @@ static void qr_input(Shop *s, int key) {
             scroller_move(&s->qr_track, key == SHOP_KEY_LEFT ? -1 : 1);
             s->set[s->qr_type].ev = s->qr_track_e[s->qr_track.sel].group;
             qr_map_request(s);
-        } else if (key == SHOP_KEY_OK && s->qr_track.n) qr_enter_options(s);
+        } else if (key == SHOP_KEY_OK && s->qr_track.n && !s->qr_track_lock[s->qr_track.sel]) qr_enter_options(s);
         else if (key == SHOP_KEY_BACK) s->screen = SC_QR_MODE;
         break;
     case SC_QR_OPTIONS:
@@ -4757,6 +6474,10 @@ static void qr_input(Shop *s, int key) {
         if ((key == SHOP_KEY_LEFT && s->qr_car_sel > 0) ||
             (key == SHOP_KEY_RIGHT && s->qr_car_sel < s->qr_ncar - 1)) {
             s->qr_car_sel += key == SHOP_KEY_LEFT ? -1 : 1;
+            /* UIQRCarSelect::ScrollCars 800dff44: SendScrollDirectionToGarageScreen(0,
+               0x9120409e left / 0xb5971bf1 right), the turntable spins that way
+               (the career car lot's ScrollCars sends none) */
+            garage_tt_request(0, key == SHOP_KEY_LEFT);
             qr_car_moved(s);
         } else if (key == SHOP_KEY_LTRIG || key == SHOP_KEY_RTRIG) {
             int nf = NELEM(k_qr_filters);
@@ -4765,7 +6486,19 @@ static void qr_input(Shop *s, int key) {
             qr_car_moved(s);
         } else if (key == SHOP_KEY_OK && s->qr_ncar) {
             if (s->qr_car_pending) s->qr_car_debounce = 0.0f;   /* the car on screen first */
-            s->qr_go = 1;
+            if (s->qr_cust) s->cust_go = 1;                 /* mode 0x20: 0x552cc0(3) -> the Car Shop */
+            else if (g_opt.p[0].ask_trans) {                /* 0x4fc1f0: Ask for Transmission (0x83aa6a) */
+                /* 0x497d50 ShowTwoButtons: "Transmission:" 0x30003d27, Manual 0x1b3a2485
+                   (0x5f5e3886: +0x15 = 1) / Auto 0x61cb0720 (0x1a2826e1: 0), the focus
+                   on the current one, back 0x1fab5998 stays; both send 0xba5b5fce = race */
+                dialog(s, DLG_AUTO, 2, 0x30003d27u, DA_TRANS_MANUAL, 0x1b3a2485u, 0x61cb0720u);
+                s->dlg_act2 = DA_TRANS_AUTO;
+                s->dlg_sel = g_opt.p[0].manual ? 0 : 1;
+                dlg_focus(s);
+            } else s->qr_go = 1;
+        } else if (key == SHOP_KEY_BACK && s->qr_cust) {   /* 0x4b22c0: back to UI_Main */
+            s->qr_cust = 0;
+            s->screen = SC_MAIN;
         } else if (key == SHOP_KEY_BACK)                    /* 0x4fa470 */
             s->screen = s->qr_type == QR_FREERUN ? SC_QR_MODE : SC_QR_OPTIONS;
         break;
@@ -4774,7 +6507,8 @@ static void qr_input(Shop *s, int key) {
 
 /* per frame: the map's rest timer and fade, the option scripts, the car debounce */
 static void qr_update(Shop *s, float dt) {
-    if (s->screen == SC_QR_TRACK && s->map_want && s->map_want != s->map_ev) {
+    s->map_t += dt;
+    if ((s->screen == SC_QR_TRACK || s->screen == SC_CRIB_WMAP) && s->map_want && s->map_want != s->map_ev) {
         s->map_alpha = 0.0f;
         if ((s->map_wait -= dt) <= 0.0f) {
             char path[600];
@@ -4794,6 +6528,7 @@ static void qr_update(Shop *s, float dt) {
             feng_image_free(&img);
             free(d);
             s->map_ev = s->map_want;
+            s->map_t = 0.0f;                            /* StartZoom 0x4b4b80 */
         }
     } else if (s->map_tex && s->map_alpha < 1.0f) {
         s->map_alpha += dt * 4.0f;
@@ -4825,6 +6560,1764 @@ static void qr_fill(const Shop *s, ShopQuickRace *q) {
 }
 
 
+/* ------------------------------------------------------------- profiles */
+
+/* The memcard flow (EnterMemcard 0x4a3100 .. ExitMemcard 0x4a31d0) runs over
+   the screen it was entered from: MC_Main's questions and messages
+   (MCV_MSG), MC_List (MCV_LIST) or the name entry (MCV_KB). The questions
+   are the front end's (DoSaveFlow 0x4e8d30, MCD_* = its dialog types);
+   the messages realmc's (MCD_RMC: its Save 0x6fce82 / Load 0x6fc532 /
+   Delete 0x6fc73a show them through ShowMessage 0x4c6050, every one
+   waiting for a button), their text from memcard/LOCALE_ENGLISH.loc. */
+enum { MCV_OFF, MCV_MSG, MCV_LIST, MCV_KB };
+enum { MCD_NONE, MCD_LOSE = 1, MCD_CREATE = 2, MCD_INFO = 3, MCD_SAVE = 5, MCD_LOAD = 6, MCD_RMC = 9 };
+/* what a realmc message's answer leads to */
+enum { RM_OVERWRITE = 1, RM_SAVED, RM_SAVE_FAIL, RM_LOADED, RM_LOAD_FAIL, RM_DELETE_Q, RM_DELETED, RM_DELETE_FAIL };
+#define O_MC_TITLE   0x426c7b4du   /* "Memory Card" -> SAVELOAD_TITLE_PC */
+#define O_MC_NAME    0x6042a783u   /* "Enter Name:" (the PC's typed entry) */
+#define O_MC_BTN     0xb8a7c6ccu   /* button strings 0..5 (0x4a35c0: 0 / 1 two, 2 one) */
+#define O_MC_BTN_G   0xb1000cc6u   /* ... their groups */
+#define O_MCL_HEAD   0x48d4fcaeu   /* Create_Button: LOAD / DELETE */
+#define O_MCL_BACK   0x001335f0u   /* the back label: BACK, CANCEL at boot */
+#define MCL_ROWS 8
+static int g_boot_load_done;   /* MC_Background's boot load runs once */
+
+/* realmc string N (1-based) of memcard/LOCALE_ENGLISH.loc: LOCL {tag, size,
+   0, count, offsets from the tag}, UTF-16 */
+static const char *rmc_str(const Shop *s, int id) {
+    static char out[16][128];
+    static int ok;
+    if (!ok) {
+        ok = 1;
+        char path[600];
+        snprintf(path, sizeof path, "%s/memcard/LOCALE_ENGLISH.loc", s->dataroot);
+        FILE *f = fopen(path, "rb");
+        static unsigned char b[4096];
+        long n = f ? (long)fread(b, 1, sizeof b, f) : 0;
+        if (f) fclose(f);
+        if (!n) printf("shop: %s not found\n", path);
+        for (long i = 0; i + 16 <= n; i++) {
+            if (memcmp(b + i, "LOCL", 4)) continue;
+            uint32_t cnt; memcpy(&cnt, b + i + 12, 4);
+            for (uint32_t k = 0; k < cnt && k < 16 && i + 20 + 4 * (long)k <= n; k++) {
+                uint32_t o; memcpy(&o, b + i + 16 + 4 * k, 4);
+                int m = 0;
+                for (long q = i + (long)o; q + 1 < n && m < 127; q += 2) {
+                    unsigned c = b[q] | b[q + 1] << 8;
+                    if (!c) break;
+                    out[k][m++] = c == 0xa0 ? ' ' : c < 256 ? (char)c : '?';
+                }
+                out[k][m] = 0;
+            }
+            break;
+        }
+    }
+    return id >= 1 && id <= 16 ? out[id - 1] : "";
+}
+/* 0x6fdaf4: %1 is the profile's name */
+static void rmc_text(const Shop *s, int id, const char *name, char *o, int cap) {
+    const char *t = rmc_str(s, id), *p = strstr(t, "%1");
+    if (p) snprintf(o, (size_t)cap, "%.*s%s%s", (int)(p - t), t, name, p + 2);
+    else snprintf(o, (size_t)cap, "%s", t);
+}
+
+static void mc_focus(Shop *s) {
+    FengAnim *a = s->mc_anim;
+    const FengPackage *pk = s->pk[PK_MC];
+    if (!a || !pk) return;
+    uint32_t hl = feng_hash_upper("Highlight"), un = feng_hash_upper("UnHighlight");
+    int msg = s->mc_view == MCV_MSG;
+    for (int b = 0; b < 6; b++) {
+        int on = msg && (s->mc_nbtn == 2 ? b < 2 : s->mc_nbtn == 1 && b == 2);
+        int cur = s->mc_nbtn == 2 ? b == s->mc_sel : b == 2;
+        uint32_t h[2] = { O_MC_BTN + (uint32_t)b, O_MC_BTN_G + (uint32_t)b };
+        for (int k = 0; k < 2; k++) {
+            int o = feng_find(pk, h[k]);
+            if (o < 0) continue;
+            feng_anim_hide(a, o, !on);
+            if (on) feng_anim_set(a, o, cur ? hl : un, 1);
+        }
+    }
+    int o;
+    if ((o = feng_find(pk, O_DLG_BLURB)) >= 0) feng_anim_hide(a, o, !msg);
+}
+/* a question or message in MC_Main: 2 buttons Yes / No (No highlighted,
+   0x4a35c0), 1 a single one; 0 a realmc task running */
+static void mc_msg(Shop *s, int dlg, const char *text, int nbtn, uint32_t b1, uint32_t b2) {
+    snprintf(s->mc_text, sizeof s->mc_text, "%s", text);
+    s->mc_dlg = dlg; s->mc_nbtn = nbtn; s->mc_b[0] = b1; s->mc_b[1] = b2;
+    s->mc_sel = 1; s->mc_view = MCV_MSG;
+    mc_focus(s);
+    audio_fe_play(FE_SND_DIALOG); s->snd_done = 1;
+    printf("memcard: \"%s\"\n", s->mc_text);
+}
+static void mc_q(Shop *s, int dlg, uint32_t msg) { mc_msg(s, dlg, str_get(s, msg), 2, STR_YES, STR_NO); }
+/* realmc's own: Yes / No are its strings 3 / 4, Continue 5 */
+static void mc_rmc(Shop *s, int then, int id, const char *name, int nbtn) {
+    char t[256];
+    rmc_text(s, id, name, t, sizeof t);
+    s->mc_then = then;
+    mc_msg(s, MCD_RMC, t, nbtn, 0, 0);
+}
+
+/* ExitMemcard: back to the screen the flow came from; a success drops the
+   backup (0x5032c0), a cancel restores it (0x5347c0) */
+static void career_helper(Shop *s);
+static void start_career_enter(Shop *s);
+static void crib_enter(Shop *s, int from_main);
+static void crib_play(Shop *s);
+static void lot_leave(Shop *s);
+static void mc_exit(Shop *s, int ok) {
+    if (!ok && s->mc_backup) { profile_restore(); s->mc_changed = 1; }
+    if (s->mc_backup) profile_drop_snapshot();
+    s->mc_backup = 0;
+    options_save();
+    s->mc_view = MCV_OFF;
+    s->screen = s->mc_ret;
+    if (s->screen == SC_PROFILE) s->prof.locked[2] = !profile_named();   /* 0x251bf83e: the locks again */
+    if (s->mc_changed) { s->mc_changed = 0; s->fe_action = SHOP_ACT_PROFILE; }   /* 0x3a2be557 */
+    printf("memcard: done (%s), profile \"%s\"\n", ok ? "success" : "cancel", profile_name());
+    /* 0x100 / 0x400: the result to UI_StartCareer, whose 0x461a18ee on a
+       named profile is StartCareerHelper (NotificationMessage 800d2150) */
+    if (s->screen == SC_START_CAREER) {
+        if (ok && (s->mc_flags & 0x500) && profile_named()) career_helper(s);
+        else start_career_enter(s);   /* the options follow the profile again */
+    }
+    /* UICareerCarLot: 0x461a18ee and 0x8867412d both StartCareerFreeRoam */
+    if (s->screen == SC_CAREER_LOT) lot_leave(s);
+    /* uiCareerCrib: 0x461a18ee / 0x8867412d after CheckMemory's save start gameplay */
+    if (s->screen == SC_CRIB && s->crib_play) { s->crib_play = 0; crib_play(s); }
+}
+/* 0x8867412d */
+static void mc_cancel(Shop *s) { mc_exit(s, (s->mc_flags & MCF_CANCEL_OK) && profile_named()); }
+
+static void kb_open(Shop *s);
+static void kb_input(Shop *s, int key);
+/* realmc suppresses its overwrite question and "Save complete." while
+   autosave is on (0x100 / 0x400), the Profile Manager clears that */
+static int mc_quiet(const Shop *s) { return g_opt.autosave && s->mc_ret != SC_PROFILE; }
+static void mc_write(Shop *s) {
+    if (profile_save()) {
+        if (mc_quiet(s)) mc_exit(s, 1);
+        else mc_rmc(s, RM_SAVED, 8, profile_name(), 1);           /* "Save complete." */
+    } else mc_rmc(s, RM_SAVE_FAIL, 9, profile_name(), 1);         /* "Unable to save %1." */
+}
+/* Save(name) 0x4d9b80 -> realmc 0x6fce82 */
+static void mc_save(Shop *s) {
+    if (profile_exists(profile_name()) && !mc_quiet(s)) mc_rmc(s, RM_OVERWRITE, 7, profile_name(), 2);
+    else mc_write(s);
+}
+/* DoSaveFlow 0x4e8d30 */
+static void mc_flow(Shop *s, int p) {
+    int st = p == 0 && !profile_named() ? 2 : p;
+    if (st == 2 && profile_named()) st = 4;
+    if (st == 4) st = !(s->mc_flags & MCF_FORCE) && g_opt.autosave ? 6 : 5;
+    if (st == 5 && !(s->mc_flags & MCF_CONFIRM) && g_opt.autosave) st = 6;
+    switch (st) {
+    case 1: mc_q(s, MCD_LOSE, 0xd36620feu); break;    /* SAVELOAD_CONFIRM_LOSE_ANY_CHANGES */
+    case 2: s->mc_flags |= MCF_ASKED;
+            mc_q(s, MCD_CREATE, 0x02b641c0u); break;  /* create a new profile? */
+    case 3: kb_open(s); break;
+    case 5: {                                         /* SAVELOAD_CONFIRM_SAVE_THE_PROFILE "%s" */
+        char f[400], t[512];
+        snprintf(f, sizeof f, "%s", str_get(s, 0x2a9ba6f9u));
+        char *p2 = strstr(f, "%s");
+        if (p2) { *p2 = 0; snprintf(t, sizeof t, "%s%s%s", f, profile_name(), p2 + 2); }
+        else snprintf(t, sizeof t, "%s", f);
+        mc_msg(s, MCD_SAVE, t, 2, STR_YES, STR_NO);
+        break;
+    }
+    default: mc_save(s); break;                       /* 6 SetAutoSave, 7 Save */
+    }
+}
+
+static void mc_list_scripts(Shop *s, int restart) {
+    FengAnim *a = s->mcl_anim;
+    const FengPackage *pk = s->pk[PK_MC_LIST];
+    if (!a || !pk) return;
+    uint32_t hl = feng_hash_upper("Highlight"), un = feng_hash_upper("UnHighlight");
+    static const int parts[3] = { QP_NAME, QP_DATA, QP_BACK };
+    for (int r = 0; r < MCL_ROWS; r++) {
+        int used = s->mc_ltop + r < s->mc_n, cur = s->mc_ltop + r == s->mc_lsel;
+        for (int k = 0; k < 3; k++) {
+            int o = qr_pool(pk, parts[k], r + 1);
+            if (o < 0) continue;
+            feng_anim_hide(a, o, !used);
+            if (used) feng_anim_set(a, o, cur ? hl : un, restart);
+        }
+    }
+    int o;   /* the arrows and tab when the list scrolls */
+    if ((o = feng_find(pk, 0x444969fdu)) >= 0) feng_anim_hide(a, o, s->mc_ltop == 0);
+    if ((o = feng_find(pk, 0x444969feu)) >= 0) feng_anim_hide(a, o, s->mc_ltop + MCL_ROWS >= s->mc_n);
+    if ((o = feng_find(pk, O_SCROLL_TAB)) >= 0) feng_anim_hide(a, o, s->mc_n <= MCL_ROWS);
+}
+static void mc_list_open(Shop *s) {
+    s->mc_view = MCV_LIST; s->mc_lsel = 0; s->mc_ltop = 0;
+    const FengPackage *pk = s->pk[PK_MC_LIST];
+    if (!pk) return;
+    if (!s->mcl_anim) s->mcl_anim = (FengAnim *)malloc(sizeof *s->mcl_anim);
+    if (!s->mcl_anim) return;
+    feng_anim_init(s->mcl_anim, pk);
+    anim_fadein(s->mcl_anim);
+    mc_list_scripts(s, 1);
+}
+
+/* Load 0x4c5f20 -> realmc 0x6fc532 */
+static void mc_load(Shop *s, const char *name) {
+    char nm[PROFILE_NAME_MAX + 1];
+    snprintf(nm, sizeof nm, "%s", name);
+    if (profile_load(nm)) { s->mc_changed = 1; mc_rmc(s, RM_LOADED, 10, nm, 1); }   /* "Load complete." */
+    else mc_rmc(s, RM_LOAD_FAIL, 11, nm, 1);                                        /* "Unable to load %1." */
+}
+
+/* InitComplete 0x4f3570 */
+static void mc_enter(Shop *s, int flags, int ret) {
+    s->mc_flags = flags; s->mc_op = flags & 0xf0; s->mc_ret = ret;
+    s->mc_changed = 0; s->mc_backup = 0;
+    const FengPackage *pk = s->pk[PK_MC];
+    if (pk) {
+        if (!s->mc_anim) s->mc_anim = (FengAnim *)malloc(sizeof *s->mc_anim);
+        if (s->mc_anim) {
+            feng_anim_init(s->mc_anim, pk);
+            anim_fadein(s->mc_anim);
+            int o;
+            if ((o = feng_find(pk, O_MC_NAME)) >= 0) feng_anim_hide(s->mc_anim, o, 1);
+        }
+    }
+    s->mc_view = MCV_MSG; s->mc_nbtn = 0; s->mc_text[0] = 0; s->mc_dlg = MCD_NONE;
+    mc_focus(s);
+    printf("memcard: enter 0x%x (profile \"%s\")\n", flags, profile_name());
+    switch (s->mc_op) {
+    case MCOP_LOAD: case MCOP_DELETE: case MCOP_BOOT:
+        s->mc_n = profile_list(s->mc_names, PROFILE_LIST_MAX);
+        if (s->mc_op == MCOP_BOOT) {
+            if (s->mc_n == 1) mc_load(s, s->mc_names[0]);     /* the one profile: no list */
+            else if (s->mc_n == 0) mc_flow(s, 2);
+            else mc_list_open(s);
+        } else if (s->mc_n == 0) mc_msg(s, MCD_INFO, str_get(s, 0xab1f0e92u), 1, STR_OK, 0);
+        else mc_list_open(s);
+        break;
+    case MCOP_SAVE_CHECK: mc_flow(s, profile_named() ? 4 : 2); break;
+    case MCOP_SAVE_CUR: if (!profile_named()) mc_exit(s, 1); else mc_flow(s, 5); break;
+    case MCOP_CREATE: mc_flow(s, profile_named() ? 1 : 2); break;
+    default: mc_exit(s, 0); break;
+    }
+}
+
+/* leaving the Car Shop / a garage change: the save check (0x2042) when
+   something changed and save prompts are on */
+void shop_save_check(Shop *s) {
+    if (!s) return;
+    int dirty = profile_dirty();
+    profile_drop_snapshot();
+    if (g_opt.save_on && dirty) mc_enter(s, 0x2042, s->screen);
+}
+
+/* HandleButtonPressed 0x4f3780 (Yes = button 0), and realmc's answers */
+static void mc_answer(Shop *s, int yes) {
+    switch (s->mc_dlg) {
+    case MCD_CREATE: if (yes) kb_open(s); else mc_cancel(s); break;
+    case MCD_INFO: mc_cancel(s); break;
+    case MCD_SAVE: if (yes) mc_save(s); else mc_cancel(s); break;
+    case MCD_LOSE:
+        if (!yes) { mc_exit(s, 0); break; }
+        profile_snapshot(); s->mc_backup = 1;          /* AllocBackupDB(1), then 0x5346f0 */
+        if (s->mc_flags & 0x20000) career_default();   /* CSNew: PlayerCareerState::Default(1) only */
+        else profile_default();
+        s->mc_changed = 1;
+        kb_open(s);
+        break;
+    case MCD_LOAD: if (yes) mc_load(s, s->mc_names[s->mc_lsel]); else mc_cancel(s); break;
+    case MCD_RMC:
+        switch (s->mc_then) {
+        case RM_OVERWRITE:   /* No fails the save (0xdc12af2e): autosave off, ask again */
+            if (yes) mc_write(s);
+            else { if (s->mc_ret != SC_PROFILE) g_opt.autosave = 0; mc_flow(s, 2); }
+            break;
+        case RM_SAVE_FAIL: g_opt.autosave = 0; mc_flow(s, 2); break;
+        case RM_LOAD_FAIL: case RM_DELETE_FAIL: mc_cancel(s); break;
+        case RM_DELETE_Q: {
+            if (!yes) { mc_cancel(s); break; }
+            char nm[PROFILE_NAME_MAX + 1];
+            snprintf(nm, sizeof nm, "%s", s->mc_names[s->mc_lsel]);
+            int cur = profile_named() && !strcmp(nm, profile_name());
+            if (profile_delete(nm)) {
+                if (cur) s->mc_changed = 1;                /* DeleteDone 0x4c6330: unnamed, defaults */
+                mc_rmc(s, RM_DELETED, 13, nm, 1);          /* "Saved game deleted." */
+            } else mc_rmc(s, RM_DELETE_FAIL, 14, nm, 1);   /* "Unable to delete %1." */
+            break;
+        }
+        default: mc_exit(s, 1); break;                     /* saved / loaded / deleted */
+        }
+        break;
+    default: mc_cancel(s); break;
+    }
+}
+
+static void mc_input(Shop *s, int key) {
+    s->snd_done = 1;
+    if (s->mc_view == MCV_KB) { kb_input(s, key); return; }
+    if (s->mc_view == MCV_LIST) {
+        if (key == SHOP_KEY_UP || key == SHOP_KEY_DOWN) {
+            int k = s->mc_lsel + (key == SHOP_KEY_UP ? -1 : 1);
+            if (k < 0 || k >= s->mc_n) return;
+            s->mc_lsel = k;
+            if (k < s->mc_ltop) s->mc_ltop = k;
+            if (k >= s->mc_ltop + MCL_ROWS) s->mc_ltop = k - MCL_ROWS + 1;
+            mc_list_scripts(s, 0);
+            audio_fe_play(key == SHOP_KEY_UP ? FE_SND_UP : FE_SND_DOWN);
+        } else if (key == SHOP_KEY_OK && s->mc_n > 0) {   /* DoSelect 0x4bea30 */
+            audio_fe_play(FE_SND_SELECT);
+            if (s->mc_op == MCOP_DELETE) mc_rmc(s, RM_DELETE_Q, 12, s->mc_names[s->mc_lsel], 2);
+            else if (profile_named()) mc_q(s, MCD_LOAD, 0x81b1d73du);
+            else mc_load(s, s->mc_names[s->mc_lsel]);
+        } else if (key == SHOP_KEY_BACK) {
+            audio_fe_play(FE_SND_BACK);
+            mc_cancel(s);
+        }
+        return;
+    }
+    if (!s->mc_nbtn) return;
+    if ((key == SHOP_KEY_LEFT || key == SHOP_KEY_RIGHT) && s->mc_nbtn == 2) {
+        int j = key == SHOP_KEY_LEFT ? 0 : 1;
+        if (j == s->mc_sel) return;
+        s->mc_sel = j;
+        mc_focus(s);
+        audio_fe_play(key == SHOP_KEY_LEFT ? FE_SND_LEFT : FE_SND_RIGHT);
+    } else if (key == SHOP_KEY_OK) {
+        audio_fe_play(FE_SND_SELECT);
+        mc_answer(s, s->mc_nbtn == 2 && s->mc_sel == 0);
+    } else if (key == SHOP_KEY_BACK && s->mc_dlg != MCD_RMC) {   /* realmc's messages want a button */
+        audio_fe_play(FE_SND_BACK);
+        mc_answer(s, 0);
+    }
+}
+/* the button strings: realmc's from its locale, the front end's by hash */
+static const char *mc_btn_text(const Shop *s, int b) {
+    if (s->mc_dlg == MCD_RMC) return rmc_str(s, s->mc_nbtn == 1 ? 5 : b == 0 ? 3 : 4);
+    return str_get(s, s->mc_nbtn == 1 ? s->mc_b[0] : s->mc_b[b & 1]);
+}
+
+/* UI_ProfileManager (0x4c58b0): Create, Load, Save (locked unnamed), Delete */
+static void profile_enter(Shop *s) {
+    scroller_set(&s->prof, k_profile_menu, NELEM(k_profile_menu));
+    s->prof.locked[2] = !profile_named();
+    s->screen = SC_PROFILE;
+}
+static void profile_input(Shop *s, int key) {
+    if (key == SHOP_KEY_LEFT) scroller_move(&s->prof, -1);
+    else if (key == SHOP_KEY_RIGHT) scroller_move(&s->prof, 1);
+    else if (key == SHOP_KEY_OK && !s->prof.locked[s->prof.sel])
+        mc_enter(s, (int)k_profile_menu[s->prof.sel].group, SC_PROFILE);
+    else if (key == SHOP_KEY_BACK) s->screen = SC_MAIN;   /* 0x911ab364 */
+}
+
+/* ---- UI_StartCareer (Setup 800d1f7c, NotificationMessage 800d2150) and
+   StartCareerHelper 800d1b30 ---------------------------------------------- */
+static void start_career_enter(Shop *s) {
+    int n = 0, started = g_career.started;
+    if (profile_named()) {
+        s->scar_e[n++] = k_start_career[started ? 1 : 0];   /* CSResume */
+        if (started) s->scar_e[n++] = k_start_career[2];    /* CSNew */
+    } else s->scar_e[n++] = k_start_career[2];              /* CSNew */
+    s->scar_e[n++] = k_start_career[3];                     /* CSLoad, always */
+    int sel = s->screen == SC_START_CAREER ? s->scar.sel : 0;   /* FEngGetLastButton: first entry */
+    scroller_set(&s->scar, s->scar_e, n);
+    s->scar.sel = sel < n ? sel : 0; s->scar.scroll = (float)s->scar.sel;
+    s->screen = SC_START_CAREER;
+}
+
+/* IG_PlayMovie (InGamePlayMovie; NotificationMessage 80183f54): the movie
+   full screen, Start / Accept (0xb5af2461, 0x406415e3) or its end (0xc3960eb9)
+   go to the next movie in the list; after the last, DoWhatNext. */
+static void movie_stop(Shop *s) {
+    mplay_close(s->mv);
+    s->mv = NULL;
+}
+
+static void career_go(Shop *s, int nis) {
+    s->career_go = 1 + (nis ? 1 : 0);
+    printf("career: StartCareerFreeRoam%s\n", nis ? " (the career start NIS)" : "");
+}
+
+/* the end of the list (one movie): DoWhatNext 6 */
+static void movie_done(Shop *s, int skipped) {
+    printf("career: movie scene01 %s\n", skipped ? "skipped" : "finished");
+    movie_stop(s);
+    s->screen = SC_START_CAREER;
+    career_go(s, career_first_movie_done());
+}
+
+/* InGamePlayMovie::LaunchFirstCareerMovie: {"scene01"} (MOVIES/Scene01.vp6) */
+static void movie_play_first(Shop *s) {
+    char path[600];
+    snprintf(path, sizeof path, "%s/MOVIES/Scene01.vp6", s->dataroot);
+    MPlay *v = mplay_open(path);
+    if (!v) {
+        printf("career: %s missing, the movie is skipped\n", path);
+        career_go(s, career_first_movie_done());
+        return;
+    }
+    s->mv = v;
+    s->screen = SC_MOVIE;
+}
+
+static void movie_update(Shop *s, float dt) {
+    if (!s->mv || s->screen != SC_MOVIE) return;
+    if (mplay_update(s->mv, dt)) movie_done(s, 0);
+}
+
+/* StartCareerHelper 800d1b30 */
+static void career_helper(Shop *s) {
+    int cs = career_start();
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_CRIB")) cs = CSTART_CRIB;   /* test aid (simulator): Resume opens the crib */
+#endif
+    switch (cs) {
+    case CSTART_CRIB:   /* FEngSwitchPackages(UI_CareerCrib.fng): the career main menu */
+        crib_enter(s, 1);
+        break;
+    case CSTART_FIRST_MOVIE:
+        movie_play_first(s);
+        break;
+    default:
+        career_free_roam_start();
+        career_go(s, 0);
+        break;
+    }
+}
+
+/* ---- uiCareerCrib (GC 800d2268..800d2a4c): UI_CareerCrib.fng, an
+   IconScrollerMenu over GarageMain (the CRIB01 platform when the file is
+   there). Reached from StartCareerHelper once DDAY_EVENT_B is done and from
+   a crib shop in free roam (LaunchFrontendShopFromGame, type 0). ---------- */
+static void crib_setup(Shop *s, int from_main) {
+    int n = 0;
+    for (int i = 0; i < (int)NELEM(k_crib); i++) {
+        if (k_crib[i].group == CR_WORLD_MAP && g_career.stage <= 1 && !getenv("OPENUG2_SIM_WMAP")) continue;   /* 1 < DAT_803bb288 */
+        s->crib_e[n++] = k_crib[i];
+    }
+    scroller_set(&s->crib, s->crib_e, n);
+    s->crib_from_main = from_main;
+    s->crib_play = 0;
+    s->front_end = 1;
+    s->screen = SC_CRIB;
+    /* uiCareerCrib ctor: BuildCurrentRideForPlayer -> CarViewer SetRideInfo
+       (from free roam the career car is already the car) */
+    if (from_main) s->fe_action = SHOP_ACT_CAREER_RIDE;
+    s->platform = 4;   /* Setup: ChangePlatform(1, 4) unless CRIB01 is already in */
+}
+static void crib_enter(Shop *s, int from_main) {
+    crib_setup(s, from_main);
+    profile_snapshot();   /* 0x35f8620b: AllocBackupDB (IsDirty's reference); FE speech event 0x11: fe_speech_screen */
+    printf("crib: %d options (%s)\n", s->crib.n, from_main ? "from the career menu" : "from free roam");
+}
+static void csel_enter(Shop *s);
+static void csp_enter(Shop *s);
+static void cwm_enter(Shop *s);
+static void crw_enter(Shop *s, int option);
+/* 0x451e768e: CheckMemory 800d2308 (EnterMemcard 0x151 when dirty), then
+   0x9a3b571d: +0x7e3c = 1, StartCareerFreeRoam */
+static void crib_play(Shop *s) {
+    profile_drop_snapshot();
+    g_career.has_spawn = 1;
+    career_go(s, 0);
+}
+static void crib_dlg(Shop *s, int act) {
+    switch (act) {
+    case DA_CRIB_PLAY:
+        if (profile_dirty()) { s->crib_play = 1; mc_enter(s, 0x151, SC_CRIB); }
+        else crib_play(s);
+        break;
+    case DA_CRIB_MAIN:   /* 0x30ed2368: ChangePlatform(4, 1), UI_Main */
+        profile_drop_snapshot();
+        s->platform = 1;
+        s->crib_from_main = 0;
+        s->screen = SC_MAIN;
+        s->fe_action = SHOP_ACT_CAREER_QUIT;
+        printf("crib: back to the main menu\n");
+        break;
+    case DA_CRIB_TEST:   /* 0x34dc1bec: DoStartTuning -> BeginCarTuning (the test track) */
+        /* FEngSetLastButton, BeginCarTuning(0, current career car, entry 0) (tuning.c, main.c) */
+        profile_drop_snapshot();
+        s->fe_action = SHOP_ACT_TEST_TRACK;
+        printf("crib: Test Track -- BeginCarTuning\n");
+        break;
+    }
+}
+static void crib_input(Shop *s, int key) {
+    if (key == SHOP_KEY_LEFT) scroller_move(&s->crib, -1);
+    else if (key == SHOP_KEY_RIGHT) scroller_move(&s->crib, 1);
+    else if (key == SHOP_KEY_OK && !s->crib.locked[s->crib.sel]) {
+        switch (s->crib.e[s->crib.sel].group) {
+        case CR_PLAY:         /* 0x60b42afb, Accept / Decline */
+            dialog(s, DLG_AUTO, 2, 0x60b42afbu, DA_CRIB_PLAY, 0x88579775u, 0xbe503981u);
+            break;
+        case CR_MAIN:         /* 0xcb5e3178 */
+            dialog(s, DLG_AUTO, 2, 0xcb5e3178u, DA_CRIB_MAIN, 0x88579775u, 0xbe503981u);
+            break;
+        case CR_TEST_TRACK:   /* 0xb10ae56f, 0xf770 / 0x61c */
+            dialog(s, DLG_AUTO, 2, 0xb10ae56fu, DA_CRIB_TEST, 0xf770u, 0x61cu);
+            break;
+        case CR_SAVE:         /* EnterMemcard 0xc41 (0x28c2c1b8 / 0x7d1e4c8c: AllocBackupDB again) */
+            mc_enter(s, 0xc41, SC_CRIB);
+            break;
+        case CR_CAR_SELECT:   /* CCarSel: UI_CareerCarSelect */
+            csel_enter(s);
+            break;
+        case CR_REWARDS:      /* React 0x4af6e0: UI_CribRewardOptionsMain */
+            crw_enter(s, -1);
+            break;
+        case CR_PARTS:        /* CCChangeParts: BeginCarCustomize(1, ..., the career car) */
+            s->fe_action = SHOP_ACT_CAREER_PARTS;
+            printf("crib: Change Parts\n");
+            break;
+        case CR_WORLD_MAP:    /* CCViewWorldMap React 0x4af710: UI_CareerWorldMap */
+            cwm_enter(s);
+            break;
+        }
+    }
+    else if (key == SHOP_KEY_BACK) {   /* 0x911ab364: gameplay, or the main menu when it came from there */
+        if (s->crib_from_main) dialog(s, DLG_AUTO, 2, 0xcb5e3178u, DA_CRIB_MAIN, 0x88579775u, 0xbe503981u);
+        else dialog(s, DLG_AUTO, 2, 0x60b42afbu, DA_CRIB_PLAY, 0x88579775u, 0xbe503981u);
+    }
+}
+
+/* ---- UICareerCribCarSelect (GC 800d4b80..800d5d64; BuildCarList PC
+   0x4e0160): UI_CareerCarSelect.fng, the career slots in order. A slot that
+   is locked (or has no car type) shows "locked" (+0x8f8), an unlocked empty
+   one "open for sponsor" (+0x8fc); the rest are the cars. Accept on another
+   car asks to switch (CommitSwitchToOwnedCar), then FORWARD -> 0xe1fde1d1:
+   back to UI_CareerCrib.fng, which builds the current ride again. -------- */
+static void lot_show(Shop *s, int delay);
+static void lot_refresh(Shop *s);
+static const char *lot_model_name(const Shop *s, int type);
+static void lot_format(char *out, size_t cap, const char *fmt, const char *a, const char *b);
+/* main.c: the garage turntable (GarageMainScreen); what 0 car, 1 lock, 2 empty, 3 back */
+void garage_tt_request(int what, int dir);
+int shop_car_pending(const Shop *s) { return s && s->qr_car_pending; }
+/* 0xc98356ba, the scroll delay after a scroll (step -1 left / +1 right, 0 none):
+   locked (+0x8f8) Show3DLock, open (+0x8fc) SpinPlatforms, else
+   SendScrollDirectionToGarageScreen + SetRideInfo; dir = scroll != 0xb5971bf1 */
+static void csel_show(Shop *s, int step) {
+    if (!s->lot_n) return;
+    int k = s->lot[s->lot_sel].kind;
+    if (step) garage_tt_request(k == 2 ? 1 : k == 1 ? 2 : 0, step < 0);
+    if (k == 0) lot_show(s, step != 0);
+}
+static void csel_enter(Shop *s) {
+    memset(s->lot, 0, sizeof s->lot);
+    s->lot_n = 0; s->lot_sel = 0; s->lot_bar = 1;
+#ifdef OPENUG2_SIM_PRE_H   /* test aid (simulator): OPENUG2_SIM_CAR2=<CARS folder>[:<garage.txt line>] fills the first open slot */
+    if (getenv("OPENUG2_SIM_CAR2"))
+        for (int i = 0; i < CAREER_NSLOTS; i++) {
+            CareerCar *c = career_car_slot(i);
+            if (!c || c->locked || c->has) continue;
+            char nm[64]; snprintf(nm, sizeof nm, "%s", getenv("OPENUG2_SIM_CAR2"));
+            char *cf = strchr(nm, ':'); if (cf) *cf++ = 0;
+            for (int t = 0; t < airace_ntypes(); t++)
+                if (!strcmp(airace_type_name(t), nm)) {
+                    c->type = t; c->has = 1; c->cfg[0] = 0;
+                    if (cf) snprintf(c->cfg, sizeof c->cfg, "%s", getenv("OPENUG2_SIM_CAR2") + (cf - nm));
+                    printf("sim: OPENUG2_SIM_CAR2 -- %s in slot %d\n", nm, i);
+                }
+            break;
+        }
+#endif
+    for (int i = 0; i < CAREER_NSLOTS && s->lot_n < QR_MAX_CARS; i++) {
+        const CareerCar *c = career_car_slot(i);
+        if (!c) continue;
+        int k = c->locked ? 2 : !c->has ? 1 : c->type < 0 ? 2 : 0;
+        s->lot[s->lot_n].type = k ? -1 : c->type;
+        s->lot[s->lot_n].handle = c->handle;
+        s->lot[s->lot_n++].kind = k;
+    }
+    lot_refresh(s);
+    s->screen = SC_CRIB_CARSEL;
+    csel_show(s, 0);
+    printf("crib car select: %d slots\n", s->lot_n);
+}
+/* 0xe1fde1d1: FEngSwitchPackages(UI_CareerCrib.fng), on the option it left by */
+static void crib_return(Shop *s, int option) {
+    s->qr_car_pending = 0;
+    crib_setup(s, s->crib_from_main);
+    for (int i = 0; i < s->crib.n; i++)   /* SetInitialPos(FEngGetLastButton) */
+        if (s->crib_e[i].group == option) { s->crib.sel = i; s->crib.scroll = (float)i; }
+    s->fe_action = SHOP_ACT_CAREER_RIDE;   /* the ctor's BuildCurrentRideForPlayer */
+}
+static void csel_back(Shop *s) { garage_tt_request(3, 0); crib_return(s, CR_CAR_SELECT); }
+
+/* ---- CribWorldMapScreen (PC ctor 0x4ee690, NotificationMessage 0x4e0f60;
+   GC 800d8fa0 / 800d9c04): UI_CareerWorldMap.fng, an event replay browser
+   (E:/re-tools/out/career/c7/WORLDMAP_CRIB_POSTRACE.md). L/R: the completed
+   stages (Scrollerina, "Stage %d"); U/D: a vertical ThumbnailScroller of the
+   region item and the region's events (BuildEventList 0x4b1360), the
+   current one's info (FillScreen) and TRACKMAP 0.3 s after the cursor rests
+   (TrackMapScroller, zoomed by SetZoom 0x498630); Accept on an event asks
+   to race it. ------------------------------------------------------------ */
+#define CWM_MAX 72
+/* PC 0x7f4388 [region]: the region item's map and zoom window */
+static const struct { float x, y, size; int track; } k_cwm_region[6] = {
+    { 0, 0, 512, 4000 }, { 163, 154, 350, 4500 }, { 126, 93, 387, 4501 },
+    { 17, 5, 480, 4502 }, { 0, 0, 512, 4503 }, { 0, 0, 512, 4504 } };
+#define O_CWM_MAP     0x90fe80f3u
+#define O_CWM_ICON    0xa334a7bcu   /* EVENT_ICONS, the pool */
+#define O_CWM_MASTER  0x38e39ad7u   /* MINI_MASTER */
+static int cwm_tid(const unsigned char *ev) { return (int16_t)(ev[0x18] | ev[0x19] << 8); }
+static int cwm_rev(const unsigned char *ev) { return ev[0x1a] & 1; }
+static const unsigned char *cwm_rec(const Shop *s, int tid) {   /* TrackInfo by number */
+    for (int i = 0; i < s->ntrk; i++) {
+        const unsigned char *r = s->trk + (long)i * 0x128;
+        if (rec_ev(r) == tid) return r;
+    }
+    return NULL;
+}
+static void cwm_map_request(Shop *s) {   /* the map timer (+0x22c): SetTrackMap 0.3 s after the cursor stops */
+    const unsigned char *ev = s->cwm.n ? s->cwm_ev[s->cwm.sel] : NULL;
+    int want = ev ? cwm_tid(ev) : k_cwm_region[s->cwm_stage >= 1 && s->cwm_stage <= 5 ? s->cwm_stage : 0].track;
+    if (want == s->map_want) return;
+    s->map_want = want; s->map_wait = 0.3f;
+}
+/* SetupRegionEvents 0x4e0ce0: the region item, then BuildEventList 0x4b1360 --
+   every event of the stage (stage 0 counts as region 1) with a track, not
+   DDAY_EVENT_A / _B, completed or not, at most 71; SnapToHead */
+static void cwm_build(Shop *s) {
+    int n = 0, st = s->cwm_stage;
+    s->cwm_ev[n++] = NULL;                                   /* AddRegionItem 0x4e0c30 */
+    int all = career_stage_cleared(st) || getenv("OPENUG2_SIM_WMAP");
+    for (int i = 0; all && i < career_nevents() && n < 72; i++) {
+        const unsigned char *ev = career_event(i);
+        int es = (signed char)ev[0x37];
+        uint32_t h = n2_u32(ev + 8);
+        if (!(es == st || (st == 1 && es == 0))) continue;
+        if (!cwm_rec(s, cwm_tid(ev)) || h == 0xdd60e402u || h == 0xdd60e403u) continue;
+        s->cwm_ev[n++] = ev;
+    }
+    s->cwm.e = NULL; s->cwm.n = n; s->cwm.sel = 0; s->cwm.scroll = 0.0f;
+    cwm_map_request(s);
+}
+static void cwm_enter(Shop *s) {
+    memset(&s->cwm, 0, sizeof s->cwm);
+    s->cwm_nst = 0;                                          /* buildRegions 0x4cbf80 */
+    while (s->cwm_nst < 7 && career_stage_cleared(s->cwm_nst + 1)) s->cwm_nst++;
+    if (!s->cwm_nst && getenv("OPENUG2_SIM_WMAP")) s->cwm_nst = 1;   /* test aid (simulator): stage 1 shown uncleared */
+    s->cwm_stage = 1;
+    cwm_build(s);
+    s->screen = SC_CRIB_WMAP;
+    printf("crib world map: %d stages, %d events in stage 1\n", s->cwm_nst, s->cwm.n - 1);
+}
+static void cwm_input(Shop *s, int key) {
+    if (key == SHOP_KEY_UP && s->cwm.sel > 0) { s->cwm.sel--; cwm_map_request(s); }   /* ScrollEvent 0x4cc140 */
+    else if (key == SHOP_KEY_DOWN && s->cwm.sel < s->cwm.n - 1) { s->cwm.sel++; cwm_map_request(s); }
+    else if (key == SHOP_KEY_LEFT && s->cwm_stage > 1) { s->cwm_stage--; cwm_build(s); }   /* ScrollRegion 0x4e0e50 */
+    else if (key == SHOP_KEY_RIGHT && s->cwm_stage < s->cwm_nst) { s->cwm_stage++; cwm_build(s); }
+    else if (key == SHOP_KEY_OK && s->cwm.sel > 0)           /* not on the region item */
+        dialog(s, DLG_AUTO, 2, 0xec9488bbu, DA_CWM_RACE, 0xf770u, 0x61cu);
+    else if (key == SHOP_KEY_BACK) crib_return(s, CR_WORLD_MAP);
+}
+/* "%d" in a localized format */
+static void cwm_fmt_d(char *o, size_t cap, const char *fmt, int v) {
+    const char *p = strstr(fmt, "%d");
+    if (!p) { snprintf(o, cap, "%s %d", fmt, v); return; }
+    snprintf(o, cap, "%.*s%d%s", (int)(p - fmt), fmt, v, p + 2);
+}
+/* ---- uiCribReward_Sponsors (GC 800d2ef0..800d3470): UI_RewardsSponsor.fng,
+   an IconScroller of each stage's chosen sponsor (DECAL_ICON_<name>) up to
+   the current stage, the selected one's header as the post-race sponsor
+   screen's (RefreshHeader 800d3278) and its contract in a CTextScroller of
+   TERMS_1..10. From the crib (+0x7454 set) BACK goes back to it. --------- */
+static const uint32_t k_csp_terms[10] = { 0xfcc58ddau, 0xfcc58ddbu, 0xfcc58ddcu, 0xfcc58dddu, 0xfcc58ddeu,
+                                          0xfcc58ddfu, 0xfcc58de0u, 0xfcc58de1u, 0xfcc58de2u, 0x9577494au };
+static unsigned csp_u16(const unsigned char *p) { return p[0] | p[1] << 8; }
+static const char *csp_name(const Shop *s) { return s->csp_n ? career_string(csp_u16(s->csp[s->csp_sel])) : ""; }
+/* the contract body broken at the last space before TERMS_1's width (CTextScroller) */
+static void csp_refresh(Shop *s) {
+    char b[64];
+    s->csp_nl = 0; s->csp_top = 0;
+    if (!s->csp_n) return;
+    snprintf(b, sizeof b, "SPONSOR_DETAILS_%s", csp_name(s));   /* ContractMessage::GetBody */
+    const char *txt = str_get(s, feng_hash(b));
+    const FengPackage *pk = s->pk[PK_CRIB_SPONSORS];
+    int o = pk ? feng_find(pk, k_csp_terms[0]) : -1;
+    if (o < 0 || !txt) return;
+    int fi = pk->obj[o].res >= 0 && pk->obj[o].res < pk->nres ? s->font_of[PK_CRIB_SPONSORS][pk->obj[o].res] : -1;
+    if (fi < 0 || !s->font[fi].ok) return;
+    const FengFont *f = &s->font[fi].f;
+    float w = pk->obj[o].wrapw > 0 ? (float)pk->obj[o].wrapw : 300.0f;
+    char ln[160]; int len = 0, sp = -1;
+    for (const char *q = txt; s->csp_nl < 48; q++) {
+        int end = !*q, brk = *q == '\n' || *q == '^';
+        if (!end && !brk && len < 159) {
+            ln[len++] = *q; ln[len] = 0;
+            if (*q == ' ') sp = len - 1;
+            if (sp > 0 && feng_text_width(f, ln) > w) {
+                ln[sp] = 0;
+                snprintf(s->csp_ln[s->csp_nl++], 160, "%s", ln);
+                len = (int)strlen(ln + sp + 1);
+                memmove(ln, ln + sp + 1, (size_t)len + 1);
+                sp = -1;
+            }
+            continue;
+        }
+        ln[len] = 0;
+        if (len || brk) snprintf(s->csp_ln[s->csp_nl++], 160, "%s", ln);
+        len = 0; sp = -1;
+        if (end) break;
+    }
+}
+static void csp_enter(Shop *s) {
+    s->csp_n = 0; s->csp_sel = 0;   /* SetInitialPos(0) */
+    for (int i = 0; i <= g_career.stage && i < 8; i++)
+        if (g_career.st[i].chosen[0]) s->csp[s->csp_n++] = g_career.st[i].chosen[0];
+#ifdef OPENUG2_SIM_PRE_H   /* test aid (simulator): stage 2's choosable sponsors */
+    if (!s->csp_n && getenv("OPENUG2_SIM_SPONSOR"))
+        for (int i = 0; i < 3; i++) if (cstage_sponsor_choice(&g_career.st[2], i)) s->csp[s->csp_n++] = cstage_sponsor_choice(&g_career.st[2], i);
+#endif
+    s->screen = SC_CRIB_SPONSORS;
+    csp_refresh(s);
+    printf("crib sponsors: %d signed\n", s->csp_n);
+}
+static void csp_input(Shop *s, int key) {
+    if ((key == SHOP_KEY_LEFT || key == SHOP_KEY_RIGHT) && s->csp_n > 1) {
+        s->csp_sel = (s->csp_sel + (key == SHOP_KEY_LEFT ? -1 : 1) + s->csp_n) % s->csp_n;
+        csp_refresh(s);
+    } else if (key == SHOP_KEY_UP && s->csp_top > 0) s->csp_top--;            /* CTextScroller */
+    else if (key == SHOP_KEY_DOWN && s->csp_top + 10 < s->csp_nl) s->csp_top++;
+    else if (key == SHOP_KEY_BACK) crw_enter(s, 2);   /* 0x911ab364, PC 0x495c40: back to the reward options
+                                                         (0x836326 is never set on the PC) */
+}
+static void csel_input(Shop *s, int key) {
+    if ((key == SHOP_KEY_LEFT && s->lot_sel > 0) ||        /* ScrollCars 800d5c90: 0x9120409e / 0xb5971bf1 */
+        (key == SHOP_KEY_RIGHT && s->lot_sel < s->lot_n - 1)) {
+        int d = key == SHOP_KEY_LEFT ? -1 : 1;
+        s->lot_sel += d; s->lot_bar += d;
+        csel_show(s, d);
+        lot_refresh(s);
+    } else if (key == SHOP_KEY_OK && s->lot_n) {           /* 0xc407210 / 0x406415e3 */
+        char t[1024];
+        const CareerCar *cur = career_current_car();
+        int k = s->lot[s->lot_sel].kind;
+        const char *now = k == 0 ? lot_model_name(s, s->lot[s->lot_sel].type) : "";
+        if (s->qr_car_pending) s->qr_car_debounce = 0.0f;
+        if (k == 2) {                                      /* locked */
+            lot_format(t, sizeof t, str_get(s, 0x2415be66u), now, NULL);
+            dialog_text(s, DLG_AUTO, 1, t, DA_NONE, 0, 0);
+        } else if (k == 1) {                               /* open for a sponsor's car */
+            lot_format(t, sizeof t, str_get(s, 0xcf3b2d70u), now, NULL);
+            dialog_text(s, DLG_AUTO, 1, t, DA_NONE, 0, 0);
+        } else if (cur && cur->handle == s->lot[s->lot_sel].handle) {   /* already the current car */
+            lot_format(t, sizeof t, str_get(s, 0x7ee84e4eu), now, NULL);
+            dialog_text(s, DLG_AUTO, 1, t, DA_NONE, 0, 0);
+        } else {
+            lot_format(t, sizeof t, str_get(s, 0x1231c38fu), now, cur ? lot_model_name(s, cur->type) : "");
+            dialog_text(s, DLG_AUTO, 2, t, DA_CRIB_SWITCH, STR_YES, STR_NO);
+        }
+    } else if (key == SHOP_KEY_BACK) csel_back(s);         /* 0x911ab364: FORWARD */
+}
+
+static void start_career_input(Shop *s, int key) {
+    if (key == SHOP_KEY_LEFT) scroller_move(&s->scar, -1);
+    else if (key == SHOP_KEY_RIGHT) scroller_move(&s->scar, 1);
+    else if (key == SHOP_KEY_OK && !s->scar.locked[s->scar.sel]) {
+        switch (s->scar.e[s->scar.sel].group) {
+        case CS_RESUME: career_helper(s); break;                       /* CSResume::React */
+        case CS_NEW: mc_enter(s, 0x21961, SC_START_CAREER); break;     /* CSNew: create + career Default */
+        case CS_LOAD: mc_enter(s, 0xc11, SC_START_CAREER); break;      /* CSLoad: 0x461a18ee / 0xf35d144e */
+        }
+    }
+    else if (key == SHOP_KEY_BACK) s->screen = SC_MAIN;   /* 0x911ab364 */
+}
+
+/* ---- UICareerCarLot (GC 800d34bc..800d4a20, PC 0x4ed8a0..): the career Car
+   Lot, UI_CareerCarLot.fng; LaunchFrontendShopFromGame 8012721c opens it for
+   a shop of type 4 (+0x50). Every car is free: a buy fills the first empty
+   unlocked slot (CommitChooseCar), a trade puts the stock car in a slot in
+   place of its car (CareerCarTrade). States (CalcNextCarLotState 800d3880):
+   1 start -> 2 an empty slot, 3 one slot (trade the career car), 4 more
+   slots, all full (trade it, or 5: browse the career cars for the one to
+   trade); 6 done: the memcard save (0x141) when the profile changed, then
+   StartCareerFreeRoam. ------------------------------------------------------ */
+enum { LOT_START = 1, LOT_BUY = 2, LOT_TRADE = 3, LOT_TRADE_OR_BROWSE = 4, LOT_BROWSE = 5, LOT_DONE = 6 };
+#define O_LOT_ARROW_1 0x42aa46bcu        /* Scroll_Bar_Arrow_1 (FEScrollBar "Scroll_Bar", 801554b4) */
+#define O_LOT_ARROW_2 0x42aa46bdu        /* Scroll_Bar_Arrow_2 */
+#define O_LOT_HANDLE  0x95043b2du        /* Scroll_Bar_Handle */
+#define O_LOT_BACKING 0x66eaf210u        /* Scroll_Bar_Backing */
+
+/* GetCarModelNameLocalizedString 8011d84c: CAR_NAME_<type> (GC "CAR_NAME_%s%s", suffix "") */
+static const char *lot_model_name(const Shop *s, int type) {
+    return str_get(s, hash_more(hash_more(0xffffffffu, "CAR_NAME_"), airace_type_name(type)));
+}
+/* the dialog text with its %s filled in order (FormatMessage) */
+static void lot_format(char *out, size_t cap, const char *fmt, const char *a, const char *b) {
+    size_t n = 0; int k = 0;
+    for (const char *p = fmt; *p && n + 1 < cap; ) {
+        if (p[0] == '%' && p[1] == 's') {
+            const char *v = k++ == 0 ? a : b;
+            for (; v && *v && n + 1 < cap; v++) out[n++] = *v;
+            p += 2;
+        } else out[n++] = *p++;
+    }
+    out[n] = 0;
+}
+static const ShopCar *lot_car_info(const Shop *s, int type) {
+    const char *nm = airace_type_name(type);
+    for (int i = 0; i < s->ncars; i++) if (!strcmp(s->cars[i].folder, nm)) return &s->cars[i];
+    return NULL;
+}
+/* the car viewer on the current entry (BuildCarList / ScrollCars: CarViewer
+   SetRideInfo), by the car select's request; delay: the scroll's 0xc98356ba
+   wait before the new car goes on */
+static void lot_show(Shop *s, int delay) {
+    if (!s->lot_n) return;
+    snprintf(s->qr_car_cur, sizeof s->qr_car_cur, "%s", airace_type_name(s->lot[s->lot_sel].type));
+    s->qr_car_pending = 1; s->qr_car_debounce = delay ? 0.35f : 0.0f;
+}
+/* BuildCarList 800d47d4: filter 1 the stock cars (career_lot_cars), 4 the
+   career slots that hold a car (an empty or locked slot has no car type and
+   fails IsCarAvailableInShop); the first entry current */
+static void lot_build(Shop *s, int filter) {
+    memset(s->lot, 0, sizeof s->lot);
+    s->lot_n = 0; s->lot_sel = 0;
+    if (filter == 1) {
+        int t[QR_MAX_CARS], n = career_lot_cars(t, QR_MAX_CARS);
+        for (int i = 0; i < n; i++) { s->lot[s->lot_n].type = t[i]; s->lot[s->lot_n++].handle = career_stock_handle(t[i]); }
+    } else {
+        for (int i = 0; i < CAREER_NSLOTS && s->lot_n < QR_MAX_CARS; i++) {
+            const CareerCar *c = career_car_slot(i);
+            if (!c || !c->has || c->type < 0 || !career_stock_handle(c->type) || !career_car_in_region(c->type) ||
+                (career_car_on_disc && !career_car_on_disc(c->type)) || !career_car_unlocked(c->type)) continue;
+            s->lot[s->lot_n].type = c->type; s->lot[s->lot_n++].handle = c->handle;
+        }
+    }
+    printf("car lot: %d %s cars\n", s->lot_n, filter == 1 ? "stock" : "career");
+    lot_show(s, 0);
+}
+/* RefreshHeader 800d45f4: the logos and sliders of the current car, the
+   scroll bar (Update(1, count, +0x88), the arrows off at the list's ends) */
+static void lot_refresh(Shop *s) {
+    s->lot_hdr.type = s->lot_n ? s->lot[s->lot_sel].type : -1;
+    s->lot_hdr.kind = s->lot_n ? s->lot[s->lot_sel].kind : 0;
+    s->lot_hdr.n = s->lot_n; s->lot_hdr.idx = s->lot_bar;
+    s->lot_hdr.first = s->lot_sel == 0; s->lot_hdr.last = s->lot_sel >= s->lot_n - 1;
+}
+static int lot_next(const Shop *s, int st) {                 /* CalcNextCarLotState 800d3880 */
+    switch (st) {
+    case LOT_START:
+        if (s->lot_empty > 0) return LOT_BUY;
+        if (s->lot_unlocked == 1) return LOT_TRADE;
+        if (s->lot_unlocked > 1) return LOT_TRADE_OR_BROWSE;
+        return LOT_START;
+    case LOT_TRADE_OR_BROWSE: return LOT_BROWSE;
+    case LOT_BUY: case LOT_TRADE: case LOT_BROWSE: case LOT_DONE: return LOT_DONE;
+    default: return LOT_START;
+    }
+}
+/* StartCareerFreeRoam from the lot (0x9a3b571d, the memcard's end, 0x51123592 DeallocBackupDB) */
+static void lot_leave(Shop *s) {
+    s->qr_car_pending = 0;
+    profile_drop_snapshot();
+    career_go(s, 0);
+}
+/* EnterCarLotState 800d3680 (FILTERTYPE, shown with "Career Cars" in 4, is
+   not in the PC's UI_CareerCarLot) */
+static void lot_enter(Shop *s, int st) {
+    s->lot_state = st;
+    printf("car lot: state %d\n", st);
+    if (st == LOT_BROWSE) lot_build(s, 4);
+    else if (st == LOT_DONE) {
+        if (profile_dirty()) mc_enter(s, 0x141, SC_CAREER_LOT);   /* IsDirty: EnterMemcard 0x141 */
+        else lot_leave(s);                                         /* 0x9a3b571d */
+    }
+}
+/* the dialogs' messages (NotificationMessage 800d3ae8) */
+static void lot_dlg(Shop *s, int act) {
+    const CareerCar *cur = career_current_car();
+    uint32_t sel = s->lot_n ? s->lot[s->lot_sel].handle : 0;
+    switch (act) {
+    case DA_LOT_BUY:                                       /* 0xd05fc3a3 */
+        if (s->lot_state == LOT_BUY) {                     /* CommitBuy(FindFirstEmptySlot, the stock car) */
+            int slot = career_first_empty_slot();
+            career_choose_car(slot < 0 ? 0 : slot, sel);
+            printf("car lot: bought %s into slot %d\n", airace_type_name(s->lot[s->lot_sel].type), slot < 0 ? 0 : slot);
+            lot_enter(s, lot_next(s, s->lot_state));
+        } else if (s->lot_state == LOT_TRADE) {            /* CommitTrade(the career car, the stock car) */
+            if (cur) career_car_trade(cur->handle, sel);
+            printf("car lot: traded the career car for %s\n", airace_type_name(s->lot[s->lot_sel].type));
+            lot_enter(s, lot_next(s, s->lot_state));
+        } else if (s->lot_state == LOT_BROWSE) {           /* CommitTrade(this career car, the remembered one) */
+            career_car_trade(sel, s->lot_new);
+            printf("car lot: traded slot %08x for %08x\n", (unsigned)sel, (unsigned)s->lot_new);
+            lot_enter(s, lot_next(s, s->lot_state));       /* ExitCurrentCarLotState 800d3814 */
+        }
+        break;
+    case DA_LOT_TRADE:                                     /* 0x526adefc: trade the career car */
+        if (cur) career_car_trade(cur->handle, sel);
+        printf("car lot: traded the career car for %s\n", s->lot_n ? airace_type_name(s->lot[s->lot_sel].type) : "-");
+        lot_enter(s, LOT_DONE);
+        break;
+    case DA_LOT_BROWSE:                                    /* 0x75d1e35e: Browse My Other Cars, or cancel */
+        s->lot_new = sel;
+        lot_enter(s, lot_next(s, s->lot_state));
+        break;
+    case DA_LOT_EXIT:                                      /* 0x51123592: DeallocBackupDB, StartCareerFreeRoam */
+        lot_leave(s);
+        break;
+    }
+}
+static void lot_input(Shop *s, int key) {
+    if ((key == SHOP_KEY_LEFT && s->lot_sel > 0) ||        /* ScrollCars 800d4a20: 0x9120409e / 0xb5971bf1 */
+        (key == SHOP_KEY_RIGHT && s->lot_sel < s->lot_n - 1)) {
+        int d = key == SHOP_KEY_LEFT ? -1 : 1;
+        s->lot_sel += d; s->lot_bar += d;
+        lot_show(s, 1);
+        lot_refresh(s);
+    } else if (key == SHOP_KEY_OK && s->lot_n) {           /* 0xc407210 / 0x406415e3 */
+        char t[1024];
+        const CareerCar *cur = career_current_car();
+        const char *now = lot_model_name(s, s->lot[s->lot_sel].type);
+        const char *mine = cur ? lot_model_name(s, cur->type) : "";
+        if (s->qr_car_pending) s->qr_car_debounce = 0.0f;  /* the car on screen first */
+        switch (s->lot_state) {
+        case LOT_BUY:                                      /* "Do you want this stock %s?" */
+            lot_format(t, sizeof t, str_get(s, 0xda8f3e96u), now, NULL);
+            dialog_text(s, DLG_AUTO, 2, t, DA_LOT_BUY, STR_YES, STR_NO);
+            break;
+        case LOT_TRADE:                                    /* "Do you want to trade-in your %s ^for this stock %s?" */
+            lot_format(t, sizeof t, str_get(s, 0x85215bc6u), mine, now);
+            dialog_text(s, DLG_AUTO, 2, t, DA_LOT_BUY, STR_YES, STR_NO);
+            break;
+        case LOT_TRADE_OR_BROWSE:                          /* ... "^Or do you want to choose one of your other cars?" */
+            lot_format(t, sizeof t, str_get(s, 0x3192f5d1u), mine, now);
+            dialog_text(s, DLG_AUTO, 2, t, DA_LOT_TRADE, 0xfb75e78fu, 0x2699cf8eu);   /* Trade this car? / Browse My Other Cars */
+            s->dlg_act2 = DA_LOT_BROWSE; s->dlg_back = DA_LOT_BROWSE;
+            break;
+        case LOT_BROWSE: {                                 /* this career car for the remembered stock car */
+            int nt = career_stock_type(s->lot_new);
+            lot_format(t, sizeof t, str_get(s, 0x85215bc6u), now, nt >= 0 ? lot_model_name(s, nt) : "");
+            dialog_text(s, DLG_AUTO, 2, t, DA_LOT_BUY, STR_YES, STR_NO);
+            break;
+        }
+        default: break;
+        }
+    } else if (key == SHOP_KEY_BACK) {                     /* 0x911ab364 */
+        const CareerCar *c0 = career_car_by_handle(career_slot_handle(0));
+        if (c0 && c0->has)                                 /* "Are you sure you wish to exit back to Explore Mode?" */
+            dialog(s, DLG_AUTO, 2, 0xd76e0b5au, DA_LOT_EXIT, STR_YES, STR_NO);
+        else                                               /* "Rachel needs her car back. ..." */
+            dialog(s, DLG_AUTO, 1, 0x272ebebau, DA_NONE, 0, 0);
+    }
+}
+
+int shop_platform(const Shop *s) { return s && s->platform > 0 ? s->platform : 1; }
+#ifdef OPENUG2_SIM_PRE_H
+/* test aid (simulator): the C11 career autopilot's next key for the front end -- dialogs on their
+   first button, the car lot buys the first car, the crib plays; 0 = leave it alone */
+int shop_sim_auto_key(const Shop *s) {
+    if (!s) return 0;
+    if (s->mc_view != MCV_OFF) return !s->mc_nbtn ? 0 : s->mc_nbtn == 2 && s->mc_sel ? SHOP_KEY_LEFT : SHOP_KEY_OK;
+    if (dlg_open(s)) return s->dlg_nbtn == 2 && s->dlg_sel ? SHOP_KEY_LEFT : SHOP_KEY_OK;
+    switch (s->screen) {
+    case SC_CAREER_LOT: case SC_MOVIE: return SHOP_KEY_OK;
+    case SC_MAG_REWARD: return s->mag_shot <= 0 ? SHOP_KEY_OK : 0;   /* Continue once the cover photo is taken */
+    case SC_CRIB:
+        for (int i = 0; i < s->crib.n; i++)
+            if (s->crib.e[i].group == CR_PLAY) return i == s->crib.sel ? SHOP_KEY_OK : i < s->crib.sel ? SHOP_KEY_LEFT : SHOP_KEY_RIGHT;
+        return 0;
+    default: return 0;
+    }
+}
+int shop_sim_screen(const Shop *s) { return s ? s->screen : -1; }
+#endif
+int shop_on_main_menu(const Shop *s) { return s && s->screen == SC_MAIN; }
+
+void shop_crib_return(Shop *s, int from_main) {
+    if (!s) return;
+    s->crib_from_main = from_main;
+    crib_return(s, CR_PARTS);
+}
+/* QuitToWorldMap: UI_CareerCrib again, on its last button (World Map) */
+void shop_crib_return_map(Shop *s, int from_main) {
+    if (!s) return;
+    s->crib_from_main = from_main;
+    crib_return(s, CR_WORLD_MAP);
+}
+int shop_crib_from_main(const Shop *s) { return s && s->crib_from_main; }
+
+/* ---------------------------------------------------------------- the uniques shop */
+
+/* UniquesBrowser (UI_ChooseUniquePart.fng, Setup 8016d2d0): THE_UNIQUES_SHOP
+   (type 6), which GetShopWeAreCurrentlyIn gives while a world challenge's
+   goal shop is entered (state 4). Its strip: GetUniquesPartsList 8012d688
+   over the challenge's +0x15..+0x17 unlockable entities -- a visual one
+   (+0x14 == 1) every upgrade level 4 part of MapUnlockableToCarSlotID's
+   slot (0x3e: the vinyls of group 0x18; 0x0d: the wheels, one per name of
+   the car's rim size), a performance one (2) MapUnlockableToPerfPackage's
+   junkman path unless IsUniqueInstalled. Icons / names by slot 8016ce1c /
+   8016cea4, by path 8016cff4 / 8016cf28. */
+static int uq_ent_slot(int ent) {                                   /* MapUnlockableToCarSlotID 8012ec20 */
+    switch (ent) {
+    case 0x0b: return 9;    case 0x0c: return 0xc;  case 0x0d: return 0x1d; case 0x0e: return 0xf;
+    case 0x0f: return 0xe;  case 0x10: return 0xb;  case 0x11: return 2;    case 0x12: return 1;
+    case 0x13: return 0x20; case 0x14: return 7;    case 0x15: return 0x10; case 0x16: return 6;
+    case 0x18: return 0x9f; case 0x19: return 0x9a; case 0x1b: return 0x9c; case 0x1e: return 0x22;
+    case 0x21: return 0x1f; case 0x23: return 0xa0; case 0x24: return 0xa1;
+    }
+    return -1;
+}
+static int uq_ent_path(int ent) {                                   /* MapUnlockableToPerfPackage 8012ee40 */
+    static const signed char t[11] = { -1, 3, 7, 5, 2, 1, 0, 8, 6, 4, 9 };
+    return ent >= 0 && ent <= 10 ? t[ent] : -1;
+}
+static uint32_t uq_slot_icon(int slot) {                            /* 8016ce1c */
+    switch (slot) {
+    case 0xc: return 0xbb034ea6u; case 6: return 0x945e9bc5u; case 9: return 0x028f7092u; case 0x1d: return 0x0294d2a3u;
+    }
+    return slot >= 0x40 && slot < 0x44 ? 0x1b3a8dd3u : 0x74ce8c0bu;
+}
+static uint32_t uq_slot_name(int slot) {                            /* 8016cea4 */
+    switch (slot) {
+    case 0xc: return 0xbb034ea6u; case 6: return 0x945e9bc5u; case 9: return 0x028f7092u; case 0x1d: return 0x0294d2a3u;
+    }
+    return slot >= 0x40 && slot < 0x44 ? 0xd6d115e4u : 0;
+}
+static uint32_t uq_path_icon(int p) {                               /* 8016cff4 */
+    static const uint32_t t[9] = { 0xea57d2c4u, 0x01a29ffau, 0x9701bde4u, 0xc15c94e6u, 0x06ef789cu,
+                                   0x178475e7u, 0xbaa23a28u, 0x502abeedu, 0x06e8e477u };
+    return p >= 0 && p < 9 ? t[p] : 0;
+}
+static uint32_t uq_path_name(int p) {                               /* 8016cf28 */
+    static const uint32_t t[9] = { 0x758d5e3cu, 0x73ad2f72u, 0xa7886f38u, 0x026eea5eu, 0xabd0ff14u,
+                                   0x9c34c75fu, 0xaa8959adu, 0xa7884765u, 0xabca6aefu };
+    return p >= 0 && p < 9 ? t[p] : 0;
+}
+/* the junkman paths installed (FECarConfig +0x2f4; the session's career car) */
+static int uq_add(Shop *s, int slot, int path) {
+    if (s->uqs.n >= 64) return -1;
+    int i = s->uqs.n++;
+    memset(&s->uq[i], 0, sizeof s->uq[i]);
+    s->uq[i].slot = slot; s->uq[i].path = path;
+    s->uq_e[i].tex = path >= 0 ? uq_path_icon(path) : uq_slot_icon(slot);
+    s->uq_e[i].str = path >= 0 ? uq_path_name(path) : uq_slot_name(slot);
+    s->uq_e[i].group = slot;
+    return i;
+}
+/* RefreshHeader 8016d0c0: a part with no LANGUAGEHASH its name ("%s %s %d\""
+   brand, name and MAX size for wheels) in the option title; with one the
+   game prints into 0xb1027477, which this package lacks -- the slot's name stays */
+static void uq_name(Shop *s, int i, const unsigned char *r, uint32_t brand) {
+    unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
+    const char *nm = s->db_str ? (const char *)s->db + s->db_str + soff * 4L : "?";
+    uint32_t mx = 0, lang = 0;
+    if (db_attr(s, aoff, 0x4732da07u, &lang)) return;
+    if (s->uq[i].slot == 0x1d) {
+        db_attr(s, aoff, 0xeb0101e2u, &mx);
+        const char *bn = "";
+        for (int k = 0; k < NELEM(k_rims_tuner); k++) if (k_rims_tuner[k].key == brand) bn = str_get(s, k_rims_tuner[k].str);
+        for (int k = 0; !bn[0] && k < NELEM(k_rims_suv); k++) if (k_rims_suv[k].key == brand) bn = str_get(s, k_rims_suv[k].str);
+        snprintf(s->uq[i].name, sizeof s->uq[i].name, "%s %s %d\"", bn, nm, (int)(signed char)mx);
+    } else snprintf(s->uq[i].name, sizeof s->uq[i].name, "%s", nm);
+}
+static int uq_build(Shop *s) {
+    const unsigned char *wc = g_career.wcs.wc;
+    s->uqs.n = 0; s->uqs.sel = 0; s->uqs.scroll = 0.0f;
+    if (!wc || !s->db || !s->db_parts) return 0;
+    int type = (signed char)wc[0x14];
+    s->uq_perf = type == 2;
+    int rim = g_shop_rec_ok ? (signed char)g_shop_rec[0xdc] : 0, rmax = g_shop_rec_ok ? (signed char)g_shop_rec[0xde] : 0;
+    for (int e = 0; e < 3; e++) {
+        int ent = wc[0x15 + e];
+        if (ent == 0xff || ent == 0) continue;
+        if (type == 2) {
+            int path = uq_ent_path(ent);
+            if (path >= 0 && !s->fitted.junk[path]) uq_add(s, -1, path);
+            continue;
+        }
+        if (type != 1) continue;
+        if (ent == 0x3e) {                                           /* the unique vinyls */
+            for (int k = 0; k < vinyl_count(); k++) {
+                const VinylPart *v = vinyl_at(k);
+                if (v->group != 0x18 || v->level != 4) continue;
+                int i = uq_add(s, 0x40, -1);
+                if (i < 0) break;
+                s->uq[i].hash = v->hash; s->uq[i].okey = v->hash; s->uq[i].ent = vinyl_price_row(0x18);
+                const char *nm = v->lang ? str_get(s, v->lang) : "";
+                snprintf(s->uq[i].name, sizeof s->uq[i].name, "%s", v->lang ? "" : v->name);
+                (void)nm;   /* a LANGUAGEHASH name goes to the missing 0xb1027477 */
+            }
+            continue;
+        }
+        if (ent == 0x0d) {                                           /* the wheels: one per name */
+            int model = db_model(s, "WHEELS"), first = s->uqs.n;
+            const unsigned char *kept[64]; int nk = 0;
+            for (long p = s->db_parts; model >= 0 && p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
+                const unsigned char *r = s->db + p;
+                if (!n2_u32(r) && !(r[8] | r[9] << 8)) break;
+                if (r[4] != G_WHEEL || r[7] != model || (r[5] >> 5) != 4) continue;
+                unsigned aoff = r[10] | r[11] << 8, soff = r[8] | r[9] << 8;
+                const char *nm = s->db_str ? (const char *)s->db + s->db_str + soff * 4L : "";
+                int at = -1;
+                for (int k = 0; k < nk && at < 0; k++)
+                    if (!strcasecmp(nm, (const char *)s->db + s->db_str + (kept[k][8] | kept[k][9] << 8) * 4L)) at = k;
+                if (at < 0) { if (nk < 64) kept[nk++] = r; continue; }
+                uint32_t o_new = 0, o_old = 0, m_new = 0, m_old = 0;
+                unsigned ka = kept[at][10] | kept[at][11] << 8;
+                db_attr(s, aoff, 0xce7d8db5u, &o_new); db_attr(s, ka, 0xce7d8db5u, &o_old);
+                db_attr(s, aoff, 0xeb0101e2u, &m_new); db_attr(s, ka, 0xeb0101e2u, &m_old);
+                if ((signed char)o_new == rim && (signed char)o_old <= (signed char)o_new &&
+                    (signed char)m_old < (signed char)m_new && (signed char)m_new <= rmax) kept[at] = r;
+            }
+            for (int k = 0; k < nk; k++) {                           /* Setup: the car's rim size only */
+                const unsigned char *r = kept[k];
+                unsigned aoff = r[10] | r[11] << 8;
+                uint32_t outer = 0, brand = 0;
+                db_attr(s, aoff, 0xce7d8db5u, &outer);
+                if ((signed char)outer != rim) continue;
+                db_attr(s, aoff, 0xEBB03E66u, &brand);
+                const char *folder = preset_rim_folder(brand);
+                int st, in, out;
+                if (!folder || !rim_part_parse(folder, n2_u32(r), &st, &in, &out)) {
+                    printf("career uniques: wheel %s has no rim folder here\n", preset_part_name(s, r));
+                    continue;
+                }
+                int i = uq_add(s, 0x1d, -1);
+                if (i < 0) break;
+                s->uq[i].hash = n2_u32(r); s->uq[i].okey = n2_u32(r); s->uq[i].ent = 0x21;
+                snprintf(s->uq[i].folder, sizeof s->uq[i].folder, "%s", folder);
+                s->uq[i].value = RIM_VALUE(st, in);
+                uq_name(s, i, r, brand);
+            }
+            (void)first;
+            continue;
+        }
+        int slot = uq_ent_slot(ent), group = preset_slot_group(slot);
+        if (slot < 0 || group < 0) continue;
+        static const char *const libs[] = { NULL, "SPOILER", "SPOILER_HATCH", "SPOILER_SUV", "EXHAUST", "ROOF" };
+        int models[6], nm = 0;
+        models[nm++] = db_model(s, s->car);
+        for (int l = 1; l <= 5; l++)
+            if ((group == G_SPOILER && l <= 3) || (group == G_EXHAUST && l == 4) || (group == G_ROOF && l == 5))
+                models[nm++] = db_model(s, libs[l]);
+        for (int mi = 0; mi < nm; mi++)
+            for (long p = s->db_parts; models[mi] >= 0 && p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
+                const unsigned char *r = s->db + p;
+                if (!n2_u32(r) && !(r[8] | r[9] << 8)) break;
+                int upg = r[5] | r[6] << 8;
+                if (r[4] != group || r[7] != models[mi] || (upg >> 5 & 7) != 4) continue;
+                int v = part_value_lib(s->car, group, n2_u32(r), mi > 0, upg);
+                if (v < 0) { printf("career uniques: %s has no part value on %s\n", preset_part_name(s, r), s->car); continue; }
+                int i = uq_add(s, slot, -1);
+                if (i < 0) break;
+                s->uq[i].hash = n2_u32(r); s->uq[i].okey = n2_u32(r); s->uq[i].value = v; s->uq[i].ent = slot_ent(slot);
+                uq_name(s, i, r, 0);
+            }
+    }
+    scroller_set(&s->uqs, s->uq_e, s->uqs.n);
+    return s->uqs.n;
+}
+/* PreviewPart / PreviewJunkmanPart: the shown one on the car */
+static void uq_preview(Shop *s) {
+    if (!s->uqs.n) return;
+    const __typeof__(s->uq[0]) *u = &s->uq[s->uqs.sel];
+    if (u->path >= 0) return;                                        /* the junkman parts look like nothing */
+    if (u->slot == 0x1d) {
+        snprintf(s->prev_folder, sizeof s->prev_folder, "%s", u->folder);
+        s->prev_style = u->value; s->rim_pending = 1; s->rim_debounce = 0.35f;
+        return;
+    }
+    N2CarConfig next = s->fitted;
+    if (u->slot == 0x40) {                                           /* a unique takes all four layers */
+        memset(next.vinyl, 0, sizeof next.vinyl); memset(next.vinyl_col, 0, sizeof next.vinyl_col);
+        next.vinyl[0] = u->hash;
+    } else body_put(&next, group_slot(preset_slot_group(u->slot)), u->value, 0);
+    if (memcmp(&next, &s->preview, sizeof next)) { s->preview = next; request_preview(s); }
+}
+/* 0xd05fc3a3: InstallPart + BuyCarPart (visual) / InstallJunkmanPart, NotifyUniqueChosen, StartCareerFreeRoam */
+static void uq_install(Shop *s) {
+    if (!s->uqs.n) return;
+    const __typeof__(s->uq[0]) *u = &s->uq[s->uqs.sel];
+    if (u->path >= 0) {
+        /* InstallJunkmanPart: the spec's path flag, RebuildPhysicsInfo (main: n2_set_perf) */
+        s->fitted.junk[u->path] = 1; s->preview.junk[u->path] = 1;
+        request_preview(s); s->debounce = 0.0f;
+        printf("career uniques: junkman path %d installed\n", u->path);
+    } else {
+        if (u->slot == 0x1d) {
+            memcpy(s->rim_folder, s->prev_folder, sizeof s->rim_folder);
+            s->rim_style = s->prev_style;
+            if (s->rim_pending) s->rim_debounce = 0.0f;
+        } else {
+            s->fitted = s->preview;
+            if (u->slot == 9) { hood_installed(&s->fitted, 4); s->preview = s->fitted; request_preview(s); }
+            if (s->pending) s->debounce = 0.0f;
+        }
+        career_buy_part(u->ent, u->okey, 0);                         /* level 4: no cost */
+        printf("career uniques: %s (slot 0x%x) installed\n", u->name[0] ? u->name : str_get(s, s->uq_e[s->uqs.sel].str), u->slot);
+    }
+    career_wc_unique_chosen();
+    s->uq_done = 1;
+    s->exit_req = 1;
+}
+static void uq_enter(Shop *s) {
+    uq_build(s);
+    s->screen = SC_UNIQUES;
+    printf("career uniques: %d parts (%s)\n", s->uqs.n, s->uq_perf ? "junkman paths" : "visual");
+    uq_preview(s);
+}
+static void uq_input(Shop *s, int key) {
+    if (key == SHOP_KEY_LEFT || key == SHOP_KEY_RIGHT) {
+        int was = s->uqs.sel;
+        scroller_move(&s->uqs, key == SHOP_KEY_LEFT ? -1 : 1);
+        if (s->uqs.sel != was) uq_preview(s);
+    } else if (key == SHOP_KEY_OK && s->uqs.n) dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_UQ_PICK, 0, 0);
+    else if (key == SHOP_KEY_BACK) dialog(s, PK_DLG_S, 2, 0x20d0d219u, DA_UQ_LEAVE, STR_YES, STR_NO);
+}
+int shop_uniques_done(const Shop *s) { return s && s->uq_done; }
+
+/* the shop's scene (+0x40, "CARLOT01.BIN" ...) through PlatformNameMap; CRIB01 when none */
+static int shop_scene_platform(const unsigned char *shop) {
+    static const char *const plat[] = { "", "SHOWROOM", "AUDIOSHOP01", "CARLOT01", "CRIB01", "MEGALOSHOP01",
+                                        "PAINTSHOP01", "PARTSSHOP01", "PERFSHOP01" };
+    int r = 4;
+    if (shop) {
+        char nm[17]; int k = 0;
+        for (; k < 16 && shop[0x40 + k] && shop[0x40 + k] != '.'; k++) nm[k] = (char)toupper(shop[0x40 + k]);
+        nm[k] = 0;
+        for (int i = 1; i < (int)NELEM(plat); i++) if (!strcmp(nm, plat[i])) r = i;
+    }
+    return r;
+}
+int shop_career_customize(Shop *s, int entry, const unsigned char *shop) {
+    if (!s) return 0;
+    int type = shop ? (signed char)shop[0x50] : 0;
+    s->cust_entry = entry;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_SHOPFOUND")) career_sim_find_shops();
+#endif
+    s->cshop = entry ? NULL : shop;
+    s->career = entry ? 2 : 6;                         /* GetPartUnlockFilter: the crib 2, a shop 6 */
+    s->platform = shop_scene_platform(shop);           /* GarageMainScreen: the shop's scene, else CRIB01 */
+    if (entry) {                                       /* CalcFirstScreen: UI_ChooseCustomizeCategory */
+        s->cust_shop = 0;
+        s->screen = SC_CAR_SHOP;
+        printf("career customize: Change Parts (owned parts only), $%d\n", g_career.cash);
+        return 1;
+    }
+    /* EnterShopFromFreeRoam 8015df74: 3 perf -> 1, 1 paint -> 2, 2 parts -> 0,
+       5 ICE -> 3, 6 uniques -> 6; PickScreenForShop 80160498 */
+    switch (type) {
+    case 2:   /* UI_GenericParts_Browser: SetupBodyShop 80164368 / 0x545b50 snaps the category strip to the
+                 last button or Front Bumpers (1) even when it is locked (no lock skip); not browsing parts */
+        s->cust_shop = 0; s->body.sel = 0; s->body.scroll = 0.0f; body_locks(s); s->screen = SC_BODY; break;
+    case 3: s->cust_shop = 1; car_shop_open(s, CAT_PERFORMANCE); break;                        /* UI_ChoosePerformanceCategory */
+    case 1: s->cust_shop = 2; car_shop_open(s, CAT_GRAPHICS); break;                           /* UI_ChoosePaintCategory */
+    case 5: s->cust_shop = 3; car_shop_open(s, CAT_SPECIALTIES); break;                        /* UI_ICEMAIN */
+    case 6: s->cust_shop = 6; uq_enter(s); break;                                               /* UI_ChooseUniquePart */
+    default:
+        printf("career customize: shop type %d (UI_ChooseUniquePart) is not built yet\n", type);
+        s->career = 0;
+        return 0;
+    }
+    printf("career customize: shop type %d, screen %d, $%d\n", type, s->screen, g_career.cash);
+    return 1;
+}
+
+/* LaunchFrontendShopFromGame 8012721c for the shop the career is in */
+/* ---- UIMagazineReward (GC 801868fc / PC 565750, Notify 80186f18 / PC
+   55b260): UI_MagazineReward.fng over UI_MagazineBack.fng, the CarViewer
+   car posed for the cover. SelectNextMagazineSetup 80186b28 takes the
+   showcase's FEMagazineSetup (hash +0x28; the first when there is none)
+   from MAGAZINES_FRONTEND.BIN (chunk 0x30230, after it: car, render and
+   magazine setup counts; FECarSetup at +0xc stride 0x38 = hash, anim flags,
+   then the garage camera's view: heading, steer, FOV, target, eye;
+   FERenderSetup at +0xe0c stride 0x18; FEMagazineSetup at +0x110c stride
+   0x68), GenerateMagazineSelection 80185470 picks one of each list, and
+   MagazineTextureHandler pack 0 (MAGAZINES_STREAMING_HIGH.bin) holds the
+   art. Accept 0x406415e3: LeaveThisScreen 80186ecc -> ReturnFromFrontend-
+   Reward 80186754 -> StartCareerFreeRoam (the spot saved on the way in).
+   No Back. --------------------------------------------------------- */
+static int mag_pick(const unsigned char *m, int cnt_off, int cap) {
+    unsigned n = n2_u32(m + cnt_off);
+    if (n > (unsigned)cap) n = (unsigned)cap;
+    return n >= 2 ? rand() % (int)n : 0;   /* bRandom(n) */
+}
+int shop_magazine_reward(Shop *s, const unsigned char *sc) {
+    if (!s || !sc) return 0;
+    char path[600];
+    snprintf(path, sizeof path, "%s/FRONTEND/MAGAZINES_FRONTEND.BIN", s->dataroot);
+    long len = 0;
+    unsigned char *d = n2_read_file(path, &len);
+    if (!d || len < 8 + 0x110c || n2_u32(d) != 0x30230u) {
+        free(d); printf("magazine: %s unreadable\n", path); return 0;
+    }
+    const unsigned char *b = d + 8;
+    unsigned nc = n2_u32(b), nr = n2_u32(b + 4), nm = n2_u32(b + 8);
+    if (nc > 64) nc = 64;
+    if (nr > 32) nr = 32;
+    while (nm && 8 + 0x110c + (long)nm * 0x68 > len) nm--;
+    if (!nm) { free(d); printf("magazine: no magazine setups\n"); return 0; }
+    uint32_t want = n2_u32(sc + 0x28);
+    const unsigned char *m = b + 0x110c;                      /* GetMagazineSetupByIndex(0) */
+    for (unsigned i = 0; i < nm; i++)
+        if (n2_u32(b + 0x110c + i * 0x68) == want) m = b + 0x110c + i * 0x68;
+    uint32_t sel[6];                                           /* FEMagazineSelection */
+    sel[0] = n2_u32(m + 0x20 + 4 * mag_pick(m, 0x08, 3));     /* back */
+    sel[1] = n2_u32(m + 0x2c + 4 * mag_pick(m, 0x0c, 2));     /* mast */
+    sel[2] = n2_u32(m + 0x34 + 4 * mag_pick(m, 0x10, 5));     /* chick */
+    sel[3] = n2_u32(m + 0x48 + 4 * mag_pick(m, 0x14, 3));     /* extra */
+    sel[4] = n2_u32(m + 0x54 + 4 * mag_pick(m, 0x18, 3));     /* car setup */
+    sel[5] = n2_u32(m + 0x60 + 4 * mag_pick(m, 0x1c, 2));     /* render setup */
+#ifdef OPENUG2_SIM_PRE_H   /* test aid (simulator): OPENUG2_SIM_MAGCAR=<hex> forces the FECarSetup */
+    if (getenv("OPENUG2_SIM_MAGCAR")) sel[4] = (uint32_t)strtoul(getenv("OPENUG2_SIM_MAGCAR"), NULL, 16);
+#endif
+    s->mag_cam_ok = 0; s->mag_flags = 0; s->mag_rig = 0; s->mag_env[0] = 0;
+    for (unsigned i = 0; i < nc; i++) {                        /* GetCarSetupByHash: CarViewer::SetCameraParams */
+        const unsigned char *cs = b + 0xc + i * 0x38;
+        if (n2_u32(cs) != sel[4]) continue;
+        s->mag_flags = (int)n2_u32(cs + 4);
+        /* heading, steer, fov, tgt[3], eye[3], two camera +0xb4/+0xb8 floats
+           (0x451200; unused), roll (0x4455a0 -> mover +0xb8, 0x444de0) */
+        for (int k = 0; k < 12; k++) memcpy(&s->mag_cam[k], cs + 8 + 4 * k, 4);
+        s->mag_cam_ok = 1;
+    }
+    for (unsigned i = 0; i < nr; i++) {                        /* GetRenderSetupByHash */
+        const unsigned char *rs = b + 0xe0c + i * 0x18;
+        if (n2_u32(rs) == sel[5]) {   /* SelectNextMagazineSetup: SetShaperLights + FE env map */
+            s->mag_rig = n2_u32(rs + 4);
+            memcpy(s->mag_env, rs + 8, 15); s->mag_env[15] = 0;
+            printf("magazine: render setup %08x: shaper lights %08x, envmap %s\n",
+                   (unsigned)sel[5], (unsigned)s->mag_rig, s->mag_env);
+        }
+    }
+    printf("magazine: setup %08x%s (%.24s), back %08x mast %08x chick %08x extra %08x, car %08x%s flags %d\n",
+           (unsigned)n2_u32(m), n2_u32(m) == want ? "" : " (first: no match)", (const char *)sc,
+           (unsigned)sel[0], (unsigned)sel[1], (unsigned)sel[2], (unsigned)sel[3], (unsigned)sel[4],
+           s->mag_cam_ok ? "" : " (missing)", s->mag_flags);
+    free(d);
+    /* MagazineTextureHandler::LoadTextures: pack 0 */
+    glDeleteTextures(4, s->mag_tex); memset(s->mag_tex, 0, sizeof s->mag_tex);
+    snprintf(path, sizeof path, "%s/FRONTEND/MAGAZINES_STREAMING_HIGH.bin", s->dataroot);
+    uint32_t keys[4]; int slot[4], nk = 0;
+    for (int i = 0; i < 4; i++) if (sel[i]) { keys[nk] = sel[i]; slot[nk++] = i; }
+    FengImage img[4]; memset(img, 0, sizeof img);
+    long plen = 0;   /* its textures are JDLZ pieces: the in-memory reader (2.9 MB) */
+    unsigned char *pd = nk ? n2_read_file(path, &plen) : NULL;
+    int got = pd ? feng_tpk_load(pd, plen, keys, nk, img) : 0;
+    free(pd);
+    for (int i = 0; i < nk; i++) {
+        if (img[i].rgba) s->mag_tex[slot[i]] = upload_rgba(img[i].w, img[i].h, img[i].rgba);
+        feng_image_free(&img[i]);
+    }
+    printf("magazine: %d of %d cover textures\n", got, nk);
+    s->mag_sc = sc;
+    s->mag_shot = 30;   /* PC 0x55b498: +0x74 > 2 ticks after 0x115bbd44 (the save-photo answer; guess: at once) */
+    s->front_end = 1;
+    s->screen = SC_MAG_REWARD;
+    return 1;
+}
+int shop_mag_view(const Shop *s, float cam[9]) {
+    if (!s || s->screen != SC_MAG_REWARD || !s->mag_cam_ok) return 0;
+    memcpy(cam, s->mag_cam, 9 * sizeof(float));
+    return 1;
+}
+int shop_mag_render(const Shop *s, uint32_t *rig, char env[16], float *roll) {
+    if (!s || s->screen != SC_MAG_REWARD || !s->mag_cam_ok) return 0;
+    *rig = s->mag_rig;
+    memcpy(env, s->mag_env, 16);
+    *roll = s->mag_cam[11];
+    return 1;
+}
+static void mag_input(Shop *s, int key) {
+    if (key != SHOP_KEY_OK) return;                            /* 0x406415e3 only */
+    glDeleteTextures(4, s->mag_tex); memset(s->mag_tex, 0, sizeof s->mag_tex);
+    s->mag_cam_ok = 0; s->mag_flags = 0;
+    printf("magazine: cover accepted\n");
+    s->mag_shot = 0;
+    career_go(s, 0);
+}
+
+/* bStringHash(str, seed): the hash carried on over str */
+static uint32_t hash_on(uint32_t h, const char *str) {
+    while (*str) h = h * 33u + (unsigned char)*str++;
+    return h;
+}
+/* GetNumShowcaseData(kind) PC 0x510d50 / GC 8018734c: the completed (state
+   record +6 == 1) showcases of kind 1 / 3 (magazines) or 2 / 4 (DVDs) */
+static int sc_of_mode(const unsigned char *sc, int mode) {
+    int k = sc[0x24];
+    return mode == 1 ? (k == 1 || k == 3) : (k == 2 || k == 4);
+}
+static int sc_done(const unsigned char *sc) {
+#ifdef OPENUG2_SIM_PRE_H   /* test aid (simulator): every showcase done */
+    if (getenv("OPENUG2_SIM_MAGS")) return 1;
+#endif
+    CareerRecord *r = career_record(n2_u32(sc + 0x20));
+    return r && r->flag[CREC_DONE] == 1;
+}
+static int num_showcases_done(int mode) {
+    int n = 0;
+    for (int i = 0; i < career_nshowcases(); i++) {
+        const unsigned char *sc = career_showcase(i);
+        if (sc_of_mode(sc, mode) && sc_done(sc)) n++;
+    }
+    return n;
+}
+
+/* ---- the cover photos (ScreenShot 0x832dac). PC: once the photo is taken
+   the screen asks for a screenshot (0x5ce510: a 512x512 A8R8G8B8 surface,
+   0x488b50 asks the renderer), 0x5c3120 StretchRects the middle of the back
+   buffer into it -- 320 x 432 of 640 x 480, left / right -10 / +3, top /
+   bottom -4 / -6 -- and the 1 MB is saved with the profile (memcard op
+   0xcb1, file name 0x510af0: the profile name padded to 7 with '_', then the
+   showcase's index as 0-9 / A-Z). UIMagazineView loads it back (op 0xcc1)
+   into the "SCREENSHOTHASH" texture on MagImage. The port keeps the file
+   beside the profile, 512 x 512 RGBA top row first. ---- */
+#define COVER_W 512
+static int cover_path(int idx, char *out, int cap) {
+    char nm[16];
+    const char *p = profile_name();
+    int n = (int)strlen(p);
+    if (n > 7) n = 7;
+    memcpy(nm, p, (size_t)n);
+    while (n < 7) nm[n++] = '_';
+    nm[7] = (char)(idx < 10 ? '0' + idx : 'A' + idx - 10);
+    nm[8] = 0;
+    return profile_file(nm, out, cap);
+}
+static int sc_index(const unsigned char *sc) {
+    for (int i = 0; i < career_nshowcases(); i++) if (career_showcase(i) == sc) return i;
+    return -1;
+}
+const unsigned char *shop_cover_due(Shop *s) {
+    if (!s || s->screen != SC_MAG_REWARD || s->mag_shot <= 0 || --s->mag_shot) return NULL;
+    return s->mag_sc;
+}
+void shop_cover_capture(const unsigned char *sc, int W, int H) {
+    char path[400];
+    int idx = sc ? sc_index(sc) : -1;
+    if (idx < 0 || idx > 35 || W <= 0 || H <= 0 || !cover_path(idx, path, sizeof path)) {
+        printf("cover photo: not saved (showcase %d, profile '%s')\n", idx, profile_name());
+        return;
+    }
+    /* PC: 320 x 432 of 640 x 480 (w by W / 640) on a 4:3 back buffer; the
+       front end here keeps the cover 4:3 in the screen's height, so both
+       sides (and the PC's pixel nudges) scale by H / 480 */
+    int w = 320 * H / 480, h = 432 * H / 480;
+    int x0 = W / 2 - w / 2 - 10 * H / 480, x1 = W / 2 + w / 2 + 3 * H / 480;     /* D3D rows: top down */
+    int y0 = H / 2 - h / 2 - 4 * H / 480, y1 = H / 2 + h / 2 - 6 * H / 480;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > W) x1 = W;
+    if (y1 > H) y1 = H;
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    unsigned char *px = (unsigned char *)malloc((size_t)rw * rh * 4);
+    unsigned char *out = (unsigned char *)malloc(COVER_W * COVER_W * 4);
+    if (!px || !out) { free(px); free(out); return; }
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(x0, H - y1, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, px);   /* GL rows: bottom up */
+    for (int y = 0; y < COVER_W; y++) {                      /* the StretchRect (point) */
+        int sy = rh - 1 - y * rh / COVER_W;
+        for (int x = 0; x < COVER_W; x++) {
+            const unsigned char *q = px + ((size_t)sy * rw + x * rw / COVER_W) * 4;
+            unsigned char *d = out + ((size_t)y * COVER_W + x) * 4;
+            d[0] = q[0]; d[1] = q[1]; d[2] = q[2]; d[3] = 255;
+        }
+    }
+    FILE *f = fopen(path, "wb");
+    int ok = f && fwrite(out, 1, COVER_W * COVER_W * 4, f) == COVER_W * COVER_W * 4;
+    if (f) fclose(f);
+    free(px); free(out);
+    printf("cover photo: %s %s (%.24s, %dx%d of %dx%d)\n", ok ? "saved" : "cannot save", path, (const char *)sc,
+           rw, rh, W, H);
+}
+
+/* ---- uiCribRewardOptionsMain (PC Setup 0x4afb70, NotificationMessage
+   0x495b60; GC 800d2c90 / 800d2b24): UI_CribRewardOptionsMain.fng. Show
+   Magazines / Show DVDs, locked while GetNumShowcaseData(kind) is 0, and
+   Sponsors, locked while none is chosen. The first time in on its first
+   option (0x836327), after that on the one it left by. Back: FORWARD, then
+   0xe1fde1d1 -> UI_CareerCrib. ---- */
+enum { CRW_MAG, CRW_DVD, CRW_SPONSORS };
+static const ShopEntry k_crw[3] = {
+    { 0xc7993f9au, 0xff293517u, CRW_MAG },        /* CRWShowMagazines 0x4afb00 -> EnterMagazineSelect 0x53ddb0 */
+    { 0x7647b08cu, 0x597df2a7u, CRW_DVD },        /* CRWShowDVDs 0x4afb20 -> EnterDvdSelect 0x53ddf0 */
+    { 0xe0004602u, 0x0878ffdfu, CRW_SPONSORS },   /* CRWShowSponsors 0x4afb40 -> UI_RewardsSponsor */
+};
+static void crw_enter(Shop *s, int option) {
+    int sel = option >= 0 && s->crw_seen ? option : 0;
+    memcpy(s->crw_e, k_crw, sizeof k_crw);
+    scroller_set(&s->crw, s->crw_e, 3);
+    s->crw.locked[0] = num_showcases_done(1) == 0;
+    s->crw.locked[1] = num_showcases_done(2) == 0;
+    s->crw.locked[2] = career_num_sponsors_chosen() == 0;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_SPONSOR")) s->crw.locked[2] = 0;
+#endif
+    s->crw_seen = 1;
+    s->crw.sel = sel; s->crw.scroll = (float)sel;
+    s->screen = SC_CRIB_REWARDS;
+    printf("crib rewards: magazines %d, DVDs %d, sponsors %d\n", num_showcases_done(1), num_showcases_done(2),
+           career_num_sponsors_chosen());
+}
+static void msel_enter(Shop *s, int mode, int keep);
+static void crw_input(Shop *s, int key) {
+    if (key == SHOP_KEY_LEFT) scroller_move(&s->crw, -1);
+    else if (key == SHOP_KEY_RIGHT) scroller_move(&s->crw, 1);
+    else if (key == SHOP_KEY_OK && !s->crw.locked[s->crw.sel]) {
+        switch (s->crw.e[s->crw.sel].group) {
+        case CRW_MAG: msel_enter(s, 1, 0); break;
+        case CRW_DVD: msel_enter(s, 2, 0); break;
+        case CRW_SPONSORS: csp_enter(s); break;
+        }
+    } else if (key == SHOP_KEY_BACK) {
+        crib_return(s, CR_REWARDS);
+    }
+}
+
+/* ---- UIMagazineSelect (PC create 0x55b520, Setup 0x550dd0, list 0x523f60,
+   Notify 0x54b210; GC 80187494..): UI_MagazineSelect.fng, an IconScroller
+   of the completed showcases of the mode -- icon 0xff293517 / 0x597df2a7,
+   text bStringHash("_TITLE", +0x28). The header: "Magazines" / "DVD covers",
+   "View Magazine" / "View DVD", the cover's _TITLE and _BODY, MagThumb the
+   texture +0x28. The first time in on the first one (0x838581). OK
+   (MagazineThing::React 0x53de60): the mag setup hash = +0x28, then
+   UI_MagazineView. Back: ReturnFromMagazineSelect -> the reward options. ---- */
+static void mview_enter(Shop *s, int idx);
+static void msel_enter(Shop *s, int mode, int keep) {
+    int n = 0;
+    for (int i = 0; i < career_nshowcases() && n < 32; i++) {
+        const unsigned char *sc = career_showcase(i);
+        if (!sc_of_mode(sc, mode) || !sc_done(sc)) continue;
+        s->msel_e[n].str = hash_on(n2_u32(sc + 0x28), "_TITLE");
+        s->msel_e[n].tex = mode == 1 ? 0xff293517u : 0x597df2a7u;
+        s->msel_e[n++].group = i;
+    }
+    int sel = keep && s->msel_seen ? s->msel.sel : 0;
+    scroller_set(&s->msel, s->msel_e, n);
+    if (sel >= n) sel = n ? n - 1 : 0;
+    s->msel.sel = sel; s->msel.scroll = (float)sel;
+    s->msel_mode = mode;
+    s->msel_seen = 1;
+    s->screen = SC_MAG_SELECT;
+    printf("magazine select: %s, %d covers\n", mode == 1 ? "magazines" : "DVDs", n);
+}
+static void msel_input(Shop *s, int key) {
+    if (key == SHOP_KEY_LEFT) scroller_move(&s->msel, -1);
+    else if (key == SHOP_KEY_RIGHT) scroller_move(&s->msel, 1);
+    else if (key == SHOP_KEY_OK && s->msel.n) mview_enter(s, s->msel_e[s->msel.sel].group);
+    else if (key == SHOP_KEY_BACK) {                       /* 0x911ab364: 0x510e10, 0x838581 = 0 */
+        s->msel_seen = 0;
+        crw_enter(s, s->msel_mode == 1 ? 0 : 1);
+    }
+}
+
+/* ---- UIMagazineView (PC ctor 0x553be0, Notify 0x565b50): 0x35f8620b makes
+   the 320 x 432 "SCREENSHOTHASH" texture and loads the photo (op 0xcc1);
+   0x42317a19 (loaded): MagImage shows it; 0x2b46fe08 (failed) and Back go
+   back to UI_MagazineSelect. ---- */
+static void mview_enter(Shop *s, int idx) {
+    char path[400];
+    const unsigned char *sc = career_showcase(idx);
+    if (s->mview_tex) { glDeleteTextures(1, &s->mview_tex); s->mview_tex = 0; }
+    unsigned char *px = NULL;
+    long len = 0;
+    if (sc && cover_path(idx, path, sizeof path)) px = n2_read_file(path, &len);
+    if (!px || len != COVER_W * COVER_W * 4) {             /* 0x2b46fe08 */
+        free(px);
+        printf("magazine view: %.24s has no photo -- back to the list\n", sc ? (const char *)sc : "?");
+        msel_enter(s, s->msel_mode, 1);
+        return;
+    }
+    s->mview_tex = upload_rgba(COVER_W, COVER_W, px);
+    free(px);
+    s->mview_idx = idx;
+    s->screen = SC_MAG_VIEW;
+    printf("magazine view: %.24s (%s)\n", (const char *)sc, path);
+}
+static void mview_input(Shop *s, int key) {
+    if (key != SHOP_KEY_BACK) return;
+    if (s->mview_tex) { glDeleteTextures(1, &s->mview_tex); s->mview_tex = 0; }   /* 0x488aa0 */
+    msel_enter(s, s->msel_mode, 1);
+}
+
+int shop_career_shop(Shop *s, const unsigned char *shop) {
+    if (!s || !shop) return 0;
+    int type = (signed char)shop[0x50];
+    if (type == 0 || type > 6) {   /* FEngSwitchPackages(UI_CareerCrib.fng) */
+        crib_enter(s, 0);
+        return 1;
+    }
+    if (type != 4) {   /* 0 / >6 UI_CareerCrib.fng, 1..6 PickScreenForShop + EnterShopFromFreeRoam */
+        printf("career shop %s: type %d (%s) is not built yet\n", (const char *)shop, type,
+               type < 1 || type > 6 ? "UI_CareerCrib" : "the customization shops");
+        return 0;
+    }
+    s->front_end = 1;
+    /* the constructor: Setup (BuildCarList(1), InitUnlockedAndEmptySlots,
+       RefreshHeader), then the first state */
+    s->lot_bar = 1; s->lot_new = 0;
+    lot_build(s, 1);
+    career_slot_counts(&s->lot_unlocked, &s->lot_empty);
+    lot_refresh(s);
+    s->screen = SC_CAREER_LOT;
+    s->platform = shop_scene_platform(shop);           /* the lot's scene: CARLOT01 */
+    /* 0x35f8620b: CareerSpeech::HandleFESpeechEvent(4) (fe_speech_screen)
+       and AllocBackupDB (IsDirty's reference) */
+    profile_snapshot();
+    printf("car lot: %s, %d slots unlocked, %d empty\n", (const char *)shop, s->lot_unlocked, s->lot_empty);
+    lot_enter(s, lot_next(s, LOT_START));
+    return 1;
+}
+
+/* UI_VirtualKeyboard (FEKeyboard 0x4e3300). The PC types the profile name
+   inline on a physical keyboard (FEngBeginTextInput 0x555f80); the pad
+   port takes the console path of the same call: the virtual keyboard in
+   mode 3 (text input type 6), "NAME" to start, 7 characters, A-Z / 0-9 only
+   (caps forced on, shift off), header "Create User Name". The keys are the
+   package's KB_SYMBOL / KB_LETTER / KB_CONTROL strings over their _BUTTON
+   backings; their focus is code colours (HighlightButton 0x498a80), not
+   scripts. */
+enum { KBC_BACK, KBC_DONE, KBC_CAPS, KBC_SHIFT, KBC_SPACE };
+typedef struct { uint32_t txt, btn; char ch; } KbKey;
+/* ch: the mode-3 character (symbols 0x78df8a, letters row 1 where row 2
+   allows it), 0 a blank key; the controls KBC_* */
+static const KbKey k_kb[] = {
+    { 0x97f52421u, 0x9e922abcu, 0 },   { 0x97f52422u, 0x9e922abdu, '1' }, { 0x97f52423u, 0x9e922abeu, '2' },
+    { 0x97f52424u, 0x9e922abfu, '3' }, { 0x97f52425u, 0x9e922ac0u, '4' }, { 0x97f52426u, 0x9e922ac1u, '5' },
+    { 0x97f52427u, 0x9e922ac2u, '6' }, { 0x97f52428u, 0x9e922ac3u, '7' }, { 0x97f52429u, 0x9e922ac4u, '8' },
+    { 0x97f52441u, 0x9e922adcu, '9' }, { 0x97f52442u, 0x9e922addu, '0' }, { 0x97f52443u, 0x9e922adeu, 0 },
+    { 0x97f52444u, 0x9e922adfu, 0 },
+    { 0x378c455bu, 0xf1a466b6u, 'Q' }, { 0x378c455cu, 0xf1a466b7u, 'W' }, { 0x378c455du, 0xf1a466b8u, 'E' },
+    { 0x378c455eu, 0xf1a466b9u, 'R' }, { 0x378c455fu, 0xf1a466bau, 'T' }, { 0x378c4560u, 0xf1a466bbu, 'Y' },
+    { 0x378c4561u, 0xf1a466bcu, 'U' }, { 0x378c4562u, 0xf1a466bdu, 'I' }, { 0x378c4563u, 0xf1a466beu, 'O' },
+    { 0x378c457bu, 0xf1a466d6u, 'P' }, { 0x378c457cu, 0xf1a466d7u, 0 },   { 0x378c457du, 0xf1a466d8u, 0 },
+    { 0x378c457eu, 0xf1a466d9u, 0 },
+    { 0x378c457fu, 0xf1a466dau, 'A' }, { 0x378c4580u, 0xf1a466dbu, 'S' }, { 0x378c4581u, 0xf1a466dcu, 'D' },
+    { 0x378c4582u, 0xf1a466ddu, 'F' }, { 0x378c4583u, 0xf1a466deu, 'G' }, { 0x378c4584u, 0xf1a466dfu, 'H' },
+    { 0x378c459cu, 0xf1a466f7u, 'J' }, { 0x378c459du, 0xf1a466f8u, 'K' }, { 0x378c459eu, 0xf1a466f9u, 'L' },
+    { 0x378c459fu, 0xf1a466fau, 0 },   { 0x378c45a0u, 0xf1a466fbu, 0 },
+    { 0x378c45a1u, 0xf1a466fcu, 'Z' }, { 0x378c45a2u, 0xf1a466fdu, 'X' }, { 0x378c45a3u, 0xf1a466feu, 'C' },
+    { 0x378c45a4u, 0xf1a466ffu, 'V' }, { 0x378c45a5u, 0xf1a46700u, 'B' }, { 0x378c45bdu, 0xf1a46718u, 'N' },
+    { 0x378c45beu, 0xf1a46719u, 'M' }, { 0x378c45bfu, 0xf1a4671au, 0 },   { 0x378c45c0u, 0xf1a4671bu, 0 },
+    { 0x378c45c1u, 0xf1a4671cu, 0 },
+    { 0x261a66ccu, 0xf9f25f07u, KBC_BACK }, { 0x261a66cdu, 0xf9f25f08u, KBC_DONE },
+    { 0x261a66ceu, 0xf9f25f09u, KBC_CAPS }, { 0x261a66cfu, 0xf9f25f0au, KBC_SHIFT },
+    { 0x261a66d0u, 0xf9f25f0bu, KBC_SPACE },
+};
+#define KB_N NELEM(k_kb)
+#define KB_CTL 47          /* k_kb[47..51]: the controls */
+#define KB_FOCUS_MS 900    /* BACK's INIT script focuses it (0x1b3909aa at 900) */
+/* FEButtonMap 0x5189e0's geometric pick with the package's own links,
+   up / down / left / right (wrap mode 0) */
+static const signed char k_kb_nav[52][4] = {
+    { -1, 13, 47, 1 }, { 37, 13, 0, 2 }, { 38, 13, 1, 3 }, { 39, 14, 2, 4 }, { 40, 15, 3, 5 }, { 41, 16, 4, 6 },
+    { 42, 17, 5, 7 }, { 43, 18, 6, 8 }, { 43, 19, 7, 9 }, { 44, 20, 8, 10 }, { 45, 21, 9, 11 }, { 46, 22, 10, 12 },
+    { 46, 23, 11, 47 }, { 2, 26, 25, 14 }, { 3, 27, 13, 15 }, { 4, 28, 14, 16 }, { 5, 29, 15, 17 }, { 6, 30, 16, 18 },
+    { 7, 31, 17, 19 }, { 8, 32, 18, 20 }, { 9, 33, 19, 21 }, { 10, 34, 20, 22 }, { 11, 35, 21, 23 }, { 12, 36, 22, 24 },
+    { 12, 48, 23, 25 }, { 47, 48, 24, 13 }, { 13, 37, 49, 27 }, { 14, 38, 26, 28 }, { 15, 39, 27, 29 }, { 16, 40, 28, 30 },
+    { 17, 41, 29, 31 }, { 18, 42, 30, 32 }, { 19, 43, 31, 33 }, { 20, 44, 32, 34 }, { 21, 45, 33, 35 }, { 22, 46, 34, 36 },
+    { 23, 46, 35, 48 }, { 26, 51, 50, 38 }, { 27, 51, 37, 39 }, { 28, 51, 38, 40 }, { 29, 51, 39, 41 }, { 30, 51, 40, 42 },
+    { 31, 51, 41, 43 }, { 32, 51, 42, 44 }, { 33, 51, 43, 45 }, { 34, 51, 44, 46 }, { 35, 51, 45, 50 }, { 46, 25, 12, 0 },
+    { 25, 46, 36, 49 }, { 13, 50, 48, 26 }, { 49, 51, 46, 37 }, { 42, -1, 40, 44 },
+};
+#define O_KB_TEXT 0x5dfa6642u   /* the buffer */
+static const uint32_t k_kb_hidden[] = {   /* mode 3: the CAPS / SHIFT / SPACE labels, the Caps and Special prompts */
+    0x261a66ceu, 0x261a66cfu, 0x261a66d0u, 0x2a7d443du, 0xca67c5a7u, 0x04c913f7u, 0xbf8ec481u,
+};
+static const uint32_t k_kb_typed[] = {    /* shown once a character is in (0xc98356ba): Delete, DONE */
+    0xc6f00a18u, 0x64aff8d3u, 0x261a66cdu,
+};
+static int kb_cursor(const Shop *s) { return s->kb_fresh ? 0 : (int)strlen(s->kb_text); }
+/* HighlightButton / HighlightControl: label white, backing (207,233,242,200);
+   idle (50,50,50) on (84,154,192,80) */
+static void kb_color(Shop *s, int k, int on) {
+    const FengPackage *pk = s->pk[PK_KEYBOARD];
+    int o;
+    if ((o = feng_find(pk, k_kb[k].txt)) >= 0) feng_anim_color(s->kb_anim, o, on ? 0xffffffffu : 0xff323232u);
+    if ((o = feng_find(pk, k_kb[k].btn)) >= 0) feng_anim_color(s->kb_anim, o, on ? 0xc8cfe9f2u : 0x50549ac0u);
+}
+static void kb_vis(Shop *s) {
+    const FengPackage *pk = s->pk[PK_KEYBOARD];
+    if (!pk || !s->kb_anim) return;
+    int o, typed = kb_cursor(s) > 0;
+    for (int i = 0; i < NELEM(k_kb_hidden); i++)
+        if ((o = feng_find(pk, k_kb_hidden[i])) >= 0) feng_anim_hide(s->kb_anim, o, 1);
+    for (int i = 0; i < NELEM(k_kb_typed); i++)
+        if ((o = feng_find(pk, k_kb_typed[i])) >= 0) feng_anim_hide(s->kb_anim, o, !typed);
+}
+static void kb_open(Shop *s) {
+    s->mc_view = MCV_KB;
+    snprintf(s->kb_text, sizeof s->kb_text, "%s", str_get(s, 0x818f0385u));   /* LABEL_NAME_CAPS "NAME" */
+    s->kb_fresh = 1; s->kb_sel = -1; s->kb_ms = 0;
+    mc_focus(s);   /* MC_Main under it: no message, no buttons */
+    const FengPackage *pk = s->pk[PK_KEYBOARD];
+    if (!pk) return;
+    if (!s->kb_anim) s->kb_anim = (FengAnim *)malloc(sizeof *s->kb_anim);
+    if (!s->kb_anim) return;
+    feng_anim_init(s->kb_anim, pk);
+    anim_fadein(s->kb_anim);
+    kb_vis(s);
+}
+static void kb_tick(Shop *s, int ms) {
+    if (!s->kb_anim) return;
+    feng_anim_tick(s->kb_anim, ms);
+    s->kb_ms += ms;
+    if (s->kb_sel < 0 && s->kb_ms >= KB_FOCUS_MS) {
+        for (int k = 0; k < KB_N; k++) kb_color(s, k, 0);   /* '=' leaves its authored black too */
+        s->kb_sel = KB_CTL + KBC_BACK; kb_color(s, s->kb_sel, 1);
+    }
+}
+/* AppendChar 0x4e3390: the first edit drops "NAME", blank keys too */
+static void kb_append(Shop *s, char c) {
+    if (s->kb_fresh) { s->kb_fresh = 0; s->kb_text[0] = 0; }
+    size_t n = strlen(s->kb_text);
+    if (c && n < PROFILE_NAME_MAX) { s->kb_text[n] = c; s->kb_text[n + 1] = 0; }
+    kb_vis(s);
+}
+/* AppendBackspace 0x4b51d0 */
+static void kb_backspace(Shop *s) {
+    size_t n = strlen(s->kb_text);
+    if (n && s->kb_fresh) { s->kb_fresh = 0; s->kb_text[0] = 0; }
+    else if (n) s->kb_text[n - 1] = 0;
+    kb_vis(s);
+}
+/* done (0xda5b8712, blocked at cursor 0): the name, then DoSaveFlow(5) */
+static void kb_done(Shop *s) {
+    if (kb_cursor(s) == 0) return;
+    audio_fe_play(FE_SND_SELECT);
+    profile_set_name(s->kb_text);
+    s->mc_view = MCV_MSG;
+    mc_focus(s);
+    printf("memcard: name \"%s\"\n", s->kb_text);
+    mc_flow(s, 5);
+}
+static void kb_input(Shop *s, int key) {
+    if (key == SHOP_KEY_UP || key == SHOP_KEY_DOWN || key == SHOP_KEY_LEFT || key == SHOP_KEY_RIGHT) {
+        if (s->kb_sel < 0) return;
+        int dir = key == SHOP_KEY_UP ? 0 : key == SHOP_KEY_DOWN ? 1 : key == SHOP_KEY_LEFT ? 2 : 3;
+        int k = k_kb_nav[s->kb_sel][dir];
+        if (k < 0) return;
+        kb_color(s, s->kb_sel, 0); s->kb_sel = k; kb_color(s, k, 1);
+        static const int snd[4] = { FE_SND_UP, FE_SND_DOWN, FE_SND_LEFT, FE_SND_RIGHT };
+        audio_fe_play(snd[dir]);
+    } else if (key == SHOP_KEY_OK) {
+        if (s->kb_sel < 0) return;
+        if (s->kb_sel < KB_CTL) { audio_fe_play(FE_SND_SELECT); kb_append(s, k_kb[s->kb_sel].ch); }
+        else if (k_kb[s->kb_sel].ch == KBC_BACK) { audio_fe_play(FE_SND_BACK); kb_backspace(s); }
+        else if (k_kb[s->kb_sel].ch == KBC_DONE) kb_done(s);
+        else audio_fe_play(FE_SND_SELECT);   /* CAPS / SHIFT / SPACE: nothing in mode 3 */
+    } else if (key == SHOP_KEY_SQ) {        /* BUTTON1 "Backspace": not over "NAME" */
+        if (kb_cursor(s) > 0) { audio_fe_play(FE_SND_BACK); kb_backspace(s); }
+    } else if (key == SHOP_KEY_BACK) {      /* Dispose(1): cancel 0xc9d30688 */
+        audio_fe_play(FE_SND_BACK);
+        s->kb_text[0] = 0;
+        s->mc_view = MCV_MSG; mc_focus(s);
+        if (s->mc_flags & MCF_ASKED) mc_flow(s, 2);
+        else if (s->mc_flags & 0x20000) mc_exit(s, 0);   /* the backup back, a cancel */
+        else mc_cancel(s);
+    }
+}
+
 static void shop_input_screen(Shop *s, int key);
 /* what a key can change on the screens (a changed value = the screen took the key) */
 static uint32_t shop_sig(const Shop *s) {
@@ -4834,7 +8327,7 @@ static uint32_t shop_sig(const Shop *s) {
     SIG(s->screen); SIG(s->top.sel); SIG(s->body.sel); SIG(s->cat.sel); SIG(s->rims.sel);
     SIG(s->main.sel); SIG(s->part_sel); SIG(s->fe_action); SIG(s->exit_req);
     SIG(s->rim_style); SIG(s->prev_style); SIG(s->qr_type); SIG(s->qr_mode.sel);
-    SIG(s->qr_track.sel); SIG(s->qr_rsel); SIG(s->qr_car_sel); SIG(s->qr_filter); SIG(s->qr_go);
+    SIG(s->qr_track.sel); SIG(s->qr_rsel); SIG(s->qr_car_sel); SIG(s->qr_filter); SIG(s->qr_go); SIG(s->qr_cust);
     SIG(s->set); SIG(s->pending); SIG(s->fitted);
     SIG(s->opt_main.sel); SIG(s->opt_rsel); SIG(g_opt);
     SIG(s->ctl_sel); SIG(s->ctl_col); SIG(s->ctl_cap);
@@ -4842,6 +8335,8 @@ static uint32_t shop_sig(const Shop *s) {
     SIG(s->paintcat.sel); SIG(s->paint_mode); SIG(s->paint_sel); SIG(s->paint_brand);
     SIG(s->vlay.sel); SIG(s->vcat.sel); SIG(s->vmode);
     SIG(s->dloc.sel); SIG(s->dlev);
+    SIG(s->scar.sel); SIG(s->career_go); SIG(s->lot_sel); SIG(s->lot_state);
+    SIG(s->cwm.sel); SIG(s->cwm_stage);
 #undef SIG
     return h;
 }
@@ -5106,8 +8601,54 @@ static void gfx_revert(Shop *s, int what) {
         if (((what & GFX_PAINT) && gfx_paint_cancels(i)) || (what & 8)) a->paint[i] = b->paint[i];
     s->preview = *a; request_preview(s); s->debounce = 0.0f;
 }
-/* 0x547570: the pending list into the installed setup */
+/* GetCarPartCost 801294f4 of a paint setup part: MapCarPartToUnlockable
+   8012e8bc (base paint by its brand, vinyls by their group, the rest the
+   slot's entity) at the part's level; DoesPaintPartHaveCost 8016fa6c: the
+   decal layouts 0x34..0x3e are free, so are the vinyl colours (entity 0) */
+static int setup_part_ent(const Shop *s, int slot, uint32_t hash, int *lvl) {
+    const unsigned char *r = db_part(s, hash);
+    *lvl = r ? ((r[5] | r[6] << 8) >> 5) & 7 : 0;
+    if (!r || (slot > 0x33 && slot < 0x3f)) return 0;
+    if (slot == 0x3f) {
+        uint32_t br = 0;
+        db_attr(s, r[10] | r[11] << 8, 0xebb03e66u, &br);
+        return br == BR_GLOSS ? 0x25 : br == BR_PEARL ? 0x27 : br == 0x066350f0u ? 0x4e :
+               br == 0x0000da27u ? 0x4d : br == 0x0016bdceu ? 0x28 : 0x26;
+    }
+    if (slot >= 0x40 && slot <= 0x43) { int g = r[5] & 0x1f; return g <= 0x1b ? vinyl_price_row(g) : 0; }
+    return slot_ent(slot);
+}
+static int setup_part_cost(const Shop *s, int slot, uint32_t hash) {
+    int lvl, ent = setup_part_ent(s, slot, hash, &lvl);
+    return ent_price(s, ent, lvl);   /* a level-0 decal: the level-1 price */
+}
+/* the setup's parts: what differs from the installed graphics; with `buy`
+   BuyCarPart 80129480 each (Spend + owned), InstallPaintSetup 8016f534 */
+static int gfx_setup_walk(const Shop *s, int buy) {
+    const N2CarConfig *a = &s->fitted, *b = &s->gfx_base;
+    int sum = 0, lvl, c;
+#define SETUP_PART(sl, h) do { c = setup_part_cost(s, sl, h); sum += c; \
+        if (buy) career_buy_part(setup_part_ent(s, sl, h, &lvl), own_key(sl, h), c); } while (0)
+    for (int i = 0; i < N2_PAINT_COUNT; i++)
+        if (a->paint[i] && a->paint[i] != b->paint[i]) SETUP_PART(k_paint_cat[i].group, a->paint[i]);
+    for (int l = 0; l < VINYL_LAYERS; l++)
+        if (a->vinyl[l] && a->vinyl[l] != b->vinyl[l]) SETUP_PART(0x40 + l, a->vinyl[l]);
+    for (int loc = 0; loc < 7; loc++)
+        for (int n = 0; n < 8; n++) {
+            const DecalPart *d = a->decal[loc][n] && a->decal[loc][n] != b->decal[loc][n] ? decal_by_name(a->decal[loc][n]) : NULL;
+            if (d) SETUP_PART(0x61 + loc * 8 + n, d->hash);
+        }
+#undef SETUP_PART
+    return sum;
+}
+/* GetPaintSetupPrice 8016fa88 */
+static int gfx_setup_price(const Shop *s) { return s->career ? gfx_setup_walk(s, 0) : 0; }
+/* 0x547570: the pending list into the installed setup (the career buys it) */
 static void gfx_install(Shop *s) {
+    if (s->career) {
+        int c = gfx_setup_walk(s, 1);
+        printf("career shop: graphics setup bought for $%d, $%d left\n", c, g_career.cash);
+    }
     s->gfx_base = s->fitted;
     printf("shop: graphics setup installed\n");
 }
@@ -5118,13 +8659,14 @@ static void gfx_back(Shop *s) {
     if (gfx_changed(s)) {
         dialog(s, PK_DLG_S, 2, 0x511cca10u, DA_GFX_LEAVE, 0, 0);
         s->dlg_act2 = DA_GFX_DISCARD;
-    } else s->screen = SC_CAR_SHOP;
+    } else cust_up(s);
 }
 /* 0x562b90 (Install Setup, class 0x79b6ec): with changes "purchase this
    graphics setup for your car?" (0x7f24787; yes 0xd05fc3a3 = 0x547570),
    else "make a selection to install before checking out!" (0x51e3f647) */
 static void gfx_install_ask(Shop *s) {
-    if (gfx_changed(s)) dialog(s, PK_DLG_S, 2, 0x07f24787u, DA_GFX_INSTALL, 0, 0);
+    /* PSPurchaseSetup::React 8030f4e4: the career's 0xa0c16cab, no cash check */
+    if (gfx_changed(s)) dialog(s, PK_DLG_S, 2, s->career ? 0xa0c16cabu : 0x07f24787u, DA_GFX_INSTALL, 0, 0);
     else dialog(s, PK_DLG_S, 1, 0x51e3f647u, DA_NONE, 0, 0);
 }
 /* 0xc519bfc0 on Paint / Vinyls / Decals: "cancel the changes to your ...
@@ -5140,9 +8682,59 @@ static void gfx_cancel_ask(Shop *s) {
 /* a dialog's first button */
 static void dlg_act(Shop *s, int act) {
     switch (act) {
+    case DA_OPT_LEAVE: opt_leave(s); break;
+    case DA_LOT_BUY: case DA_LOT_TRADE: case DA_LOT_BROWSE: case DA_LOT_EXIT: lot_dlg(s, act); break;
+    case DA_CRIB_PLAY: case DA_CRIB_MAIN: case DA_CRIB_TEST: crib_dlg(s, act); break;
+    case DA_CRIB_SWITCH:   /* 0xd05fc3a3: SwitchCars, FORWARD */
+        career_switch_car(s->lot[s->lot_sel].handle);
+        printf("crib car select: the career car is now %s (slot %08x)\n",
+               airace_type_name(s->lot[s->lot_sel].type), (unsigned)s->lot[s->lot_sel].handle);
+        csel_back(s);
+        break;
     case DA_PAINT_ADD: paint_add(s); break;
+    case DA_SHOP_LEAVE: s->exit_req = 1; break;   /* 0xd05fc3a3: ExitToRoamHelper 8015dd24 */
+    case DA_UQ_PICK: uq_install(s); break;
+    case DA_CWM_RACE:                           /* 0x51123592: the start request (0x837b6d) */
+        s->fe_event = s->cwm.n ? s->cwm_ev[s->cwm.sel] : NULL;
+        if (s->fe_event) {
+            s->fe_action = SHOP_ACT_CAREER_EVENT;
+            printf("crib world map: race %s\n", career_string(csp_u16(s->fe_event)));
+        }
+        break;
+    case DA_UQ_LEAVE:                           /* 0x34dc1bec: NotifyUniqueChosen, StartCareerFreeRoam */
+        career_wc_unique_chosen();
+        s->uq_done = 1;
+        printf("career uniques: left without a part\n");
+        s->exit_req = 1;
+        break;
+    case DA_PART_BUY: {                         /* 0x9f00f07: BuyCarPart + InstallPart */
+        const ShopPart *q = s->nparts ? &s->parts[s->part_sel] : NULL;
+        if (q) career_buy_part(q->ent, q->okey, q->price);
+        printf("career shop: bought %s for $%d, $%d left\n", q ? q->name : "?", q ? q->price : 0, g_career.cash);
+        s->fitted = s->preview;
+        if (q && s->part_group == G_HOOD) {    /* InstallPart: UninstallHoodDecals as DA_PART */
+            hood_installed(&s->fitted, q->level);
+            if (memcmp(&s->fitted, &s->preview, sizeof s->fitted)) { s->preview = s->fitted; request_preview(s); }
+        }
+        if (s->pending) s->debounce = 0.0f;
+        break;
+    }
+    case DA_RIM_BUY: {   /* 0x9f00f07: BuyCarPart(0x1d, the size part) */
+        const ShopPart *q = rim_cur(s);
+        if (q) career_buy_part(q->ent, q->okey, q->price);
+        printf("career shop: bought rims %s for $%d, $%d left\n", q ? q->name : "?", q ? q->price : 0, g_career.cash);
+        memcpy(s->rim_folder, s->prev_folder, sizeof s->rim_folder);
+        s->rim_style = s->prev_style;
+        if (s->rim_pending) s->rim_debounce = 0.0f;
+        s->size_mode = 0;
+        break;
+    }
     case DA_PART:                               /* install what is shown */
         s->fitted = s->preview;
+        if (s->part_group == G_HOOD && s->nparts) {
+            hood_installed(&s->fitted, s->parts[s->part_sel].level);
+            if (memcmp(&s->fitted, &s->preview, sizeof s->fitted)) { s->preview = s->fitted; request_preview(s); }
+        }
         if (s->pending) s->debounce = 0.0f;
         break;
     case DA_RIM:
@@ -5152,8 +8744,26 @@ static void dlg_act(Shop *s, int act) {
         s->size_mode = 0;   /* 0x9f00f07 installs, then 0x55fce0(0) leaves the size list */
         break;
     case DA_PERF_PKG: case DA_PERF_STOCK: perf_pkg_yes(s); break;
+    case DA_PERF_PKG_BUY:     /* 0x9f00f07: parts with brands -> ChooseBrandsScreen, else 0x5501e0(1) */
+        if (!brand_open(s, 1)) perf_pkg_buy(s, NULL);
+        break;
+    case DA_GEN_BUY: {   /* 0x9f00f07: BuyCarPart, then the install */
+        const ShopPart *q = s->nparts ? &s->parts[s->part_sel] : NULL;
+        if (q) career_buy_part(q->ent, q->okey, q->price);
+        printf("career shop: bought %s for $%d, $%d left\n", q ? q->name : "?", q ? q->price : 0, g_career.cash);
+        if (s->buy_after != DA_GEN_BUY) dlg_act(s, s->buy_after);
+        break;
+    }
+    case DA_PERF_PART_BUY:     /* 0x9f00f07: a part with brands -> ChooseBrandsScreen */
+        if (!brand_open(s, 0)) perf_part_buy(s, 0);
+        break;
     case DA_PERF_PART: perf_part_yes(s); break;
     case DA_CTL_RESET: options_ctl_preset(&g_opt, 0); break;
+    case DA_TRANS_MANUAL: case DA_TRANS_AUTO:          /* 0x5f5e3886 / 0x1a2826e1, then 0xba5b5fce */
+        g_opt.p[0].manual = act == DA_TRANS_MANUAL;
+        printf("qr: transmission %s\n", act == DA_TRANS_MANUAL ? "manual" : "auto");
+        s->qr_go = 1;
+        break;
     case DA_VINYL_ADD: vinyl_install(s); break;
     case DA_VINYL_CHANGE: vcat_enter(s); break;
     case DA_VINYL_REMOVE: vinyl_remove(s, 0); break;
@@ -5200,19 +8810,159 @@ static void dlg_act(Shop *s, int act) {
         s->preview = s->fitted; request_preview(s); s->debounce = 0.0f;
         break;
     case DA_GFX_INSTALL: gfx_install(s); break;
-    case DA_GFX_LEAVE: gfx_install(s); s->screen = SC_CAR_SHOP; break;
-    case DA_GFX_DISCARD: gfx_revert(s, GFX_ALL); s->screen = SC_CAR_SHOP; break;
+    case DA_GFX_LEAVE: gfx_install(s); cust_up(s); break;
+    case DA_GFX_DISCARD: gfx_revert(s, GFX_ALL); cust_up(s); break;
     case DA_GFX_CANCEL: if (gfx_changed(s)) gfx_revert(s, s->gfx_cancel); break;
     default: break;
     }
 }
 static void ctl_input(Shop *s, int key);
+/* ------------------------------------------------------------------ help */
+
+/* Each screen's Help (0x526c40: HelpDialog_SMALL, _MED past 4 lines; the
+   screen's HELP_* string, the "Help" button $JOY_EVENT_FENG_HELP$ on its
+   help bar): the string of the console screen it ports. */
+static uint32_t help_of(const Shop *s) {
+    switch (s->mc_view) {   /* the memcard screens over the screen */
+    case MCV_LIST: return s->mc_op == MCOP_BOOT ? 0x4754130eu : 0x424d7a17u;   /* HELP_LOAD_PROFILE(_BOOT_UP) */
+    case MCV_KB:   return 0xcaf6d39eu;   /* HELP_VIRTUAL_KEYBOARD */
+    case MCV_MSG:  return 0;
+    default: break;
+    }
+    switch (s->screen) {
+    case SC_MAIN:        return 0xd6dfcf20u;   /* HELP_MAIN_MENU */
+    case SC_QR_MODE:     return 0xc6923ecdu;   /* HELP_QR_MODE_SELECT */
+    case SC_QR_TRACK:    return 0xcb2afc50u;   /* HELP_QR_TRACK_PRESET */
+    case SC_QR_OPTIONS:  return 0x7f2d0c79u;   /* HELP_QR_MODE_OPTIONS */
+    case SC_QR_CAR:      return s->qr_cust ? 0xfab1b6bbu : 0x6c6c43feu;   /* HELP_CRIB_CAR_SELECT / HELP_QR_CAR_SELECT */
+    case SC_CAREER_LOT:  return 0xc3cabafdu;   /* HELP_CAREER_CARLOT (0x7f80f4) */
+    case SC_CRIB_CARSEL: return 0xfab1b6bbu;   /* HELP_CRIB_CAR_SELECT */
+    case SC_CRIB_REWARDS: return 0x10965456u;  /* the PC screen table 0x7f7f58 */
+    case SC_MAG_SELECT:  return s->msel_mode == 1 ? 0x82f20772u : 0x8a9e0f44u;   /* Setup: +0x28 */
+    case SC_OPT_MAIN:    return 0x9323df57u;   /* HELP_OPTIONS_MAIN */
+    case SC_OPT:         return 0xed586157u;   /* HELP_OPTIONS_STANDARD_MENU */
+    case SC_CTL:         return 0xa33d508au;   /* HELP_CONTROLER_OPTIONS */
+    case SC_JUKE:        return 0xd8f5edf7u;   /* HELP_OPTIONS_EATRAX */
+    case SC_CREDITS:     return 0x844feb00u;   /* HELP_OPTIONS_CREDITS */
+    case SC_CAR_SHOP:    return 0xebf23e40u;   /* HELP_SHOP_SELECT */
+    case SC_BODY:        return 0x7a4c4ab2u;   /* HELP_BODY_SHOP_MAIN */
+    case SC_PERFORMANCE: return 0xc3a914f6u;   /* HELP_PERFORMANCE_SHOP_MAIN */
+    case SC_GRAPHICS:    return 0xa9e93ff5u;   /* HELP_GRAPHICS_SHOP_MAIN */
+    case SC_SPECIALTIES: return 0x264a5f10u;   /* HELP_CARSPECIALTIES_SHOP_MAIN */
+    case SC_PARTS: case SC_CARBON: return 0x43a05263u;   /* HELP_BODY_SHOP_PART_SELECT */
+    case SC_RIM_BRAND:   return 0xebf23e40u;   /* HELP_SHOP_SELECT */
+    case SC_RIMS:        return 0x18cdd1fcu;   /* HELP_WHEEL */
+    case SC_PAINT:       return 0x0dc884cbu;   /* HELP_GRAPHICS_SHOP_PAINT_SELECT */
+    case SC_PERF_PKG:    return 0x8109153du;   /* HELP_PERFORMANCE_SHOP_PACKAGE */
+    case SC_VLAYER:      return 0x9da9e93du;   /* HELP_GRAPHICS_SHOP_VINYL_LAYER_SELECT */
+    case SC_VCAT: case SC_DLOC: return 0xaade3025u;   /* HELP_GRAPHICS_SHOP_DECAL_SELECT_CATEGORY */
+    case SC_VLIST:       return 0x11e168c1u;   /* HELP_GRAPHICS_SHOP_VINYL_SELECT */
+    case SC_DPICK:       return 0x73332e68u;   /* HELP_GRAPHICS_SHOP_DECAL_SELECT */
+    case SC_TINT: case SC_BULB: return 0xd3e04e45u;   /* HELP_CAR_SPECIALTIES_SUB_LEVELS */
+    case SC_SPEC:        return s->spec_slot == 0x22 ? 0x6c4bf67cu   /* HELP_CARSPECIALTIES_SHOP_TRUNKLAYOUT_SELECT */
+                              : s->spec_slot > 0x22 && s->spec_slot <= 0x2e ? 0xa93e10e9u   /* HELP_CAR_SPECIALTIES_CHANGE_COMPONENT */
+                              : 0xd3e04e45u;   /* HELP_CAR_SPECIALTIES_SUB_LEVELS */
+    case SC_NEON:        return 0x71345941u;   /* HELP_CARSPECIALTIES_NEON_SELECT */
+    case SC_NEON_LIST:   return 0x846ee660u;   /* HELP_CAR_SPECIALTIES_NEON_SELECT */
+    case SC_HUD:         return 0x1b2794c7u;   /* HELP_HUD_SELECT */
+    case SC_HUD_COL:     return 0x4e4485feu;   /* HELP_CHANGE_COLORS */
+    case SC_ICE:         return s->ice_mode == 4 ? 0xde7acec2u : 0xfd036061u;   /* ..._AUDIOCOMPONENTS_SELECT / ..._TRUNKLAYOUT_OR_COMPONENTS_SELECT */
+    default:             return 0;
+    }
+}
+/* What $JOY_EVENT_FENG_BUTTON1$ is on this screen in the port: Square opens
+   the split hood / doors and previews the purge, resets the graphics
+   category and clears the decals (0xc519bfc0); the jukebox grabs with
+   Triangle. -1: not ported here (Customize from the car select, Player
+   Select, Switch Players, EA Messenger) -- its prompt and help line go. */
+static int button1_glyph(const Shop *s) {
+    switch (s->screen) {
+    case SC_SPEC: return s->spec_slot == 9 || s->spec_slot == 0xa0 || s->spec_slot == 0xa2 ? HUD_PAD_SQUARE : -1;
+    case SC_GRAPHICS: case SC_DLOC: case SC_DPICK: return HUD_PAD_SQUARE;
+    case SC_JUKE: return HUD_PAD_TRIANGLE;
+    default: return -1;
+    }
+}
+static int pad_token(const Shop *s, const char *q, int *glyph, const char **txt, float *adv);
+/* Select: the screen's help text, less the lines of keys it has no use for
+   here, in HelpDialog_SMALL / _MED */
+static void help_open(Shop *s) {
+    uint32_t h = help_of(s);
+    const char *src = h ? str_get(s, h) : "";
+    if (!*src) return;
+    char out[sizeof s->dlg_text]; int n = 0, lines = 0;
+    for (const char *q = src; *q; ) {
+        const char *e = q;
+        while (*e && *e != '^' && *e != '\n') e++;
+        int keep = 0, dead = 0;
+        for (const char *t = q; t < e; t++) {
+            int g; const char *tt; float adv;
+            int k = pad_token(s, t, &g, &tt, &adv);
+            if (!k) { if (*t != ' ') keep = 1; continue; }
+            if (g < 0 && !tt && adv == 0.0f) dead = 1;
+            t += k - 1;
+        }
+        if (keep && !dead && n + (e - q) + 2 < (int)sizeof out) {
+            if (n) out[n++] = '^';
+            memcpy(out + n, q, (size_t)(e - q)); n += (int)(e - q);
+            lines++;
+        }
+        q = *e ? e + 1 : e;
+    }
+    out[n] = 0;
+    if (!n) return;
+    snprintf(s->dlg_text, sizeof s->dlg_text, "%s", out);
+    printf("shop: help 0x%08x, %d lines\n", h, lines);
+    dialog_text(s, lines > 4 ? PK_HELP_M : PK_HELP_S, 1, s->dlg_text, DA_NONE, 0, 0);
+}
+
 static void shop_input_screen(Shop *s, int key) {
-    if (dlg_open(s)) { dlg_input(s, key); return; }
+    if (dlg_open(s)) { if (key != SHOP_KEY_HELP) dlg_input(s, key); return; }
+    if (s->mc_view != MCV_OFF && key != SHOP_KEY_HELP) { mc_input(s, key == SHOP_KEY_TRI ? SHOP_KEY_BACK : key); return; }
+    if (key == SHOP_KEY_HELP) { help_open(s); return; }
     if (key == SHOP_KEY_TRI && s->screen != SC_CTL && s->screen != SC_JUKE) key = SHOP_KEY_BACK;   /* Triangle backs out */
     switch (s->screen) {
-    case SC_SPLASH:
-        if (key == SHOP_KEY_OK) s->screen = SC_MAIN;
+    case SC_SPLASH:   /* MC_Background (0x4c51f0): the boot load, once */
+        if (key == SHOP_KEY_OK) {
+            s->screen = SC_MAIN;
+            if (!g_boot_load_done) { g_boot_load_done = 1; mc_enter(s, 0x121, SC_MAIN); }
+        }
+        break;
+    case SC_PROFILE:
+        profile_input(s, key);
+        break;
+    case SC_START_CAREER:
+        start_career_input(s, key);
+        break;
+    case SC_CAREER_LOT:
+        lot_input(s, key);
+        break;
+    case SC_CRIB:
+        crib_input(s, key);
+        break;
+    case SC_CRIB_CARSEL:
+        csel_input(s, key);
+        break;
+    case SC_CRIB_SPONSORS:
+        csp_input(s, key);
+        break;
+    case SC_CRIB_WMAP:
+        cwm_input(s, key);
+        break;
+    case SC_MAG_REWARD:
+        mag_input(s, key);
+        break;
+    case SC_CRIB_REWARDS:
+        crw_input(s, key);
+        break;
+    case SC_MAG_SELECT:
+        msel_input(s, key);
+        break;
+    case SC_MAG_VIEW:
+        mview_input(s, key);
+        break;
+    case SC_MOVIE:   /* IG_PlayMovie: Start / Accept (both SHOP_KEY_OK) skip */
+        if (key == SHOP_KEY_OK && s->mv) movie_done(s, 1);
         break;
     case SC_MAIN:
         if (key == SHOP_KEY_LEFT) scroller_move(&s->main, -1);
@@ -5220,7 +8970,9 @@ static void shop_input_screen(Shop *s, int key) {
         else if (key == SHOP_KEY_OK && !s->main.locked[s->main.sel]) {
             if (k_main_menu[s->main.sel].group == MM_QUICK_RACE) s->screen = SC_QR_MODE;
             else if (k_main_menu[s->main.sel].group == MM_OPTIONS) s->screen = SC_OPT_MAIN;
-            else s->fe_action = SHOP_ACT_CUSTOMIZE;
+            else if (k_main_menu[s->main.sel].group == MM_PROFILE) profile_enter(s);
+            else if (k_main_menu[s->main.sel].group == MM_CAREER) start_career_enter(s);
+            else { s->qr_cust = 1; qr_enter_cars(s); }   /* 0x4aed30: mode 0x20, UI_QRCarSelect */
         }
         else if (key == SHOP_KEY_BACK) s->screen = SC_SPLASH;
         break;
@@ -5242,20 +8994,8 @@ static void shop_input_screen(Shop *s, int key) {
     case SC_CAR_SHOP:
         if (key == SHOP_KEY_LEFT) scroller_move(&s->top, -1);
         else if (key == SHOP_KEY_RIGHT) scroller_move(&s->top, 1);
-        else if (key == SHOP_KEY_OK && !s->top.locked[s->top.sel]) {
-            static const int to[CAT_COUNT] = { SC_BODY, SC_PERFORMANCE, SC_GRAPHICS, SC_SPECIALTIES };
-            s->screen = to[s->top.sel];
-            if (s->screen == SC_PERFORMANCE) scroller_set(&s->cat, k_perf_shop, NELEM(k_perf_shop));
-            if (s->screen == SC_GRAPHICS) {
-                scroller_set(&s->cat, k_graphics_shop, NELEM(k_graphics_shop));
-                s->gfx_base = s->fitted;
-            }
-            if (s->screen == SC_SPECIALTIES) {
-                scroller_set(&s->cat, k_special_shop, NELEM(k_special_shop));
-                for (int i = 0; i < s->cat.n; i++)   /* Custom Gauges, Neon, Window Tint, Lights always; the rest 0x539d00 */
-                    s->cat.locked[i] = i > 3 && spec_locked(s, s->cat.e[i].group);
-            }
-        } else if (key == SHOP_KEY_BACK) s->exit_req = 1;
+        else if (key == SHOP_KEY_OK && !s->top.locked[s->top.sel]) car_shop_open(s, s->top.sel);
+        else if (key == SHOP_KEY_BACK) s->exit_req = 1;
         break;
     case SC_BODY:
         if (key == SHOP_KEY_LEFT) scroller_move(&s->body, -1);
@@ -5265,13 +9005,22 @@ static void shop_input_screen(Shop *s, int key) {
             else if (k_body_shop[s->body.sel].group == G_CARBON) cf_menu(s, 0);
             else open_parts(s);
         }
-        else if (key == SHOP_KEY_BACK) s->screen = SC_CAR_SHOP;
+        else if (key == SHOP_KEY_OK) {   /* 801615f8: a locked category -> MakeFrontendSound(0x13) = table 7 */
+            audio_fe_play(FE_SND_WRONG); s->snd_done = 1;
+        }
+        else if (key == SHOP_KEY_BACK) cust_up(s);
         break;
     case SC_RIM_BRAND:
         if (key == SHOP_KEY_LEFT) scroller_move(&s->rims, -1);
         else if (key == SHOP_KEY_RIGHT) scroller_move(&s->rims, 1);
         else if (key == SHOP_KEY_OK) { build_rims(s, s->rims.sel); s->screen = SC_RIMS; }
-        else if (key == SHOP_KEY_BACK) s->screen = SC_BODY;
+        else if (key == SHOP_KEY_BACK) {   /* CalcPrevScreenFromRimBrand 80160c78: UI_GenericParts_Browser */
+            /* a new PartSelectionScreen: SetupBodyShop 80164368 with DAT_803d96e4
+               (StartBrowsingWheels) snaps the category strip to Rims (0x1d), not
+               browsing parts -- s->parts holds the rim list now */
+            s->rim_from_parts = 0; s->nparts = 0; s->part_group = -1;
+            s->screen = SC_BODY;
+        }
         break;
     case SC_RIMS:
         if (s->size_mode) {   /* the size list (0x55fb00): previews each size, OK buys it */
@@ -5280,9 +9029,7 @@ static void shop_input_screen(Shop *s, int key) {
                 int k = s->size_sel + (key == SHOP_KEY_UP ? -1 : 1);
                 if (k >= 0 && k < n) { s->size_sel = k; rim_preview(s, 0.35f); }
             } else if (key == SHOP_KEY_OK) {
-                if (!strcmp(s->prev_folder, s->rim_folder) && s->prev_style == s->rim_style)
-                    dialog(s, PK_DLG_S, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-                else dialog(s, PK_DLG_S, 2, 0xf5ac2b2au, DA_RIM, 0, 0);
+                rim_accept(s);
             } else if (key == SHOP_KEY_BACK) {   /* 0x55fce0(1) */
                 s->size_mode = 0; rim_preview(s, 0.0f);
             }
@@ -5309,9 +9056,7 @@ static void shop_input_screen(Shop *s, int key) {
             rim_preview(s, 0.0f);
         } else if (key == SHOP_KEY_OK && s->nparts > 0) {
             /* 0x567a50: the same two, in GenericDialog_SMALL */
-            if (!strcmp(s->prev_folder, s->rim_folder) && s->prev_style == s->rim_style)
-                dialog(s, PK_DLG_S, 1, 0xda15d7e5u, DA_NONE, 0, 0);
-            else dialog(s, PK_DLG_S, 2, 0xf5ac2b2au, DA_RIM, 0, 0);
+            rim_accept(s);
         } else if (key == SHOP_KEY_BACK) {
             if (strcmp(s->prev_folder, s->rim_folder) || s->prev_style != s->rim_style) {
                 memcpy(s->prev_folder, s->rim_folder, sizeof s->prev_folder);
@@ -5341,12 +9086,22 @@ static void shop_input_screen(Shop *s, int key) {
                  s->cat.e[s->cat.sel].group == 0x22) ice_audio_enter(s);
         else if (key == SHOP_KEY_OK && s->screen == SC_SPECIALTIES && !s->cat.locked[s->cat.sel] &&
                  spec_group(s->cat.e[s->cat.sel].group) >= 0) { s->spec_ret = SC_SPECIALTIES; spec_enter(s, s->cat.e[s->cat.sel].group); }
+        else if (key == SHOP_KEY_OK && s->screen == SC_PERFORMANCE && !s->cat.locked[s->cat.sel] &&
+                 s->cat.e[s->cat.sel].group == PERF_TEST_TRACK) {
+            /* DoStartTuning 801720f0: BeginCarTuning(0, career car, entry 1) */
+            /* the shop's changes go to the career car first (the EXIT commit, main.c) */
+            s->tt_req = 1; s->exit_req = 1;
+            printf("perf shop: Test Track -- BeginCarTuning (entry 1)%c", 10);
+        }
         else if (key == SHOP_KEY_OK && s->screen == SC_PERFORMANCE && !s->cat.locked[s->cat.sel])
-            perf_pkg_enter(s, k_perf_shop[s->cat.sel].group);
-        else if (key == SHOP_KEY_BACK) s->screen = SC_CAR_SHOP;
+            perf_pkg_enter(s, s->cat.e[s->cat.sel].group);
+        else if (key == SHOP_KEY_BACK) cust_up(s);
         break;
     case SC_PAINT:
         paint_input(s, key);
+        break;
+    case SC_UNIQUES:
+        uq_input(s, key);
         break;
     case SC_VLAYER: case SC_VCAT: case SC_VLIST:
         vinyl_input(s, key);
@@ -5355,7 +9110,8 @@ static void shop_input_screen(Shop *s, int key) {
         decal_input(s, key);
         break;
     case SC_PERF_PKG:
-        perf_pkg_input(s, key);
+        if (s->brand_on) brand_input(s, key);
+        else perf_pkg_input(s, key);
         break;
     case SC_TINT:
         tint_input(s, key);
@@ -5383,28 +9139,30 @@ static void shop_input_screen(Shop *s, int key) {
         else if (key == SHOP_KEY_DOWN) parts_cursor(s, 1);
         else if ((key == SHOP_KEY_LEFT || key == SHOP_KEY_RIGHT) && s->cf_mode) {
             int step = key == SHOP_KEY_LEFT ? -1 : 1;
-            do scroller_move(&s->cfm, step); while (s->cfm.sel >= 4);   /* the lists only */
+            for (int t = 0; t < 8; t++) {   /* the open lists only */
+                scroller_move(&s->cfm, step);
+                if (s->cfm.sel < 4 && !s->cfm.locked[s->cfm.sel]) break;
+            }
             if (memcmp(&s->preview, &s->fitted, sizeof s->preview)) {
                 s->preview = s->fitted; request_preview(s);
             }
             cf_open_parts(s);
         } else if (key == SHOP_KEY_LEFT || key == SHOP_KEY_RIGHT) {
-            /* the top strip changes category without leaving the browser */
-            int step = key == SHOP_KEY_LEFT ? -1 : 1;
-            for (int t = 0; t < s->body.n; t++) {
-                scroller_move(&s->body, step);
-                if (!s->body.locked[s->body.sel] && s->body.e[s->body.sel].group != G_CARBON) break;
-            }
-            if (memcmp(&s->preview, &s->fitted, sizeof s->preview)) {
-                s->preview = s->fitted; request_preview(s);
-            }
-            open_parts(s);
+            /* ScrollHorizontal 801631a4: nothing while browsing parts ([0x8c],
+               cleared by StopBrowsingParts 80164240 on BACK) */
+        } else if (key == SHOP_KEY_OK && !s->cf_mode && s->body.n && s->body.e[s->body.sel].group == G_WHEEL) {
+            /* the Rims category (AddCategoryRims): StartBrowsingWheels 80163638 ->
+               CalcNextScreenFromPartsBrowser 80160a64: the rim brands */
+            s->rim_from_parts = 1; s->screen = SC_RIM_BRAND;
         } else if (key == SHOP_KEY_OK) {
             /* 0x566490: the part fitted -> "already installed!", else
                "Would you like to install this part now?" */
             const ShopPart *q = s->nparts ? &s->parts[s->part_sel] : NULL;
             if (q && q->available) {
                 if (!memcmp(&s->preview, &s->fitted, sizeof s->preview)) dialog(s, DLG_AUTO, 1, 0xda15d7e5u, DA_NONE, 0, 0);
+                else if (part_to_buy(s, q) && g_career.cash < q->price)   /* "not enough cash" */
+                    dialog(s, PK_DLG_S, 1, 0xd1ac60beu, DA_NONE, 0, 0);
+                else if (part_to_buy(s, q)) dialog(s, DLG_AUTO, 2, 0x44b7167fu, DA_PART_BUY, 0, 0);
                 else dialog(s, DLG_AUTO, 2, 0xf5ac2b2au, DA_PART, 0, 0);
             }
         } else if (key == SHOP_KEY_BACK) {
@@ -5412,7 +9170,7 @@ static void shop_input_screen(Shop *s, int key) {
                 s->preview = s->fitted; request_preview(s); s->debounce = 0.0f;
             }
             if (s->cf_mode) cf_menu(s, 1);
-            else s->screen = SC_BODY;
+            else s->screen = SC_BODY;   /* StopBrowsingParts: the category strip (a city shop's exit dialog is BACK there) */
         }
         break;
     }
@@ -5420,10 +9178,90 @@ static void shop_input_screen(Shop *s, int key) {
 
 static int rating_shown(const Shop *s);
 static void rating_update(Shop *s);
+/* the screens' 0x35f8620b HandleFESpeechEvent sends (career only; GC
+   caller table SPEECH_GAME 1e).  Guesses: PartSelectionScreen's
+   gCarCustomizeManager+0x1c == 0 and ChoosePaintScreen's +0x28 == 2 gates
+   are not modelled */
+static void fe_speech_screen(Shop *s) {
+    if (s->spk_screen == s->screen + 1) return;
+    if (s->spk_screen == SC_CRIB_SPONSORS + 1) career_speech_sponsor_done();   /* HandleSponsorSelectDone */
+    s->spk_screen = s->screen + 1;
+    if (s->screen == SC_CRIB_SPONSORS) career_speech_sponsor();       /* HandleSponsorSelect */
+    if (s->screen == SC_UNIQUES) career_speech_uniques(!s->uq_perf);  /* UniquesBrowser 0x5255d0 / 0x525610 */
+    if (!s->career && s->screen != SC_CRIB && s->screen != SC_CAREER_LOT) return;
+    int ev = -1;
+    switch (s->screen) {
+    case SC_CRIB: ev = 0x11; break;          /* uiCareerCrib */
+    case SC_CAREER_LOT: ev = 4; break;       /* UICareerCarLot */
+    case SC_PARTS: ev = 2; break;            /* PartSelectionScreen */
+    case SC_DLOC: ev = 5; break;             /* ChooseDecalCategory */
+    case SC_ICE: ev = 0x12; break;           /* IceSelectionScreen */
+    case SC_PERFORMANCE: ev = 1; break;      /* ChoosePerfCategory */
+    case SC_GRAPHICS: ev = 0xf; break;       /* ChoosePaintShopCategory */
+    case SC_VLAYER: ev = 0xe; break;         /* ChooseVinylLayerScreen */
+    case SC_PAINT: ev = 8; break;            /* ChoosePaintScreen */
+    default: break;
+    }
+    if (ev >= 0) career_speech_fe(ev);
+}
+static int g_shop_career_mode;
+#define ALT_NAME_T 0.75f                     /* GC 8032b214 / PC 0x79936c */
+#define ALT_CASH_T 5.0f                      /* GC 8032b218 / PC 0x799368 */
+static void alt_update(Shop *s, float dt) {
+    int on = s->career || g_shop_career_mode || s->screen >= SC_CAREER_LOT;
+    if (!on) { s->alt_cur = 0; return; }
+    int ms = (int)(dt * 1000.0f + 0.5f);
+    if (!s->alt_cur || s->screen != s->alt_screen) {   /* a new MenuScreen: SetAlternatingText(name, cash, 0.75, 5.0) */
+        s->alt_screen = s->screen; s->alt_cur = 1;
+        s->alt_timer = (int)(ALT_NAME_T * 4000.0f + 0.5f);
+        s->alt_gen++; s->alt_ms = 0;
+        return;
+    }
+    s->alt_ms += ms;
+    if (s->alt_anim && s->alt_anim->p) feng_anim_tick(s->alt_anim, ms);
+    s->alt_timer -= (int)(dt * 4000.0f);             /* Timer::CountDown 801a6bdc */
+    if (s->alt_timer < 0) s->alt_timer = 0;
+    if (s->alt_timer > 0) return;
+    s->alt_cur = s->alt_cur == 1 ? 2 : 1;            /* Fade_Out the current, Fade_In the other */
+    s->alt_timer = (int)((s->alt_cur == 2 ? ALT_CASH_T : ALT_NAME_T) * 4000.0f + 0.5f);
+    s->alt_gen++; s->alt_ms = 0;
+}
+/* the colour of the name (0xeb406fec) / cash (0xeb3a688a) text: the alpha of
+   its FADE_IN / FADE_OUT script; a second package with them in the same
+   frame, or one without the scripts, shows the current text only */
+static const float *alt_col(Shop *s, const FengPackage *pk, int i, const float *c, float *out) {
+    uint32_t h = pk->obj[i].hash;
+    if ((h != O_PLAYER && h != O_CASH) || !s->alt_cur) return c;
+    memcpy(out, c, 4 * sizeof *out);
+    if (!s->alt_anim && (s->alt_anim = (FengAnim *)malloc(sizeof *s->alt_anim)) != NULL) s->alt_anim->p = NULL;
+    FengAnim *a = s->alt_anim;
+    if (a && (a->p == pk || !s->alt_bound)) {
+        if (a->p != pk || s->alt_bgen != s->alt_gen) {
+            int fresh = a->p != pk, ok = 1, o;
+            if (fresh) feng_anim_init(a, pk);
+            if ((o = feng_find(pk, O_PLAYER)) >= 0) ok &= feng_anim_set(a, o, s->alt_cur == 1 ? 0xbcc00f05u : 0x54c20a66u, 1) != 0;
+            if ((o = feng_find(pk, O_CASH)) >= 0) ok &= feng_anim_set(a, o, s->alt_cur == 2 ? 0xbcc00f05u : 0x54c20a66u, 1) != 0;
+            if (fresh && s->alt_ms > 0) feng_anim_tick(a, s->alt_ms);
+            s->alt_scripts = ok; s->alt_bgen = s->alt_gen;
+        }
+        s->alt_bound = 1;
+        if (s->alt_scripts) {
+            FengPlace pl; feng_anim_place(a, i, &pl);
+            out[3] = pl.hidden ? 0.0f : pl.rgba[3];
+            return out;
+        }
+    }
+    if ((h == O_PLAYER) != (s->alt_cur == 1)) out[3] = 0.0f;
+    return out;
+}
 void shop_update(Shop *s, float dt) {
     if (!s) return;
-    Scroller *list[14] = { &s->top, &s->body, &s->cat, &s->rims, &s->main, &s->qr_mode, &s->qr_track,
-                           &s->opt_main, &s->paintcat, &s->perfpkg, &s->vlay, &s->vcat, &s->dloc, &s->cfm };
+    Scroller *list[] = { &s->top, &s->body, &s->cat, &s->rims, &s->main, &s->qr_mode, &s->qr_track,
+                         &s->opt_main, &s->paintcat, &s->perfpkg, &s->vlay, &s->vcat, &s->dloc, &s->prof, &s->scar, &s->cfm,
+                         &s->icem, &s->neonm, &s->crib, &s->cwm };
+    movie_update(s, dt);
+    s->alt_t += dt;
+    alt_update(s, dt);
     s->blink += dt;
     if (rating_shown(s)) rating_update(s);
     {   /* DIM / UNDIM: 100 ms each way */
@@ -5431,6 +9269,7 @@ void shop_update(Shop *s, float dt) {
         s->dim = s->dim < tgt ? fminf(tgt, s->dim + st) : fmaxf(tgt, s->dim - st);
     }
     qr_update(s, dt);
+    fe_speech_screen(s);
     if (s->screen == SC_OPT && s->opt_anim) feng_anim_tick(s->opt_anim, (int)(dt * 1000.0f + 0.5f));
     if (s->screen == SC_CTL && s->ctl_anim) feng_anim_tick(s->ctl_anim, (int)(dt * 1000.0f + 0.5f));
     if (s->screen == SC_JUKE && s->juke_anim) feng_anim_tick(s->juke_anim, (int)(dt * 1000.0f + 0.5f));
@@ -5439,8 +9278,12 @@ void shop_update(Shop *s, float dt) {
     if ((s->screen == SC_HUD || s->screen == SC_HUD_COL) && s->chud_anim) feng_anim_tick(s->chud_anim, (int)(dt * 1000.0f + 0.5f));
     if (s->screen == SC_PERF_PKG && s->perf_anim) feng_anim_tick(s->perf_anim, (int)(dt * 1000.0f + 0.5f));
     if (s->screen == SC_PERF_PKG && s->buy_anim) feng_anim_tick(s->buy_anim, (int)(dt * 1000.0f + 0.5f));
+    if (s->screen == SC_PERF_PKG && s->brand_on && s->brand_anim) feng_anim_tick(s->brand_anim, (int)(dt * 1000.0f + 0.5f));
     if (dlg_open(s) && s->dlg_anim) feng_anim_tick(s->dlg_anim, (int)(dt * 1000.0f + 0.5f));
-    for (int i = 0; i < 13; i++) {
+    if (s->mc_view != MCV_OFF && s->mc_anim) feng_anim_tick(s->mc_anim, (int)(dt * 1000.0f + 0.5f));
+    if (s->mc_view == MCV_LIST && s->mcl_anim) feng_anim_tick(s->mcl_anim, (int)(dt * 1000.0f + 0.5f));
+    if (s->mc_view == MCV_KB) kb_tick(s, (int)(dt * 1000.0f + 0.5f));
+    for (int i = 0; i < (int)NELEM(list); i++) {
         Scroller *sc = list[i];
         float target = (float)sc->sel;
         sc->scroll += (target - sc->scroll) * SCROLL_EASE;
@@ -5456,10 +9299,23 @@ void shop_update(Shop *s, float dt) {
 
 int shop_poll(Shop *s, ShopAction *a) {
     if (!s || !a) return 0;
-    if (s->fe_action) { a->kind = s->fe_action; s->fe_action = 0; return 1; }
+    if (s->fe_action) { a->kind = s->fe_action; a->event = s->fe_event; s->fe_action = 0; s->fe_event = NULL; return 1; }
+    if (s->career_go) {                                  /* StartCareerFreeRoam */
+        a->kind = SHOP_ACT_CAREER;
+        a->career_nis = s->career_go == 2;
+        s->career_go = 0;
+        return 1;
+    }
     if (s->qr_car_pending && s->qr_car_debounce <= 0.0f) {   /* the car select's car on the platform */
         s->qr_car_pending = 0;
         a->kind = SHOP_ACT_QR_CAR;
+        snprintf(a->car, sizeof a->car, "%s", s->qr_car_cur);
+        return 1;
+    }
+    if (s->cust_go && !s->qr_car_pending) {             /* Customize: the Car Shop for this car */
+        s->cust_go = 0;
+        g_qr_filter = s->qr_filter;
+        a->kind = SHOP_ACT_CUSTOMIZE;
         snprintf(a->car, sizeof a->car, "%s", s->qr_car_cur);
         return 1;
     }
@@ -5683,6 +9539,53 @@ static void wrap_text(const FengFont *f, const char *txt, float wrapw, char *out
     out[n] = 0;
 }
 
+/* A $...$ token of the console FNGs and help strings (0x51c110's button
+   font): *glyph a hud_pad_glyph id, or *txt letters drawn in the font, or
+   neither (*adv: a spacer's width in font units). The key a prompt names is
+   the one the Vita binds: Select / Accept Cross, Cancel Circle, Button1 the
+   screen's (button1_glyph), Help the Select button, the d-pad and its
+   "alternate" sticks (the left stick moves the highlight, the right one
+   turns the car). Returns the token's length, 0 when s is not a token. */
+static int button1_glyph(const Shop *s);
+static uint32_t help_of(const Shop *s);
+static int pad_token(const Shop *s, const char *q, int *glyph, const char **txt, float *adv) {
+    *glyph = -1; *txt = NULL; *adv = 0.0f;
+    if (*q != '$') return 0;
+    const char *e = strchr(q + 1, '$');
+    if (!e) return 0;
+    int n = (int)(e - q) + 1;
+    char t[64];
+    if (n >= (int)sizeof t) return 0;
+    memcpy(t, q, (size_t)n); t[n] = 0;
+    static const struct { const char *tok; int g; const char *txt; } k[] = {
+        { "$JOY_EVENT_FENG_SELECT$", HUD_PAD_CROSS }, { "$JOY_EVENT_FENG_ACCEPT$", HUD_PAD_CROSS },
+        { "$JOY_EVENT_FENG_CANCEL$", HUD_PAD_CIRCLE }, { "$JOY_EVENT_FENG_BUTTON0$", HUD_PAD_SQUARE },
+        { "$JOY_EVENT_FENG_LTRIGGER$", -1, "L" }, { "$JOY_EVENT_FENG_RTRIGGER$", -1, "R" },
+        { "$JOY_EVENT_FENG_HELP$", -1, "SELECT" },
+        { "$JOY_EVENT_FENG_PAD_UP$", HUD_PAD_DPAD_UD }, { "$JOY_EVENT_FENG_PAD_DOWN$", HUD_PAD_DPAD_UD },
+        { "$JOY_EVENT_FENG_PAD_LEFT$", HUD_PAD_DPAD_LR }, { "$JOY_EVENT_FENG_PAD_RIGHT$", HUD_PAD_DPAD_LR },
+        { "$JOY_EVENT_FENG_PAD_UP_ALTERNATE$", HUD_PAD_LSTICK }, { "$JOY_EVENT_FENG_PAD_DOWN_ALTERNATE$", HUD_PAD_LSTICK },
+        { "$JOY_EVENT_FENG_PAD_LEFT_ALTERNATE$", HUD_PAD_LSTICK },
+        { "$JOY_EVENT_FENG_PAD_RIGHT_ALTERNATE$", HUD_PAD_RSTICK } };
+    for (int j = 0; j < NELEM(k); j++)
+        if (!strcmp(t, k[j].tok)) { *glyph = k[j].g; *txt = k[j].txt; return n; }
+    if (!strcmp(t, "$JOY_EVENT_FENG_BUTTON1$")) { *glyph = button1_glyph(s); return n; }
+    if (!strcmp(t, "$ICON_SPACER$")) { *adv = 6.0f; return n; }
+    return strncmp(t, "$JOY_EVENT_", 11) ? 0 : n;   /* other pads' buttons: nothing */
+}
+/* a line's width with its tokens (glyphs one font line square) */
+static float rich_width(const Shop *s, const FengFont *f, const char *line, float sc) {
+    float w = 0.0f;
+    for (const char *q = line; *q; ) {
+        int g; const char *tt; float adv;
+        int n = pad_token(s, q, &g, &tt, &adv);
+        if (!n) { char one[2] = { *q, 0 }; w += feng_text_width(f, one) * sc; q++; continue; }
+        w += g >= 0 ? (float)f->line * sc : tt ? feng_text_width(f, tt) * sc : adv * sc;
+        q += n;
+    }
+    return w;
+}
+
 static void text_at(Shop *s, const DC *dc, int p, int i, const char *txt, float tx, float ty,
                     float sc, const float *c) {
     const FengPackage *pk = s->pk[p];
@@ -5691,10 +9594,11 @@ static void text_at(Shop *s, const DC *dc, int p, int i, const char *txt, float 
     int fi = s->font_of[p][o->res];
     if (fi < 0 || !s->font[fi].ok) return;
     const ShopFont *F = &s->font[fi];
-    char line[160], wrapped[1024];
-    if (o->wrapw > 0) { wrap_text(&F->f, txt, (float)o->wrapw, wrapped, (int)sizeof wrapped); txt = wrapped; }
+    char line[256], wrapped[1024];
+    int rich = strchr(txt, '$') != NULL;
+    if (o->wrapw > 0 && !rich) { wrap_text(&F->f, txt, (float)o->wrapw, wrapped, (int)sizeof wrapped); txt = wrapped; }
     int nlines = 1;
-    for (const char *q = txt; *q; q++) if (*q == '^') nlines++;
+    for (const char *q = txt; *q; q++) if (*q == '^' || *q == '\n') nlines++;
     /* 0x51c110: lines (leading Sl + the font's line) apart */
     float lh = ((float)o->lead + (float)F->f.line) * sc;
     float y = ty;
@@ -5703,14 +9607,45 @@ static void text_at(Shop *s, const DC *dc, int p, int i, const char *txt, float 
     const char *q = txt;
     while (*q) {
         int n = 0;
-        while (q[n] && q[n] != '^' && n < (int)sizeof line - 1) { line[n] = q[n]; n++; }
+        while (q[n] && q[n] != '^' && q[n] != '\n' && n < (int)sizeof line - 1) { line[n] = q[n]; n++; }
         line[n] = 0;
-        float x = tx, w = feng_text_width(&F->f, line) * sc;
+        float x = tx, w = rich ? rich_width(s, &F->f, line, sc) : feng_text_width(&F->f, line) * sc;
         if (o->just & FENG_JUST_HCENTER) x -= 0.5f * w;
         else if (o->just & FENG_JUST_RIGHT) x -= w;
         float v[160 * 4 * 5]; int nq = 0;
-        for (const char *ch = line; *ch && nq < 160; ch++) {
-            const FengGlyph *g = &F->f.g[(unsigned char)*ch];
+        const char *tt = NULL;
+        float lsc = sc, ly = y;
+        {   /* a prompt that is one worded key ("SELECT" for Help): smaller,
+               ending where a glyph there would, clear of its label */
+            int g; const char *wt; float adv;
+            if (rich && pad_token(s, line, &g, &wt, &adv) == n && wt && strlen(wt) > 1) {
+                lsc = 0.7f * sc;
+                x += (float)F->f.line * sc - feng_text_width(&F->f, wt) * lsc;
+                ly = y + 0.3f * (float)F->f.line * sc;
+            }
+        }
+        float sc0 = sc, y0l = y;
+        sc = lsc; y = ly;
+        for (const char *ch = line; (*ch || (tt && *tt)) && nq < 160; ) {
+            char cur;
+            if (tt && *tt) cur = *tt++;
+            else {
+                int g; float adv;
+                int k = rich ? pad_token(s, ch, &g, &tt, &adv) : 0;
+                if (k) {
+                    ch += k;
+                    if (g >= 0) {   /* the glyph, a font line square, between the batches */
+                        draw_quads(dc, F->tex, v, nq, c, 0); nq = 0;
+                        float gs = (float)F->f.line * sc, wc[4] = { 1, 1, 1, c[3] };
+                        GLuint gt = hud_pad_glyph(g);
+                        if (gt) blit(dc, gt, gs, gs, x + 0.5f * gs, y + 0.5f * gs, 0.0f, wc, 0);
+                        x += gs;
+                    } else if (!tt) x += adv * sc;
+                    continue;
+                }
+                cur = *ch++;
+            }
+            const FengGlyph *g = &F->f.g[(unsigned char)cur];
             if (!g->ok) continue;
             if (g->w && g->h) {
                 float x0 = x + g->xo * sc, y0 = y + g->yo * sc;
@@ -5726,9 +9661,9 @@ static void text_at(Shop *s, const DC *dc, int p, int i, const char *txt, float 
             x += g->adv * sc;
         }
         draw_quads(dc, F->tex, v, nq, c, 0);
-        y += lh;
+        sc = sc0; y = y0l + lh;
         q += n;
-        if (*q == '^') q++;
+        if (*q == '^' || *q == '\n') q++;
     }
 }
 
@@ -5736,6 +9671,25 @@ static void text_at(Shop *s, const DC *dc, int p, int i, const char *txt, float 
 static void text(Shop *s, const DC *dc, int p, int i, const char *txt, const float *c) {
     const FengObj *o = &s->pk[p]->obj[i];
     text_at(s, dc, p, i, txt, o->ax + s->text_dx, o->ay + s->text_dy, o->size[0], c);
+}
+
+/* Split Hoods / Doors / Nitrous Purge: the second help-bar prompt the parts
+   browser shows (0x54fb70 -> 0x547090: UI_ICEMAIN's Button1 icon 0x89782734
+   and label 0xa936c3a2, its group 100.7 right of Install's; label
+   ICE_OPEN_CLOSE_HOOD 0xeaa1d5df / ICE_OPEN_CLOSE_DOORS 0x3e9431dc /
+   0xba0e1020). UI_GenericParts_Browser has only Install, so the pair is
+   drawn from its select-token and label objects moved along. */
+static void spec_open_prompt(Shop *s, const DC *dc, int p, uint32_t label) {
+    const FengPackage *pk = s->pk[p];
+    int ti = pk ? feng_find(pk, O_SELECT_TOKEN) : -1, li = pk ? feng_find(pk, 0xa936c3a2u) : -1;
+    if (ti < 0 || li < 0) return;
+    DC odc = *dc;
+    s->text_dx = 100.7f;
+    odc.pin = obj_pin(pk, ti, 1);
+    text(s, &odc, p, ti, "$JOY_EVENT_FENG_BUTTON1$", s->rgba[p][ti]);
+    odc.pin = obj_pin(pk, li, 1);
+    text(s, &odc, p, li, str_get(s, label), s->rgba[p][li]);
+    s->text_dx = 0.0f;
 }
 
 /* PC_Loading: how far a custom first line's right edge moves past the
@@ -5763,6 +9717,12 @@ typedef struct {
 } Texts;
 
 
+static const char *g_player_txt = "";   /* the profile's name, "No Profile" (set per frame) */
+static const char *g_cash_txt = "";     /* career: the wallet ("%$d"), in turn with the name */
+static int g_shop_career_mode;
+void shop_set_career_mode(int on) { g_shop_career_mode = on; }
+static const char *g_paint_total;   /* career: the paint setup's Total Cost (O_TOTAL in 0x9ff84a88), NULL: the screen's own */
+static char g_paint_price[24];       /* career: the highlighted colour's price (0x0013c45e) */
 static const char *override_text(uint32_t h, const Texts *t) {
     for (int k = 0; k < t->nx; k++) if (t->xh[k] == h) return t->xt[k];
     switch (h) {
@@ -5770,26 +9730,19 @@ static const char *override_text(uint32_t h, const Texts *t) {
     case O_OPTION_A: case O_OPTION_B: return t->option;
     case O_PART_NAME: return t->part ? t->part : "";
     case O_PART_PRICE: return t->price ? t->price : "";
-    case O_TOTAL: return t->total ? t->total : "";
-    /* no career yet: no bank and no profile name to show */
-    case O_CASH: case O_PLAYER: return "";
-    /* PC key prompts; the Vita has no icons for them in the game data */
-    case O_HELP_LABEL: case O_HELP_TOKEN: return "";
-    case O_SELECT_TOKEN: return "X";
+    case O_TOTAL: return g_paint_total ? g_paint_total : t->total ? t->total : "";
+    case O_PLAYER: return g_player_txt;
+    case O_CASH: return g_cash_txt;
+    case 0x0013c45eu: return g_paint_price;
     case 0x47ff4e7cu: return "";   /* "Event Handler" debug string */
     default: return NULL;
     }
 }
 
-/* PC prompts the packages author as tokens: accept / select is X on the
-   Vita, the others (help, EA Messenger) have no function here. */
+/* The prompts the packages author as $JOY_EVENT_FENG_...$ tokens draw as
+   the Vita's buttons (text_at -> pad_token); EA Messenger has no function
+   here, nor its Button1 (button1_glyph). */
 static const char *authored_text(const FengObj *o) {
-    if (!strncmp(o->text, "$JOY_EVENT_FENG_", 16)) {
-        if (!strncmp(o->text, "$JOY_EVENT_FENG_LTRIGGER$", 25)) return "L";
-        if (!strncmp(o->text, "$JOY_EVENT_FENG_RTRIGGER$", 25)) return "R";
-        return !strcmp(o->text, "$JOY_EVENT_FENG_SELECT$") || !strcmp(o->text, "$JOY_EVENT_FENG_ACCEPT$")
-             ? "X" : "";
-    }
     if (!strcmp(o->text, "EA Messenger")) return "";
     return o->text;
 }
@@ -5904,6 +9857,11 @@ static int dim_obj(Shop *s, int p, int i) {
     return 0;
 }
 
+/* FEngSetInvisible(PartPrice 0x0380b632) for the next draw_package */
+static void price_hide(Shop *s, int hide) {
+    if (!hide || s->nov >= (int)NELEM(s->ov)) return;
+    ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_PART_PRICE; ov->hide = 1;
+}
 static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_lock,
                          const Scroller *strip, int part_list) {
     const FengPackage *pk = s->pk[p];
@@ -5938,6 +9896,9 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
            circles (-44) are one strip; the per-group pin split them on a wide
            screen (text on the left edge, circles centred) */
         if (p == PK_LOADING) odc.pin = -1.0f;
+        /* the cover screens are one 4:3 picture: the U2_magazine_texture side
+           masks must meet the cover's edges, not the screen's */
+        if (p == PK_MAG_REWARD || p == PK_MAG_BACK || p == PK_MAG_VIEW) odc.pin = 0.0f;
         odc.cover = o->type != FENG_STRING && fabsf(o->size[0]) >= 600.0f && fabsf(o->size[1]) >= 440.0f;
         dc = &odc;
         const float *c = s->rgba[p][i];
@@ -5985,17 +9946,27 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
         }
         {   /* a hidden group hides what is in it */
             int gone = 0;
-            for (int q = o->parent; q >= 0 && !gone; q = pk->obj[q].parent)
+            for (int q = o->parent; q >= 0 && !gone; q = pk->obj[q].parent) {
                 for (int k = 0; k < s->nov; k++) if (s->ov[k].hide && s->ov[k].hash == pk->obj[q].hash) gone = 1;
+                /* the help bar's four arrows (group 0x2bac0cee, on the cash text): INIT runs HIDE, and only
+                   the 0x2bac0cee message (0x54e6b0 / 0x553940) touches them -- never shown on a menu */
+                if (pk->obj[q].hash == 0x2bac0ceeu) gone = 1;
+            }
             if (gone) continue;
         }
         if (o->type == FENG_STRING) {
+            if ((o->hash == O_HELP_LABEL || o->hash == O_HELP_TOKEN) && !help_of(s)) continue;
             const char *ov = override_text(o->hash, t);
-            text(s, dc, p, i, ov ? ov : authored_text(o), c);
+            float ac[4];
+            text(s, dc, p, i, ov ? ov : authored_text(o), alt_col(s, pk, i, c, ac));
             continue;
         }
         if (ov_img && ov_img->tex) {   /* the code's texture (logos, the track map) */
             float b[4] = { c[0], c[1], c[2], c[3] * (ov_img->alpha > 0.0f ? ov_img->alpha : 1.0f) };
+            if (ov_img->uvo) {
+                blit_uv(dc, ov_img->tex, fabsf(o->size[0]), fabsf(o->size[1]), o->ax, o->ay, o->aangle, ov_img->uv, b, 0);
+                continue;
+            }
             blit(dc, ov_img->tex, ov_img->geom ? ov_img->w : fabsf(o->size[0]),
                  ov_img->geom ? ov_img->h : fabsf(o->size[1]), ov_img->geom ? ov_img->x : o->ax,
                  ov_img->geom ? ov_img->y : o->ay, o->aangle, b, 0);
@@ -6020,6 +9991,97 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
     }
     if (!strip_done) draw_scroller(s, &strip_dc, strip, cx, cy, w, h);
     if (!list_done) draw_part_list(s, &list_dc, p);
+}
+
+static void cwm_draw(Shop *s, const DC *dc, Texts *t) {
+    const FengPackage *pk = s->pk[PK_CRIB_WMAP];
+    if (!pk) return;
+    const unsigned char *ev = s->cwm.n ? s->cwm_ev[s->cwm.sel] : NULL;
+    const unsigned char *r = ev ? cwm_rec(s, cwm_tid(ev)) : NULL;
+    static char reg[48], dist[48], best[32];
+    static uint32_t xh[9]; static const char *xt[9];
+    int nx = 0, type = ev ? (signed char)ev[0xf] : 0;
+    cwm_fmt_d(reg, sizeof reg, str_get(s, 0x0a96b270u), s->cwm_stage);   /* "Stage %d" */
+    xh[nx] = 0xc8e97c9cu; xt[nx++] = reg;
+    /* FillScreen: PlayableEvent 0x496d70 / PlayableRegion 0x496ef0 (blank) */
+    uint32_t tstr = type == 0 ? 0x268d063cu : type == 1 ? 0xba613729u : type == 2 ? 0x0fda6758u
+                  : type == 4 ? 0x40c91ba7u : type == 5 ? 0x59ecb2c2u : 0;
+    float km = r ? (float)(int)n2_u32(r + 0x98) * 0.001f : 0.0f;
+    snprintf(dist, sizeof dist, "%.2f %s", km * 0.62137f, str_get(s, STR_MI));   /* 0x83aa1a 0: miles */
+    if (ev && type == 5) hud_num(best, sizeof best, hs_best_drift(cwm_tid(ev), cwm_rev(ev)));
+    else if (ev) hud_time_str(best, hs_best_time(cwm_tid(ev), cwm_rev(ev), r));
+    xh[nx] = 0x4d2f5c61u; xt[nx++] = ev ? str_get(s, 0xed8ca191u) : "";
+    xh[nx] = 0x23eae8b9u; xt[nx++] = ev ? str_get(s, career_has_completed(n2_u32(ev + 8)) ? 0xb1ee4ca9u : 0xd11ecd79u) : "";
+    xh[nx] = 0x4d2f5c62u; xt[nx++] = ev ? str_get(s, 0x7f904ae8u) : "";
+    xh[nx] = 0x23eae8bau; xt[nx++] = ev && tstr ? str_get(s, tstr) : "";
+    xh[nx] = 0x4d2f5c63u; xt[nx++] = ev ? str_get(s, 0x7019add7u) : "";
+    xh[nx] = 0x23eae8bbu; xt[nx++] = ev ? dist : "";
+    xh[nx] = 0x4d2f5c64u; xt[nx++] = !ev ? "" : str_get(s, type == 5 ? 0x4e0a36a0u : type == 1 || type == 4 ? 0xdb0c5efdu : 0x3b4a1ecbu);
+    xh[nx] = 0x23eae8bcu; xt[nx++] = ev ? best : "";
+    t->xh = xh; t->xt = xt; t->nx = nx;
+    s->nov = 0;
+    ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_CWM_MAP;
+    if (s->map_tex && s->map_ev == s->map_want && s->map_alpha > 0.0f) {
+        /* StartZoom 0x4b4b80: no size -> SetZoom(0); snap -> SetZoom(1); else
+           SetZoom over 0.5 s (its countdown, so 0 -> 1); SetZoom 0x498630:
+           s = sin(p pi/2), the window S = 512 - (512 - size) s at (x s, y s) */
+        float zx, zy, zs; int snap = 0;
+        if (ev && r) { memcpy(&zx, r + 0x118, 4); memcpy(&zy, r + 0x11c, 4); memcpy(&zs, r + 0x120, 4); snap = (int)n2_u32(r + 0x124) != 0; }
+        else { int g = s->cwm_stage >= 1 && s->cwm_stage <= 5 ? s->cwm_stage : 0;
+               zx = k_cwm_region[g].x; zy = k_cwm_region[g].y; zs = k_cwm_region[g].size; }
+        float p = zs <= 0.0f ? 0.0f : snap ? 1.0f : fminf(s->map_t / 0.5f, 1.0f);
+        float sn = sinf(p * 1.5707964f), S = 512.0f - (512.0f - (zs > 0.0f ? zs : 512.0f)) * sn;
+        ov->tex = s->map_tex; ov->alpha = s->map_alpha; ov->uvo = 1;
+        ov->uv[0] = zx * sn / 512.0f; ov->uv[1] = zy * sn / 512.0f;
+        ov->uv[2] = (zx * sn + S) / 512.0f; ov->uv[3] = (zy * sn + S) / 512.0f;
+    } else ov->hide = 1;
+    /* the pool and MINI_MASTER (the scroller's anchor) are drawn as the nodes below */
+    static const uint32_t off[] = { O_CWM_ICON, O_CWM_MASTER, 0x3fbb7a4eu };
+    for (int k = 0; k < (int)NELEM(off); k++) { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = off[k]; ov->hide = 1; }
+    /* RefreshHeader 0x4b1590: the region arrows, the list arrows, the side bar */
+    uint32_t hide[4]; int nh = 0;
+    if (s->cwm_stage <= 1) hide[nh++] = 0x444969fdu;
+    if (s->cwm_stage >= s->cwm_nst) hide[nh++] = 0x444969feu;
+    if (s->cwm.sel <= 0) hide[nh++] = 0x640f0f22u;
+    if (s->cwm.sel >= s->cwm.n - 1) hide[nh++] = 0x640f0f23u;
+    for (int k = 0; k < nh; k++) { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = hide[k]; ov->hide = 1; }
+    {   /* FEScrollBar::Update(1, count, index) 80155720, vertical along SideScrollBar's backing */
+        int ihd = feng_find(pk, 0xf31e8ed3u), ibk = feng_find(pk, 0x884fba76u), n = s->cwm.n;
+        ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0xf31e8ed3u;
+        if (n <= 1 || ihd < 0 || ibk < 0) ov->hide = 1;
+        else {
+            float bh = fabsf(pk->obj[ibk].size[1]), top = pk->obj[ibk].ay - 0.5f * bh;
+            float hh = fabsf(pk->obj[ihd].size[1]), f = (float)s->cwm.sel, cy;
+            if (f == 0.0f) cy = top + hh * 0.5f;
+            else if (f == (float)n - 1.0f) cy = top + bh - hh * 0.5f;
+            else cy = f * ((bh - hh) / (float)(n - 1)) + top + hh * 0.5f;
+            ov->geom = 1; ov->x = pk->obj[ihd].ax; ov->y = cy;
+            ov->w = fabsf(pk->obj[ihd].size[0]); ov->h = hh;
+        }
+    }
+    draw_package(s, dc, PK_CRIB_WMAP, t, 0, NULL, 0);
+    s->nov = 0;
+    /* ThumbnailScroller (Update 0x538760): vertical, pitch 16 + 20, the
+       current node on MINI_MASTER, others 0.8x, the current pulsing; the
+       nodes outside the 273 window hidden; all hidden while dimmed (StartDim) */
+    int m = feng_find(pk, O_CWM_MASTER);
+    if (m < 0 || dlg_open(s)) return;
+    const FengObj *mo = &pk->obj[m];
+    GLuint tex = mo->res > 0 && mo->res < pk->nres ? s->res_tex[PK_CRIB_WMAP][mo->res] : 0;
+    if (!tex) return;
+    DC idc = *dc; idc.cover = 0; idc.fade = 0.0f; idc.pin = obj_pin(pk, m, 1);
+    float w = fabsf(mo->size[0]), h = fabsf(mo->size[1]);
+    for (int i = 0; i < s->cwm.n; i++) {
+        float y = mo->ay + ((float)i - s->cwm.scroll) * (h + 20.0f);
+        if (fabsf(y - mo->ay) > 273.0f * 0.5f) continue;
+        float k = 0.8f;
+        if (i == s->cwm.sel) {
+            float tri = s->cwm.pulse < 1.0f ? s->cwm.pulse : 2.0f - s->cwm.pulse;
+            float a = tri * 255.0f * 1.1f + 127.5f; if (a > 255.0f) a = 255.0f;
+            k = 0.97f + a * 0.000117647f;
+        }
+        blit(&idc, tex, w * k, h * k, mo->ax, y, 0.0f, s->rgba[PK_CRIB_WMAP][m], 0);
+    }
 }
 
 /* A package through its running scripts (UI_QRModeOptions): every object at
@@ -6049,12 +10111,15 @@ static void draw_anim_package(Shop *s, const DC *dc0, int p, const FengAnim *a, 
         dc.pin = s->qr_rowobj[i] ? 0.0f : obj_pin(pk, i, p == PK_QR_OPTIONS ? 1 : 2);
         if (o->type == FENG_STRING) {
             const char *tx = otxt ? otxt[i] : NULL;
+            if (!tx && (o->hash == O_HELP_LABEL || o->hash == O_HELP_TOKEN) && !help_of(s)) continue;
             if (!tx) { const char *ov = override_text(o->hash, t); tx = ov ? ov : authored_text(o); }
-            text_at(s, &dc, p, i, tx, pl.x, pl.y, pl.sx, pl.rgba);
+            float ac[4];
+            text_at(s, &dc, p, i, tx, pl.x, pl.y, pl.sx, alt_col(s, pk, i, pl.rgba, ac));
             continue;
         }
-        GLuint tex = 0; int add = 0;
-        if (p == PK_CHUD)   /* custom gauges: the style's art (0x549000) */
+        GLuint tex = g_anim_tex[i]; int add = 0;
+        if (tex) ;
+        else if (p == PK_CHUD)   /* custom gauges: the style's art (0x549000) */
             for (int q = 0; q < 6; q++) if (o->hash == k_chud_obj[q] && s->chud_tex[q]) tex = s->chud_tex[q];
         if (tex) ;
         else if (s->qr_rowobj[i] == 2) { if (arrow) tex = arrow->tex; }   /* 0x54ef30: U2_Menu_Arrow */
@@ -6071,6 +10136,32 @@ static void draw_anim_package(Shop *s, const DC *dc0, int p, const FengAnim *a, 
     }
 }
 
+static void brand_draw(Shop *s, const DC *dc) {
+    const FengPackage *pk = s->pk[PK_BRAND];
+    if (!pk || !s->brand_anim) return;
+    static const char *otxt[FENG_MAX_OBJ];
+    memset(otxt, 0, sizeof otxt);
+    memset(g_anim_tex, 0, sizeof g_anim_tex);
+    for (int k = 0; k < s->brand_n; k++) {   /* 0x53b960 */
+        uint32_t b = s->brand_w[k].b[s->brand_w[k].cur];
+        int on = brand_obj(pk, QP_NAME, k + 1), od = brand_obj(pk, QP_DATA, k + 1), oi = brand_obj(pk, QP_N, k + 1);
+        if (on >= 0) otxt[on] = str_get(s, s->brand_w[k].name);
+        if (od >= 0) otxt[od] = perf_brand_str(b, 1);
+        if (oi >= 0) {
+            char di[48]; snprintf(di, sizeof di, "DECAL_ICON_%s", perf_brand_str(b, 0));
+            const ShopTex *it = tex_find(s, feng_tex_key(di));
+            if (!it) it = tex_find(s, 0x74ce8c0bu);   /* no icon: 0x74ce8c0b */
+            g_anim_tex[oi] = it ? it->tex : 0;
+        }
+    }
+    Texts bt; memset(&bt, 0, sizeof bt);
+    s->row_arrow = K_MENU_ARROW;
+    brand_marks(s);
+    draw_anim_package(s, dc, PK_BRAND, s->brand_anim, &bt, otxt);
+    memset(g_anim_tex, 0, sizeof g_anim_tex);
+    memset(s->qr_rowobj, 0, sizeof s->qr_rowobj);
+}
+
 /* 0x55bc90: the box is up on every Customize screen but the parts / rims /
    spinner browsers, the paint and the decal screens */
 static int rating_shown(const Shop *s) {
@@ -6085,6 +10176,24 @@ static int rating_shown(const Shop *s) {
 static int rating_in_graphics(const Shop *s) {
     return s->screen == SC_GRAPHICS || s->screen == SC_PAINT || s->screen == SC_VLAYER || s->screen == SC_VCAT ||
            s->screen == SC_VLIST || s->screen == SC_DLOC || s->screen == SC_DPICK;
+}
+/* GetNumberOfStars of a configuration (the career car's at the commit: C9 GetCurrentPlayerStarRating) */
+float shop_rate(const Shop *s, const N2CarConfig *c, const char *rim_folder, int rim_style) {
+    return s && c ? shop_rating(s, c, rim_folder, rim_style) : 0.0f;
+}
+/* the same for another car than the shop's (a loaded profile's career cars:
+   GetCurrentPlayerStarRating works from the car, so the stars never wait for
+   a shop commit); the rim size filter of the shop's car record is not used */
+float shop_rate_car(Shop *s, const char *car, const N2CarConfig *c, const char *rim_folder, int rim_style) {
+    if (!s || !c || !car || !car[0]) return 0.0f;
+    char keep[sizeof s->car];
+    memcpy(keep, s->car, sizeof keep);
+    snprintf(s->car, sizeof s->car, "%s", car);
+    int rok = g_shop_rec_ok; g_shop_rec_ok = 0;
+    float r = shop_rating(s, c, rim_folder ? rim_folder : "", rim_style);
+    g_shop_rec_ok = rok;
+    memcpy(s->car, keep, sizeof keep);
+    return r;
 }
 static void rating_update(Shop *s) {
     const N2CarConfig *b = rating_in_graphics(s) ? &s->gfx_base : &s->fitted;
@@ -6140,6 +10249,81 @@ static void draw_rating(Shop *s, const DC *dc) {
     s->nov = 0;
 }
 
+/* the memcard screens: MC_Main (its message and buttons, or just the
+   backdrop under the list / keyboard), MC_List, UI_VirtualKeyboard */
+static void kb_draw(Shop *s, const DC *dc) {
+    const FengPackage *pk = s->pk[PK_KEYBOARD];
+    if (!pk || !s->kb_anim) return;
+    static const char *otxt[FENG_MAX_OBJ];
+    static char ch[KB_CTL][2];
+    memset(otxt, 0, sizeof otxt);
+    for (int k = 0; k < KB_CTL; k++) {   /* UpdateVisuals 0x4ce500: "%c" of the map, blank keys empty */
+        int o = feng_find(pk, k_kb[k].txt);
+        if (o < 0) continue;
+        ch[k][0] = k_kb[k].ch; ch[k][1] = 0;
+        otxt[o] = ch[k];
+    }
+    static const uint32_t ctl_str[2] = { 0x0e00af3fu, 0x0e0204f4u };   /* KB_BTN_BACK / KB_BTN_DONE */
+    int o;
+    for (int c = 0; c < 2; c++)
+        if ((o = feng_find(pk, k_kb[KB_CTL + c].txt)) >= 0) otxt[o] = str_get(s, ctl_str[c]);
+    if ((o = feng_find(pk, O_KB_TEXT)) >= 0) otxt[o] = s->kb_text;
+    if ((o = feng_find(pk, O_TITLE)) >= 0) otxt[o] = str_get(s, 0x3de4eff0u);       /* LABEL_CREATE_USER_NAME */
+    if ((o = feng_find(pk, 0x64aff8d3u)) >= 0) otxt[o] = str_get(s, 0x95e10f41u);   /* KB_BTN_DELETE */
+    Texts t; memset(&t, 0, sizeof t);
+    draw_anim_package(s, dc, PK_KEYBOARD, s->kb_anim, &t, otxt);
+}
+static void mc_draw(Shop *s, const DC *dc0) {
+    DC dc = *dc0;
+    static const char *otxt[FENG_MAX_OBJ];
+    Texts t; memset(&t, 0, sizeof t);
+    unsigned char keep[FENG_MAX_OBJ];
+    memcpy(keep, s->qr_rowobj, sizeof keep);
+    memset(s->qr_rowobj, 0, sizeof s->qr_rowobj);
+    const FengPackage *pk = s->pk[PK_MC];
+    if (pk && s->mc_anim) {
+        memset(otxt, 0, sizeof otxt);
+        int o, msg = s->mc_view == MCV_MSG;
+        if ((o = feng_find(pk, O_MC_TITLE)) >= 0) otxt[o] = msg ? str_get(s, 0xb19f8b41u) : "";   /* SAVELOAD_TITLE_PC */
+        if ((o = feng_find(pk, O_DLG_BLURB)) >= 0) otxt[o] = msg ? s->mc_text : "";
+        for (int b = 0; b < 6; b++)
+            if ((o = feng_find(pk, O_MC_BTN + (uint32_t)b)) >= 0)
+                otxt[o] = msg && (s->mc_nbtn == 2 ? b < 2 : s->mc_nbtn == 1 && b == 2) ? mc_btn_text(s, b) : "";
+        draw_anim_package(s, &dc, PK_MC, s->mc_anim, &t, otxt);
+    }
+    const FengPackage *lp = s->pk[PK_MC_LIST];
+    if (s->mc_view == MCV_LIST && lp && s->mcl_anim) {
+        memset(otxt, 0, sizeof otxt);
+        for (int r = 0; r < MCL_ROWS; r++) {
+            int k = s->mc_ltop + r, on = qr_pool(lp, QP_NAME, r + 1), od = qr_pool(lp, QP_DATA, r + 1);
+            if (on >= 0) otxt[on] = k < s->mc_n ? s->mc_names[k] : "";
+            if (od >= 0) otxt[od] = "";
+        }
+        int o;
+        if ((o = feng_find(lp, O_MC_TITLE)) >= 0) otxt[o] = str_get(s, 0xc09b6bceu);   /* SAVE_LOAD_TITLE */
+        if ((o = feng_find(lp, O_MCL_HEAD)) >= 0) otxt[o] = str_get(s, s->mc_op == MCOP_DELETE ? 0x56b00632u : 0x0018ecffu);
+        if ((o = feng_find(lp, O_MCL_BACK)) >= 0) otxt[o] = str_get(s, s->mc_op == MCOP_BOOT ? STR_CANCEL : 0x001335f0u);
+        draw_anim_package(s, &dc, PK_MC_LIST, s->mcl_anim, &t, otxt);
+    }
+    if (s->mc_view == MCV_KB) kb_draw(s, &dc);
+    memcpy(s->qr_rowobj, keep, sizeof keep);
+}
+
+/* the movie letterboxed over black (IG_PlayMovie) */
+static void movie_draw(Shop *s, const DC *dc) {
+    static const float black[4] = { 0, 0, 0, 1 }, white[4] = { 1, 1, 1, 1 };
+    float v[20];
+    put_vert(v, -1, -1, 0, 1); put_vert(v + 5, 1, -1, 1, 1); put_vert(v + 10, 1, 1, 1, 0); put_vert(v + 15, -1, 1, 0, 0);
+    draw_quads(dc, 0, v, 1, black, 0);
+    int mw = 0, mh = 0;
+    GLuint mt = mplay_tex(s->mv, &mw, &mh);
+    if (!mt || mh <= 0) return;
+    float ma = MPLAY_ASPECT, hx = 1.0f, hy = 1.0f;
+    if (dc->asp > ma) hx = ma / dc->asp; else hy = dc->asp / ma;
+    put_vert(v, -hx, -hy, 0, 1); put_vert(v + 5, hx, -hy, 1, 1); put_vert(v + 10, hx, hy, 1, 0); put_vert(v + 15, -hx, hy, 0, 0);
+    draw_quads(dc, mt, v, 1, white, 0);
+}
+
 void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
     if (!s || width <= 0 || height <= 0) return;   /* rp NULL: before the engine's renderer exists */
     (void)quad;
@@ -6156,7 +10340,121 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
 
     Texts t; memset(&t, 0, sizeof t);
     char price[32], total[32];
+    {   /* the career's Paint Shop screens show the setup's Total Cost */
+        static char tot[24];
+        int on = s->career && (s->screen == SC_PAINT || s->screen == SC_VLAYER || s->screen == SC_VLIST ||
+                               s->screen == SC_DLOC || s->screen == SC_DPICK || s->screen == SC_GRAPHICS);
+        if (on) hud_num(tot, (int)sizeof tot, gfx_setup_price(s));
+        g_paint_total = on ? tot : NULL;
+        g_paint_price[0] = 0;
+        if (on && s->screen == SC_PAINT && s->vmode < 0 && s->paint_n && s->paint_mode)
+            hud_num(g_paint_price, (int)sizeof g_paint_price, setup_part_cost(s, paint_slot(s), s->paint_hash[s->paint_sel]));
+    }
+    g_player_txt = profile_named() ? profile_name() : str_get(s, STR_NO_PROFILE);
+    g_cash_txt = "";
+    s->alt_bound = 0;
+    if (s->alt_cur) {   /* SetAlternatingPlayerCash 80151d20 (the lot / crib: career mode by then): both
+                           strings set, "%s" the name, "%$d" the wallet (reprinted on each switch and after a
+                           buy -- the wallet only changes by a buy here, so it is printed every frame);
+                           alt_col fades them in turn, the name 0.75 s, the cash 5.0 s */
+        static char cash[24];
+        hud_num(cash, (int)sizeof cash, g_career.cash);
+        g_cash_txt = cash;
+    }
     switch (s->screen) {
+    case SC_START_CAREER:
+        t.title = str_get(s, STR_CAREER);
+        t.option = str_get(s, s->scar.e[s->scar.sel].str);
+        draw_package(s, &dc, s->pk[PK_START_CAREER] ? PK_START_CAREER : PK_OPT_MAIN, &t, 0, &s->scar, 0);
+        break;
+    case SC_MOVIE:
+        movie_draw(s, &dc);
+        break;
+    case SC_CRIB_SPONSORS: {   /* RefreshHeader 800d3278 */
+        static char sb[6][64];
+        static uint32_t xh[16]; static const char *xt[16];
+        int nx = 0;
+        const unsigned char *sp = s->csp_n ? s->csp[s->csp_sel] : NULL;
+        const char *nm = csp_name(s);
+        snprintf(sb[0], sizeof sb[0], "SPONSOR_%s", nm);
+        xh[nx] = 0xf13f76b4u; xt[nx++] = sp ? str_get(s, feng_hash(sb[0])) : "";
+        for (int i = 0; i < 10; i++) { xh[nx] = k_csp_terms[i]; xt[nx++] = s->csp_top + i < s->csp_nl ? s->csp_ln[s->csp_top + i] : ""; }
+        snprintf(sb[1], sizeof sb[1], "%d", sp ? (int)(int16_t)csp_u16(sp + 0xc) : 0);   /* the signing bonus */
+        xh[nx] = 0xf25b6bbau; xt[nx++] = sp ? sb[1] : "";
+        snprintf(sb[2], sizeof sb[2], "%d", career_url_purse(g_career.stage));            /* GetURLPurse */
+        xh[nx] = 0x7d8e1791u; xt[nx++] = sp ? sb[2] : "";
+        snprintf(sb[3], sizeof sb[3], "%d", sp ? (int)csp_u16(sp + 2) : 0);               /* the sponsor race purse */
+        xh[nx] = 0x195d8d22u; xt[nx++] = sp ? sb[3] : "";
+        snprintf(sb[4], sizeof sb[4], "SPONSOR_INFO_%s", nm);
+        xh[nx] = 0xf13cef3fu; xt[nx++] = sp ? str_get(s, feng_hash(sb[4])) : "";
+        t.xh = xh; t.xt = xt; t.nx = nx;
+        s->nov = 0;
+        ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0xb04669e3u;
+        snprintf(sb[5], sizeof sb[5], "DECAL_ICON_%s", nm);
+        const ShopTex *it = sp ? tex_find(s, feng_tex_key(sb[5])) : NULL;
+        if (it) ov->tex = it->tex; else ov->hide = 1;
+        ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = feng_hash("JOY_EVENT"); ov->hide = 1;
+        draw_package(s, &dc, PK_CRIB_SPONSORS, &t, 0, NULL, 0);
+        s->nov = 0;
+        break;
+    }
+    case SC_CRIB_WMAP:
+        cwm_draw(s, &dc, &t);
+        break;
+    case SC_MAG_REWARD: {   /* the 0xc98356ba tick: Mast / Chick / Extra once loaded; the PC button "Continue" */
+        static uint32_t xh[1]; static const char *xt[1];
+        static const uint32_t ob[3] = { 0xb6638240u, 0x82227f6du, 0x824fa72fu };
+        xh[0] = 0xb8a7c6cfu; xt[0] = str_get(s, 0xde02cf84u);
+        t.xh = xh; t.xt = xt; t.nx = 1;
+        s->nov = 0;
+        for (int i = 0; i < 3; i++) {
+            ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = ob[i];
+            if (s->mag_tex[i + 1]) ov->tex = s->mag_tex[i + 1]; else ov->hide = 1;
+        }
+        if (s->pk[PK_MAG_REWARD]) draw_package(s, &dc, PK_MAG_REWARD, &t, 0, NULL, 0);
+        s->nov = 0;
+        break;
+    }
+    case SC_CRIB_REWARDS:
+        t.option = str_get(s, s->crw.e[s->crw.sel].str);
+        draw_package(s, &dc, PK_CRIB_REWARDS, &t, s->crw.locked[s->crw.sel], &s->crw, 0);
+        break;
+    case SC_MAG_SELECT: {   /* PopulateDataInfoStuff 0x54b150, the 0xc98356ba tick 0x54b292 */
+        static uint32_t xh[4]; static const char *xt[4];
+        const unsigned char *sc = s->msel.n ? career_showcase(s->msel_e[s->msel.sel].group) : NULL;
+        uint32_t seed = sc ? n2_u32(sc + 0x28) : 0;
+        int nx = 0;
+        xh[nx] = 0x10cba23u; xt[nx++] = str_get(s, s->msel_mode == 1 ? 0x246536efu : 0xbb095ca1u);
+        xh[nx] = 0x9e302291u; xt[nx++] = sc ? str_get(s, hash_on(seed, "_TITLE")) : "";
+        xh[nx] = 0x3554deb1u; xt[nx++] = sc ? str_get(s, hash_on(seed, "_BODY")) : "";
+        t.xh = xh; t.xt = xt; t.nx = nx;
+        t.title = str_get(s, s->msel_mode == 1 ? 0xf7333312u : 0x653b26c4u);
+        t.option = sc ? xt[1] : "";
+        s->nov = 0;
+        ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0xd29141b4u;   /* MagThumb: texture +0x28 */
+        const ShopTex *th = sc ? tex_find(s, seed) : NULL;
+        if (th) ov->tex = th->tex; else ov->hide = 1;
+        draw_package(s, &dc, PK_MAG_SELECT, &t, 0, &s->msel, 0);
+        s->nov = 0;
+        break;
+    }
+    case SC_MAG_VIEW: {   /* the 0xc98356ba tick 0x565cc1: MagImage = the loaded photo */
+        s->nov = 0;
+        ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0xd1cc9c37u;
+        if (s->mview_tex) ov->tex = s->mview_tex; else ov->hide = 1;
+        draw_package(s, &dc, PK_MAG_VIEW, &t, 0, NULL, 0);
+        s->nov = 0;
+        break;
+    }
+    case SC_CRIB:   /* the package's own title */
+        t.option = str_get(s, s->crib.e[s->crib.sel].str);
+        draw_package(s, &dc, s->pk[PK_CRIB] ? PK_CRIB : PK_OPT_MAIN, &t, s->crib.locked[s->crib.sel], &s->crib, 0);
+        break;
+    case SC_PROFILE:
+        t.title = str_get(s, STR_PROFILE_MANAGER);
+        t.option = str_get(s, s->prof.e[s->prof.sel].str);
+        draw_package(s, &dc, s->pk[PK_PROFILE] ? PK_PROFILE : PK_OPT_MAIN, &t, 0, &s->prof, 0);
+        break;
     case SC_CAR_SHOP: case SC_BODY: case SC_GRAPHICS: case SC_SPECIALTIES: case SC_PERFORMANCE: {
         const Scroller *sc = s->screen == SC_CAR_SHOP ? &s->top : s->screen == SC_BODY ? &s->body : &s->cat;
         int p = s->screen == SC_PERFORMANCE && s->pk[PK_PERFORMANCE] ? PK_PERFORMANCE : PK_CATEGORY;
@@ -6179,11 +10477,13 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         t.title = str_get(s, STR_SPECIALTIES);
         t.option = s->neonm.n ? str_get(s, s->neonm.e[s->neonm.sel].str) : "";
         t.part = q ? q->name : "";
-        snprintf(price, sizeof price, "$%d", q ? q->price : 0);
-        snprintf(total, sizeof total, "$%d", q && (q->hash != s->fitted.neon[slot][0] ||
+        hud_num(price, (int)sizeof price, q ? q->price : 0);
+        hud_num(total, (int)sizeof total, q && (q->hash != s->fitted.neon[slot][0] ||
                  (unsigned)q->value != s->fitted.neon[slot][1]) ? q->price : 0);
         t.price = price; t.total = total;
+        s->nov = 0; price_hide(s, !s->career || s->cust_entry == 1);   /* RefreshHeader: PartPrice */
         draw_package(s, &dc, PK_PARTS, &t, 0, &s->neonm, 1);
+        s->nov = 0;
         break;
     }
     case SC_HUD: case SC_HUD_COL: {
@@ -6197,20 +10497,26 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         draw_anim_package(s, &dc, PK_CHUD, s->chud_anim, &ct, NULL);
         const ShopPart *q = s->nparts ? &s->parts[s->part_sel] : NULL;
         t.part = q ? q->name : "";
-        snprintf(price, sizeof price, "$%d", q ? q->price : 0);
+        hud_num(price, (int)sizeof price, q ? q->price : 0);
         t.price = price;
         if (s->screen == SC_HUD) {   /* the overlay goes while the colours are chosen (0x563d00) */
             s->nov = 0;
             ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0x0937e8f1u; ov->hide = 1;   /* the icon pool */
+            price_hide(s, !s->career || s->cust_entry == 1);   /* 0x548d20: PartPrice */
             draw_package(s, &dc, PK_CHUDOV, &t, 0, NULL, 1);
             s->nov = 0;
         }
         break;
     }
+    case SC_UNIQUES:
+        t.title = str_get(s, 0x9986a6e3u);                           /* RefreshHeader: 0x42adb44c */
+        t.option = !s->uqs.n ? "" : s->uq[s->uqs.sel].name[0] ? s->uq[s->uqs.sel].name : str_get(s, s->uq_e[s->uqs.sel].str);
+        draw_package(s, &dc, s->pk[PK_UNIQUE] ? PK_UNIQUE : PK_CATEGORY, &t, 0, &s->uqs, 0);
+        break;
     case SC_CARBON:
         t.title = str_get(s, STR_BODY_SHOP);
         t.option = s->cfm.n ? str_get(s, s->cfm.e[s->cfm.sel].str) : "";
-        draw_package(s, &dc, PK_CATEGORY, &t, 0, &s->cfm, 0);
+        draw_package(s, &dc, PK_CATEGORY, &t, s->cfm.locked[s->cfm.sel], &s->cfm, 0);
         break;
     case SC_SPLASH:
         draw_package(s, &dc, PK_SPLASH, &t, 0, NULL, 0);
@@ -6233,9 +10539,13 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
                       : s->qr_type == QR_SPRINT || s->qr_type == QR_DRAG ? 0xdb0c5efdu : 0x3b4a1ecbu;
         static const uint32_t xh[6] = { O_QR_TRACK_NAME, O_QR_RACE_TYPE, O_QR_DISTANCE,
                                         O_QR_BEST_LABEL, O_QR_BEST, O_QR_COMMENT };
-        const char *xt[6] = { r ? qr_track_name(s, ev, q->dir && r[0x86] == 1) : "",
+        static char rec[32];   /* FindBestDriftScore 0x502c50 / FindBestLapTime 0x502aa0 */
+        int rev = q->dir && r && r[0x86] == 1;
+        if (s->qr_type == QR_DRIFT) hud_num(rec, sizeof rec, hs_best_drift(ev, rev));
+        else hud_time_str(rec, hs_best_time(ev, rev, r));
+        const char *xt[6] = { r ? qr_track_name(s, ev, rev) : "",
                               str_get(s, qr_type_str(s->qr_type)), dist, str_get(s, best),
-                              "",                       /* no records without a profile */
+                              r ? rec : "",
                               str_get(s, feng_hash(comment_lbl)) };
         t.title = str_get(s, STR_QR_TRACK_TITLE);
         t.xh = xh; t.xt = xt; t.nx = 6;
@@ -6269,10 +10579,20 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         const FengPackage *pk = s->pk[PK_QR_CAR];
         const ShopCar *c = s->qr_ncar ? &s->cars[s->qr_car_list[s->qr_car_sel]] : NULL;
         static const uint32_t xh[4] = { O_TITLE, O_QR_FILTER, O_QR_RACE_MODE, O_QR_CUSTOMIZE };
-        const char *xt[4] = { str_get(s, STR_QR_CAR_TITLE), str_get(s, k_qr_filters[s->qr_filter].str),
+        const char *xt[4] = { str_get(s, s->qr_cust ? STR_QR_CUST_TITLE : STR_QR_CAR_TITLE),
+                              str_get(s, k_qr_filters[s->qr_filter].str),
                               str_get(s, qr_type_str(s->qr_type)), "" };
         t.xh = xh; t.xt = xt; t.nx = 4;
         s->nov = 0;
+        {   /* the PC's lone Accept token sits on the Customize prompt, unlabelled */
+            ObjOv *h = &s->ov[s->nov++]; memset(h, 0, sizeof *h); h->hash = 0xab9f2841u; h->hide = 1;
+        }
+        if (s->qr_cust) {   /* 0x4b2310 mode 0x20: no race; the tuned-car button (new car: hidden) */
+            static const uint32_t ch[3] = { O_QR_MODE_BOX, O_QR_CUSTOMIZE, O_QR_CUST_BTN };
+            for (int k = 0; k < 3; k++) {
+                ObjOv *h = &s->ov[s->nov++]; memset(h, 0, sizeof *h); h->hash = ch[k]; h->hide = 1;
+            }
+        }
         const ShopTex *ph = tex_find(s, K_GENERIC_PLACEHOLDER);
         char nm[64];
         ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_QR_LOGO;
@@ -6309,6 +10629,88 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         if (s->qr_car_sel == 0) { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_SCROLL_L; ov->hide = 1; }
         if (s->qr_car_sel >= s->qr_ncar - 1) { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_SCROLL_R; ov->hide = 1; }
         draw_package(s, &dc, PK_QR_CAR, &t, 0, NULL, 0);
+        s->nov = 0;
+        break;
+    }
+    case SC_CAREER_LOT: case SC_CRIB_CARSEL: {   /* UICareerCarLot / UICareerCribCarSelect: RefreshHeader (800d45f4 / 800d5594) */
+        int pid = s->screen == SC_CRIB_CARSEL ? PK_CRIB_CARSEL : PK_CAREER_LOT;
+        const FengPackage *pk = s->pk[pid];
+        if (!pk) break;
+        int ty = s->lot_hdr.type;
+        const ShopCar *c = ty >= 0 ? lot_car_info(s, ty) : NULL;
+        s->nov = 0;
+        const ShopTex *ph = tex_find(s, K_GENERIC_PLACEHOLDER);
+        char nm[64];
+        ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_QR_LOGO;   /* GetCarTypeLogoHash(type, 1) */
+        snprintf(nm, sizeof nm, "CARSELECT_MANUFACTURER_%s", c ? c->make : "");
+        const ShopTex *lt = c ? tex_find(s, feng_tex_key(nm)) : NULL;
+        if (!lt) lt = ph;
+        if (lt) ov->tex = lt->tex; else ov->hide = 1;
+        ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_QR_BADGE;         /* (type, 0) */
+        snprintf(nm, sizeof nm, "SECONDARY_LOGO_%s", ty >= 0 ? airace_type_name(ty) : "");
+        const ShopTex *bt = ty >= 0 ? tex_find(s, feng_tex_key(nm)) : NULL;
+        if (!bt) bt = ph;
+        if (bt) ov->tex = bt->tex; else ov->hide = 1;
+        /* UpdateSliders 800d4560: the car select's sliders (46 in from each end) */
+        float v3[3] = { c ? c->accel : 0.0f, c ? c->top_speed : 0.0f, c ? c->handling : 0.0f };
+        for (int k = 0; k < 3; k++) {
+            int ib = feng_find(pk, k_qr_slider[k][0]), ih = feng_find(pk, k_qr_slider[k][1]),
+                ic = feng_find(pk, k_qr_slider[k][2]);
+            if (ib < 0) continue;
+            float bw = fabsf(pk->obj[ib].size[0]), x0 = pk->obj[ib].ax - 0.5f * bw + 46.0f;
+            float len = bw - 92.0f, f = v3[k] < 0.0f ? 0.0f : v3[k] > 1.0f ? 1.0f : v3[k];
+            if (ih >= 0) {
+                ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = k_qr_slider[k][1]; ov->geom = 1;
+                ov->x = x0 + f * len; ov->y = pk->obj[ih].ay;
+                ov->w = fabsf(pk->obj[ih].size[0]); ov->h = fabsf(pk->obj[ih].size[1]);
+            }
+            if (ic >= 0) {
+                ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = k_qr_slider[k][2]; ov->geom = 1;
+                ov->w = f * len; ov->h = fabsf(pk->obj[ic].size[1]);
+                ov->x = x0 + 0.5f * ov->w; ov->y = pk->obj[ic].ay;
+                if (ov->w <= 0.0f) ov->hide = 1;
+            }
+        }
+        /* FEScrollBar::Update(1, n, idx) 80155720: one car or none hides the
+           handle and the arrows; else the handle (shown for idx != 0) at
+           SetPosNonResized 80155a30 along the backing, the arrows off at the ends */
+        int ihd = feng_find(pk, O_LOT_HANDLE), ibk = feng_find(pk, O_LOT_BACKING);
+        int n = s->lot_hdr.n, idx = s->lot_hdr.idx;
+        if (n <= 1 || idx == 0 || ihd < 0 || ibk < 0) {
+            ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_LOT_HANDLE; ov->hide = 1;
+        } else {
+            float bw = fabsf(pk->obj[ibk].size[0]), left = pk->obj[ibk].ax - 0.5f * bw;
+            float hw = fabsf(pk->obj[ihd].size[0]), f = (float)idx - 1.0f, cx;
+            if (f == 0.0f) cx = left + hw * 0.5f;
+            else if (f == (float)n - 1.0f) cx = left + bw - hw * 0.5f;
+            else cx = f * ((bw - hw) / (float)(n - 1 > 1 ? n - 1 : 1)) + left + hw * 0.5f;
+            ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_LOT_HANDLE; ov->geom = 1;
+            ov->x = cx; ov->y = pk->obj[ihd].ay;
+            ov->w = hw; ov->h = fabsf(pk->obj[ihd].size[1]);
+        }
+        if (n <= 1 || s->lot_hdr.first) { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_LOT_ARROW_1; ov->hide = 1; }
+        if (n <= 1 || s->lot_hdr.last) { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_LOT_ARROW_2; ov->hide = 1; }
+        static char slot_t[64], lock_t[256];
+        static const uint32_t csel_h[2] = { 0x6d221aa2u, 0xba5709c8u };   /* SLOT_TITLE, SPONSOR_LOCKED_TEXT */
+        static const char *csel_t[2] = { slot_t, lock_t };
+        if (pid == PK_CRIB_CARSEL) {
+            /* Setup: FILTERTYPE, TRADE_GROUP and JOY_EVENT(141 / 142) off */
+            static const uint32_t off[] = { 0xd999b6e7u, 0xd42f677bu, 0x9f24c659u, 0x9f24c67au };
+            for (int k = 0; k < (int)NELEM(off); k++) { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = off[k]; ov->hide = 1; }
+            snprintf(slot_t, sizeof slot_t, "%s %d", str_get(s, 0x93475966u), s->lot_hdr.idx);   /* "%s %d" */
+            int kind = s->lot_hdr.kind;
+            lock_t[0] = 0;
+            if (kind) {   /* CARBADGE and BOTTOM_GROUP off, SPONSOR_LOCKED_TEXT on, the logo the slot's art */
+                snprintf(lock_t, sizeof lock_t, "%s", str_get(s, kind == 1 ? 0xca89507eu : 0xc9f7f7e5u));
+                ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0xf5a9d520u; ov->hide = 1;
+                for (int k = 0; k < s->nov; k++) if (s->ov[k].hash == O_QR_BADGE) { s->ov[k].hide = 1; s->ov[k].tex = 0; }
+                const ShopTex *st = tex_find(s, kind == 1 ? 0xda665928u : K_TRACK_LOCKED);
+                for (int k = 0; k < s->nov; k++)
+                    if (s->ov[k].hash == O_QR_LOGO) { if (st) { s->ov[k].tex = st->tex; s->ov[k].hide = 0; } else s->ov[k].hide = 1; }
+            } else { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0xba5709c8u; ov->hide = 1; }
+            t.xh = csel_h; t.xt = csel_t; t.nx = 2;
+        }
+        draw_package(s, &dc, pid, &t, 0, NULL, 0);
         s->nov = 0;
         break;
     }
@@ -6402,7 +10804,11 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         for (int n = 0; n < s->perf_nrow; n++) {
             int on = perf_obj(s, "PartName_%d", n + 1), op = perf_obj(s, "PartPrice_%d", n + 1);
             if (on >= 0) otxt[on] = str_get(s, s->perf_row_name[n]);
-            if (op >= 0) otxt[op] = str_get(s, s->perf_row_price[n]);
+            if (op >= 0) otxt[op] = s->perf_row_price[n] ? str_get(s, s->perf_row_price[n]) : s->perf_row_cash[n];
+        }
+        if (s->career && !s->cust_entry) {
+            static const uint32_t cb[3] = { 0x06e0c9a8u, 0xbe8693e1u, 0x0380b632u };
+            for (int i = 0; i < 3; i++) { int o = feng_find(pk, cb[i]); if (o >= 0) otxt[o] = s->perf_cost_txt[i]; }
         }
         static const uint32_t xh[2] = { O_PERF_HEADER, O_PERF_TITLE };
         const char *xt[2] = { str_get(s, perf_cat_label(s->perf_cat)), str_get(s, k_perf_pkg[s->perfpkg.sel].str) };
@@ -6421,7 +10827,14 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
             for (int k = 0; k < s->buy_n; k++) {
                 int on = qr_pool(bp, QP_NAME, k + 1), od = qr_pool(bp, QP_DATA, k + 1);
                 if (on >= 0) otxt[on] = str_get(s, s->buy_name[k]);
-                if (od >= 0) otxt[od] = str_get(s, buy_installed(s, k) ? 0xed56be1fu : 0x4287206fu);
+                if (od >= 0) {   /* BuyPerfPartWidget::Draw 8030ef5c */
+                    static char bc[BUY_MAX][16];
+                    int i = s->buy_idx[k];
+                    if (buy_installed(s, k)) otxt[od] = str_get(s, 0xed56be1fu);
+                    else if (!s->career) otxt[od] = str_get(s, 0x4287206fu);
+                    else if (perf_bought(s, i)) otxt[od] = str_get(s, 0x0371711cu);
+                    else { hud_num(bc[k], (int)sizeof bc[k], perf_part_price(i)); otxt[od] = bc[k]; }
+                }
             }
             int o;
             if ((o = feng_find(bp, O_BUY_TORQUE)) >= 0) otxt[o] = s->buy_txt[0];
@@ -6431,6 +10844,7 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
             draw_anim_package(s, &dc, PK_PERF_BUY, s->buy_anim, &bt, otxt);
             memset(s->qr_rowobj, 0, sizeof s->qr_rowobj);
         }
+        if (s->brand_on) brand_draw(s, &dc);   /* pushed over the package screen (0x55bd60) */
         break;
     }
     case SC_CREDITS: {
@@ -6464,20 +10878,22 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         draw_package(s, &dc, s->pk[PK_RIMBRAND] ? PK_RIMBRAND : PK_CATEGORY, &t, 0, &s->rims, 0);
         break;
     case SC_RIMS: {
-        const ShopPart *q = s->nparts ? &s->parts[s->part_sel] : NULL;
+        const ShopPart *q = rim_cur(s);
         t.title = str_get(s, STR_RIM_STYLES);
         t.option = s->rims.n ? str_get(s, s->rims.e[s->rims.sel].str) : "";
         t.part = q ? q->name : "";
-        static char sized[64];   /* 0x5468a0: "%s %d", the name and the INNER_RADIUS of the size list's part */
+        static char sized[64];   /* 0x5468a0: "%s %d\"" (0x79c1c4), the name and the INNER_RADIUS of the size list's part */
         if (q && s->size_mode) {
-            snprintf(sized, sizeof sized, "%s %d", q->name, s->rim_sizes[s->part_sel][s->size_sel]);
+            snprintf(sized, sizeof sized, "%s %d\"", q->name, s->rim_sizes[s->part_sel][s->size_sel]);
             t.part = sized;
         }
         int changed = strcmp(s->prev_folder, s->rim_folder) || s->prev_style != s->rim_style;
-        snprintf(price, sizeof price, "$%d", q ? q->price : 0);
-        snprintf(total, sizeof total, "$%d", q && changed ? q->price : 0);
+        snprintf(price, sizeof price, "%d", q ? q->price : 0);   /* RimsBrowser 80165d20: "%d", not grouped */
+        hud_num(total, (int)sizeof total, q && changed ? q->price : 0);
         t.price = price; t.total = total;
+        s->nov = 0; price_hide(s, !s->career);                    /* the gamemode only */
         draw_package(s, &dc, s->pk[PK_RIMS] ? PK_RIMS : PK_PARTS, &t, 0, &s->rims, 1);
+        s->nov = 0;
         break;
     }
     case SC_VLAYER: {
@@ -6487,7 +10903,7 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         int movable = s->fitted.vinyl[s->vlay.sel] && vinyl_unique_at(&s->fitted) < 0;
         static const uint32_t hide[] = { O_VL_ARROW_L, O_VL_ARROW_R, O_VL_LTRIG, O_VL_RTRIG, O_VL_REORDER };
         s->nov = 0;
-        {   /* Customize, not the career: no cost (0x545460) */
+        if (!s->career) {   /* Customize, not the career: no cost (0x545460) */
             ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0x9ff84a88u; ov->hide = 1;
         }
         for (int k = 0; k < NELEM(hide); k++) {
@@ -6506,13 +10922,29 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         t.title = NULL;
         t.option = s->dloc.n ? str_get(s, s->dloc.e[s->dloc.sel].str) : "";
         s->nov = 0;
-        ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0x9ff84a88u; ov->hide = 1;
+        ObjOv *ov;
+        if (!s->career) { ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0x9ff84a88u; ov->hide = 1; }
         draw_package(s, &dc, s->pk[PK_DECAL] ? PK_DECAL : PK_CATEGORY, &t, 0, &s->dloc, 0);
         if (s->screen == SC_DPICK && s->pk[PK_DECALOV]) {
             const ShopPart *q = s->nparts ? &s->parts[s->part_sel] : NULL;
             Texts ot; memset(&ot, 0, sizeof ot);
             ot.part = q ? q->name : "";
-            ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = O_PART_PRICE; ov->hide = 1;
+            /* ChooseDecalScreen RefreshHeader (PC 0x546f40 / GC 80168d2c): the
+               price is GetCarPartCost of the LAYOUT part of the decal's
+               location (MapDecalSlotToDecalLayoutSlot 0x50e5a0: 0x34 + loc,
+               no wide-body translation), the paint setup's (0x5214d0) else
+               the installed one, "0" with neither; hidden on "No Decal" and
+               outside the career. Every layout part is level 0 (HOOD RECT
+               MEDIUM / SMALL ..., upgrade 0x100 / 0x101) and SetStockParts
+               80244784 installs the level-0 one in every layout slot, so with
+               entity 0x4c's level-0 rule it reads the decal level-1 price */
+            static char dprice[24];
+            int dloc = decal_loc_of(s->dslot);
+            const unsigned char *lr = decal_layout_rec(s, dloc, s->fitted.decal_layout[dloc] == 2);
+            if (lr) hud_num(dprice, (int)sizeof dprice, ent_price(s, slot_ent(0x34 + dloc), (lr[5] >> 5) & 7));
+            else snprintf(dprice, sizeof dprice, "0");
+            ot.price = dprice;
+            price_hide(s, !s->career || !q || !q->hash);
             draw_package(s, &dc, PK_DECALOV, &ot, 0, NULL, 1);
         }
         s->nov = 0;
@@ -6529,10 +10961,12 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         t.option = str_get(s, s->vcat.e[s->vcat.sel].str);
         t.part = q ? q->name : "";
         int changed = q && q->hash != s->fitted.vinyl[s->vlayer];
-        snprintf(price, sizeof price, "$%d", q ? q->price : 0);
-        snprintf(total, sizeof total, "$%d", changed ? q->price : 0);
+        hud_num(price, (int)sizeof price, q ? q->price : 0);
+        hud_num(total, (int)sizeof total, changed ? q->price : 0);
         t.price = price; t.total = total;
+        s->nov = 0; price_hide(s, !s->career || s->cust_entry == 1);   /* RefreshHeader: PartPrice */
         draw_package(s, &dc, PK_PARTS, &t, 0, &s->vcat, 1);
+        s->nov = 0;
         break;
     }
     case SC_TINT: {
@@ -6540,10 +10974,12 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         t.title = str_get(s, STR_SPECIALTIES);
         t.option = s->cat.n ? str_get(s, s->cat.e[s->cat.sel].str) : "";
         t.part = q ? q->name : "";
-        snprintf(price, sizeof price, "$%d", q ? q->price : 0);
-        snprintf(total, sizeof total, "$%d", q && tint_of(q) != s->fitted.tint ? q->price : 0);
+        hud_num(price, (int)sizeof price, q ? q->price : 0);
+        hud_num(total, (int)sizeof total, q && tint_of(q) != s->fitted.tint ? q->price : 0);
         t.price = price; t.total = total;
+        s->nov = 0; price_hide(s, !s->career || s->cust_entry == 1);   /* RefreshHeader: PartPrice */
         draw_package(s, &dc, PK_PARTS, &t, 0, &s->cat, 1);
+        s->nov = 0;
         break;
     }
     case SC_ICE:
@@ -6560,10 +10996,15 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
                    s->spec_slot == 0x22 ? str_get(s, 0xc8d23393u) :
                    s->cat.n ? str_get(s, s->cat.e[s->cat.sel].str) : "";
         t.part = q ? q->name : "";
-        snprintf(price, sizeof price, "$%d", q ? q->price : 0);
-        snprintf(total, sizeof total, "$%d", q && !spec_is_fitted(s, q) ? q->price : 0);
+        hud_num(price, (int)sizeof price, q ? q->price : 0);
+        hud_num(total, (int)sizeof total, q && !spec_is_fitted(s, q) ? q->price : 0);
         t.price = price; t.total = total;
+        s->nov = 0; price_hide(s, !s->career || s->cust_entry == 1);   /* RefreshHeader: PartPrice */
         draw_package(s, &dc, PK_PARTS, &t, 0, ice ? &s->icem : &s->cat, 1);
+        s->nov = 0;
+        if (s->nparts > 0 && button1_glyph(s) >= 0)
+            spec_open_prompt(s, &dc, PK_PARTS, s->spec_slot == 9 ? 0xeaa1d5dfu :
+                             s->spec_slot == 0xa0 ? 0x3e9431dcu : 0xba0e1020u);
         break;
     }
     case SC_BULB: {
@@ -6571,10 +11012,12 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         t.title = str_get(s, STR_SPECIALTIES);
         t.option = s->cat.n ? str_get(s, s->cat.e[s->cat.sel].str) : "";
         t.part = q ? q->name : "";
-        snprintf(price, sizeof price, "$%d", q ? q->price : 0);
-        snprintf(total, sizeof total, "$%d", q && q->hash != s->fitted.bulb ? q->price : 0);
+        hud_num(price, (int)sizeof price, q ? q->price : 0);
+        hud_num(total, (int)sizeof total, q && q->hash != s->fitted.bulb ? q->price : 0);
         t.price = price; t.total = total;
+        s->nov = 0; price_hide(s, !s->career || s->cust_entry == 1);   /* RefreshHeader: PartPrice */
         draw_package(s, &dc, PK_PARTS, &t, 0, &s->cat, 1);
+        s->nov = 0;
         break;
     }
     case SC_PARTS: {
@@ -6583,14 +11026,17 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         t.option = s->cf_mode ? str_get(s, s->cfm.e[s->cfm.sel].str) : str_get(s, s->body.e[s->body.sel].str);
         t.part = q ? q->name : "";
         int changed = memcmp(&s->preview, &s->fitted, sizeof s->preview) != 0;
-        snprintf(price, sizeof price, "$%d", q ? q->price : 0);
-        snprintf(total, sizeof total, "$%d", q && changed ? q->price : 0);
+        hud_num(price, (int)sizeof price, q ? q->price : 0);
+        hud_num(total, (int)sizeof total, q && changed ? q->price : 0);
         t.price = price; t.total = total;
+        s->nov = 0; price_hide(s, !s->career || s->cust_entry == 1);   /* RefreshHeader: PartPrice */
         draw_package(s, &dc, PK_PARTS, &t, q && !q->available, s->cf_mode ? &s->cfm : &s->body, 1);
+        s->nov = 0;
         break;
     }
     }
     if (rating_shown(s)) draw_rating(s, &dc);
+    if (s->mc_view != MCV_OFF) mc_draw(s, &dc);
     if (dlg_open(s) && s->dlg_anim) {         /* the dialog over the screen */
         const FengPackage *pk = s->pk[s->dlg_pk];
         static const char *otxt[FENG_MAX_OBJ];
@@ -6613,4 +11059,39 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
     if (depth_on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (blend_on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
     if (cull_on) glEnable(GL_CULL_FACE);
+}
+
+/* UI_MagazineBack.fng under the car (the 0xc98356ba tick: MagazineBack once
+   loaded), drawn into the 3D frame before the car */
+void shop_draw_under(Shop *s, const RProg *rp, int width, int height) {
+    if (!s || !s->prog || s->screen != SC_MAG_REWARD || !s->pk[PK_MAG_BACK] || width <= 0 || height <= 0) return;
+    DC dc; dc.s = s; dc.rp = rp; dc.asp = (float)width / (float)height; dc.pin = 0.0f; dc.cover = 0; dc.fade = 0.0f;
+    GLboolean depth_on = glIsEnabled(GL_DEPTH_TEST), blend_on = glIsEnabled(GL_BLEND);
+    GLboolean cull_on = glIsEnabled(GL_CULL_FACE);
+    GLboolean depth_mask = GL_TRUE; glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(s->prog);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(s->u_tex, 0);
+    Texts t; memset(&t, 0, sizeof t);
+    s->nov = 0;
+    ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov); ov->hash = 0xb65d77fcu;
+    if (s->mag_tex[0]) ov->tex = s->mag_tex[0]; else ov->hide = 1;
+    draw_package(s, &dc, PK_MAG_BACK, &t, 0, NULL, 0);
+    s->nov = 0;
+    if (rp) glUseProgram(rp->prog);
+    glDepthMask(depth_mask);
+    if (depth_on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (blend_on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (cull_on) glEnable(GL_CULL_FACE);
+}
+
+/* the perf shop's Test Track: the EXIT it raised is BeginCarTuning(entry 1) */
+int shop_take_tt(Shop *s) { int r = s ? s->tt_req : 0; if (s) s->tt_req = 0; return r; }
+/* back from the test track (DoQuitTuning entry 1 -> UI_ChoosePerformanceCategory,
+   FEngSetLastButton): the Test Track button selected */
+void shop_perf_select_tt(Shop *s) {
+    if (!s || s->screen != SC_PERFORMANCE) return;
+    for (int i = 0; i < s->cat.n; i++) if (s->cat.e[i].group == PERF_TEST_TRACK) s->cat.sel = i;
 }

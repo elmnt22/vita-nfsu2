@@ -9,6 +9,10 @@
 
 #include "physics.h"
 
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
+#define HITCH_THREAD 1   /* the frame thread counters in hitch_report */
+#include <psp2/kernel/threadmgr.h>
+#endif
 #ifdef __vita__
 void vita_mark(const char *fmt, ...);
 #define VMARK(...) vita_mark(__VA_ARGS__)
@@ -193,6 +197,7 @@ void world_resident_resources_free(WorldResidentResources *resources) {
     free(resources->obstacles);
     free(resources->obstacle_z);
     free(resources->obstacle_src);
+    phys_wall_index_drop(resources->wall_index);
     memset(resources, 0, sizeof *resources);
 }
 
@@ -289,6 +294,10 @@ static int resident_worker_precompute(WorldResident *candidate) {
     if (!r->obstacles || !r->obstacle_z || !r->obstacle_src) return 0;
     r->obstacle_count = phys_collect_walls(scene, r->obstacles, r->obstacle_src,
                                            r->obstacle_z, n);
+    /* their broad-phase index too: activation only installs it (hwlog28:
+       building it there was 5-6 ms of the frame) */
+    r->wall_index = phys_wall_index_make((const float (*)[4])r->obstacles,
+                                         (const float (*)[2])r->obstacle_z, r->obstacle_count);
     VMARK("  worker: %d collision walls", r->obstacle_count);
     if (world_build_aborted()) return 0;
     SDL_AtomicSet(&resident_tex_fetch, 1);
@@ -305,7 +314,7 @@ static int resident_worker_precompute(WorldResident *candidate) {
         for (int i = 0; i < n; i++) {
             if ((i & 31) == 0 && world_build_aborted()) return 0;
             const N2Mesh *m = &scene->meshes[i];
-            if (m->world_role == 1 || m->cat == N2_SKY || m->cat == N2_GLOW) continue;   /* not world batches */
+            if (m->world_role == 1 || m->world_role == 3 || m->cat == N2_SKY || m->cat == N2_GLOW) continue;   /* not world batches (3: smokeable.c draws it) */
             if (m->shared_geometry && m->shared_geometry->packed) reused_packed++;
             render_pack_mesh(m, &r->mesh_packed[i]);
         }
@@ -344,14 +353,31 @@ int world_resident_precompute(WorldResident *candidate) {
 }
 #endif
 
-#define HITCH_MAX 64
+#define HITCH_MAX 160
 static struct { const char *label; Uint64 t; } g_hitch[HITCH_MAX];
 static int g_hitch_n = -1;   /* -1: no open span */
 static Uint64 g_hitch_t0;
+#ifdef HITCH_THREAD
+/* The frame thread's own counters over the span: how often another thread
+   or an interrupt took its core, how often it waited (a lock, a sleep), and
+   its time inside malloc / free (sdl_vita.c) -- a stage that runs long with
+   no work of its own to show for it was waiting on one of these. */
+static SceKernelThreadInfo g_hitch_ti;
+static int hitch_thread_info(SceKernelThreadInfo *ti) {
+    memset(ti, 0, sizeof *ti);
+    ti->size = sizeof *ti;
+    return sceKernelGetThreadInfo(sceKernelGetThreadId(), ti) >= 0;
+}
+extern void vita_heap_main_take(double *sum_ms, double *max_ms, int *calls);
+#endif
 
 void hitch_begin(void) {
     g_hitch_t0 = SDL_GetPerformanceCounter();
     g_hitch_n = 0;
+#ifdef HITCH_THREAD
+    if (!hitch_thread_info(&g_hitch_ti)) g_hitch_ti.size = 0;
+    { double s, m; int c; vita_heap_main_take(&s, &m, &c); }   /* the span's own heap time from here */
+#endif
 }
 
 void hitch_mark(const char *label) {
@@ -366,6 +392,27 @@ void hitch_report(double threshold_ms) {
     double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
     Uint64 end = SDL_GetPerformanceCounter();
     double total = (double)(end - g_hitch_t0) * f;
+    double tpre = 0, tintr = 0, twait = 0, trun = 0, heap = 0, heap_max = 0;
+    int heap_calls = 0;
+#ifdef HITCH_THREAD
+    {
+        SceKernelThreadInfo ti;
+        if (g_hitch_ti.size && hitch_thread_info(&ti)) {
+            tpre = (double)(ti.threadPreemptCount - g_hitch_ti.threadPreemptCount);
+            tintr = (double)(ti.intrPreemptCount - g_hitch_ti.intrPreemptCount);
+            twait = (double)(ti.threadReleaseCount - g_hitch_ti.threadReleaseCount);
+            trun = (double)(ti.runClocks - g_hitch_ti.runClocks) / 1000.0;
+        }
+        vita_heap_main_take(&heap, &heap_max, &heap_calls);
+    }
+    /* in a race a long update is worth a line from 20 ms (at most 2 a second) */
+    {
+        static Uint64 last_line;
+        Uint64 now = SDL_GetPerformanceCounter();
+        if (threshold_ms > 20.0 && total >= 20.0 && total < threshold_ms &&
+            (double)(now - last_line) * f > 500.0) { threshold_ms = 20.0; last_line = now; }
+    }
+#endif
     if (total >= threshold_ms) {
         char line[1024];
         int len = snprintf(line, sizeof line, "hitch %.1f ms:", total);
@@ -379,8 +426,64 @@ void hitch_report(double threshold_ms) {
         }
         double rest = (double)(end - prev) * f;
         if (rest >= 1.0 && len < (int)sizeof line - 32)
-            snprintf(line + len, sizeof line - (size_t)len, " rest=%.1f", rest);
+            len += snprintf(line + len, sizeof line - (size_t)len, " rest=%.1f", rest);
+#ifdef HITCH_THREAD
+        if (len < (int)sizeof line - 120)
+            snprintf(line + len, sizeof line - (size_t)len,
+                     " | main thread: preempted %.0f, interrupts %.0f, waits %.0f, ran %.1f ms; heap %.2f ms (%d calls, max %.2f)",
+                     tpre, tintr, twait, trun, heap, heap_calls, heap_max);
+#endif
         printf("%s\n", line);
+    }
+    /* rolling split of the frame's update: per label ms/frame (a label hit
+       twice in a frame, e.g. once per sim tick, adds up), logged every 300
+       frames */
+    {
+        enum { SPLIT_MAX = 160, SPLIT_FRAMES = 300 };
+        static const char *s_label[SPLIT_MAX];
+        static double s_sum[SPLIT_MAX], s_max[SPLIT_MAX], s_total, s_total_max;
+        static double s_pre, s_pre_max, s_wait, s_wait_max, s_heap, s_heap_max, s_heap1;
+        static int s_n, s_frames;
+        double fr[SPLIT_MAX] = {0};
+        Uint64 prev = g_hitch_t0;
+        for (int i = 0; i < g_hitch_n; i++) {
+            double ms = (double)(g_hitch[i].t - prev) * f;
+            prev = g_hitch[i].t;
+            int k = 0;
+            while (k < s_n && s_label[k] != g_hitch[i].label) k++;
+            if (k == s_n) { if (s_n == SPLIT_MAX) continue; s_label[s_n++] = g_hitch[i].label; }
+            fr[k] += ms;
+        }
+        for (int k = 0; k < s_n; k++) {
+            s_sum[k] += fr[k];
+            if (fr[k] > s_max[k]) s_max[k] = fr[k];
+        }
+        s_total += total;
+        if (total > s_total_max) s_total_max = total;
+        s_pre += tpre + tintr; if (tpre + tintr > s_pre_max) s_pre_max = tpre + tintr;
+        s_wait += twait; if (twait > s_wait_max) s_wait_max = twait;
+        s_heap += heap; if (heap > s_heap_max) s_heap_max = heap;
+        if (heap_max > s_heap1) s_heap1 = heap_max;
+        if (++s_frames >= SPLIT_FRAMES) {
+            char line[2048];
+            int len = snprintf(line, sizeof line, "sim split ms/frame over %d frames: total %.1f (max %.1f)",
+                               s_frames, s_total / s_frames, s_total_max);
+            for (int k = 0; k < s_n && len < (int)sizeof line - 48; k++)
+                if (s_sum[k] / s_frames >= 0.005 || s_max[k] >= 5.0)
+                    len += snprintf(line + len, sizeof line - (size_t)len, " %s=%.3f/%.1f",
+                                    s_label[k], s_sum[k] / s_frames, s_max[k]);
+#ifdef HITCH_THREAD
+            if (len < (int)sizeof line - 140)
+                snprintf(line + len, sizeof line - (size_t)len,
+                         " | main thread per frame: preempted %.2f (max %.0f), waits %.2f (max %.0f), heap %.3f ms (max %.2f, one call %.2f)",
+                         s_pre / s_frames, s_pre_max, s_wait / s_frames, s_wait_max, s_heap / s_frames, s_heap_max, s_heap1);
+#endif
+            printf("%s\n", line);
+            s_pre = s_pre_max = s_wait = s_wait_max = s_heap = s_heap_max = s_heap1 = 0;
+            for (int k = 0; k < s_n; k++) s_sum[k] = s_max[k] = 0;
+            s_total = s_total_max = 0;
+            s_frames = 0;
+        }
     }
     g_hitch_n = -1;
 }
@@ -435,12 +538,25 @@ static int resident_resources_step(WorldResidentResources *resources,
         facade.neighborhood = *neighborhood;
         /* ponytail: eight uncached attempts, not a time deadline; split an
          * individual decode/upload only if one texture is a measured stall. */
-        int bound = world_bind_textures_step(
+        int bound;
+#ifdef __vita__
+        if (sliced && max_batches < 128) {
+            /* smooth: up to 8 uploads, one at a time, until 4 ms are gone
+               (hwlog29: 8 at once reached 9.5 ms with large textures) */
+            Uint64 limit = SDL_GetPerformanceFrequency() * 4 / 1000;
+            int k = 0;
+            do bound = world_bind_textures_step(
+                    &facade, resources->texture_keys, resources->textures,
+                    resources->texture_modes, texture_cap, &resources->texture_binding, 1);
+            while (!bound && ++k < 8 && SDL_GetPerformanceCounter() - texture_begin < limit);
+        } else
+#endif
+        bound = world_bind_textures_step(
             &facade, resources->texture_keys, resources->textures,
             resources->texture_modes, texture_cap, &resources->texture_binding,
             max_batches == INT_MAX ? INT_MAX :
 #ifdef __vita__
-            max_batches >= 128 ? 16 : 8);   /* urgent : smooth (decoded on the worker; upload only) */
+            16);   /* urgent (decoded on the worker; upload only) */
 #else
             8);
 #endif
@@ -491,6 +607,11 @@ static int resident_resources_step(WorldResidentResources *resources,
         if (sliced) return 0;
     }
 
+    /* hwlog28: grass + sky/glow + plan in one frame were 15-20 ms, and the
+       upload's tail (sorting, normals, vista) as much again -- the frames
+       that set off the 3-tick catch-up. Unhurried (smooth) finishes take
+       them one frame each; the urgent ones keep going. */
+    int smooth = sliced && max_batches < 128;
     if (resources->setup_stage == 2) {
         Uint64 texture_begin = SDL_GetPerformanceCounter();
         if (neighborhood->have_grass)
@@ -500,16 +621,33 @@ static int resident_resources_step(WorldResidentResources *resources,
         if (timing) timing->textures_ms = (uint32_t)(
             resources->texture_ticks * 1000 / SDL_GetPerformanceFrequency());
         VMARK("  resident: %d textures uploaded", resources->texture_count);
-
+        resources->setup_stage = 7;
+        if (smooth) return 0;
+    }
+    if (resources->setup_stage == 7) {
         Uint64 batch_begin = SDL_GetPerformanceCounter();
         resources->sky_count = upload_cat_batches(
             &neighborhood->scene, N2_SKY, resources->mesh_textures,
             &resources->sky, NULL);
+        if (resources->sky_count < 0) goto fail;
+        hitch_mark("fin.sky");
+        resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+        resources->setup_stage = 10;
+        if (smooth) return 0;   /* hwlog29: sky + glow together reached 9 ms */
+    }
+    if (resources->setup_stage == 10) {
+        Uint64 batch_begin = SDL_GetPerformanceCounter();
         resources->glow_count = upload_cat_batches(
             &neighborhood->scene, N2_GLOW, resources->mesh_textures,
             &resources->glow, NULL);
         if (resources->sky_count < 0 || resources->glow_count < 0) goto fail;
         hitch_mark("fin.sky_glow");
+        resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+        resources->setup_stage = 8;
+        if (smooth) return 0;
+    }
+    if (resources->setup_stage == 8) {
+        Uint64 batch_begin = SDL_GetPerformanceCounter();
         if (resources->cpu_plan) {
             if (upload_world_batches_bind_prepared(resources->cpu_plan,
                     resources->mesh_textures,resources->terrain_texture,resources->mesh_modes)) {
@@ -535,19 +673,23 @@ static int resident_resources_step(WorldResidentResources *resources,
     }
 
     Uint64 batch_begin = SDL_GetPerformanceCounter();
-    hitch_mark("fin.pre_upload");
-    int uploaded = upload_world_batches_step(&resources->upload, max_batches,
-                        &resources->ordinary, &resources->ordinary_count,
-                        resources->mesh_batch);
-    if (uploaded < 0) goto fail;
-    if (!uploaded) {
-        resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
-        return 0;
+    if (resources->setup_stage == 3) {
+        hitch_mark("fin.pre_upload");
+        int uploaded = upload_world_batches_step(&resources->upload, max_batches,
+                            &resources->ordinary, &resources->ordinary_count,
+                            resources->mesh_batch);
+        if (uploaded < 0) goto fail;
+        if (!uploaded) {
+            resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+            return 0;
+        }
+        if (resources->ordinary_count <= 0 || !resources->ordinary) goto fail;
+        hitch_mark("fin.batch_upload");
+        VMARK("  resident: %d world batches uploaded", resources->ordinary_count);
+        hitch_mark("fin.vmark_batches");
+        resources->setup_stage = 9;
+        if (smooth) { resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin; return 0; }
     }
-    if (resources->ordinary_count <= 0 || !resources->ordinary) goto fail;
-    hitch_mark("fin.batch_upload");
-    VMARK("  resident: %d world batches uploaded", resources->ordinary_count);
-    hitch_mark("fin.vmark_batches");
     resident_free_normals(resources);
     hitch_mark("fin.free_normals");
     if (include_vista && !resident_vista_batches(resources, neighborhood)) goto fail;

@@ -24,6 +24,11 @@ void aciddraw_free(void);
    blending off, depth writes on and the program unbound. Returns quads drawn. */
 int  aciddraw_draw(const float V[16], const float PV[16], float proj, const AcidOwner *incar);
 
+/* eLightFlare pool (0x48ab20 add, 0x494280 draw, eRenderLightFlare 0x490920,
+   flare type 3/4 = the normal view): a light flare of type 0..14 at pos for
+   this frame, drawn and cleared by the next aciddraw_draw. */
+void aciddraw_light_flare(const float pos[3], int type);
+
 #ifdef __cplusplus
 }
 #endif

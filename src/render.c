@@ -26,8 +26,16 @@
 
 #ifdef N2_GLES
 #  define GLSL_HEADER "precision mediump float;\n"
+/* Vertex shaders whose positions are absolute world coordinates (|x| up to
+   ~2000 m): at mediump the clip z of geometry near the camera is off by
+   metres, and a road or kerb under the chase camera wrote a depth in front
+   of the player's car and hid it (career free roam at the airport lot, on
+   GLES drivers that honour mediump in vertex shaders). The car's own shader
+   works in model space and keeps GLSL_HEADER. */
+#  define GLSL_VS_HEADER "precision highp float;\n"
 #else
 #  define GLSL_HEADER "#version 120\n#define lowp\n#define mediump\n#define highp\n"
+#  define GLSL_VS_HEADER GLSL_HEADER
 #endif
 /* Depth of field (render_set_dof): with it on, the original draws every
    opaque world / car / character mesh a second time with the effect's depth
@@ -165,7 +173,7 @@ int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
 }
 
 static const char *VS =
-    GLSL_HEADER
+    GLSL_VS_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
     "uniform mat4 uMVP; uniform mat4 uModel; varying vec2 vUV; varying vec3 vN; varying float vDepth;\n"
     "varying vec3 vPos; varying vec4 vColor;\n"
@@ -652,7 +660,7 @@ void free_headlight_shadows(HeadlightShadows *s) {
 }
 
 static int headlight_shadow_init(HeadlightShadows *s) {
-    const char *vs=GLSL_HEADER
+    const char *vs=GLSL_VS_HEADER
         "attribute vec3 aPos;attribute vec2 aUV;uniform mat4 uMVP;"
         "varying vec2 uv;varying float vShadowDist;"
         "void main(){uv=aUV;gl_Position=uMVP*vec4(aPos,1.0);vShadowDist=gl_Position.w;}";
@@ -880,7 +888,7 @@ static const char *FS_WORLD_LITE_OPAQUE =
    the alpha test and fog. World normals are flat per face, so the result
    matches FS_WORLD_LITE. */
 static const char *VS_WORLD_LITE =
-    GLSL_HEADER
+    GLSL_VS_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
     "uniform mat4 uMVP; uniform mat4 uModel;\n"
     "uniform float uVColor, uAmbient, uDiffuse; uniform vec3 uLight;\n"
@@ -912,7 +920,7 @@ static const char *FS_WORLD_LITE_CUTOUT =
    Here the lit/prelit colour is FS_WORLD_LITE_OPAQUE's, and the reflection
    is added before fog as the original's per-vertex fog then blends both. */
 static const char *VS_WORLD_REFL =
-    GLSL_HEADER
+    GLSL_VS_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
     "uniform mat4 uMVP; uniform mat4 uModel; varying vec2 vUV; varying vec3 vN; varying float vDepth;\n"
     "varying vec4 vColor; varying vec3 vRefl;\n"
@@ -959,7 +967,7 @@ static const char *FS_SKY_OPAQUE =
    the per-pixel one wherever the clamp is not active); uTextureAlpha is 0 or
    1, so the alpha select becomes a mix. */
 static const char *VS_WORLD_FAST =
-    GLSL_HEADER
+    GLSL_VS_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec4 aColor;\n"
     "uniform mat4 uMVP; uniform float uFogDensity, uFogK, uFogFloor;\n"
     "varying vec2 vUV; varying vec3 vCol; varying vec2 vFog;\n"
@@ -1291,6 +1299,73 @@ GpuMesh *upload_scene(N2Scene *s) {
     return gm;
 }
 
+/* Draw merging for a car drawn as a whole (the AI cars): the meshes 'ok'
+   marks that share every per-draw state (category, vertex colour, texture,
+   material, trim) become one buffer set, drawn at the first one's place.
+   lead[i] = merged index for a group's first mesh, -1 for the other
+   members, -2 for meshes left alone. Same vertices, normals and colours as
+   upload_scene, so the picture is the same with fewer draws. */
+GpuMesh *upload_scene_merged(const N2Scene *s, const GpuMesh *gm, const unsigned char *ok,
+                             short *lead, int *nout) {
+    *nout = 0;
+    for (int i = 0; i < s->count; i++) lead[i] = -2;
+    GpuMesh *out = (GpuMesh *)calloc((size_t)s->count, sizeof(GpuMesh));
+    int *members = (int *)malloc((size_t)s->count * sizeof(int));
+    if (!out || !members) { free(out); free(members); return NULL; }
+    int n = 0;
+    for (int i = 0; i < s->count; i++) {
+        if (!ok[i] || lead[i] != -2) continue;
+        const N2Mesh *a = &s->meshes[i];
+        int nm = 0, nv = 0, ni = 0;
+        for (int j = i; j < s->count; j++) {
+            if (!ok[j] || lead[j] != -2) continue;
+            const N2Mesh *b = &s->meshes[j];
+            if (gm[j].cat != gm[i].cat || !b->vcol != !a->vcol || gm[j].texkey != gm[i].texkey ||
+                gm[j].car_material != gm[i].car_material || gm[j].trim != gm[i].trim) continue;
+            if (nv + b->nverts > 65535) continue;          /* 16-bit indices */
+            members[nm++] = j; nv += b->nverts; ni += b->nidx;
+            lead[j] = -1;
+        }
+        lead[i] = (short)n;
+        float *pos = (float *)malloc((size_t)nv * 5 * sizeof(float));
+        float *nor = (float *)calloc((size_t)nv * 3, sizeof(float));
+        uint16_t *idx = (uint16_t *)malloc((size_t)ni * sizeof(uint16_t));
+        unsigned char *col = a->vcol ? (unsigned char *)malloc((size_t)nv * 4) : NULL;
+        if (!pos || !nor || !idx || (a->vcol && !col)) {
+            free(pos); free(nor); free(idx); free(col);
+            for (int q = 0; q < nm; q++) lead[members[q]] = -2;   /* drawn alone */
+            continue;
+        }
+        int vo = 0, io = 0;
+        for (int q = 0; q < nm; q++) {
+            const N2Mesh *b = &s->meshes[members[q]];
+            memcpy(pos + 5 * vo, b->verts, (size_t)b->nverts * 5 * sizeof(float));
+            mesh_normals(b, nor + 3 * vo);
+            if (col) memcpy(col + 4 * vo, b->vcol, (size_t)b->nverts * 4);
+            for (int t = 0; t < b->nidx; t++) idx[io + t] = (uint16_t)(b->idx[t] + vo);
+            vo += b->nverts; io += b->nidx;
+        }
+        GpuMesh *g = &out[n];
+        glGenBuffers(1, &g->vbo); glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * 5 * sizeof(float), pos, GL_STATIC_DRAW);
+        glGenBuffers(1, &g->nbo); glBindBuffer(GL_ARRAY_BUFFER, g->nbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * 3 * sizeof(float), nor, GL_STATIC_DRAW);
+        if (col) {
+            glGenBuffers(1, &g->cbo); glBindBuffer(GL_ARRAY_BUFFER, g->cbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * 4, col, GL_STATIC_DRAW);
+        }
+        glGenBuffers(1, &g->ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)ni * sizeof(uint16_t), idx, GL_STATIC_DRAW);
+        g->nidx = ni; g->cat = gm[i].cat; g->texkey = gm[i].texkey; g->trim = gm[i].trim;
+        g->draw_mode = gm[i].draw_mode; g->car_material = gm[i].car_material;
+        free(pos); free(nor); free(idx); free(col);
+        n++;
+    }
+    free(members);
+    *nout = n;
+    return out;
+}
+
 void render_mesh_repose(GpuMesh *g, const N2Mesh *m, const float *M) {
     if (!g || !m || !g->vbo || !g->nbo || m->nverts <= 0 || !m->verts) return;
     float *nor = (float *)calloc((size_t)m->nverts * 3, sizeof(float));
@@ -1558,6 +1633,21 @@ static void batch_audit_report(const N2Scene *s, const BSortEnt *ent, int i0, in
     }
 }
 
+/* A batch's CPU copy lives only until glBufferData copies it: one grow-only
+   pair (vertices, indices) on the GL thread instead of a malloc + free per
+   batch, which from 64 KB up is a kernel block each (sdl_vita.c BIGBLK_MIN)
+   and used to leave heap holes between streaming builds. */
+static void *g_batch_scr[2]; static size_t g_batch_scr_cap[2];
+static void *batch_scratch(int k, size_t n) {
+    if (n > g_batch_scr_cap[k]) {
+        size_t cap = (n + (n >> 2) + 0xFFFF) & ~(size_t)0xFFFF;
+        free(g_batch_scr[k]);
+        g_batch_scr[k] = malloc(cap);
+        g_batch_scr_cap[k] = g_batch_scr[k] ? cap : 0;
+    }
+    return g_batch_scr[k];
+}
+
 /* merge meshes [i0,i1) of the sort array into one uploaded batch */
 static float *const *g_batch_normals;   /* set for the duration of a step */
 static PackedMesh *g_batch_packed;
@@ -1607,9 +1697,9 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
         }
     }
 #endif
-    BatchedVertex *bv = (BatchedVertex *)malloc((size_t)nv * sizeof *bv);
-    uint16_t *bi = (uint16_t *)malloc((size_t)ni * sizeof *bi);
-    if (!bv || !bi) { free(bv); free(bi); return 0; }
+    BatchedVertex *bv = (BatchedVertex *)batch_scratch(0, (size_t)nv * sizeof *bv);
+    uint16_t *bi = (uint16_t *)batch_scratch(1, (size_t)ni * sizeof *bi);
+    if (!bv || !bi) return 0;
     float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
     int vo = 0, io = 0;
     for (int k = i0; k < i1; k++) {
@@ -1632,7 +1722,7 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
         }
         float *pre = g_batch_normals ? g_batch_normals[ent[k].idx] : NULL;
         float *nor = pre ? pre : (float *)calloc((size_t)m->nverts * 3, sizeof(float));
-        if (!nor) { free(bv); free(bi); return 0; }
+        if (!nor) return 0;
         if (!pre) mesh_normals(m, nor);   /* per source mesh: no cross-mesh smoothing */
         for (int v = 0; v < m->nverts; v++) {
             BatchedVertex *o = &bv[vo + v]; const float *p = m->verts + v*5;
@@ -1686,7 +1776,7 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, bi, GL_STATIC_DRAW);
     if (glGetError() != GL_NO_ERROR) {
         glDeleteBuffers(1, &b->vbo); glDeleteBuffers(1, &b->ibo);
-        memset(b, 0, sizeof *b); free(bv); free(bi); return 0;
+        memset(b, 0, sizeof *b); return 0;
     }
 #ifdef __vita__
     if (g_batch_reuse) {
@@ -1718,7 +1808,6 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
        sort first, which is what `texkey` reported. */
     b->unresolved = (unsigned char)(!tex && named == i1 - i0);
     for (int c = 0; c < 3; c++) { b->bbox_min[c] = mn[c]; b->bbox_max[c] = mx[c]; }
-    free(bv); free(bi);
 #ifdef __vita__
     g_batch_gl_us += sceKernelGetProcessTimeWide() - t_gl;
 #endif
@@ -1781,7 +1870,8 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
     int m = 0;
     for (int i = 0; i < n; i++) {
         const N2Mesh *mesh = &s->meshes[i];
-        if (mesh->world_role == 1 || mesh->cat == N2_SKY || mesh->cat == N2_GLOW) continue;
+        /* role 3: a smokeable prop, drawn by smokeable.c */
+        if (mesh->world_role == 1 || mesh->world_role == 3 || mesh->cat == N2_SKY || mesh->cat == N2_GLOW) continue;
         GLuint tex = mtex[i];
         if (!tex && mesh->cat == N2_TERRAIN) tex = texTerr;   /* fallback baked in */
         float cx = (mbb[i][0]+mbb[i][2])*0.5f, cy = (mbb[i][1]+mbb[i][3])*0.5f;
@@ -2821,8 +2911,8 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     /* Count limits alone allow a large resident to monopolise a frame.
        Check between complete batches; synchronous startup remains unbounded. */
     unsigned long long step_begin = sceKernelGetProcessTimeWide();
-    unsigned long long budget_us = max_batches >= 128 ? 24000 : 6000;   /* smooth: a city frame has ~8 ms to spare */
-    int sliced = max_batches != INT_MAX;
+    unsigned long long budget_us = max_batches >= 128 ? 24000 : 4000;   /* smooth: a city frame has ~7 ms to spare, and a batch can run over (hwlog29: 9 ms steps at 6) */
+    int sliced = max_batches != INT_MAX, emitted = 0, smooth = sliced && max_batches < 128;
 #endif
     while (j->next < j->meshes && max_batches > 0) {
 #ifdef __vita__
@@ -2854,6 +2944,7 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
         run0[j->count] = i0; run1[j->count] = i;
         j->count++; j->next = i;
 #ifdef __vita__
+        emitted++;
         /* Retained GPU buffers still cost CPU packing time, bounded below,
            but should not consume the allowance for actual GPU uploads. */
         if (g_batch_reused == reused_before) max_batches--;
@@ -2868,6 +2959,11 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     g_batch_reuse = 0;
 #endif
     if (j->next < j->meshes) return 0;
+#ifdef __vita__
+    /* smooth: the last batches' frame leaves the sort and the mesh map
+       (several ms on a city area) to the next call */
+    if (smooth && emitted) return 0;
+#endif
     int nb = j->count;
 #ifdef __vita__
     printf("batches: %d built, CPU packing %llu ms, GL buffers %llu ms, %ld KB uploaded\n",
@@ -3272,7 +3368,7 @@ int render_carfx_active(void) { return g_cfx.active; }
    (with depth of field on, its second pass writes the depth alpha: uDofW). No fog
    term in the effect. The skinning itself runs on the CPU (nisdraw.c). */
 static const char *VS_BONE =
-    GLSL_HEADER
+    GLSL_VS_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor;\n"
     "uniform mat4 uMVP; uniform vec3 uEye;\n"
     "uniform vec4 uSH0, uSH1, uSH2, uSH3, uSH4, uSH5, uSH6, uSH7, uSH8, uSH9;\n"
@@ -3317,7 +3413,7 @@ GLuint render_bone_program(void) {
 /* worldnodepth.fx (SPEED2.EXE, the Acid particles, aciddraw.c): colour =
    saturate(2 * tex * vertex colour), alpha = tex * vertex alpha, no fog. */
 static const char *VS_PARTICLE =
-    GLSL_HEADER
+    GLSL_VS_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec4 aColor;\n"
     "uniform mat4 uMVP;\n"
     "varying vec2 vUV; varying vec4 vC;\n"
@@ -3365,6 +3461,12 @@ void render_carfx_end(void) {
 }
 
 void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) {
+    render_wheel_mesh_n(r, mesh, texture, mode, 0, NULL, NULL, -1);
+}
+/* n > 0: the same mesh drawn n times (the 4 wheels), each with its own MVP
+   (uniform uMVP) and model matrix, under one state setup and restore */
+void render_wheel_mesh_n(const RProg *r, GpuMesh *mesh, GLuint texture, int mode,
+                         int n, const float (*mvp)[16], const float (*world)[16], GLint uMVP) {
     const GLint loc[]={r->uUseTex,r->uAlphaTest,r->uTextureAlpha,r->uAlpha,r->uDecal,
                        r->uRimTint,r->uSpec,r->uEnv,r->uClearcoat};
     float saved[9];for(int i=0;i<9;i++)glGetUniformfv(r->prog,loc[i],saved+i);
@@ -3399,7 +3501,11 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
     if(translucent){glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);}
     else glDisable(GL_BLEND);
     render_carfx_part(mesh->car_material, mesh->cat);
-    draw_gpumesh(mesh);
+    if(n<=0)draw_gpumesh(mesh);
+    else for(int w=0;w<n;w++){
+        glUniformMatrix4fv(uMVP,1,GL_FALSE,mvp[w]);render_model(r,world[w]);
+        draw_gpumesh(mesh);
+    }
     for(int i=0;i<9;i++)glUniform1f(loc[i],saved[i]);
     glBindTexture(GL_TEXTURE_2D,(GLuint)oldtex);
     glBlendFuncSeparate((GLenum)src,(GLenum)dst,(GLenum)srca,(GLenum)dsta);
@@ -3802,3 +3908,103 @@ void draw_text(GpuMesh *quad, GLint uMVP, const char *s, float x, float y, float
     }
 }
 float text_width(const char *s, float px) { return (float)strlen(s) * 4 * px; }
+
+#ifdef __vita__
+/* ---- Rear-view mirror (eView 3, EVIEW_PLAYER1_RVM) ------------------------
+ * PC: the view renders into its own target (0x5ba1a0: CreateTexture 256x256
+ * A8R8G8B8 render target + D16 depth, 0x7fee80/84/78/7c); after the world,
+ * the cars and the effects (0x5caad0 view 3) the "RVM" texture is laid over
+ * the whole target alpha blended (0x5c27b0 SRCALPHA / INVSRCALPHA) and
+ * "RVM_MASK" written with ONE / ZERO (technique 8: taken as the target's
+ * alpha); 0x5cbf40 then draws the target alpha blended (0x5bcbc0(1, 5, 6))
+ * as one poly over x 440..200, y 15..95 of the 640x480 screen -- the first
+ * corner on the right with u = 0, so the picture is flipped left to right
+ * like a mirror (GC DisplayRVMs 801da75c: 224..416 x 20..84, u 1 -> 0). */
+static struct { GLuint fbo, tex, depth; int w, h, failed; } g_rvm;
+int render_rvm_begin(int w, int h, const float clear_rgb[3]) {
+    if (g_rvm.failed) return 0;
+    if (!g_rvm.fbo || g_rvm.w != w || g_rvm.h != h) {
+        if (g_rvm.fbo) { glDeleteFramebuffers(1, &g_rvm.fbo); glDeleteTextures(1, &g_rvm.tex);
+                         glDeleteRenderbuffers(1, &g_rvm.depth); g_rvm.fbo = 0; }
+        glGenTextures(1, &g_rvm.tex);
+        glBindTexture(GL_TEXTURE_2D, g_rvm.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &g_rvm.fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_rvm.fbo);
+        glGenRenderbuffers(1, &g_rvm.depth);
+        glBindRenderbuffer(GL_RENDERBUFFER, g_rvm.depth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_rvm.depth);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_rvm.tex, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            printf("rear-view mirror unavailable (framebuffer incomplete)\n");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            g_rvm.failed = 1;
+            return 0;
+        }
+        g_rvm.w = w; g_rvm.h = h;
+        printf("rear-view mirror target %dx%d\n", w, h);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_rvm.fbo);
+    glViewport(0, 0, w, h);
+    glClearColor(clear_rgb[0], clear_rgb[1], clear_rgb[2], 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    return 1;
+}
+void render_rvm_end(int screen_w, int screen_h) {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, screen_w, screen_h);
+}
+GLuint render_rvm_texture(void) { return g_rvm.failed ? 0 : g_rvm.tex; }
+
+static const char *RVM_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform sampler2D uOver; uniform sampler2D uMask;\n"
+    "uniform float uHaveOver; uniform float uHaveMask;\n"
+    "void main(){\n"
+    "  vec2 t = vec2(1.0 - vUV.x, vUV.y);\n"          /* the mirror flip */
+    "  vec2 m = vec2(t.x, 1.0 - t.y);\n"              /* TPK art: top-left origin */
+    "  vec3 c = texture2D(uTex, t).rgb;\n"
+    "  vec4 o = texture2D(uOver, m);\n"
+    "  c = mix(c, o.rgb, o.a * uHaveOver);\n"
+    "  float a = mix(1.0, texture2D(uMask, m).a, uHaveMask);\n"
+    "  gl_FragColor = vec4(c, a);\n"
+    "}\n";
+static GLuint g_rvm_prog;
+void render_rvm_composite(GpuMesh *quad, GLuint over, GLuint mask, int x, int y, int w, int h,
+                          int screen_w, int screen_h) {
+    if (!g_rvm_prog) {
+        GLuint p = glCreateProgram();
+        glAttachShader(p, compile(GL_VERTEX_SHADER, BLIT_VS));
+        glAttachShader(p, compile(GL_FRAGMENT_SHADER, RVM_FS));
+        glBindAttribLocation(p, 0, "aPos");
+        glBindAttribLocation(p, 1, "aUV");
+        glLinkProgram(p);
+        GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        g_rvm_prog = ok ? p : (GLuint)-1;
+        printf("rear-view mirror program: %s\n", ok ? "ok" : "link failed");
+    }
+    if (g_rvm_prog == (GLuint)-1 || !quad || g_rvm.failed || !g_rvm.tex) return;
+    GLboolean depth = glIsEnabled(GL_DEPTH_TEST), blend = glIsEnabled(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glViewport(x, y, w, h);
+    glUseProgram(g_rvm_prog);
+    glUniform1i(glGetUniformLocation(g_rvm_prog, "uTex"), 0);
+    glUniform1i(glGetUniformLocation(g_rvm_prog, "uOver"), 1);
+    glUniform1i(glGetUniformLocation(g_rvm_prog, "uMask"), 2);
+    glUniform1f(glGetUniformLocation(g_rvm_prog, "uHaveOver"), over ? 1.0f : 0.0f);
+    glUniform1f(glGetUniformLocation(g_rvm_prog, "uHaveMask"), mask ? 1.0f : 0.0f);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, mask ? mask : g_rvm.tex);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, over ? over : g_rvm.tex);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_rvm.tex);
+    draw_gpumesh(quad);
+    glViewport(0, 0, screen_w, screen_h);
+    if (depth) glEnable(GL_DEPTH_TEST);
+    if (!blend) glDisable(GL_BLEND);
+}
+#endif

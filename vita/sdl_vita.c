@@ -103,7 +103,7 @@ static int boot_writer(unsigned args,void *argp) {
 }
 static void boot_queue_start(void) {
     if(sceKernelCreateLwMutex(&g_boot_queue_lock,"boot-queue",0,0,NULL)<0)return;
-    SceUID uid=sceKernelCreateThread("boot-writer",boot_writer,0x10000100,0x10000,0,0,NULL);
+    SceUID uid=sceKernelCreateThread("boot-writer",boot_writer,0x10000100,0x10000,0,SCE_KERNEL_CPU_MASK_USER_1|SCE_KERNEL_CPU_MASK_USER_2,NULL);   /* off the frame thread's core 0 */
     if(uid>=0 && sceKernelStartThread(uid,0,NULL)>=0) {g_boot_thread=uid;return;}
     if(uid>=0)sceKernelDeleteThread(uid);
     sceKernelDeleteLwMutex(&g_boot_queue_lock);
@@ -152,6 +152,10 @@ __attribute__((constructor(101))) static void vita_boot_probe(void) {
         (unsigned)(info.size_cdram >> 20), (unsigned)(info.size_phycont >> 20));
     g_heap_base = (char *)sbrk(0);
     sceIoMkdir("ux0:data/OpenUG2", 0777);
+    /* the last run's logs survive one relaunch as *_prev.txt (a crash's log was lost to the relaunch) */
+    sceIoRemove("ux0:data/OpenUG2/log_prev.txt");    sceIoRename("ux0:data/OpenUG2/log.txt", "ux0:data/OpenUG2/log_prev.txt");
+    sceIoRemove("ux0:data/OpenUG2/boot_prev.txt");   sceIoRename("ux0:data/OpenUG2/boot.txt", "ux0:data/OpenUG2/boot_prev.txt");
+    sceIoRemove("ux0:data/OpenUG2/crumbs_prev.txt"); sceIoRename("ux0:data/OpenUG2/crumbs.txt", "ux0:data/OpenUG2/crumbs_prev.txt");
     SceUID fd = sceIoOpen("ux0:data/OpenUG2/boot.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd >= 0) { sceIoWrite(fd, line, (SceSize)len); sceIoClose(fd); }
     g_boot_lock_ready=sceKernelCreateLwMutex(&g_boot_lock,"openug-boot",0,0,NULL)>=0;
@@ -336,7 +340,8 @@ static int async_writer(unsigned args, void *argp) {
 static void async_log_start(void) {
     if (g_async_thread >= 0) return;
     if (sceKernelCreateLwMutex(&g_async_lock, "log-queue", 0, 0, NULL) < 0) return;
-    SceUID uid = sceKernelCreateThread("log-writer", async_writer, 0x10000100, 0x10000, 0, 0, NULL);
+    SceUID uid = sceKernelCreateThread("log-writer", async_writer, 0x10000100, 0x10000, 0,
+                                 SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);   /* off core 0 */
     if (uid >= 0 && sceKernelStartThread(uid, 0, NULL) >= 0) { g_async_thread = uid; return; }
     if (uid >= 0) sceKernelDeleteThread(uid);
     sceKernelDeleteLwMutex(&g_async_lock);
@@ -526,7 +531,8 @@ static int wd_thread(SceSize args, void *argp) {
     }
 }
 static void wd_start(void) {
-    SceUID uid = sceKernelCreateThread("watchdog", wd_thread, 0x10000100, 0x4000, 0, 0, NULL);
+    SceUID uid = sceKernelCreateThread("watchdog", wd_thread, 0x10000100, 0x4000, 0,
+                                 SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);   /* off core 0 */
     if (uid >= 0) sceKernelStartThread(uid, 0, NULL);
     vita_mark("race watchdog thread: 0x%08X (%d s)", (unsigned)uid, WD_SECONDS);
 }
@@ -606,8 +612,14 @@ static void vita_big(const char *fn, size_t n, void *caller) {
    than the 2-3 MB arrays a build needs, so builds failed (10-08). Kernel
    blocks are mapped page by page, so they never need a contiguous hole. The
    heap keeps the small, numerous allocations. Either side falls back to the
-   other when it runs dry. */
-#define BIGBLK_MIN   (512u * 1024u)
+   other when it runs dry.
+   64 KB (was 512, 10-22): tile geometry blocks, mesh arrays and build arrays
+   of 64-512 KB came and went with streaming inside the heap, and the holes
+   they left pushed brk up through a long session (hwlog22: 95 -> 104 of
+   115 MB from 8 to 16 min, live flat at ~85). Sim heap model (sim/sim_heap.c),
+   4 chained races: brk max 89 -> 74 MB, largest hole 1.2 -> 3.6 MB, ~200
+   kernel blocks live, read-ahead hits unchanged (72%). */
+#define BIGBLK_MIN   (64u * 1024u)
 #define BIGBLK_POOL  (125u * 1024u * 1024u)  /* = what the heap gave up (240 -> 115 MB); kept out of vitaGL's reach */
 #define BIGBLK_SLOTS 4096
 #define BIGBLK_RESERVE (12u * 1024u * 1024u)   /* kernel memory left for thread stacks, modules */                   /* open addressing, power of two */
@@ -718,10 +730,25 @@ static void bigblk_set_req(void *p, size_t n) {
 void __real_free(void *p);
 #define HEAP_FALLBACK_MIN (16u * 1024u)   /* heap full: a kernel block for this */
 
+/* the frame thread's time in malloc / calloc / realloc / free (waiting on
+   the heap lock while a worker holds it, or walking a fragmented heap):
+   world_resident.c's hitch report takes it each frame */
+static volatile Uint64 g_heap_main_us, g_heap_main_max; static volatile int g_heap_main_calls;
+#define HEAP_T0 Uint64 ht0 = sceKernelGetThreadId() == g_main_thid ? sceKernelGetProcessTimeWide() : 0
+#define HEAP_T1 if (ht0) { Uint64 d = sceKernelGetProcessTimeWide() - ht0; g_heap_main_us += d; \
+                           if (d > g_heap_main_max) g_heap_main_max = d; g_heap_main_calls++; }
+void vita_heap_main_take(double *sum_ms, double *max_ms, int *calls) {
+    *sum_ms = (double)g_heap_main_us / 1000.0; *max_ms = (double)g_heap_main_max / 1000.0;
+    *calls = g_heap_main_calls;
+    g_heap_main_us = 0; g_heap_main_max = 0; g_heap_main_calls = 0;
+}
+
 void *__wrap_malloc(size_t n) {
+    HEAP_T0;
     void *p = n >= BIGBLK_MIN ? bigblk_alloc(n) : NULL;
     if (!p && (p = __real_malloc(n)) && n >= BIGBLK_MIN) spill_add(p);
     if (!p && n >= HEAP_FALLBACK_MIN) p = bigblk_alloc(n);
+    HEAP_T1
     if (!p && n) vita_oom("malloc", n, __builtin_return_address(0));
     else if (n >= BIG_ALLOC) vita_big("malloc", n, __builtin_return_address(0));
     return p;
@@ -741,7 +768,10 @@ void *__wrap_calloc(size_t c, size_t n) {
     return p;
 }
 void __wrap_free(void *p) {
+    if (!p) return;
+    HEAP_T0;
     if (!bigblk_free(p)) { spill_sub(p); __real_free(p); }
+    HEAP_T1
 }
 void *__wrap_realloc(void *q, size_t n) {
     if (!q) return __wrap_malloc(n);
@@ -792,7 +822,7 @@ int SDL_Init(Uint32 flags) {
     boot_queue_start();
     async_log_start();
     extern int vgl_ug2_build __attribute__((weak));
-    vita_mark("boot logging: %s; log.txt %s (custom gauges build, vitaGL %s)",
+    vita_mark("boot logging: %s; log.txt %s (player-merge+finshed build, vitaGL %s)",
               g_boot_thread>=0?"background queue":"synchronous fallback",
               g_async_thread>=0?"background queue":"synchronous",
               &vgl_ug2_build ? "patched layout-cache" : "stock");
@@ -1333,7 +1363,8 @@ static void poll_pad(void) {
     /* the game's actions through the controller setup's bindings: W gas,
        S brake/reverse, E / Q shift, A / D steer (the left stick always),
        Space handbrake, N nitrous, C camera, B look back, keypad 7 / 8 hydraulics, Pause. Engage,
-       world map, SMS, career stats and reset have no game code yet. */
+       keypad 9 / 6 / 3 / 2 engage, world map, SMS, career stats, keypad 1
+       reset (a pulse on the button's release, below). */
     set_key(SDL_SCANCODE_W, act_down(b, OPT_ACT_THROTTLE));
     set_key(SDL_SCANCODE_S, act_down(b, OPT_ACT_BACK));
     set_key(SDL_SCANCODE_E, act_down(b, OPT_ACT_SHIFT_UP));
@@ -1343,6 +1374,10 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_SPACE, act_down(b, OPT_ACT_HANDBRAKE));
     set_key(SDL_SCANCODE_N, act_down(b, OPT_ACT_NITROUS) && !(b & SCE_CTRL_SELECT));
     set_key(SDL_SCANCODE_C, act_down(b, OPT_ACT_CAMERA));
+    set_key(SDL_SCANCODE_KP_9, act_down(b, OPT_ACT_ENGAGE));   /* free roam's challenge */
+    set_key(SDL_SCANCODE_KP_6, act_down(b, OPT_ACT_WORLD_MAP));   /* joy event 0xc0: the career world map */
+    set_key(SDL_SCANCODE_KP_3, act_down(b, OPT_ACT_READ_SMS));   /* joy event 0xc2: the SMS mailbox */
+    set_key(SDL_SCANCODE_KP_2, act_down(b, OPT_ACT_CAREER_STATS));   /* RC message 0x13 (0x6068c5): UI_Status_Master */
     set_key(SDL_SCANCODE_B, act_down(b, OPT_ACT_LOOK_BACK));
     set_key(SDL_SCANCODE_KP_7, act_down(b, OPT_ACT_HYD_PRESSURE));   /* hydraulics (hyd_player) */
     set_key(SDL_SCANCODE_KP_8, act_down(b, OPT_ACT_HYD_BOUNCE));
@@ -1351,10 +1386,12 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_KP_ENTER, (b & SCE_CTRL_CROSS) != 0);
     set_key(SDL_SCANCODE_BACKSPACE, (b & SCE_CTRL_CIRCLE) != 0);
     set_key(SDL_SCANCODE_DELETE, (b & SCE_CTRL_SQUARE) != 0);   /* menus: Square */
-    set_key(SDL_SCANCODE_LEFT, (b & SCE_CTRL_LEFT) != 0);
-    set_key(SDL_SCANCODE_RIGHT, (b & SCE_CTRL_RIGHT) != 0);
-    set_key(SDL_SCANCODE_UP, (b & SCE_CTRL_UP) != 0);
-    set_key(SDL_SCANCODE_DOWN, (b & SCE_CTRL_DOWN) != 0);
+    /* the d-pad, or the left stick past half (the menus' PAD_*_ALTERNATE;
+       nothing reads the arrows while driving) */
+    set_key(SDL_SCANCODE_LEFT, (b & SCE_CTRL_LEFT) || lx < -64);
+    set_key(SDL_SCANCODE_RIGHT, (b & SCE_CTRL_RIGHT) || lx > 64);
+    set_key(SDL_SCANCODE_UP, (b & SCE_CTRL_UP) || vita_lstick_y < -0.5f);
+    set_key(SDL_SCANCODE_DOWN, (b & SCE_CTRL_DOWN) || vita_lstick_y > 0.5f);
     set_key(SDL_SCANCODE_LEFTBRACKET, (b & L) != 0);
     set_key(SDL_SCANCODE_RIGHTBRACKET, (b & R) != 0);
     set_key(SDL_SCANCODE_F, (b & SCE_CTRL_TRIANGLE) && !(b & SCE_CTRL_SELECT));   /* menus: Triangle */
@@ -1373,6 +1410,16 @@ static void poll_pad(void) {
         g_mode_t0 = now; g_mode_frames = 0;
     }
     set_key(SDL_SCANCODE_1, (b & SCE_CTRL_SELECT) && !quit && !mode_combo);
+    {   /* Reset (Player::HandleReset, main.c): on a clean release of its
+           button -- nothing else pressed while it was held -- so the Select
+           combos (quit, gfx mode, overclock) never reset the car */
+        static int rheld, rclean;
+        int rd = act_down(b, OPT_ACT_RESET);
+        if (rd && !rheld) rclean = 1;
+        else if (rd && (b & ~g_prev_buttons)) rclean = 0;
+        set_key(SDL_SCANCODE_KP_1, !rd && rheld && rclean);
+        rheld = rd;
+    }
     set_key(SDL_SCANCODE_ESCAPE, quit);
 
     pad_button(b, SCE_CTRL_UP, SDL_CONTROLLER_BUTTON_DPAD_UP);

@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <strings.h>
 
+#include "carfx.h"
 #include "world.h"
 #include "world_tiles.h"
 #include "physics.h"
@@ -88,6 +89,7 @@ static void world_append_lights(World *w, const N2LightSrc *src, int count) {
         }
         w->neighborhood.lights[w->neighborhood.nlights++] = src[i];
     }
+    carfx_lights_changed();
 }
 
 /* ---- load-time duplicate stripper (Phase 48) ----
@@ -322,6 +324,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
                 memcpy(w->neighborhood.lights, lights_cache, (size_t)nlights_cache * sizeof *lights_cache);
                 w->neighborhood.nlights = w->neighborhood.lightcap = nlights_cache;
             }
+            carfx_lights_changed();
         } else
 #endif
         {
@@ -732,6 +735,14 @@ static const WTexCacheEntry *world_texcache_find(uint32_t key) {
         h = (h + 1) & (uint32_t)(g_texcache_cap - 1);
     }
     return NULL;
+}
+
+/* a bound texture by key (0 when the cache does not hold it) */
+GLuint world_texture_lookup(uint32_t key, unsigned char *mode) {
+    const WTexCacheEntry *e = world_texcache_find(key);
+    if (!e || e->state != 1) return 0;
+    if (mode) *mode = e->mode;
+    return e->tex;
 }
 
 static void world_predecode_free(void) {
@@ -2504,7 +2515,7 @@ float world_camera_clip(const N2Scene *s,const float (*bounds)[4],
         if(bounds && (hi[0]<bounds[mi][0] || lo[0]>bounds[mi][2] ||
                       hi[1]<bounds[mi][1] || lo[1]>bounds[mi][3]))continue;
         const N2Mesh*m=&s->meshes[mi];
-        if(m->world_role==2 || m->cat==N2_SKY || m->cat==N2_GLOW)continue;
+        if(m->world_role==2 || m->world_role==3 || m->cat==N2_SKY || m->cat==N2_GLOW)continue;
         /* Z overlap first: the road and terrain meshes under the car pass the
            XY test every frame and would otherwise have every triangle walked */
         if(m->world_bounds_valid && (hi[2]<m->world_bounds[2] || lo[2]>m->world_bounds[5]))continue;

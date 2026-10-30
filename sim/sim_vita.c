@@ -77,6 +77,7 @@ int sim_open(const char *p, int flags, ...) {
 DIR *sim_opendir(const char *p) { char b[1024]; return opendir(sim_path(p, b, sizeof b)); }
 int sim_mkdir(const char *p, int mode) { (void)mode; char b[1024]; return _mkdir(sim_path(p, b, sizeof b)); }
 int sim_remove(const char *p) { char b[1024]; return remove(sim_path(p, b, sizeof b)); }
+int sim_rmdir(const char *p) { char b[1024]; return _rmdir(sim_path(p, b, sizeof b)); }
 int sim_rename(const char *a, const char *bb) {
     char b1[1024], b2[1024];
     const char *x = sim_path(a, b1, sizeof b1), *y = sim_path(bb, b2, sizeof b2);
@@ -275,11 +276,24 @@ volatile unsigned vita_wd_beat;
 void vita_mark_stats(void) {}
 void vita_log_flush(void) { fflush(stdout); }
 void vita_lap(int slot) { (void)slot; }
-void vita_heap_report(const char *label) { (void)label; }
-unsigned vita_heap_top_mb(void) { return 0; }
-unsigned vita_bigblk_room_mb(void) { return 512; }
-size_t vita_bigblk_live(void) { return 0; }
-void vita_bigblk_report(char *out, size_t cap) { if (cap) out[0] = 0; }
+/* the heap model (sim_heap.c) stands in for the console's numbers, so the
+   read-ahead's room gate and the reports behave as on the Vita */
+int sim_heap_on(void); unsigned sim_heap_brk_mb(void), sim_heap_room_mb(void);
+size_t sim_heap_big_live(void); void sim_heap_big_report(char *out, size_t cap);
+void sim_heap_report(const char *label, int detail);
+void vita_heap_report(const char *label) {
+    static Uint32 last_detail;
+    Uint32 now = SDL_GetTicks();
+    int detail = 1;
+    if (!last_detail || now - last_detail >= 60000) { detail = 2; last_detail = now ? now : 1; }
+    sim_heap_report(label, detail);
+}
+unsigned vita_heap_top_mb(void) { return sim_heap_on() > 0 ? sim_heap_brk_mb() : 0; }
+unsigned vita_bigblk_room_mb(void) { return sim_heap_on() > 0 ? sim_heap_room_mb() : 512; }
+size_t vita_bigblk_live(void) { return sim_heap_on() > 0 ? sim_heap_big_live() : 0; }
+void vita_bigblk_report(char *out, size_t cap) {
+    if (sim_heap_on() > 0) sim_heap_big_report(out, cap); else if (cap) out[0] = 0;
+}
 void vita_async_file(FILE *f) { (void)f; }
 void vita_gx_start(void) {}
 const char *vita_gx_header(void) { return ""; }
@@ -458,6 +472,10 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_SPACE, act_down(b, OPT_ACT_HANDBRAKE));
     set_key(SDL_SCANCODE_N, act_down(b, OPT_ACT_NITROUS) && !(b & P_SELECT));
     set_key(SDL_SCANCODE_C, act_down(b, OPT_ACT_CAMERA));
+    set_key(SDL_SCANCODE_KP_9, act_down(b, OPT_ACT_ENGAGE));   /* free roam's challenge */
+    set_key(SDL_SCANCODE_KP_6, act_down(b, OPT_ACT_WORLD_MAP));   /* joy event 0xc0: the career world map */
+    set_key(SDL_SCANCODE_KP_3, act_down(b, OPT_ACT_READ_SMS));   /* joy event 0xc2: the SMS mailbox */
+    set_key(SDL_SCANCODE_KP_2, act_down(b, OPT_ACT_CAREER_STATS));   /* RC message 0x13 (0x6068c5): UI_Status_Master */
     set_key(SDL_SCANCODE_B, act_down(b, OPT_ACT_LOOK_BACK));
     set_key(SDL_SCANCODE_KP_7, act_down(b, OPT_ACT_HYD_PRESSURE) || (g_script_hyd & 1));   /* hydraulics (hyd_player) */
     set_key(SDL_SCANCODE_KP_8, act_down(b, OPT_ACT_HYD_BOUNCE) || (g_script_hyd & 2));
@@ -474,6 +492,14 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_F, (b & P_TRIANGLE) && !(b & P_SELECT));
     set_key(SDL_SCANCODE_RETURN, (b & P_START) && !quit);
     set_key(SDL_SCANCODE_1, (b & P_SELECT) && !quit);
+    {   /* Reset: on a clean release of its button (vita/sdl_vita.c) */
+        static int rheld, rclean;
+        int rd = act_down(b, OPT_ACT_RESET);
+        if (rd && !rheld) rclean = 1;
+        else if (rd && (b & ~g_prev_buttons)) rclean = 0;
+        set_key(SDL_SCANCODE_KP_1, !rd && rheld && rclean);
+        rheld = rd;
+    }
     set_key(SDL_SCANCODE_ESCAPE, quit);
     pad_button(b, P_UP, SDL_CONTROLLER_BUTTON_DPAD_UP);
     pad_button(b, P_DOWN, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
@@ -510,6 +536,7 @@ int sim_PollEvent(SDL_Event *e) {
 const Uint8 *sim_GetKeyboardState(int *numkeys) { if (numkeys) *numkeys = SDL_NUM_SCANCODES; return g_keys; }
 int sim_SetRelativeMouseMode(SDL_bool on) { (void)on; return 0; }
 int sim_NumJoysticks(void) { return 0; }
+int sim_PushEvent(SDL_Event *e) { return push_event(e); }   /* the game's own pushes (test aids) join the simulated queue */
 float vita_analog_steer(void) { return g_steer; }
 
 /* ---- the test script ---------------------------------------------------------- */
@@ -583,11 +610,17 @@ void sim_probe_draw(int count) {
         printf("probe:   attr3 %d cull %d blend %d\n", en, cull, blend);
     }
 }
+int g_sim_post;
+static Uint32 g_waitpost_until;
 static void script_step(void) {
     if (g_tap.frames > 0 && --g_tap.frames == 0) g_script_buttons &= ~g_tap.bit;
     if (g_tap.frames > 0) return;
     if (g_wait_frames > 0) { g_wait_frames--; return; }
     if (g_wait_until && SDL_GetTicks() < g_wait_until) return;
+    if (g_waitpost_until) {   /* waitpost: until a post-race screen is drawn, or the timeout */
+        if (!g_sim_post && SDL_GetTicks() < g_waitpost_until) return;
+        g_waitpost_until = 0;
+    }
     g_wait_until = 0;
     while (g_line < g_nlines) {
         char cmd[32] = "", a1[128] = "", a2[64] = "";
@@ -595,6 +628,7 @@ static void script_step(void) {
         if (n < 1 || cmd[0] == '#') continue;
         printf("sim: [%d] %s %s %s\n", g_line, cmd, a1, a2);
         if (!_stricmp(cmd, "frames")) { g_wait_frames = atoi(a1); return; }
+        if (!_stricmp(cmd, "waitpost")) { g_sim_post = 0; g_waitpost_until = SDL_GetTicks() + (Uint32)(atof(a1) * 1000); return; }
         if (!_stricmp(cmd, "wait")) { g_wait_until = SDL_GetTicks() + (Uint32)(atof(a1) * 1000); return; }
         if (!_stricmp(cmd, "press")) {
             g_tap.bit = btn_bit(a1); g_tap.frames = n > 2 ? atoi(a2) : 3;

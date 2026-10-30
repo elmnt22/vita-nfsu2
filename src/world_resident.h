@@ -48,6 +48,7 @@ typedef struct {
     float (*obstacle_z)[2];
     int *obstacle_src;
     int obstacle_count;
+    struct PhysWallIndex *wall_index;   /* Vita: the worker's index of the obstacles, until activation */
     WorldBatchUpload *upload;  /* owns partial ordinary batches until complete */
     WorldBatchUpload *cpu_plan; /* worker-created grouping; no GPU owners */
     float **mesh_normals;      /* Vita: precomputed by the worker, per mesh */

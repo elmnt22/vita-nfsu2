@@ -2,11 +2,11 @@
  * profile's options block), edited by the Options screens (shop.c, rows
  * of UI_Options 0x4b6e60 / 0x4b7310 / 0x4b7cd0) and read by the game.
  *
- * The retail defaults are NOT decoded: the block is bss, nothing writes it
- * statically (all 820 _initterm entries were emulated) and the profile
- * ctor 0x515aa0 only sets the audio mode and the playlist. The defaults
- * below are this port's behaviour before the screens existed (camera Far,
- * automatic gearbox, MPH, everything shown) and full volumes.
+ * The retail defaults are OptionsSettings::Default 0x5025b0 (GC
+ * Default__15OptionsSettings 80130c78), see options_defaults. The volume
+ * levels reach the mixer linearly: GetMasterVolume (GC 8007b23c) =
+ * master x level x 32767 (FUN_00469050 only stores the block and asks the
+ * two sound objects to re-read it).
  *
  * Saved to ux0:data/OpenUG2/options.bin (cache dir relative on PC).
  */

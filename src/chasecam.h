@@ -39,13 +39,27 @@ typedef struct {
     float speed;         /* |v| (car +0x430) */
     float vtop;          /* top speed for the shake table, m/s */
     int   wheels_down;   /* car +0x424 */
-    int   nitrous;       /* hold state (0x5ed290/0x5ed300 effect timers) */
+    int   nitrous;       /* nitrous burning (0x59fa30 / 0x5ecdb0): the shake only */
+    /* HighliteMode 0x445ac0 (the "hold": eye lag /1.3, offset x1.3,
+       direction frozen) = OutsidePOV && (hyd_active || (dampen &&
+       wheels_down <= 2)) */
+    int   hyd_mode;      /* RealDriver::CouldBeDoingHydraulics 0x410470: driver
+                            +0x2fb (bounce / pressurize mode picked) */
+    int   hyd_active;    /* Car::AreHydraulicsBouncing 0x5ed290 || ::Extended
+                            0x5ed300: a bounce / extend value above 0 */
+    int   dampen;        /* car +0x38 DampenMode (set by Collision::
+                            CheckForWildCollision, n2sim_dampen) */
+    int   drift;         /* a drift race (0x89e7d9 || 0x890104): no eye lag */
+    int   burnout;       /* the smoke show (0x89e7e2 || 0x890100; online only) */
     int   drag;          /* a drag race (0x89e7d8): the shake at full scale */
     int   surface[4];    /* retail surface id under each wheel (car +0x394) */
     float bbmin[3], bbmax[3];   /* model box, car frame (model +0xe0/+0xf0) */
 } CcCar;
 
-typedef struct { float pos[3], rot[9], bbmin[3], bbmax[3]; } CcObstacle;
+/* Another car near the camera (the car list 0x890080): MinGapCars 0x44b040
+   lifts over traffic only (driver type 3), CameraWouldBeInCar 0x5f14f0
+   tests every car. vel feeds MinGapCars' fast-passing test. */
+typedef struct { float pos[3], rot[9], bbmin[3], bbmax[3], vel[3]; int traffic; } CcObstacle;
 
 typedef struct {
     float eye[3], fwd[3], up[3];   /* final camera, world */
@@ -53,6 +67,14 @@ typedef struct {
     float V[16];                   /* GL view matrix (column-major) */
     float fovy;                    /* vertical FOV, radians, 4:3 retail horizontal kept */
     float hfov43;                  /* the retail horizontal FOV at 4:3, radians */
+    float znear;                   /* near clip, camera +0xbc (0x453570: 0.5, POV id 3
+                                      0.4); 0 from the movers that leave it */
+    int hide_car;                  /* camera +0x280 = the followed car: RenderCars 0x6316d0
+                                      skips it (ShouldCarBeRendered GC 80236c48: no body,
+                                      wheels, shadow, flares). 0x453570: set for the inside
+                                      POVs (id not 0/1/5) except the hood (id 4) without
+                                      Look Back; RearViewMirrorCameraMover's ctor 0x44ba10
+                                      sets it too. */
 } CcOut;
 
 typedef struct {
@@ -72,18 +94,33 @@ typedef struct {
     /* Look Back held (JOY event 0x7e: controller +0x249 -> mover vt[5] ->
        +0x51): 0x453570 turns the eye and look offsets' forward and left
        parts round (x -1), the camera then sits ahead of the car looking
-       back. The offset table 0x7ec400 path needs mover +0x20, which only
-       another mover class sets. */
+       back (with no player, or Player::UseBirdsEye false: see birdseye). */
     int lookback;
+    /* Player::UseBirdsEye 0x5eb520 (player +0x2b == 0): Look Back then shows
+       the bird's-eye offset 0x7ec400 instead of turning round. The Player
+       ctor 0x5f1670 sets +0x2b = 1 and nothing clears it: 0 on PC. */
+    int birdseye;
+    int pov_active;                /* mover +0x4c: the POV in use (0 while the
+                                      bumper / hood view falls back, 0x453570) */
+    /* the eView camera the movers share (+0x40 eye, +0x60 target, +0xc4 fov,
+       +0x1e0 / +0x200 / +0x264 their rates): what the next mover's ctor hands
+       over from (0x444980 / 0x444a70 / 0x444910) */
+    float cam_eye[3], cam_tgt[3], cam_fov, cam_veye[3], cam_vtgt[3], cam_vfov;
+    int cam_valid;
+    int handover;                  /* the next start takes over from the camera */
 } ChaseCam;
 
 /* Reads the camera entries from the car's 0x34600 record (0x890 bytes). */
 int  chasecam_load(ChaseCam *c, const unsigned char *rec);
 /* Menu setting 0 bumper, 1 hood, 2 near, 3 far, 4 high (drift). The new
- * mover starts at its ideal (the ctor's hand-over 0x444980 is not ported). */
+ * mover takes over from the last camera (ctor 0x451660: hand-over 0x444980 /
+ * 0x444a70 / 0x444910, snapped when the eye is more than 20 m off). */
 void chasecam_set(ChaseCam *c, int setting, const CcCar *car);
 /* Jump straight to the ideal (teleport / first frame). */
 void chasecam_snap(ChaseCam *c);
+/* Another mover drew this frame (the NIS camera): remember its camera for a
+ * later hand-over. car_pos = the followed car (camera +0xb0 distance). */
+void chasecam_observe(ChaseCam *c, const CcOut *o, const float car_pos[3], float dt);
 void chasecam_update(ChaseCam *c, const CcCar *car, float dt,
                      WColl *w, const CcObstacle *obs, int nobs, CcOut *out);
 
@@ -96,6 +133,15 @@ float chasecam_noise(float x);
 void  chasecam_lookat(const float eye[3], const float at[3], float V[4][4]);
 void  chasecam_shake_view(float V[4][4], const float nz[4], unsigned short fov_u16);
 void  chasecam_out(float V[4][4], unsigned short fov_u16, CcOut *out);
+/* RearViewMirrorCameraMover (PC ctor 0x44ba10 / Update 0x44ba80): the mirror's
+   view from the car (hfov43 = FOV 20000, znear 0.75; far 192) */
+void  chasecam_rvm(const CcCar *car, CcOut *out);
+/* ResetCameraShakers 0x5729e0: stop the acceleration jolts (car +0x80 ->
+   MaybeCameraShake, applied to the drive camera and the mirror) */
+void  chasecam_shakers_reset(void);
+/* ShowcaseCameraMover (0x446400): the photo view of the car from an SCCarSetup's
+   nine floats; gup = the ground's normal under the car */
+void  chasecam_photo(ChaseCam *c, const CcCar *car, const float gup[3], const float p[9], WColl *w, CcOut *out);
 
 #ifdef __cplusplus
 }

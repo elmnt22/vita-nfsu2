@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* SPEED2.EXE 0x7ecd80: title, artist, album, where it plays */
 static const char *const k_song[MUSIC_SONGS][4] = {
@@ -175,6 +176,9 @@ static int decoder_thread(void *ud) {
 }
 
 int music_init(const char *dataroot) {
+    /* Random draws from the game's shared bRandom (0x43c1c0), which traffic,
+       cameras and AI keep consuming: a different order every session */
+    g_rng = 0x12345678u + (uint32_t)time(NULL) + (uint32_t)SDL_GetPerformanceCounter();   /* 0x57ecd8: timer + 0x12345678 */
     snprintf(g_viv, sizeof g_viv, "%s/SDATA/sdat.viv", dataroot);
     FILE *f = fopen(g_viv, "rb");
     if (!f) { printf("music: no %s\n", g_viv); return 0; }
@@ -230,6 +234,16 @@ void music_set_playlist(const unsigned char song[MUSIC_SONGS], const unsigned ch
     g_fe_mask = g_fe_left = fe; g_ig_mask = g_ig_left = ig;
     g_fe_last = g_ig_last = -1;
     g_shuffle = shuffle;
+    /* the song playing counts as played: a playlist set while it plays (the
+       boot profile load under the title's Riders) must not queue it again */
+    if (g_cur >= 0 && (g_mode == MUSIC_FE || g_mode == MUSIC_IG)) {
+        uint32_t *left = g_mode == MUSIC_FE ? &g_fe_left : &g_ig_left;
+        int *last = g_mode == MUSIC_FE ? &g_fe_last : &g_ig_last;
+        if (*left & (1u << g_cur)) {
+            *left ^= 1u << g_cur;
+            for (int k = 0; k < MUSIC_SONGS; k++) if (g_pl_song[k] == g_cur) *last = k;
+        }
+    }
 }
 
 void music_set_volume(float fe, float ig) { g_vol_fe = fe; g_vol_ig = ig; }
@@ -250,8 +264,10 @@ static int next_song(uint32_t mask, uint32_t *left, int *last) {
     }
     int cnt = 0;
     for (int s = 0; s < MUSIC_SONGS; s++) cnt += (*left >> s) & 1;
-    g_rng = g_rng * 1664525u + 1013904223u;
-    int pick = (int)((g_rng >> 8) % (uint32_t)cnt), k = 0;
+    /* bRandom 0x43c1c0: the old seed mod n, then its xorshift step */
+    int pick = (int)(g_rng % (uint32_t)cnt), k = 0;
+    {   uint32_t x = g_rng ^ 0x1d872b41u, t = x ^ (x >> 5);
+        g_rng = t ^ (t << 27) ^ x; }
     for (int s = 0; s < MUSIC_SONGS; s++)
         if (*left & (1u << s)) { if (k == pick) { *left ^= 1u << s; return s; } k++; }
     return -1;

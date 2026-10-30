@@ -31,21 +31,33 @@ int  perf_ready(void);
 typedef struct {
     float level[PERF_NCAT];
     unsigned char fit[PERF_NPARTS];
+    unsigned char junk[PERF_NCAT];     /* junkman parts per path (spec +0x28), ApplyJunkmanUpgrades */
 } PerfParts;
 
 void perf_clear(PerfParts *pp);
 /* 0x5a64a0(level, cat): the category's parts off, then every package of
    levels 1..level fitted in order (each part takes its prerequisites'
-   test and removes the parts it replaces, 0x5a6320) */
+   test and removes the parts it replaces, 0x5a6320); cat -1 (InstallAll-
+   PerfParts' "all types"): every package off, then per level categories
+   0..9 in turn */
 void perf_fit_level(PerfParts *pp, int cat, int level);
 /* the Performance Shop (UI_ChoosePerformancePackage): a package's parts,
    0x500100(cat, level) -- up to 4: part index, name (language hash, part
    +4) and price (part +8). Returns the count, 0 when there is none. */
 int  perf_pkg_parts(int cat, int level, int idx[4], unsigned int name[4], int price[4]);
+/* a part's brand hashes (up to max), and a brand's DECAL_ICON string (display 0)
+   or display name (display 1) from GLOBALB 0x34a14 ("" when unknown) */
+int  perf_part_brands(int idx, unsigned int *out, int max);
+const char *perf_brand_str(unsigned int hash, int display);
+/* is_brand_in_any_perf_package (GC 8012f894) */
+int perf_brand_in_package(unsigned int brand);
 /* 0x521340: the package's parts fitted on top of what is there (0x5a6320(on)) */
 void perf_fit_pkg(PerfParts *pp, int cat, int level);
 /* 0x5213d0: one part fitted (by its index; UI_BuyPerformanceParts) */
 void perf_fit_part(PerfParts *pp, int idx);
+/* 0x599680(idx, on, 0): one part fitted or removed by its index
+   (PhysicsUpgradeSpecification::InstallPerfPart) */
+void perf_set_part(PerfParts *pp, int idx, int on);
 /* 0x5b5810 / 0x5b56e0 of a built record: the peak torque (the P+0x200
    curve, kN m, over P+0x1f0..P+0x1f8 rpm in 50 rpm steps) and the peak power
    (torque x 1000 x rpm x 0.000104712, kW) -- raw, and over GLOBALB 0x34a32
@@ -94,6 +106,12 @@ void perf_fit_rating(int type, const unsigned char *rec, float target, float han
 /* 0x34a32 [10] [11]: the rating range levels are measured over */
 float perf_rating_min(void);
 float perf_rating_max(void);
+/* 0x34a32 [28] [29] (GetPhysicsExtrema +0x70 / +0x74): the handling range */
+float perf_handling_min(void);
+float perf_handling_max(void);
+/* GetMinMaxPerformanceMeasure 0x59a450: the car type's lowest and highest
+   rating of its part combinations; 0 when the type has none */
+int perf_type_rating_range(int type, float *lo, float *hi);
 
 #ifdef __cplusplus
 }

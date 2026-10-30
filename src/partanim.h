@@ -33,6 +33,12 @@ void partanim_free(PartAnims *pa);
    above (the hood's split style, the doors' ANIMSTYLE / wide style); flag:
    the STYLE22 hood (its halves at 0.75 and 1.25 speed). now = seconds. */
 void partanim_request(PartAnims *pa, int part, int open, int style, int flag, float now);
+/* The same with AnimateCarPart's speed (0x61f820 param 4 -> 0x433e20 +8):
+   1.0 in the shops, 20.0 from FEDoCarPartAnimNow (0x4c1860, the magazine
+   cover's poses: the clip plays 20x fast). The split hood without the
+   STYLE22 flag keeps rate 1 per frame, as 0x434190 does. */
+void partanim_request_speed(PartAnims *pa, int part, int open, int style, int flag, float speed,
+                            float now);
 /* 0x433cd0: 0 open, 1 closed (the default), 2 opening, 3 closing */
 int  partanim_state(const PartAnims *pa, int part);
 

@@ -13,8 +13,11 @@
  * (0x802228 = 1 in retail); the AI's points are scaled by the difficulty
  * (0x79dae8: 1, 1.25, 1.5).
  *
- * The other style moments (burnouts, near misses, leapfrog, ...) belong to
- * the other race types and are not in here. */
+ * The other style moments (clean laps, power slides, near misses, ...) come
+ * from MiscStyleManager (0x56ff30, race entry +0x1dc) and the racer stats
+ * (burnout, 0x5f7410); every human racer has them in every race type and in
+ * free roam (RacingCar init 0x5fc2a0), and their banked total refills the
+ * nitrous bottle (0x6016a0: 1500 points a bottle). */
 #ifndef OPENUG2_STYLE_H
 #define OPENUG2_STYLE_H
 
@@ -85,13 +88,27 @@ typedef struct {                /* StylePointsAccum, 0xa0 bytes */
 } StyleAccum;
 
 /* the race type bit of 0x56ebe0 / 0x56c500 */
-enum { STYLE_RT_DRIFT = 4 };
+enum {
+    STYLE_RT_NORMAL = 1,    /* circuit, lap KO, free roam, outrun */
+    STYLE_RT_DRAG   = 2,    /* 0x89e7d8 / 0x890108 */
+    STYLE_RT_DRIFT  = 4,    /* 0x89e7d9 / 0x890104 */
+    STYLE_RT_SPRINT = 8,    /* 0x89e7b4 */
+    STYLE_RT_STREETX = 0x10,/* 0x89e7e3 / 0x89010c */
+    STYLE_RT_URL    = 0x40  /* 0x89e7e1 */
+};
+/* 0x56ebe0's choice, in its order (0x89e7e5 / 0x20 is never set in retail) */
+int  style_race_mask(int drift, int drag, int sprint, int streetx, int url);
 void style_accum_init(StyleAccum *a, int race_mask);          /* 0x56ebe0 */
 void style_moment_add(StyleMoment *m, float v, int p2);       /* 0x56eab0 */
 /* 0x56fd10: once a frame -- clears finished moments, ticks every moment,
    sums the total. Moments that just finished (or are running) are listed
    in shown[] for the HUD (0x4da6f0); returns their count. */
 int  style_accum_tick(StyleAccum *a, float dt, StyleMoment **shown, int max);
+/* the same tick with the shown moments copied as the player's HUD reads
+   them inside it (0x4da6f0 runs between the list and the reset of the
+   finished moments) */
+typedef struct { int index, state, cont; float cur, mult; uint32_t label; } StyleShown;
+int  style_accum_tick_snap(StyleAccum *a, float dt, StyleShown *snap, int max);
 void style_accum_finish(StyleAccum *a);                       /* 0x56d710 */
 
 /* what the drift scorer reads from its car each frame */
@@ -110,14 +127,77 @@ typedef struct {
     int   ctrl_flag;        /* human controller +0x248                        */
 } StyleCar;
 
-typedef struct {            /* MiscStyleManager (0x3c), the drift part */
+typedef struct {            /* MiscStyleManager (0x3c) */
     uint8_t clean[3];       /* +0x08 +0x09 +0x0a */
+    uint8_t latch_cp;       /* +0x0b RacingCar +0xe edge */
+    uint8_t latch_lap;      /* +0x0c RacingCar +0xd edge */
+    int     best_rank;      /* +0x10 */
+    int8_t  s360;           /* +0x14 */
+    float   h360;           /* +0x18 heading in degrees */
+    int8_t  jturn;          /* +0x1c */
+    int8_t  nm_state;       /* +0x1d near miss: 0 look, 1 passing, 2 bank */
+    uint8_t nm_cleared;     /* +0x1e over the other car (CLEARED ACCIDENT) */
+    int     nm_id;          /* +0x20..+0x28 the pair: the other car's id, -1 none */
+    uint8_t finished;       /* 0x5ee250 this frame (racer done in a race) */
     int     t_coll;         /* +0x2c last hit at */
     float   coll_imp;       /* +0x30 its impulse sum */
     int     coll_kind;      /* +0x34 0 car, 3 wall */
     uint8_t coll_traffic;   /* +0x38 */
 } StyleMisc;
 void style_misc_init(StyleMisc *s);                           /* 0x56cdf0 */
+/* 0x56ed10 from outside the managers: feed moment i (e.g. 15 SPRAY SHOW,
+   0x60351d) when this race type has it */
+void style_trigger(StyleAccum *a, int i, float v, int p2);
+/* one car-against-car pair of the racer's car in the collision pair list
+   (0x86b490); the caller lists every pair of the car, ok = both cars are
+   in the race's play (not blinking 0x5ebfa0, not poofed 0x5ec060, +0x550
+   set) and both cars collide (0x592e60: always so in the port); the scan
+   also skips pairs within 0.001 (0x598730 = GJKWitness +0x14, 0x598390) */
+typedef struct {
+    int   id;               /* the other car */
+    float dist;             /* +0x10 the hulls' distance */
+    int   touch;            /* +0x244 a contact */
+    int   ok;
+    float other_z;          /* other car +0x68 */
+    float center_dist;      /* 0x401150 between the cars' +0x60 */
+    float relv;             /* |velocity difference| (0x4011b0, 0x440f70) */
+} StyleNear;
+/* what MiscStyleManager::Update (0x56ff30) reads from its racer each frame */
+typedef struct {
+    int   racing;           /* race object stage 4 (*0x890118 == 4) */
+    int   race_mode;        /* 0x89e7b0 (0: free roam) */
+    int   nracers;          /* 0x89e7c0..0x89e7cc */
+    float race_time;        /* race object +0x14 x 0.00025 */
+    int   rank;             /* RacingCar +0xa */
+    int   leader;           /* LEAD LAP: rank 1 (drift: 0x56dd90 standings) */
+    int   newcp, newlap;    /* RacingCar +0xe, +0xd */
+    int   finished;         /* 0x5ee250 */
+    int   wheels;           /* car +0x424 */
+    float speed;            /* car +0x430 */
+    float fwd_speed;        /* car +0x42c */
+    float yaw_rate;         /* car +0x118 */
+    float slip;             /* 0x59fa10 */
+    float up_z;             /* car +0xb8 */
+    uint16_t heading;       /* car +0x40c */
+    float air;              /* car +0x68 - 0x5ed400()+8 - ground (0x5e72e0) */
+    float z;                /* car +0x68 */
+    int   hyd_on;           /* 0x5ed290: a hydraulic bounce / extend is on */
+    int   body_flag;        /* car +0x3c -> +0x18 */
+    float draft;            /* car +0x4dc (0x5ebd80) */
+    int   blink;            /* 0x5ebfa0 */
+    int   dist_m;           /* car +0x410 (passed as the slide's p2) */
+    int   shortcut;         /* 0x5d9bf0 found a shortcut zone (type 0xb)
+                               whose +0x1a was 0 (the caller sets it) */
+    int   bounce_n;         /* car +0x408[4] set */
+    int   hydros_n;         /* 0x5ed470 in {2, 3} */
+    const StyleNear *near; int nnear;
+} StyleMiscIn;
+void style_misc_update(StyleMisc *s, StyleAccum *a, const StyleMiscIn *in);   /* 0x56ff30 */
+/* RacingCarStats +0x28 burnout (0x5f7410, call 0x5f781f); *state starts
+   at -1. avg_slip = the driven wheels' car +0x3b4 average. */
+void style_burnout_tick(float *state, StyleAccum *a, int racing, int race_mode,
+                        float race_time, float avg_slip, float dist);
+
 /* 0x56fb20: a collision (pair effect +0x60 impulse sum imp, created at
    t_made) of this racer; wall = not a car, other_traffic = the car hit is
    traffic. racing = car +0x424 >= 1, upright = car +0xb8 > 0.9. */

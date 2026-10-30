@@ -9,6 +9,9 @@ void vita_mark(const char *fmt, ...);
 #endif
 
 #include <limits.h>
+
+/* world_scenery.h: the career stage whose scenery / lock walls are up (-1 none). */
+int g_wg_career_stage = -1, g_wg_career_owns_car;
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>

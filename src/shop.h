@@ -29,12 +29,20 @@ enum { SHOP_KEY_UP = 1, SHOP_KEY_DOWN, SHOP_KEY_LEFT, SHOP_KEY_RIGHT,
        SHOP_KEY_OK, SHOP_KEY_BACK,
        SHOP_KEY_LTRIG, SHOP_KEY_RTRIG,     /* L1 / R1: the car select's filter */
        SHOP_KEY_TRI,                       /* Triangle: back, or the controller setup's reset */
-       SHOP_KEY_SQ };                      /* Square: the decal shop's "remove all" (0xc519bfc0) */
+       SHOP_KEY_SQ,                        /* Square: the decal shop's "remove all" (0xc519bfc0) */
+       SHOP_KEY_HELP };                    /* Select: the screen's Help ($JOY_EVENT_FENG_HELP$) */
 enum { SHOP_ACT_NONE, SHOP_ACT_PREVIEW, SHOP_ACT_RIM, SHOP_ACT_EXIT,
        SHOP_ACT_PLAY,        /* front end: Quick Race picked (unused since the QR screens) */
-       SHOP_ACT_CUSTOMIZE,   /* front end: Customize picked */
+       SHOP_ACT_CUSTOMIZE,   /* front end: Customize Car Select accepted, car `car` */
        SHOP_ACT_QR_CAR,      /* Quick Race car select: show car `car` */
-       SHOP_ACT_QR_GO };     /* Quick Race: start the race in `qr` with car `car` */
+       SHOP_ACT_QR_GO,       /* Quick Race: start the race in `qr` with car `car` */
+       SHOP_ACT_PROFILE,     /* a profile was loaded / reset: the garage car again (0x3a2be557) */
+       SHOP_ACT_CAREER,      /* UI_StartCareer: StartCareerFreeRoam (career_nis: CareerNis1 first) */
+       SHOP_ACT_CAREER_QUIT,     /* the crib's Back To Main: the career is left, UI_Main */
+       SHOP_ACT_CAREER_RIDE,     /* the crib from the career menu: the career car on the platform */
+       SHOP_ACT_CAREER_PARTS,    /* the crib's Change Parts: the Car Shop on the career car (shop_career_customize 1) */
+       SHOP_ACT_CAREER_EVENT,    /* the crib World Map's Yes: StartCareerEventFromWorldMap(event) */
+       SHOP_ACT_TEST_TRACK };    /* the crib's Test Track: DoStartTuning -> BeginCarTuning(entry 0) */
 
 /* Quick race modes (settings 0x83aab4 +0: the type) */
 enum { QR_CIRCUIT = 0, QR_SPRINT = 1, QR_DRAG = 2, QR_DRIFT = 3, QR_URL = 4,
@@ -61,6 +69,8 @@ typedef struct {
     int  rim_style;           /* ... and its STYLEnn, with the size (RIM_STYLE / RIM_INNER) */
     char car[32];             /* SHOP_ACT_QR_CAR / QR_GO: CARS/ folder */
     ShopQuickRace qr;         /* SHOP_ACT_QR_GO */
+    int career_nis;           /* SHOP_ACT_CAREER: the first-time intro scene plays */
+    const unsigned char *event;   /* SHOP_ACT_CAREER_EVENT: the career event record */
 } ShopAction;
 
 /* A rim value: STYLEnn in the low byte, the inner radius (rim size, the part's
@@ -97,6 +107,9 @@ int shop_view(const Shop *s);
    VERTSPLIT one (0x61f820); hood_flag: the STYLE22 hood; door_style: the
    doors' ANIMSTYLE, WIDE1..4 (3..6) for scissor doors on a wide body. */
 int shop_parts_open(Shop *s, int *hood_style, int *hood_flag, int *door_style);
+/* The same styles for a fitted car without a shop (the Show Off screen). */
+void shop_car_part_anim_styles(const char *dataroot, const char *car, const N2CarConfig *cfg,
+                               int *hood_style, int *hood_flag, int *door_style);
 /* A part's database attributes without a shop (GLOBALB 0x80034602, read
    once and kept): vals[i] = the raw value of keys[i]; returns a mask of
    the keys found (0: no such part). */
@@ -108,6 +121,26 @@ unsigned shop_part_attrs(const char *dataroot, uint32_t part, const uint32_t *ke
 /* A generic part's model name (model 0, or 1 the _PAINT twin; no _A LOD
    letter), e.g. AUDIO_COMP_SPEAKER0_8: 1, or 0 if it has none. */
 int shop_part_model(const char *dataroot, uint32_t part, int model, char *out, int cap);
+/* A preset ride (GLOBALB 0x30220, e.g. DDAY_PLAYER_CAR) as the garage keeps a
+ * car: its CARS/ folder, configuration and rims (RideInfo::FillWithPreset
+ * 0x637270, GC 80245bf8; slots N2CarConfig has no place for are listed in
+ * shop.c). preset_hash = bStringHash of the name. 1 if found. */
+int shop_preset_ride(const char *dataroot, uint32_t preset_hash, char car[32], N2CarConfig *cfg,
+                     char rim_folder[16], int *rim_style);
+/* RideInfo::BuildRandomRide 0x6374b0 + BuildRandomSkin 0x632ec0: a random
+ * ride of car for an opponent whose performance paths (ePhysicsUpgradePath
+ * order, levels 0..3; path 9 is re-derived as SyncVisualPartsWithPhysics
+ * does) are perf_lvl, drawn with bRandom on *rng. out gets the body parts,
+ * paints, vinyls, tint, neon, bulb (cfg->perf untouched); rim / rim_style as
+ * shop_preset_ride's. s NULL: the database shop_part_db / shop_preset_ride
+ * loaded. 0 when the database or the car type is missing. */
+int shop_random_ride(Shop *s, const char *car, const int perf_lvl[10], uint32_t *rng, N2CarConfig *out,
+                     char *rim, int rimsz, int *rim_style);
+/* the part database alone (no shop screens), loaded once */
+Shop *shop_part_db(const char *dataroot);
+/* SetUpgradePart 0x61bc80: the model of the slot's first part at that
+ * upgrade level (e.g. slot 0x1b FRONT_BRAKE level 1..3), 0 none. */
+int shop_upgrade_model(const char *dataroot, const char *car, int slot, int level, char *out, int cap);
 Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *installed,
                 const N2PartMenu menus[N2_PART_COUNT], const char *rim_folder, int rim_style);
 void  shop_close(Shop **s);
@@ -117,8 +150,55 @@ void  shop_front_end(Shop *s);
 /* The front end straight at its main menu (UI_Main), as a quit from a race
  * returns to it. */
 void  shop_main_menu(Shop *s);
+/* The Customize Car Select (UI_QRCarSelect, game mode 0x20), as leaving the
+ * Car Shop from Customize returns to it (needs the car list set). */
+void  shop_customize_cars(Shop *s);
+/* The career shop the player drove into (LaunchFrontendShopFromGame
+ * 8012721c), shop_desc the ShopDataDesc (career_enter_shop): type 4 (+0x50)
+ * opens the Car Lot (UI_CareerCarLot); the other types are not built yet
+ * (0 returned). Needs the car list set; leaving is SHOP_ACT_CAREER. */
+int   shop_career_shop(Shop *s, const unsigned char *shop_desc);
+/* UIMagazineReward: a front-end showcase's cover (kinds 3/4, after LaunchMagazine
+   paid it); Accept is SHOP_ACT_CAREER. 0 when the database is unreadable. */
+int   shop_magazine_reward(Shop *s, const unsigned char *showcase);
+/* while the cover is up: its car setup's garage camera view (heading, steer,
+   FOV, target[3], eye[3]); 0 otherwise */
+const unsigned char *shop_cover_due(Shop *s);   /* the FE cover's photo is due this frame */
+void  shop_cover_capture(const unsigned char *sc, int W, int H);   /* ScreenShot: the middle of the frame, saved */
+int   shop_mag_view(const Shop *s, float cam[9]);
+/* while the cover is up: its render setup's shaper rig hash and FE env map
+   name ("" / 0 = none), and the car setup's camera roll in degrees */
+int   shop_mag_render(const Shop *s, uint32_t *rig, char env[16], float *roll);
+/* the cover's background (UI_MagazineBack), drawn before the car */
+void  shop_draw_under(Shop *s, const RProg *rp, int width, int height);
+/* BeginCarCustomize (entry 1: the crib's Change Parts, 8015dda0) or
+   EnterShopFromFreeRoam (entry 0: a city shop of ShopDataDesc type 1..6,
+   8015df74) on a Car Shop opened over the career car: the career's unlocks
+   (GetPartUnlockFilter 8017107c), prices and cash. Entry 1 starts on
+   UI_ChooseCustomizeCategory and BACK there leaves (back to the crib);
+   entry 0 starts on PickScreenForShop's screen and BACK there asks to go
+   back to Explore Mode. Either way the exit is SHOP_ACT_EXIT. Returns 0
+   for a shop type the port has no screen for. shop: the ShopDataDesc
+   (entry 0), its scene (+0x40) the platform. */
+int   shop_career_customize(Shop *s, int entry, const unsigned char *shop);
+/* the crib again after Change Parts, on that option (from_main: it was
+   entered from the career menu) */
+void  shop_crib_return(Shop *s, int from_main);
+void  shop_crib_return_map(Shop *s, int from_main);
+int   shop_crib_from_main(const Shop *s);
+/* the UniquesBrowser ended the world challenge (a part chosen or forfeited): the save is due */
+int   shop_uniques_done(const Shop *s);
+float shop_rate(const Shop *s, const N2CarConfig *c, const char *rim_folder, int rim_style);   /* 0x5234c0 */
+float shop_rate_car(Shop *s, const char *car, const N2CarConfig *c, const char *rim_folder, int rim_style);   /* another car's */
+/* After the Car Shop (0x55bdf0): the save question when the profile
+ * changed since profile_snapshot() and save prompts are on, over the screen. */
+void  shop_save_check(Shop *s);
 /* Shows PC_Loading (the game's loading screen); shop_front_end ends it. */
 void  shop_loading(Shop *s);
+/* The screens' cache (first shop use builds it): its path, and building it
+ * without opening a shop (the PC converter). */
+const char *shop_cache_file(void);
+int   shop_build_cache(const char *dataroot);
 /* PC_Loading alone (no menus, no part database): a loading screen to keep. */
 Shop *shop_open_loading(const char *dataroot);
 /* Custom loading text (NULL/"" = the authored "LOADING") and a second line. */
@@ -134,6 +214,18 @@ void  shop_set_cars(Shop *s, const ShopCar *cars, int n, const char *cur);
 /* What main.c actually fitted after the last request (or after a car switch). */
 void  shop_set_car(Shop *s, const char *car, const N2CarConfig *fitted,
                    const N2PartMenu menus[N2_PART_COUNT]);
+
+/* The garage's platform, GarageMainScreen::ChangePlatform's PlatformNameMap
+   (GC 8035b198) index: 1 SHOWROOM, 3 CARLOT01, 4 CRIB01, ... */
+int shop_platform(const Shop *s);
+/* the front end is on UI_Main (the main menu strip) */
+int shop_on_main_menu(const Shop *s);
+/* the hash of a rim part's "<MODEL>_STYLEnn" (attribute 0x10c98090), 0 = unknown */
+uint32_t shop_rim_base(const char *dataroot, const char *folder, int value);
+#ifdef OPENUG2_SIM_PRE_H
+int shop_sim_auto_key(const Shop *s);   /* test aid: the career autopilot (main.c OPENUG2_SIM_AUTO) */
+int shop_sim_screen(const Shop *s);
+#endif
 
 /* After a SHOP_ACT_PREVIEW: what the car really shows (a part that could not
  * be attached leaves the previous one). */
@@ -162,5 +254,10 @@ void  shop_update(Shop *s, float dt);
 /* 1 and fills *a when there is an action for main.c. */
 int   shop_poll(Shop *s, ShopAction *a);
 void  shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height);
+/* the game mode is career (DAT_803ce800 == 1): every MenuScreen alternates the
+   player's name and cash (MenuScreen ctor 801515a0 -> SetAlternatingPlayerCash) */
+void  shop_set_career_mode(int on);
 
+int shop_take_tt(Shop *s);
+void shop_perf_select_tt(Shop *s);
 #endif

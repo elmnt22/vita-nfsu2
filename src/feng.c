@@ -80,13 +80,17 @@ static void parse_script(const unsigned char *d, long t, long end, FengPackage *
             ob->nscr++;
             tr = NULL;
         } else if (!memcmp(d + t, "Sc", 2) && ts >= 4 && sc) sc->chain = n2_u32(v);
-        else if (!memcmp(d + t, "EV", 2) && ts >= 12 && sc && p->nev < FENG_MAX_EV) {
-            /* {msg, target, 0, ?, -1, time} or the short {msg, target, time}
-               (e.g. the Event Handlers' DIM: a301c015 to the Targ list at 0) */
-            FengEvent *e = &p->ev[p->nev++];
-            e->msg = n2_u32(v); e->target = (int32_t)n2_u32(v + 4); e->time = (int)n2_u32(v + (ts >= 24 ? 20 : 8));
-            if (!sc->nev) sc->ev0 = (short)(p->nev - 1);
-            sc->nev++;
+        else if (!memcmp(d + t, "EV", 2) && ts >= 12 && sc) {
+            /* FEEventList: ts/12 events {msg, target, time}, e.g. an Event
+               Handler's FORWARD = aadd0187 to the package at 0, then
+               0xe1fde1d1 (EXIT_COMPLETE) to the game (-1) at 300 ms
+               (IssueScriptMessages GC 8013931c) */
+            for (int q = 0; q + 12 <= ts && p->nev < FENG_MAX_EV; q += 12) {
+                FengEvent *e = &p->ev[p->nev++];
+                e->msg = n2_u32(v + q); e->target = (int32_t)n2_u32(v + q + 4); e->time = (int)n2_u32(v + q + 8);
+                if (!sc->nev) sc->ev0 = (short)(p->nev - 1);
+                sc->nev++;
+            }
         }
         else if (!memcmp(d + t, "FI", 2) && ts >= 8 && sc) {
             if (p->ntrk >= FENG_MAX_TRK) { g_feng_trunc |= 2; tr = NULL; t += 4 + ts; continue; }
@@ -590,6 +594,11 @@ void feng_anim_rot(FengAnim *a, int obj, float deg) {
     anim_field(a, obj, 10, q, 4);
 }
 
+void feng_anim_uv(FengAnim *a, int obj, float u0, float v0, float u1, float v1) {
+    int32_t v[4] = { fw(u0), fw(v0), fw(u1), fw(v1) };
+    anim_field(a, obj, 17, v, 4);
+}
+
 void feng_anim_size(FengAnim *a, int obj, float x, float y) {
     if (obj < 0 || obj >= a->p->nobj) return;
     int32_t v[3] = { fw(x), fw(y), a->data[obj][16] };
@@ -603,9 +612,32 @@ static void msg_obj(FengAnim *a, int obj, uint32_t msg) {
         if (p->rsp[r].obj == obj && p->rsp[r].msg == msg && p->rsp[r].cmd == 0)
             feng_anim_set(a, obj, p->rsp[r].arg, 1);
 }
+int feng_anim_msg(FengAnim *a, int obj, uint32_t msg) {   /* 0x51cdc0: FEng message to one object */
+    int n = 0;
+    const FengPackage *p = a->p;
+    if (obj < 0 || obj >= p->nobj) return 0;
+    for (int r = 0; r < p->nrsp; r++)
+        if (p->rsp[r].obj == obj && p->rsp[r].msg == msg && p->rsp[r].cmd == 0) n++;
+    msg_obj(a, obj, msg);
+    return n;
+}
+int feng_anim_game_msg(FengAnim *a, uint32_t msg) {
+    for (int i = 0; a && i < a->ngame; i++)
+        if (a->game_msg[i] == msg) {
+            memmove(&a->game_msg[i], &a->game_msg[i + 1], (size_t)(a->ngame - i - 1) * sizeof a->game_msg[0]);
+            a->ngame--;
+            return 1;
+        }
+    return 0;
+}
 static void msg_send(FengAnim *a, const FengEvent *e) {
     const FengPackage *p = a->p;
-    if (e->target == -4) {                              /* the package's Targ list */
+    if (e->target == -1) {                              /* SendMessageToGame: the owner polls it */
+        if (a->ngame < (int)(sizeof a->game_msg / sizeof a->game_msg[0])) a->game_msg[a->ngame++] = e->msg;
+    } else if (e->msg == 0x1b3909aau) {
+        /* SetCurrentButton: not modelled here */
+    } else if (e->target == -4 || e->target == 0) {     /* the package's Targ list (0: every package's;
+                                                           only this one is known here) */
         for (int k = 0; k < p->ntg; k++) {
             if (p->tg[k].msg != e->msg) continue;
             for (int i = 0; i < p->nobj; i++)
@@ -761,6 +793,14 @@ int feng_tpk_load(const unsigned char *d, long len, const uint32_t *keys,
             if (d[j] == 0x02 && d[j+1] == 0 && d[j+2] == 0x32 && d[j+3] == 0x33) {
                 pix = j + 8;
                 while (pix < len && d[pix] == 0x11) pix++;
+                /* the payload starts 0x80-aligned from the chunk header;
+                   pixel bytes that are themselves 0x11 must not be eaten
+                   (InGameCommon.bun: 3 bytes, ARROW_MARKERA) -- as
+                   nfsu2.h n2_tpk_pixel_skip */
+                {
+                    long run = pix - (j + 8), r = run - (run + 8) % 0x80;
+                    if (r >= 0) pix = j + 8 + r;
+                }
                 break;
             }
         for (long o = hbeg; o + 8 <= hend; ) {
@@ -842,6 +882,7 @@ static int tpkf_header(FILE *f, long flen, long hbeg, long hend, const uint32_t 
                 if (w[j] == 0x02 && w[j+1] == 0 && w[j+2] == 0x32 && w[j+3] == 0x33) {
                     long p = j + 8;
                     while (p < wl && w[p] == 0x11) p++;
+                    p = j + 8 + n2_tpk_pixel_skip(p - (j + 8));   /* 0x11 pixel bytes stay (as feng_tpk_load) */
                     if (p < wl) pix = hend + p;
                     break;
                 }

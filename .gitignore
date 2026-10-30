@@ -69,3 +69,11 @@ tools/capture_vehicle_shots.sh
 # --- Local backup copies / junk ---
 *.pre_*
 nul
+*.bak
+*.bak[0-9]*
+*.enc_cur
+
+# --- Per-experiment build dirs (binaries, pdbs, copied game data) ---
+/build_*/
+sim/build_*/
+*.pdb

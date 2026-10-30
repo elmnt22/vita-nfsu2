@@ -184,16 +184,25 @@ enum { AFX_ENV = 1,     /* IG_GLOBAL/ENV_COMMON_MB clips 0..7 */
        AFX_SKID,        /* SOUND/SKIDS/SKID_PAV_MB clips 0..4 */
        AFX_SCRAPE,      /* IG_GLOBAL/FX_Misc_MB clip 1 (FX_Scrape), clip 0 here */
        AFX_PTURBO,      /* the player's SOUND/TURBO bank (audio_load_turbo_bank), clips 0..3 */
+       AFX_SPLASH,      /* IG_GLOBAL/ROADNOISE_00_MB clip 10 (SND_BarrelSplash), clip 0 here */
+       AFX_ROAD,        /* IG_GLOBAL/ROADNOISE_00_MB clips 0..13 (FX_ROADNOISE / _TRANS) */
+       AFX_SWTN,        /* the player's SOUND/ENGINE/SWTN_CAR_xx_MB bank, clips 0..31 (CAR_Sputter) */
        AFX_TURBO };     /* + n: AI turbo bank n (audio_load_ai_turbo_banks), clips 0..3 */
 /* 0..199 the AI and traffic effects, 200.. the collisions (5 hits x 12
-   stitch samples, 16 scrapes), 276/277 the player's turbo whine/blow-off */
-#define AUDIO_FXVOICES 278
+   stitch samples, 16 scrapes), 276/277 the player's turbo whine/blow-off,
+   278.. the water-drum sloshes (8 x 3 voices), 302.. the player's road
+   noise (2 loops, 2 base loops, 2 transitions), 308.. the player's
+   bottom-out (13 landing + 13 bump-stop stitch samples), 334/335 the
+   player's CAR_Sputter players (overrun pops), 336.. its jump-cam
+   landing stitch (13) */
+#define AUDIO_FXVOICES 349
 typedef struct {
     volatile int on;
     volatile int set, clip, loop;
     volatile unsigned trig;
     volatile float delay;
     volatile float gain, pitch;
+    volatile float pan;     /* -1 left .. 0 centre .. +1 right (equal power) */
     volatile int done;
 } AudioFxVoice;
 extern AudioFxVoice g_fxvoice[AUDIO_FXVOICES];
@@ -204,6 +213,10 @@ int audio_load_carfx_banks(const char *dataroot, const int *coll, int ncoll);
 /* the AI racers' SOUND/TURBO banks (0x7f3338 index each, at most
    CARSFX_AI_MAX distinct) into sets AFX_TURBO + 0..n-1 (inside audio_hold) */
 int audio_load_ai_turbo_banks(const char *dataroot, const int *tbank, int n);
+/* the player's SWTN_CAR_xx_MB.abk bank samples 0..31 into set AFX_SWTN
+   (inside audio_hold or before audio_init); bit k of *loops = clip k has
+   a loop. Returns clips loaded. */
+int audio_load_swtn_bank(const char *path, unsigned *loops);
 /* the turbo bank index (0x7f3338) of an audio row at an upgrade level
    (0x7f2238 record +8; the AI read level 0) */
 int audio_row_turbo(int row);
@@ -214,9 +227,27 @@ void audio_impact(float strength);
  * audio thread is outputting silence and touching no engine/clip data;
  * audio_hold(0) resumes. No-op before audio_init. */
 void audio_hold(int on);
+/* IG_PlayMovie: while pull is set the mixer plays only it (n stereo float
+   frames at rate into lr, 0..1 scaled by the master volume); NULL stops
+   and returns once the mixer has left the old source. */
+void audio_set_movie(int (*pull)(void *u, float *lr, int n, int rate), void *u);
+/* the game's speech (speech.c): pull gives n mono s16 samples at rate (the
+   rest zero); mixed on top of the game sound at master * the speech level,
+   silent while audio_pause_game is on. NULL stops (returns once the mixer
+   has left the old source). */
+void audio_set_speech(int (*pull)(void *u, int16_t *mono, int n), void *u, int rate);
+/* the Speech option (AOSpeechVol, 0..1); audio_speech_gain = master * speech */
+void audio_set_speech_level(float v);
+/* GameFlow state 3 (front end) vs in game: picks the music channel and which
+   speech duck events fire (SFXObj_Speech fields 0 / 1) */
+void audio_set_frontend(int fe);
+/* the current speech ducks in mB (music, FE sounds), for logs */
+void audio_duck_levels(int *mus, int *fe);
+float audio_speech_gain(void);
 /* front-end sounds: SoundMgr 0x458520 ids (< 0x17 FE_COMMON_MB, else FE_MB id - 0x17) */
 int  audio_load_fe_banks(const char *dataroot);
 void audio_fe_play(int id);
+void audio_camera_snapshot(void);   /* EAXSound::PlayCameraSnapShot (FX_Camera) */
 /* The Audio options (0x83aa28.., applied by SoundMgr FUN_00469050), 0..1:
    master on everything; engine on the cars' engines; tire on the skids;
    sfx on the other effects; music on the songs (the caller passes the

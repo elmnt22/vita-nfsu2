@@ -27,7 +27,7 @@ else
 endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
-SRC  := src/main.c src/render.c src/physics.c src/n2sim.c src/wcoll.c src/carcoll.c src/airacer.c src/perfparts.c src/airace.c src/racepath.c src/style.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/vinyl.c src/partanim.c
+SRC  := src/main.c src/render.c src/physics.c src/n2sim.c src/wcoll.c src/carcoll.c src/airacer.c src/perfparts.c src/airace.c src/racepath.c src/style.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/profile.c src/vinyl.c src/partanim.c src/speech.c
 HDRS := src/asset_chunks.h src/car_config.h src/car_mod.h src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h src/hud.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header

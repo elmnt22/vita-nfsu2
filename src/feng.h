@@ -117,7 +117,11 @@ typedef struct {
     unsigned char trk_done[FENG_MAX_TRK];     /* track flags bit 7 (0x5354f0) */
     int32_t keyw[FENG_MAX_KEYW];              /* the keys: setting a colour moves
                                                  the scripts' base keys (0x517ad0) */
+    uint32_t game_msg[8]; int ngame;          /* script events to the game (target -1) */
 } FengAnim;
+/* a script event the package sent to the game (SendMessageToGame GC 80147b20,
+   e.g. EXIT_COMPLETE 0xe1fde1d1 at the end of FORWARD): 1 and taken if queued */
+int  feng_anim_game_msg(FengAnim *a, uint32_t msg);
 /* every object to its authored data, hidden as authored, INIT running */
 void feng_anim_init(FengAnim *a, const FengPackage *p);
 /* 0x51cf70: switch obj to script `hash` (a name hash, feng_hash_upper);
@@ -140,6 +144,8 @@ void feng_anim_pos(FengAnim *a, int obj, float x, float y);
 /* 0x51ced0: the rotation, degrees (clockwise on screen); 0x517db0: the size */
 void feng_anim_rot(FengAnim *a, int obj, float deg);
 void feng_anim_size(FengAnim *a, int obj, float x, float y);
+int  feng_anim_msg(FengAnim *a, int obj, uint32_t msg);   /* its responses run; the count */
+void feng_anim_uv(FengAnim *a, int obj, float u0, float v0, float u1, float v1);   /* data words 17..20 */
 
 /* The screen placement of an animated object, through its parent groups
  * (0x51b0b0 / 0x52c5d0): colour (0..1) multiplied down the chain, the

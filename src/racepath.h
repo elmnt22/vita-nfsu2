@@ -23,6 +23,9 @@ typedef struct RacePath RacePath;
    0x89e7a4. NULL when the file, the event or the route cannot be built. */
 RacePath *racepath_load(const char *paths_bin, int event, int reversed);
 void      racepath_free(RacePath *p);
+/* free roam (race mode 0): the zones only, no route -- racepath_lap 0,
+   locating does nothing; NULL without chunk 0x3414a */
+RacePath *racepath_load_zones(const char *paths_bin);
 float     racepath_lap(const RacePath *p);       /* route length (track +0x18) */
 int       racepath_circuit(const RacePath *p);   /* track +0x24 */
 int       racepath_routes(const RacePath *p);    /* main route + shortcuts */
@@ -72,6 +75,10 @@ typedef struct {
    position, +0xc / +0x10 a direction, +0x14 a height, +0x30 a name hash,
    +0x42 its size. */
 const unsigned char *racepath_zone(const RacePath *p, const float pos[2], int type);
+/* the zone records in file order: the first with prev NULL, NULL after the
+   last; and racepath_zone's hold test for one record (box + polygon) */
+const unsigned char *racepath_zone_next(const RacePath *p, const unsigned char *prev);
+int racepath_zone_holds(const unsigned char *z, const float pos[2]);
 /* 0x5ee9b0: a route percent as the fraction of the lap from the start line */
 float racecps_lap_frac(const RaceCps *c, float pct);
 /* the route section of a locator node (node +8), -1 none */

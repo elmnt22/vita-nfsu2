@@ -193,10 +193,10 @@ static float stock_level(int type)
 /* 0x4feaf0 (no override slots, no race record, any type allowed): the
    list shuffled, then the first car whose stock level is within tol of
    the player's, tol 0.06 then doubling every pass */
-static int pick_car(AiRng *rng, int player_type, float player_level)
+static int pick_car(AiRng *rng, int suv, float player_level)
 {
     const signed char *list = CARS_US; int n = 26;
-    if (airace_type_suv(player_type)) { list = CARS_SUV; n = 3; }
+    if (suv) { list = CARS_SUV; n = 3; }
     int order[26];
     for (int i = 0; i < n; i++) order[i] = list[i];
     for (int i = 0; i < n; i++) {
@@ -230,7 +230,7 @@ int airace_quick(int n, int player_type, const unsigned char *player_built,
         memset(o, 0, sizeof *o);
         o->id = 100 + i;
         snprintf(o->name, sizeof o->name, "%s", names[i]);
-        o->type = pick_car(rng, player_type, plevel);
+        o->type = pick_car(rng, airace_type_suv(player_type), plevel);
         snprintf(o->car, sizeof o->car, "%s", airace_type_name(o->type));
         o->skin = o->id - 0x62;
         /* 0x4fed00: the first skill whose cumulative chance covers r */
@@ -250,6 +250,70 @@ int airace_quick(int n, int player_type, const unsigned char *player_built,
         o->rating = perf_rating(o->rec);
         o->handling = perf_handling(o->rec);
         o->klass = perf_class(o->rating);
+    }
+    return n;
+}
+
+/* RaceStarter::AddCareerEventAIOpponents 0x5260b0 (GC 8011a22c) */
+int airace_career(int n, const AiCareerSlot *slot, int suv_event, float career_level,
+                  const unsigned char *player_built, const PerfParts *player_parts, int drag,
+                  AiRng *rng, AiOpponent *out)
+{
+    if (n <= 0 || !perf_ready() || g_ntypes <= 0) return 0;
+    if (n > AIRACE_MAX) n = AIRACE_MAX;
+    float prating = perf_rating(player_built), phand = perf_handling(player_built);
+    float plevel = perf_level(prating);
+    int pclass = perf_class(prating);
+    int pnos = (int)(player_parts->level[2] + 0.5f);
+    for (int i = 0; i < n; i++) {
+        const AiCareerSlot *c = &slot[i];
+        AiOpponent *o = &out[i];
+        memset(o, 0, sizeof *o);
+        o->id = 100 + i;
+        snprintf(o->name, sizeof o->name, "%s", c->name ? c->name : "");
+        /* the level the car is picked by: 0 the entry's, 3 the stage's
+           GetAIPerformanceMatchingParameter, else the player's */
+        float t = c->mode == 0 ? (float)c->level : c->mode == 3 ? career_level : plevel;
+        /* "RANDOM": PickRandomCarsOfSomeSort 0x4feaf0 (the player's type allowed,
+           the SUV list for an SUV event +0xd), stock parts; else FillWithPreset */
+        o->type = c->type >= 0 && c->type < g_ntypes ? c->type : pick_car(rng, suv_event, t);
+        snprintf(o->car, sizeof o->car, "%s", airace_type_name(o->type));
+        o->skin = o->id - 0x62;                  /* SetCompositeNameHash(i + 2) */
+        o->skill = c->skill;
+        o->block = c->block;
+        perf_clear(&o->parts);
+        if (c->mode == 1) {
+            /* MatchPerformance(player, 1, !drag) as the quick race (0x5b7570); the
+               class is GetCarClass of the player's car */
+            perf_fit_rating(o->type, airace_type_rec(o->type), prating, drag ? -1.0f : phand, &o->parts, o->rec);
+            perf_fit_level(&o->parts, 2, pnos);
+            o->klass = pclass;
+        } else if (c->mode != 2) {
+            /* level L (0..10) along the type's rating range and the handling
+               range (none in drag), MatchPerformance(rating, 0, handling);
+               CalculateCarClass(rating, 1) reads the rating as a level (both
+               EXEs), so the class is the top one's; then the player's nitrous
+               level (MatchUpgradeLevel, path 2) */
+            float L = c->mode == 0 ? (float)c->level : career_level;   /* + 0x7992e4 (0) */
+            if (!(L > 0)) L = 0;
+            if (L > 10.0f) L = 10.0f;
+            float lo = 0, hi = 0;
+            perf_type_rating_range(o->type, &lo, &hi);
+            float target = (hi - lo) * L * 0.1f + lo;
+            float hand = drag ? -1.0f : (perf_handling_max() - perf_handling_min()) * L * 0.1f + perf_handling_min();
+            perf_fit_rating(o->type, airace_type_rec(o->type), target, hand, &o->parts, o->rec);
+            {
+                float r = target;
+                if (!(r > 0)) r = 0;
+                if (r > 10.0f) r = 10.0f;
+                o->klass = perf_class(r * 0.1f * (perf_rating_max() - perf_rating_min()) + perf_rating_min());
+            }
+            perf_fit_level(&o->parts, 2, pnos);
+        }
+        perf_build(airace_type_rec(o->type), &o->parts, o->rec);
+        o->rating = perf_rating(o->rec);
+        o->handling = perf_handling(o->rec);
+        if (c->mode == 2) o->klass = perf_class(o->rating);
     }
     return n;
 }

@@ -53,6 +53,7 @@ typedef struct {
     uint64_t packed_hash[2];
     N2GeomBlock *block;   /* non-NULL: verts/idx/vcol and this record live in it */
 } N2SharedGeometry;
+static void n2_block_free(N2GeomBlock *b) { free(b->data); free(b->geoms); free(b); }
 
 typedef struct {
     N2SharedGeometry *shared_geometry; /* immutable scenery; atomic resident/cache ownership */
@@ -131,9 +132,7 @@ static void n2_mesh_geometry_release(N2Mesh *m) {
             N2GeomBlock *b = g->block;
             free(g->packed);
             if (b) {
-                if (__atomic_sub_fetch(&b->refs, 1, __ATOMIC_ACQ_REL) == 0) {
-                    free(b->data); free(b->geoms); free(b);
-                }
+                if (__atomic_sub_fetch(&b->refs, 1, __ATOMIC_ACQ_REL) == 0) n2_block_free(b);
             } else { free(g->verts); free(g->idx); free(g->vcol); free(g); }
         }
     } else { free(m->verts); free(m->idx); free(m->vcol); }
@@ -1741,6 +1740,14 @@ static int n2_car_decal_loc(const unsigned char *d, long beg, long end, const N2
     return -1;
 }
 
+/* what a wide body (KITWnn_BODY) replaces: every KITWnn body runs bumper
+   to bumper and wider (measured on all 26 cars), so the body and doors and
+   the bumpers and skirts, stock or aftermarket, all give way to it */
+static int n2_wide_replaces(const char *name) {
+    return strstr(name,"_BODY") || strstr(name,"_DOOR_") || strstr(name,"_FRONT_BUMPER") ||
+           strstr(name,"_REAR_BUMPER") || strstr(name,"_SKIRT");
+}
+
 /* Classify a car mesh against the active profile.
  * Returns 1 = skip outright. Otherwise reports the variant token and the
  * family key (name minus that token minus any _A.._D LOD suffix) so
@@ -1764,7 +1771,7 @@ static int n2_car_is_variant(const unsigned char *d, long beg, long end,
     if(kw && kw[5]>='0' && kw[5]<='9' && kw[6]>='0' && kw[6]<='9')wnum=(kw[5]-'0')*10+(kw[6]-'0');
     if(wnum>=0 && (wide<2 || wnum!=wide-1))return 1;
     if(wnum<0 && (strstr(name,"KITW") || strstr(name,"WIDE") || strstr(name,"DECAL")))return 1;
-    if(wnum<0 && wide>1 && (strstr(name,"_BODY") || strstr(name,"_DOOR_")))return 1;
+    if(wnum<0 && wide>1 && n2_wide_replaces(name))return 1;
     int num=0;long ta=0,tl=0;
     int kind=wnum>=0?1:n2_name_variant(n,L,&num,&ta,&tl);
     if(wnum>=0){num=wnum;ta=(long)(kw+1-name);tl=6;}
@@ -2604,7 +2611,7 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                     scene->meshes[before].car_part=(unsigned char)(part_slot+1);
                     scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
                     scene->meshes[before].car_anim=n2_car_anim_class(part);
-                    scene->meshes[before].car_wide=!strstr(part,"KITW") && (strstr(part,"_BODY") || strstr(part,"_DOOR_"));
+                    scene->meshes[before].car_wide=!strstr(part,"KITW") && n2_wide_replaces(part);
                     scene->meshes[before].car_cf=(unsigned char)(strstr(part,"KITW")?3:
                         strstr(part,"_FRONT_BUMP") || strstr(part,"_REAR_BUMP")?1:
                         strstr(part,"_HOOD") && !strstr(part,"_UNDER")?4:
@@ -2643,7 +2650,7 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                     scene->meshes[before].car_part=(unsigned char)(part_slot+1);
                     scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
                     scene->meshes[before].car_anim=n2_car_anim_class(part);
-                    scene->meshes[before].car_wide=!strstr(part,"KITW") && (strstr(part,"_BODY") || strstr(part,"_DOOR_"));
+                    scene->meshes[before].car_wide=!strstr(part,"KITW") && n2_wide_replaces(part);
                     scene->meshes[before].car_cf=(unsigned char)(strstr(part,"KITW")?3:
                         strstr(part,"_FRONT_BUMP") || strstr(part,"_REAR_BUMP")?1:
                         strstr(part,"_HOOD") && !strstr(part,"_UNDER")?4:

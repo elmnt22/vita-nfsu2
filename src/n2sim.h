@@ -62,6 +62,13 @@ typedef struct {
        angle in steer_u16), the pad gives the pedals and the gears */
     int   steer_ai;
     unsigned short steer_u16;
+    /* manual == 3 selects the clutch-pedal transmission (0x407280 mode 3):
+       the pedal drives the clutch (0x594910), shifts only go in with it
+       down, a shift with it up is refused ("Missed Shift!", 0.45 s throttle
+       cut, n2sim_shift_cut), shifts into / out of R and N use the automatic
+       clutch (mode 4). clutch_pedal 0 = released .. 1 = floored (a button:
+       0 / 1); ignored in the other modes. */
+    float clutch_pedal;
 } N2Input;
 void n2sim_input(N2Sim *s, const N2Input *in);
 /* Nitrous: fit performance package level 0..3 (none, 1/3, 2/3, full of the
@@ -69,12 +76,36 @@ void n2sim_input(N2Sim *s, const N2Input *in);
 void n2sim_set_nitrous(N2Sim *s, int level);
 void n2sim_nitrous_refill(N2Sim *s);
 void n2sim_nitrous_add(N2Sim *s, float amount);   /* amount of a bottle */
+void n2sim_nitrous_fill(N2Sim *s, float amount);  /* FillNitrous 0x592640, exact (bottles, may be < 0) */
 /* nitrous left as a fraction of the bottle (0x5925b0) */
 /* A wall or car hit this frame: the steering limit eases back over 1 s. */
 void n2sim_collision(N2Sim *s);
+/* Car +0x38 DampenMode (Car::SetDampenMode 0x5f6be0): 1 = crash mode, set
+   by a hard car-car hit (carcoll.c, CheckForWildCollision 0x59fb70): no
+   damping, gravity 11, no aero, throttle <= 0.4, the full angular impulse;
+   ends 0.1 s after all four wheels are down (ResetDampenMode 0x5fc050). */
+void n2sim_set_dampen(N2Sim *s, int mode);
+int  n2sim_dampen(const N2Sim *s);
+int  n2sim_drag(const N2Sim *s);    /* n2sim_set_drag's flag */
+/* Drafting, car +0x4dc (0x5ebd80 / 0x5ebc20): the slipstream of every other
+   car (n of them, s itself skipped), 0..0.9; set it on each car before it
+   moves -- the aero drag is x (1 - draft) (0x599170 / 0x5a3380). */
+float n2sim_draft(const N2Sim *s, N2Sim *const *cars, int n);
+void  n2sim_set_draft(N2Sim *s, float d);
+float n2sim_get_draft(const N2Sim *s);
+/* 1 once after a nitrous press that was a purge (gas off or under 5 mph,
+   0x5ecdb0): the racer's SPRAY SHOW (15) */
+int   n2sim_nos_spray(N2Sim *s);
+/* the hydraulic wheels that bounced this step / are rising or lowering */
+void  n2sim_hyd_counts(const N2Sim *s, int *bounced, int *moving);
 /* The ground probe is cheap (the retail collision packs): query it every
    substep as the original does instead of once per frame. */
 void n2sim_ground_exact(N2Sim *s, int on);
+/* PhysicsMover::SetDynoMode (0x599200): the car on the dyno rollers from
+   where it is now (ResolveDynoForces: momentum kept, x / y held on the spot,
+   non-driven wheels free at full throttle); 0 lets it go. */
+void n2sim_set_dyno(N2Sim *s, int on);
+int  n2sim_dyno(const N2Sim *s);
 
 /* One frame (0x5b72d0): pre-step, int(dt/0.0044)+1 substeps, publish.
    In the Mellovator (0x5aad90) int(dt/(1/70))+1 substeps. */
@@ -132,6 +163,11 @@ typedef struct {
     int   clutch_kick;      /* drivetrain +0x74 (drift driver 0x416120) */
 } N2Controls;
 void n2sim_controls(N2Sim *s, const N2Controls *c);
+/* The driver's controller back after n2sim_controls drove the car (a scene
+   leaves it in neutral, gear request 1): the box takes first / drive again,
+   as when the start-line hold is let go (vt+0x30). */
+void n2sim_controller_begin(N2Sim *s);
+void n2sim_stop_nitrous(N2Sim *s);
 /* The car's performance level 0..10 (0x5b6990(1,-1)), which sets the
    Mellovator's tyre stiffness (+0x144 = 0.25 .. 0.5). */
 void n2sim_set_perf(N2Sim *s, float level);
@@ -164,6 +200,10 @@ void  n2sim_set_race_state(N2Sim *s, int state);
 /* a street X race (0x89e7e3): the Mellovator's tyre cap 2 (0x5a38e0), ROAD
    surface in the car state (0x59cb90) */
 void  n2sim_set_streetx(N2Sim *s, int on);
+/* The loaded track's record flags (GLOBALB 0x34201 +0x94, *0x883dac):
+   flag 0x2000 (the URL speedways) sets the Mellovator tyre force cap to
+   3.2 x load (0x5a38e0; 4 normally, 2 in street X). */
+void  n2sim_set_track_flags(N2Sim *s, unsigned flags);
 float n2sim_engine_heat(const N2Sim *s);   /* -1 off, 0..1.2, 2 blown */
 int   n2sim_engine_blown(const N2Sim *s);
 /* 0x594f20 unrounded for the current gear at `rpm` (the HUD's shift light);
@@ -194,6 +234,10 @@ typedef struct {
     int   gear;             /* 0 = R, 1 = N, 2 = 1st ...                      */
     int   gears;            /* forward gear count                             */
     int   wheels_down;      /* carstate +0x3e4                                */
+    float bottom;           /* carstate +0x330..+0x33c summed: bump-stop      */
+                            /* impulses this frame (CARFX_BOTTOM_OUT)         */
+    int   engaged;          /* carstate +0x408: gearbox state 3 (in gear, not */
+                            /* mid-shift) -- the tach's gear colour           */
     float wheel_spin[4];    /* rad, for drawing                               */
     float wheel_w[4];       /* wheel spin rate, rad/s (carstate +0x2f0)       */
     float wheel_mat[4][16]; /* wheel world matrices, rows (car +0x130): the    */
@@ -249,6 +293,25 @@ void n2sim_body_pose(N2Sim *s, const float pos[3], const float R[16], const floa
 /* 0x59bd80: impulse J at arm r from the centre of mass: p += J (|J| <= 1000),
  * L += (r x J) (|r x J| <= 10) * ang; then v and w are refreshed. */
 void n2sim_body_impulse(N2Sim *s, const float J[3], const float r[3], float ang);
+
+/* A loose rigid body without wheels or engine: a smokeable prop (smokeable.c).
+ * The same RigidBody code as the car (0x59c1e0 / 0x59c5f0), integrated with
+ * explicit Euler substeps (PhysicsSystem::IntegrateEuler 0x5aa480). */
+typedef struct N2Prop N2Prop;
+/* mass in tonnes, the diagonal of the inertia tensor (tonne m^2) and the
+   centre of gravity in model space (Smokeable::Init 0x5b1540) */
+N2Prop *n2prop_new(float mass, const float inertia[3], const float cg[3]);
+void    n2prop_free(N2Prop *p);
+/* RigidBody::SetState: centre of mass at pos, orientation R, at rest */
+void    n2prop_place(N2Prop *p, const float pos[3], const float R[16]);
+void    n2prop_body(const N2Prop *p, N2Body *o);
+void    n2prop_body_pose(N2Prop *p, const float pos[3], const float R[16], const float P[3]);
+void    n2prop_impulse(N2Prop *p, const float J[3], const float r[3]);
+/* one Euler substep of h seconds, then the orientation re-orthonormalised */
+void    n2prop_substep(N2Prop *p, float h);
+/* Smokeable::ComputeAuxiliaries 0x5a8e70 by damping state: 0 free (gravity
+   9.8), 1 momenta x 0.95, 2 frozen (momenta and gravity 0) */
+void    n2prop_damp(N2Prop *p, int state);
 
 #ifdef __cplusplus
 }

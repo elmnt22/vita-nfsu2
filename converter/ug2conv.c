@@ -30,6 +30,15 @@ void res_unpin(void);
 void world_instance_library_release(void);
 void world_instance_cache_flush(void);
 void world_instance_set_detail(int low);
+/* conv_extras.c: the caches the game writes on first use */
+int conv_track_extras_done(const char *bun);
+int conv_track_extras(const char *troot, const char *bun);
+int conv_car_count(void);
+const char *conv_car_name(int i);
+int conv_car_mods(const char *dataroot, int i);
+const char *conv_shop_file(void);
+int conv_shop_done(void);
+int conv_shop(void);
 
 static const struct { const char *bun, *name; } k_tracks[] = {
     { "STREAML4RA", "The City" },        { "STREAML4RB", "Drag Strips 1" },
@@ -120,6 +129,7 @@ static struct {
     volatile DWORD start;
     char game[MAX_PATH];
     char msg[512];
+    char extra[128];   /* the first-use cache being made after the tracks */
 } g_job;
 
 void conv_fatal(const char *what) {
@@ -171,6 +181,25 @@ static void convert_all(void) {
                (GetTickCount() - t0) / 1000.0);
     }
     res_unpin(); world_instance_library_release(); world_instance_cache_flush();
+    /* then what the game would build the first time it needs it: each
+       track's stripped bundle and start, the cars' parts lists, the shop */
+    int extras_ok = 1;
+    for (int t = 0; t < NTRACKS && ok; t++) {
+        if (!track_done(t) || conv_track_extras_done(k_tracks[t].bun)) continue;
+        snprintf(g_job.extra, sizeof g_job.extra, "Preparing %s...", k_tracks[t].name);
+        extras_ok &= conv_track_extras(TRACKS_ROOT, k_tracks[t].bun);
+        world_instance_library_release(); world_instance_cache_flush();
+    }
+    for (int i = 0; i < conv_car_count() && ok; i++) {
+        snprintf(g_job.extra, sizeof g_job.extra, "Preparing car parts lists (%d of %d)...", i + 1, conv_car_count());
+        extras_ok &= conv_car_mods("ux0:data/OpenUG2", i);
+    }
+    if (ok) {
+        snprintf(g_job.extra, sizeof g_job.extra, "Preparing the shop screens...");
+        extras_ok &= conv_shop();
+    }
+    g_job.extra[0] = 0;
+    if (!extras_ok) printf("converter: some first-use caches failed (the Vita builds those itself)\n");
     unsigned secs = (GetTickCount() - g_job.start) / 1000;
     if (!ok) snprintf(g_job.msg, sizeof g_job.msg, "Conversion failed on %s. See convert_log.txt in the output folder.",
                       k_tracks[g_job.ncur].name);
@@ -196,19 +225,33 @@ static struct {
     char msg[512];
 } g_send;
 
+#define SEND_CAP (5 * NTRACKS + 64)
+static int send_add(SendFile *f, int n, const char *name) {   /* a cache file, if made */
+    snprintf(f[n].local, sizeof f[n].local, "%s\\cache\\%s", g_out, name);
+    snprintf(f[n].remote, sizeof f[n].remote, VITA_CACHE "/%s", name);
+    return file_exists(f[n].local) ? n + 1 : n;
+}
 static int send_list(SendFile *f, int cap) {
     int n = 0;
-    /* per track: the compact bundle, the tile pack, then the index -- its
-       presence tells the game the set is whole, so it goes last */
-    for (int t = 0; t < NTRACKS && n + 3 <= cap; t++) {
+    char name[128];
+    /* per track: the compact bundle, its stripped copy and start, the tile
+       pack, then the index -- its presence tells the game the set is whole,
+       so it goes last */
+    for (int t = 0; t < NTRACKS && n + 5 <= cap; t++) {
         if (!track_done(t)) continue;
         compact_path(f[n].local, sizeof f[n].local, t);
         snprintf(f[n].remote, sizeof f[n].remote, VITA_CACHE "/%s.BUN.compact", k_tracks[t].bun); n++;
+        snprintf(name, sizeof name, "%s.BUN.compact.strip", k_tracks[t].bun); n = send_add(f, n, name);
+        snprintf(name, sizeof name, "%s.focus", k_tracks[t].bun + 6); n = send_add(f, n, name);
         snprintf(f[n].local, sizeof f[n].local, "%s\\cache\\tiles\\%s_v%d.pak", g_out, k_tracks[t].bun, WTILE_VERSION);
         snprintf(f[n].remote, sizeof f[n].remote, VITA_CACHE "/tiles/%s_v%d.pak", k_tracks[t].bun, WTILE_VERSION); n++;
         snprintf(f[n].local, sizeof f[n].local, "%s\\cache\\tiles\\%s_v%d.idx", g_out, k_tracks[t].bun, WTILE_VERSION);
         snprintf(f[n].remote, sizeof f[n].remote, VITA_CACHE "/tiles/%s_v%d.idx", k_tracks[t].bun, WTILE_VERSION); n++;
     }
+    for (int i = 0; i < conv_car_count() && n + 1 < cap; i++) {
+        snprintf(name, sizeof name, "mods_%s.bin", conv_car_name(i)); n = send_add(f, n, name);
+    }
+    if (n < cap) n = send_add(f, n, conv_shop_file());
     for (int i = 0; i < n; i++) f[i].size = file_size(f[i].local);
     return n;
 }
@@ -232,8 +275,8 @@ static int ftp_put(HINTERNET c, const SendFile *f, char *buf, DWORD bufsz) {
 }
 
 static void send_all(void) {
-    static SendFile files[3 * NTRACKS];
-    int n = send_list(files, 3 * NTRACKS);
+    static SendFile files[SEND_CAP];
+    int n = send_list(files, SEND_CAP);
     long long total = 0;
     for (int i = 0; i < n; i++) total += files[i].size;
     g_send.total = total; g_send.sent = 0; g_send.nfiles = n;
@@ -369,7 +412,7 @@ static void on_send(void) {
 }
 static void on_timer(void) {
     char m[256];
-    if (g_job.busy && g_job.todo) {
+    if (g_job.busy && g_job.todo && !g_job.extra[0]) {
         const WTileProgress *p = &g_job.prog;
         float f = p->cells_total > 0 ? (float)p->cells_done / (float)p->cells_total : 0.0f;
         if (f > 1.0f) f = 1.0f;
@@ -379,6 +422,8 @@ static void on_timer(void) {
         snprintf(m, sizeof m, "Converting %d of %d: %s  -  %d%%      (%u:%02u)", g_job.cur + 1, g_job.todo,
                  k_tracks[g_job.ncur].name, (int)(f * 100.0f), secs / 60, secs % 60);
         set_status(m);
+    } else if (g_job.busy && g_job.extra[0]) {
+        set_status(g_job.extra);
     } else if (g_job.done) {
         g_job.done = 0;
         if (g_job.ok) SendMessageA(g_bar, PBM_SETPOS, 1000, 0);

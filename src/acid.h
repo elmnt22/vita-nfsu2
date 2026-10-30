@@ -135,6 +135,18 @@ typedef struct AcidCar {
     float purge_col[2][16];              /* 0x8a3f60 colour slots of the purge's hood / tyre clones */
     float wheel_timer[4];                /* car +0x99c: time each tyre has slid */
     float smoke[4];                      /* car +0x3e4: last skid smoke strength */
+    int   flame_armed;                   /* car +0x924: revs dropped, next rev-up flames */
+    int   fxlog[CARFX_COUNT];            /* OPENUG2_FXLOG rate limit (frames) */
+    /* CarDamage (car +0x958, 0x63a360): 32 sectors round the body's
+       outline, each 0..128 (BodyDamage +8), their sum (+0x28, /4096 =
+       the damage 0x610ad0), the breakable items' sectors (+0xe8) and
+       levels (+0xe0, 2 bits each), the outline box (+0x58 / +0x60) */
+    int   dmg_on;
+    unsigned char dmg[32];
+    int   dmg_sum;
+    unsigned dmg_flags;
+    signed char dmg_item[15];
+    float dmg_min[2], dmg_max[2];
 } AcidCar;
 
 /* 0x638190: wheels = the record's four wheel points (P+0x10+0x30i, car
@@ -180,8 +192,58 @@ typedef struct {
     int   centre_surface;     /* 0x5e72e0 at the car (drive-over), -1 unknown */
     int   nitrous;            /* 0x59fa30: nitrous burning */
     float throttle;           /* |car +0x30 +0x20c| */
+    float bottom;             /* car +0x370..+0x37c summed: bump-stop impulses this frame */
+    int   gear;               /* car +0x434 (1 = neutral) */
+    float rpm;                /* car +0x440 tachometer rpm */
+    float rpm_range;          /* engine +0x1f8 - +0x1f0: redline - idle */
+    float flame;              /* 0x5995e0(4) turbo level + 0.5 with the junkman turbo: the shift flame */
 } AcidCarFrame;
 void acid_car_frame(AcidCar *c, const AcidCarFrame *f);
+
+/* CarDamage: the body box (car space x/y min, max) and the model markers
+   place the breakable items (InitSectorPositions 0x610e00); then
+   acid_damage_hit takes a collision impulse (CarCollisionBody::ApplyImpulse
+   0x5a0b00 -> AddDamage 0x593bf0: |J| at the car-space point). Damage
+   only counts while TheRaceParameters' damage flag (0x89e7d2) is on. */
+void  acid_damage_setup(AcidCar *c, const float bbmin[2], const float bbmax[2],
+                        const AcidMarker *mk, int nmk);
+void  acid_damage_hit(AcidCar *c, const float local[3], float jmag);
+float acid_damage(const AcidCar *c);                 /* 0x610ad0: 0..1 */
+void  acid_damage_repair(AcidCar *c);                /* RepairAllDamage */
+extern int acid_damage_enabled;                      /* 0x89e7d2 */
+/* the collision code's hook: an impulse J (world) at r (world offset from
+   the body's centre) on the car simulated by `sim`; main.c routes it */
+extern void (*acid_impulse_cb)(const void *sim, const float J[3], const float r[3]);
+static inline void acid_car_impulse(const void *sim, const float J[3], const float r[3])
+{ if (acid_impulse_cb) acid_impulse_cb(sim, J, r); }
+
+/* ---- emitters owned by others (Smokeable's motion / anchor lists) ------ */
+/* afxGetEmitters: clones of every loaded template of definition group
+   `group` (a list through ->next; free with acid_free_clones) */
+AcidEmitter *acid_clones(uint32_t group);
+void acid_free_clones(AcidEmitter *list);
+/* afxCopyEmitter 0x48b830: a fresh emitter from t, state 1 (on) */
+AcidEmitter *acid_copy(const AcidEmitter *t);
+/* AddAutoEmitter 0x48bc50: e runs with the world emitters (acid_tick) from
+   now on (its ->next is the manager's); acid_auto_remove takes it out and
+   frees it */
+void acid_auto_add(AcidEmitter *e);
+void acid_auto_remove(AcidEmitter *e);
+
+/* TriggerEffectEmitters (GC 8022cf54..8022d2dc): the clones of one
+   definition group, placed at a point on demand */
+typedef struct AcidTrigger {
+    int on; float pos[3];               /* +0 / +4 */
+    AcidEmitter *tmpl;                  /* +0x14 afxGetEmitters (Init) */
+    AcidEmitter *live[8]; int nlive;    /* +0x1c the placed copies */
+} AcidTrigger;
+void acid_trigger_init(AcidTrigger *t, const char *group);
+/* SetEffectLocation: 1 when placed (or already there); a z of 0 asks
+   ground(x, y, &z) for the height, 0 when that fails */
+int  acid_trigger_place(AcidTrigger *t, const float pos[3],
+                        int (*ground)(float x, float y, float *z));
+void acid_trigger_off(AcidTrigger *t);   /* DisableEffect: its particles go too */
+void acid_trigger_free(AcidTrigger *t);  /* the dtor */
 
 /* ---- collisions ---------------------------------------------------------- */
 /* 0x592c10: the surface a contact between collidables of surfaces a and b

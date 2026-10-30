@@ -73,6 +73,20 @@ int airace_quick(int n, int player_type, const unsigned char *player_built,
                  const PerfParts *player_parts, int difficulty,
                  const unsigned char *blob, AiRng *rng, AiOpponent *out);
 
+/* RaceStarter::AddCareerEventAIOpponents 0x5260b0 (GC 8011a22c): a career
+   event's opponents from its entries (CareerEventData +0x40, 12 B each):
+   the name, perf mode (0 fixed level, 1 match the player's car, 2 as it
+   comes, 3 the stage's GetAIPerformanceMatchingParameter), level, car
+   (type -1 = "RANDOM", else the preset's car type), skill by the career
+   difficulty and block level. suv_event = event +0xd. */
+typedef struct {
+    const char *name;
+    int mode, level, type, skill, block;
+} AiCareerSlot;
+int airace_career(int n, const AiCareerSlot *slot, int suv_event, float career_level,
+                  const unsigned char *player_built, const PerfParts *player_parts, int drag,
+                  AiRng *rng, AiOpponent *out);
+
 /* 0x5264a0: start positions. mode 1 humans first, 2 AI first, 3 humans
    first then the (single) human swapped with a random racer. pos[0..nh)
    are the humans, pos[nh..nh+na) the AI; filled 1-based. */

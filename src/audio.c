@@ -138,13 +138,11 @@ static unsigned g_rng = 22222;
 static float frand(void) { g_rng = g_rng*1664525u + 1013904223u; return (int)(g_rng>>9)/4194304.0f - 1.0f; }
 
 /* auxiliary acoustics (audio-thread state): turbo whine, blow-off valve,
- * overrun exhaust pops */
+ * (no overrun pops: the original has none) */
 typedef struct {
     float turbo_phase;
     float hiload;            /* recent-max load, ~150ms decay */
     float bov_env, bov_hp;   /* blow-off hiss envelope + highpass state */
-    float pop_env, pop_lp;   /* backfire envelope + lowpass (thump) state */
-    float pop_timer;
     float boost, hiboost, whine_pos;   /* bank whine: smoothed pressure, recent peak */
     float road_pos, wind_pos[3];
     float nos_vol, nos_pos; int nos_was;
@@ -721,7 +719,7 @@ int audio_load_turbo_bank(const char *dataroot, const char *carname) {
  *   2 release); FX_PURGE ("SND: NitrousPurge" 0x45f2d0, the nitrous
  *   held at a standstill, 0x5ecdb0) the same way: 4 engage, 3 loop,
  *   5 release. */
-static Clip g_road_clip[1], g_wind_clip[3], g_nos_clip[3], g_purge_clip[3];
+static Clip g_road_clip[14], g_wind_clip[3], g_nos_clip[3], g_purge_clip[3];
 
 /* ---- front-end sounds (SoundMgr 0x458520): an id < 0x17 plays that
    sample of GLOBAL/FE_COMMON_MB.abk (the FE_Common object, PlayCommonSample),
@@ -769,6 +767,30 @@ void audio_fe_play(int id) {
     g_fev[v].c = c;
 }
 
+/* EAXSound::PlayCameraSnapShot: EAXSound+8 = 1; SFX_Common::UpdateParams then
+   releases the last FX_Camera and starts a new one -- CSIS FX_Camera in
+   IG_GLOBAL/FX_Misc_MB.abk, its variant table = clip 0 (a new shot cuts the old) */
+static char g_fxmisc_path[512];
+static Clip g_camsnap;
+void audio_camera_snapshot(void) {
+    if (!g_camsnap.s && g_fxmisc_path[0]) abk_clip(g_fxmisc_path, 0, &g_camsnap);
+    if (!g_camsnap.s || !g_camsnap.n) return;
+    int v = -1;
+    for (int i = 0; i < FE_VOICES && v < 0; i++) if (g_fev[i].c == &g_camsnap) v = i;
+    if (v < 0) {
+        v = 0;
+        for (int i = 0; i < FE_VOICES; i++) {
+            if (!g_fev[i].c) { v = i; break; }
+            if (g_fev[i].pos > g_fev[v].pos) v = i;
+        }
+    }
+    g_fev[v].c = NULL;
+    __sync_synchronize();
+    g_fev[v].pos = 0.0f;
+    __sync_synchronize();
+    g_fev[v].c = &g_camsnap;
+}
+
 void audio_pause_game(int on) { g_game_mute = on; }
 static volatile float g_lv_master = 1.0f, g_lv_sfx = 1.0f, g_lv_engine = 1.0f, g_lv_tire = 1.0f,
                       g_lv_music = 1.0f;
@@ -796,19 +818,23 @@ static void fe_voices_mix(float *acc, int n) {
 int audio_load_env_banks(const char *dataroot) {
     char path[512]; int n = 0;
     g_nos_voice.c = NULL; g_purge_voice.c = NULL;
-    clip_free(&g_road_clip[0]);
+    for (int i = 0; i < 14; i++) clip_free(&g_road_clip[i]);
     for (int i = 0; i < 3; i++) { clip_free(&g_wind_clip[i]); clip_free(&g_nos_clip[i]); clip_free(&g_purge_clip[i]); }
-    static const int road_ids[1] = { 0 }, wind_ids[3] = { 0, 1, 2 }, nos_ids[3] = { 1, 0, 2 };
+    /* FX_ROADNOISE loops = variant table +0xe18 (bank entries 1..7 = clips 0..6),
+       its +0xe70 table (clips 7..10), FX_ROADNOISE_TRANS = +0xea4 (clips 11..13);
+       played by carsfx.c (CARSFX_RoadNoise) as set AFX_ROAD */
+    static const int road_ids[14] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 }, wind_ids[3] = { 0, 1, 2 }, nos_ids[3] = { 1, 0, 2 };
     snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/ROADNOISE_00_MB.abk", dataroot);
-    n += abk_clips(path, road_ids, 1, g_road_clip);
+    int nroad = abk_clips(path, road_ids, 14, g_road_clip);
+    n += nroad > 0;
     snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/WIND_00_MB.abk", dataroot);
     n += abk_clips(path, wind_ids, 3, g_wind_clip);
     snprintf(path, sizeof path, "%s/SOUND/NOS/Nitrous_00_MB.abk", dataroot);
     n += abk_clips(path, nos_ids, 3, g_nos_clip);
     {   static const int purge_ids[3] = { 4, 3, 5 };   /* FX_PURGE: 4 engage, 3 loop, 5 release */
         abk_clips(path, purge_ids, 3, g_purge_clip); }
-    printf("environment sounds: %d of 7 clips (road %u, wind %u/%u/%u, nitrous %u/%u/%u samples)\n", n,
-           g_road_clip[0].n, g_wind_clip[0].n, g_wind_clip[1].n, g_wind_clip[2].n,
+    printf("environment sounds: %d of 7 clips (road %d of 14 clips, clip 0 %u, wind %u/%u/%u, nitrous %u/%u/%u samples)\n", n,
+           nroad, g_road_clip[0].n, g_wind_clip[0].n, g_wind_clip[1].n, g_wind_clip[2].n,
            g_nos_clip[0].n, g_nos_clip[1].n, g_nos_clip[2].n);
     return n;
 }
@@ -855,7 +881,7 @@ int audio_load_traffic_clip(const char *dataroot) {
 
 /* ---- the other cars' sample effects (g_fxvoice, set by carsfx.c) ---- */
 AudioFxVoice g_fxvoice[AUDIO_FXVOICES];
-static Clip g_env_clip[8], g_woosh_clip[16], g_collall[94], g_scrape_clip;
+static Clip g_env_clip[8], g_woosh_clip[16], g_collall[94], g_scrape_clip, g_splash_clip;
 typedef struct { Clip c[4]; } AiTurboBank;
 static AiTurboBank g_aiturbo[8];
 /* audio thread: cursor (negative = delay still running), last trig seen,
@@ -891,9 +917,16 @@ int audio_load_carfx_banks(const char *dataroot, const int *coll, int ncoll) {
     for (int j = 0; j < nwant; j++) g_collall[want[j]] = tmp[j];
     clip_free(&g_scrape_clip);
     snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/FX_Misc_MB.abk", dataroot);
+    snprintf(g_fxmisc_path, sizeof g_fxmisc_path, "%s", path);
     int ns = abk_clip(path, 1, &g_scrape_clip);           /* the FX_Scrape patch's variant table: bank entry 2 */
-    n = ne + nw + nc + ns;
-    printf("car effects: ENV_COMMON %d of 8, woosh %d of 16, collision %d of %d clips, scrape %d\n", ne, nw, nc, nwant, ns);
+    /* SND_BarrelSplash = FX_ROADNOISE_TRANS variant 3: that patch's variant
+       table (the 2nd, file +0xe70) holds bank entries 8..11, so entry 11 = clip 10 */
+    clip_free(&g_splash_clip);
+    snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/ROADNOISE_00_MB.abk", dataroot);
+    int nsp = abk_clip(path, 10, &g_splash_clip);
+    n = ne + nw + nc + ns + nsp;
+    printf("car effects: ENV_COMMON %d of 8, woosh %d of 16, collision %d of %d clips, scrape %d, barrel splash %d\n",
+           ne, nw, nc, nwant, ns, nsp);
     memset(g_fvs, 0, sizeof g_fvs);
     return n;
 }
@@ -914,6 +947,18 @@ int audio_load_ai_turbo_banks(const char *dataroot, const int *tbank, int n) {
     return ok;
 }
 
+static Clip g_swtn_clip[32];
+int audio_load_swtn_bank(const char *path, unsigned *loops) {
+    int want[32];
+    for (int i = 0; i < 32; i++) { clip_free(&g_swtn_clip[i]); want[i] = i; }
+    for (int v = 0; v < AUDIO_FXVOICES; v++) if (g_fxvoice[v].set == AFX_SWTN) g_fvs[v].live = 0;
+    int n = abk_clips(path, want, 32, g_swtn_clip);
+    unsigned m = 0;
+    for (int i = 0; i < 32; i++) if (g_swtn_clip[i].loop_end > 0) m |= 1u << i;
+    if (loops) *loops = m;
+    return n;
+}
+
 static const Clip *fx_clip(int set, int k) {
     if (k < 0) return NULL;
     switch (set) {
@@ -924,6 +969,9 @@ static const Clip *fx_clip(int set, int k) {
         return k == 0 ? &g_nos_clip[1] : k == 1 ? &g_nos_clip[0] : k == 2 ? &g_nos_clip[2] : NULL;
     case AFX_SKID:  return k == 0 ? &g_skid_clip : k <= 4 ? &g_skidk[k - 1] : NULL;
     case AFX_SCRAPE: return k == 0 ? &g_scrape_clip : NULL;
+    case AFX_SPLASH: return k == 0 ? &g_splash_clip : NULL;
+    case AFX_ROAD:  return k < 14 ? &g_road_clip[k] : NULL;
+    case AFX_SWTN:  return k < 32 ? &g_swtn_clip[k] : NULL;
     case AFX_PTURBO: return k == 0 ? &g_turbo_whine : k <= 3 ? &g_bov_clip[k - 1] : NULL;
     default:
         if (set >= AFX_TURBO && set < AFX_TURBO + 8 && k < 4) return &g_aiturbo[set - AFX_TURBO].c[k];
@@ -931,9 +979,10 @@ static const Clip *fx_clip(int set, int k) {
     }
 }
 
-/* one buffer of an effect voice into acc[0..n): the clip at the voice's
-   pitch, gain ramped across the buffer */
-static void fx_voice_mix(int v, float *acc, int n) {
+/* one buffer of an effect voice into acc[0..n) (mid) and side[0..n) (right
+   minus left, halved): the clip at the voice's pitch, gain ramped across the
+   buffer, equal-power pan */
+static void fx_voice_mix(int v, float *acc, float *side, int n) {
     AudioFxVoice *fv = &g_fxvoice[v];
     FxVoiceState *st = &g_fvs[v];
     unsigned trig = fv->trig;
@@ -952,6 +1001,12 @@ static void fx_voice_mix(int v, float *acc, int n) {
     if (!(pitch > 0.25f && pitch < 4.0f)) pitch = 1.0f;
     float step = c->rate / 44100.0f * pitch;
     int loop = fv->loop;
+    float p = fv->pan, km = 1.0f, ks = 0.0f;
+    if (p > 1e-3f || p < -1e-3f) {             /* gL/gR = cos/sin of (p+1)pi/4, x sqrt2 */
+        if (p > 1.0f) p = 1.0f; if (p < -1.0f) p = -1.0f;
+        float a = (p + 1.0f) * 0.785398f, gl = cosf(a) * 1.414214f, gr = sinf(a) * 1.414214f;
+        km = 0.5f * (gl + gr); ks = 0.5f * (gr - gl);
+    }
     float g0 = st->gain, dg = (g1 - g0) / (float)n;
     for (int i = 0; i < n; i++) {
         g0 += dg;
@@ -967,7 +1022,9 @@ static void fx_voice_mix(int v, float *acc, int n) {
             s = clip_at(c, st->pos);
             st->pos += step;
         }
-        acc[i] += s * g0 * 0.6f;             /* the traffic engine's level */
+        s *= g0 * 0.6f;                      /* the traffic engine's level */
+        acc[i] += s * km;
+        side[i] += s * ks;
     }
     st->gain = g1;
 }
@@ -1027,6 +1084,18 @@ void audio_impact(float strength) {
     if (strength > g_impact_req) g_impact_req = strength;
 }
 
+/* a full-screen movie's sound (IG_PlayMovie): while set, the mixer plays
+   it alone (the front end and the songs are stopped under a movie) */
+static int (*volatile g_movie_pull)(void *u, float *lr, int n, int rate);
+static void *volatile g_movie_user;
+void audio_set_movie(int (*pull)(void *u, float *lr, int n, int rate), void *u) {
+    if (pull) { g_movie_user = u; __sync_synchronize(); g_movie_pull = pull; return; }
+    g_movie_pull = NULL;
+    __sync_synchronize();
+    audio_hold(1);      /* a callback still inside the old source has returned */
+    audio_hold(0);
+    g_movie_user = NULL;
+}
 void audio_hold(int on) {
     if (!g_audio_live) return;
     if (on) {
@@ -1040,6 +1109,57 @@ void audio_hold(int on) {
     }
 }
 
+/* the game's speech (speech.c, GameSpeech's stream): mono s16 at its own
+   rate, mixed on top of the game sound (not exclusive like the movie); it
+   stops with the game sound under audio_pause_game */
+static int (*volatile g_speech_pull)(void *u, int16_t *mono, int n);
+static void *volatile g_speech_user;
+static volatile int g_speech_rate = 22050;
+static volatile float g_lv_speech = 1.0f;
+void audio_set_speech(int (*pull)(void *u, int16_t *mono, int n), void *u, int rate) {
+    if (pull) {
+        g_speech_pull = NULL;
+        __sync_synchronize();
+        audio_hold(1); audio_hold(0);   /* the mixer has left any old source */
+        g_speech_user = u; g_speech_rate = rate > 0 ? rate : 22050;
+        __sync_synchronize();
+        g_speech_pull = pull;
+        return;
+    }
+    g_speech_pull = NULL;
+    __sync_synchronize();
+    audio_hold(1);
+    audio_hold(0);
+    g_speech_user = NULL;
+}
+void audio_set_speech_level(float v) { g_lv_speech = v; }
+float audio_speech_gain(void) { return g_lv_master * g_lv_speech; }
+/* linear resample of the pull to 44100 into acc[0..n) (audio thread) */
+static int speech_mix(float *acc, int n) {   /* 1 = a clip is playing (SFXObj_Speech) */
+    static int16_t buf[8192 + 4];
+    static int have;
+    static double pos;
+    int (*pull)(void *, int16_t *, int) = g_speech_pull;
+    static int live;   /* the last pull wrote samples */
+    if (!pull) { have = 0; pos = 0.0; return live = 0; }
+    double step = (double)g_speech_rate / 44100.0;
+    int need = (int)(pos + n * step) + 2;
+    if (need > 8192) need = 8192;
+    if (need > have) { live = pull(g_speech_user, buf + have, need - have) > 0; have = need; }
+    for (int i = 0; i < n; i++) {
+        int i0 = (int)pos;
+        if (i0 + 1 >= have) break;
+        float fr = (float)(pos - i0);
+        acc[i] = (buf[i0] * (1.0f - fr) + buf[i0 + 1] * fr) / 32768.0f;
+        pos += step;
+    }
+    int used = (int)pos;
+    if (used > have) used = have;
+    memmove(buf, buf + used, sizeof(int16_t) * (size_t)(have - used));
+    have -= used; pos -= used;
+    return live;
+}
+
 static float clip_at(const Clip *c, float pos) {
     uint32_t i0 = (uint32_t)pos;
     if (i0 + 1 >= c->n) return 0.0f;
@@ -1047,10 +1167,91 @@ static float clip_at(const Clip *c, float pos) {
     return (c->s[i0]*(1.0f-fr) + c->s[i0+1]*fr) / 32768.0f;
 }
 
-/* the songs' level under the effects: the original's mix level isn't
-   decoded (the AO*MusicVol sliders scale it); full-scale music would sit
-   on the knee */
-#define MUSIC_MIX 0.5f
+int carsfx_curve(unsigned type, unsigned x, int db);   /* carsfx.h: 0x468160 */
+/* MAPOUTPUT.mxb map 0 (class-0 objects) master levels, mB: Music ch0 -1100,
+   ch1 -900, SFX_Common (FE_COMMON sounds) -200; the player car's map 1 master
+   is -300 and the port's 0.62 car gain stands for it. ch0 = front end / ch1 =
+   in game follows their duck triggers (evt 11 FE speech -> ch0, evt 9 in-game
+   speech -> ch1): GUESS (GAPS.md Audio). */
+#define MIX_REF_MB   (-300)
+#define MUS_FE_MB    (-1100)
+#define MUS_IG_MB    (-900)
+static float mb_gain(int mb) { return powf(10.0f, (float)mb / 2000.0f); }
+/* the speech level: GetMasterVolume(1) = master * speech (GC 0x8007b23c) */
+#define SPEECH_MIX 1.0f
+/* Speech ducking = the mixmap's NFSEvtMixCtl ATR events (GC UpdateEvtMixCtl
+   800b6ab8 / UpdateATREvent 800b68b4), triggered by SFXObj_Speech::UpdateParams
+   (GC 800a3668): field 0 = speech playing in the front end (GameFlow state 3),
+   field 1 = speech playing in game. Range scaled by MasterVol +0x2c
+   (speech * master). Env word: time (w & 0xfff) * 16.667 ms, curve (w >> 12) & 0xf.
+   Only map 0 (music, FE sounds, ambience, NIS) has speech triggers: the cars'
+   map 1 is never ducked. Env_Duck / IntensityVsDucking are not used for it. */
+typedef struct { int range; unsigned att, rel; int on, lvl0, out, env; float t, trel; } MixEvt;
+static MixEvt g_evt_mus_fe = { -810, 0x8005, 0x8011 },   /* evt 11 -> Music ch0 */
+              g_evt_mus_ig = { -1320, 0x8003, 0x802f },  /* evt 9 -> sub1 (clamp -1320) -> ch1 */
+              g_evt_fe_ig = { -900, 0x2005, 0x2011 },    /* evt 2 -> SFX_Common */
+              g_evt_fe_fe = { -689, 0x2008, 0x2011 };    /* evt 5 -> SFX_Common */
+static volatile int g_fe_side = 1;
+void audio_set_frontend(int fe) { g_fe_side = fe ? 1 : 0; }
+static void evt_atr(MixEvt *e, int trig) {   /* UpdateATREvent */
+    float A = (float)(e->att & 0xfff) * 16.666670f, R = (float)(e->rel & 0xfff) * 16.666670f, x;
+    unsigned w;
+    if (A <= e->t) {
+        if (trig) {
+            if (e->trel != 0.0f) { e->trel = 0.0f; e->on = 1; e->lvl0 = e->out; e->env = 0x7fff; e->t = 0.0f; return; }
+            e->env = 0; e->trel = 0.0f; e->t = A; e->on = 0; e->lvl0 = 0; return;
+        }
+        if (e->trel == 0.0f) e->trel = e->t;
+        float el = e->t - e->trel;
+        if (R < el) { e->lvl0 = 0; e->env = 0x7fff; e->trel = 0.0f; e->on = 0; e->t = 0.0f; return; }
+        x = 32767.0f - el * 32767.0f / R; w = e->rel;
+    } else {
+        if (!trig) { e->env = 0; e->on = 1; e->lvl0 = e->out; e->t = A; return; }
+        x = e->t * 32767.0f / A; w = e->att;
+    }
+    int c = carsfx_curve((w >> 12) & 0xf, (unsigned)(int)x, 0);
+    e->env = e->range < 0 ? c : 0x7fff - c;
+}
+/* UpdateEvtMixCtl: the event's level in mB (0 = idle) */
+static int evt_update(MixEvt *e, int trig, float dt, float scale) {
+    if (e->t == 0.0f && !trig) { e->on = 0; e->trel = 0.0f; return e->out = 0; }
+    e->t += dt * 1000.0f;
+    evt_atr(e, trig);
+    float k = (32767.0f - (float)e->env) * (1.0f / 32768.0f);
+    int o;
+    if (!e->on) o = (int)(k * (float)e->range);
+    else if (!trig) o = (int)(k * (float)e->lvl0);
+    else o = (int)(k * (float)(e->range - e->lvl0)) + e->lvl0;
+    e->out = o;
+    return (int)(scale * (float)o);
+}
+static volatile int g_duck_log_mus, g_duck_log_fe;   /* last levels, for the sim log */
+void audio_duck_levels(int *mus, int *fe) { if (mus) *mus = g_duck_log_mus; if (fe) *fe = g_duck_log_fe; }
+#ifdef OPENUG2_SIM_PRE_H
+/* sim aid (OPENUG2_SIM_WAV): each bus's level every 0.1 s as "[mix]" lines
+   -- the ducks (mB), the speech flag, RMS / peak dBFS of music, speech, the
+   effect voices and the car voices (the bus gains applied) */
+static int g_simwav;
+static double g_sm_acc[4], g_sm_pk[4]; static int g_sm_n, g_sm_sp; static unsigned g_sm_t;
+static void sim_mix_stats(const float *mus, float lvmus, const float *spk, float lvsp, const float *fxb,
+                          const float *cars, float lvfx, int n, int ncar, int sp_on, int dmus, int dfe)
+{
+    if (!g_simwav) return;
+    for (int i = 0; i < n; i++) {
+        float x[4] = { 0.5f * (mus[i * 2] + mus[i * 2 + 1]) * lvmus, i < ncar ? spk[i] * lvsp : 0.0f,
+                       i < ncar ? fxb[i] * lvfx : 0.0f, i < ncar ? cars[i] * lvfx : 0.0f };
+        for (int k = 0; k < 4; k++) { g_sm_acc[k] += x[k] * x[k]; if (fabsf(x[k]) > g_sm_pk[k]) g_sm_pk[k] = fabsf(x[k]); }
+    }
+    g_sm_n += n; g_sm_sp |= sp_on;
+    if (g_sm_n < 4410) return;
+    double r[4], p[4];
+    for (int k = 0; k < 4; k++) { r[k] = 10.0 * log10(g_sm_acc[k] / g_sm_n + 1e-12); p[k] = 20.0 * log10(g_sm_pk[k] + 1e-9); }
+    printf("[mix] t %.1f speech %d duck mus %d fe %d | dB rms/peak mus %.1f/%.1f speech %.1f/%.1f fx %.1f/%.1f cars %.1f/%.1f\n",
+           g_sm_t / 10.0, g_sm_sp, dmus, dfe, r[0], p[0], r[1], p[1], r[2], p[2], r[3], p[3]);
+    memset(g_sm_acc, 0, sizeof g_sm_acc); memset(g_sm_pk, 0, sizeof g_sm_pk);
+    g_sm_n = 0; g_sm_sp = 0; g_sm_t++;
+}
+#endif
 static void audio_mix(void *ud, Uint8 *stream, int len) {
     (void)ud;
     if (g_audio_hold) {   /* a reload is swapping the data under us */
@@ -1081,6 +1282,21 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
             if (!g_shift_clip[g_shift_which].n) g_shift_which = 0;
             if (g_shift_clip[g_shift_which].n) g_shift_pos = 0.0f;
         }
+    }
+    if (g_movie_pull) {   /* IG_PlayMovie: the movie's own sound, nothing else */
+        static float mv[2 * 4096];
+        int16_t *o = (int16_t *)stream;
+        int nm = len / 4;
+        if (nm > 4096) nm = 4096;
+        memset(stream, 0, (size_t)len);
+        memset(mv, 0, sizeof(float) * 2 * (size_t)nm);
+        g_movie_pull(g_movie_user, mv, nm, 44100);
+        for (int i = 0; i < 2 * nm; i++) {
+            float x = mv[i] * g_lv_master;
+            if (x > 1.0f) x = 1.0f; if (x < -1.0f) x = -1.0f;
+            o[i] = (int16_t)(x * 32767.0f);
+        }
+        return;
     }
     static float hit = 0.0f, lp = 0.0f;
     int16_t *out = (int16_t *)stream;
@@ -1118,24 +1334,48 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
     int ncar = n < 4096 ? n : 4096;
     memset(fe, 0, sizeof(float) * (size_t)ncar);
     fe_voices_mix(fe, ncar);
-    const float lvm = g_lv_master, lvmus = MUSIC_MIX * g_lv_music * g_lv_master;
+    /* the speech first: its playing flag triggers the map-0 ducks */
+    static float fxb[4096], fxs[4096], spk[4096];
+    memset(spk, 0, sizeof(float) * (size_t)ncar);
+    const int sp_on = speech_mix(spk, ncar);   /* the speech stream runs over the front end too (crib / FE calls) */
+    const int fes = g_fe_side;
+    const float dts = (float)n / 44100.0f, dsc = g_lv_speech * g_lv_master;
+    /* both events run every buffer (their release outlives a FE/IG switch);
+       evt 9 reaches ch1 through sub1, clamped to -1320 */
+    int d_mfe = evt_update(&g_evt_mus_fe, sp_on && fes, dts, dsc),
+        d_mig = evt_update(&g_evt_mus_ig, sp_on && !fes, dts, dsc),
+        d_fe = evt_update(&g_evt_fe_ig, sp_on && !fes, dts, dsc) + evt_update(&g_evt_fe_fe, sp_on && fes, dts, dsc);
+    if (d_mig < -1320) d_mig = -1320;
+    const int dmus = fes ? d_mfe : d_mig;
+    g_duck_log_mus = dmus; g_duck_log_fe = d_fe;
+    const float lvm = g_lv_master,
+                lvmus = 0.62f * mb_gain((fes ? MUS_FE_MB : MUS_IG_MB) - MIX_REF_MB + dmus) * g_lv_music * g_lv_master,
+                gfe = mb_gain(d_fe);   /* the FE_COMMON sounds' duck */
     if (!g_lv_stereo)   /* Mono: both channels the songs' mid */
         for (int i = 0; i < n; i++) mus[i * 2] = mus[i * 2 + 1] = 0.5f * (mus[i * 2] + mus[i * 2 + 1]);
-    if (g_game_mute) {   /* paused: the front-end sounds and the music only */
+    const float lvsp = SPEECH_MIX * g_lv_speech * lvm;
+    if (g_game_mute) {   /* paused: the front-end sounds, the speech and the music only */
+#ifdef OPENUG2_SIM_PRE_H
+        sim_mix_stats(mus, lvmus, spk, lvsp, fe, fe, 0.62f * lvm * gfe, n, ncar, sp_on, dmus, d_fe);
+#endif
         for (int i = 0; i < n; i++)
             for (int c = 0; c < 2; c++) {
-                float x = fe[i] * 0.62f * lvm + mus[i * 2 + c] * lvmus;
+                float x = fe[i] * 0.62f * lvm * gfe + (i < ncar ? spk[i] * lvsp : 0.0f) + mus[i * 2 + c] * lvmus;
                 if (x > 1.0f) x = 1.0f; if (x < -1.0f) x = -1.0f;
                 out[i * 2 + c] = (int16_t)(x * 32767.0f);
             }
         return;
     }
-    static float fxb[4096];
     memset(cars, 0, sizeof(float) * (size_t)ncar);
     memset(fxb, 0, sizeof(float) * (size_t)ncar);
+    memset(fxs, 0, sizeof(float) * (size_t)ncar);
     for (int v = 0; v < AUDIO_CARVOICES; v++) car_voice_mix(v, cars, ncar);
-    for (int v = 0; v < AUDIO_FXVOICES; v++) fx_voice_mix(v, fxb, ncar);
+    for (int v = 0; v < AUDIO_FXVOICES; v++) fx_voice_mix(v, fxb, fxs, ncar);
+    if (!g_lv_stereo) memset(fxs, 0, sizeof(float) * (size_t)ncar);   /* Mono */
     const float lve = g_lv_engine, lvt = g_lv_tire, lvs = g_lv_sfx;
+#ifdef OPENUG2_SIM_PRE_H
+    sim_mix_stats(mus, lvmus, spk, lvsp, fxb, cars, lvs * 0.62f * lvm, n, ncar, sp_on, dmus, d_fe);
+#endif
     for (int i = 0; i < n; i++) {
         /* engine inertia: revs chase the target (~110ms), load a bit faster */
         e->current_rpm  += (target - e->current_rpm)  * 0.0002f;
@@ -1297,33 +1537,17 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
                 eng += (anz - x->bov_hp) * x->bov_env * 0.5f * master;
                 x->bov_env *= 0.99975f;                   /* ~250ms tail */
             }
-            /* overrun pops: high rpm + closed throttle, irregular intervals */
-            if (e->current_rpm > 4000.0f && e->current_load < 0.05f) {
-                x->pop_timer -= 1.0f / 44100.0f;
-                if (x->pop_timer <= 0.0f) {
-                    g_rng = g_rng*1664525u + 1013904223u;
-                    x->pop_timer = 0.10f + (float)(g_rng >> 20 & 1023) / 1023.0f * 0.20f;
-                    x->pop_env = 0.5f + (float)(g_rng >> 8 & 255) / 255.0f * 0.5f;
-                }
-            } else x->pop_timer = 0.12f;
-            if (x->pop_env > 0.003f) {
-                x->pop_lp += (anz - x->pop_lp) * 0.10f;   /* deep bang */
-                eng += x->pop_lp * x->pop_env * 2.2f * master;
-                x->pop_env *= 0.9992f;                    /* ~35ms transient */
-            }
+            /* no overrun pops: SPEED2.EXE / Speed.elf have no backfire sound
+               event (CARFX_EXHAUST_BLOWOFF is the flame effect only); the
+               overrun is the GIN decel sweep */
         }
         float nz = frand();
         float env;
-        if (g_road_clip[0].n) {
-            /* tyre roar rises with speed; wind with speed squared, stepping
-               through FX_WIND's three loops (light, mid, strong) */
+        /* the road noise is CARSFX_RoadNoise in carsfx.c (AFX_ROAD voices);
+           the wind: FX_WIND's three loops (light, mid, strong) by speed */
+        env = 0.0f;
+        if (g_wind_clip[0].n) {
             AuxAudio *x = &g_aux;
-            float rg = (0.08f + 0.35f * spd) * (spd < 0.1f ? spd * 10.0f : 1.0f);
-            float rs = 0.85f + 0.3f * spd;
-            env = 0.0f;
-            if (rg > 0.001f)
-                env += loop_next(&g_road_clip[0], &x->road_pos,
-                                 rs * g_road_clip[0].rate / 44100.0f) * rg;
             float wg = spd * spd * 0.45f;
             if (wg > 0.001f) {
                 float ws = 0.9f + 0.2f * spd;
@@ -1336,9 +1560,6 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
                         env += loop_next(&g_wind_clip[k], &x->wind_pos[k],
                                          ws * g_wind_clip[k].rate / 44100.0f) * wg * w3[k];
             }
-        } else {   /* road/wind: low-passed white noise scaled by speed */
-            lp += (nz - lp) * 0.25f;
-            env = lp * road;
         }
         /* nitrous: engage one-shot, burn loop fading in under it, release */
         {   AuxAudio *x = &g_aux;
@@ -1398,11 +1619,13 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
             if (g_coll_pos >= (float)k->n - 1.0f) g_coll_cur = -1;
         }
         float s = (eng + (i < ncar ? cars[i] : 0.0f)) * lve + scr * lvt +
-                  (env + thud*0.8f + (i < ncar ? fxb[i] : 0.0f)) * lvs + (i < ncar ? fe[i] : 0.0f);
+                  (env + thud*0.8f + (i < ncar ? fxb[i] : 0.0f)) * lvs + (i < ncar ? fe[i] * gfe : 0.0f);
         /* master gain ~1.8x the old 11000/32768, with a soft knee above
            half scale instead of hard clipping when everything plays at once */
         for (int c = 0; c < 2; c++) {
-            float x = s * 0.62f * lvm + mus[i * 2 + c] * lvmus, ax = x < 0.0f ? -x : x;
+            float x = (s + (i < ncar ? (c ? fxs[i] : -fxs[i]) * lvs : 0.0f)) * 0.62f * lvm +
+                      mus[i * 2 + c] * lvmus + (i < ncar ? spk[i] : 0.0f) * lvsp,
+                  ax = x < 0.0f ? -x : x;
             if (ax > 0.5f) {
                 float o = ax - 0.5f;
                 ax = 0.5f + o / (1.0f + 2.0f * o);   /* -> 1.0 asymptotically */
@@ -1468,6 +1691,35 @@ void audio_selftest(void) {
     g_engine.target_rpm = ENG_IDLE_RPM; g_engine.load = 0.0f;   /* reset */
 }
 
+#ifdef OPENUG2_SIM_PRE_H
+static int sim_wav_thread(void *path)
+{
+    FILE *f = fopen((const char *)path, "wb");
+    if (!f) { printf("audio: sim wav %s not writable\n", (const char *)path); return 0; }
+    static const unsigned char h[44] = { 'R','I','F','F', 0,0,0,0, 'W','A','V','E', 'f','m','t',' ', 16,0,0,0, 1,0, 2,0,
+                                         0x44,0xac,0,0, 0x10,0xb1,2,0, 4,0, 16,0, 'd','a','t','a', 0,0,0,0 };
+    fwrite(h, 1, 44, f);
+    static int16_t buf[2 * 1024];
+    Uint32 t0 = SDL_GetTicks(); uint64_t done = 0; unsigned blocks = 0;
+    for (;;) {
+        uint64_t want = (uint64_t)(SDL_GetTicks() - t0) * 441 / 10;
+        while (done + 1024 <= want) {
+            audio_cb(NULL, (Uint8 *)buf, sizeof buf);
+            fwrite(buf, 1, sizeof buf, f);
+            done += 1024;
+            if (++blocks % 43 == 0) {   /* keep the header's sizes current (~1 s) */
+                uint32_t d = (uint32_t)(done * 4), r = d + 36;
+                long at = ftell(f);
+                fseek(f, 4, SEEK_SET); fwrite(&r, 4, 1, f);
+                fseek(f, 40, SEEK_SET); fwrite(&d, 4, 1, f);
+                fseek(f, at, SEEK_SET); fflush(f);
+            }
+        }
+        SDL_Delay(5);
+    }
+    return 0;
+}
+#endif
 SDL_AudioDeviceID audio_init(void) {
     SDL_AudioSpec want; SDL_memset(&want, 0, sizeof want);
     want.freq = 44100; want.format = AUDIO_S16SYS; want.channels = 2;
@@ -1475,6 +1727,14 @@ SDL_AudioDeviceID audio_init(void) {
     SDL_AudioDeviceID adev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
     if (adev) SDL_PauseAudioDevice(adev, 0);
     g_audio_live = adev != 0;
+    if (!adev) printf("audio: no output device (%s)\n", SDL_GetError());
+#ifdef OPENUG2_SIM_PRE_H
+    if (!adev && getenv("OPENUG2_SIM_WAV")) {   /* sim aid: mix in real time into a WAV */
+        g_simwav = 1; g_audio_live = 1;
+        SDL_CreateThread(sim_wav_thread, "simwav", (void *)getenv("OPENUG2_SIM_WAV"));
+        printf("audio: sim mix -> %s\n", getenv("OPENUG2_SIM_WAV"));
+    }
+#endif
     g_shift_event = 0;   /* the selftest's gear changes are not real shifts */
     return adev;
 }

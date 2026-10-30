@@ -321,6 +321,13 @@ void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
  * are identical to the linear scan (same rects, same ascending order). NULL
  * clears it. Not thread-safe: the frame thread owns it. */
 void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int nobst);
+/* The same index in two steps: _make on any thread (the streaming worker
+ * prepares the next area's), _install on the frame thread (takes it over;
+ * NULL clears), _drop when it is never installed. */
+typedef struct PhysWallIndex PhysWallIndex;
+PhysWallIndex *phys_wall_index_make(const float (*obst)[4], const float (*obz)[2], int nobst);
+void phys_wall_index_install(PhysWallIndex *ix);
+void phys_wall_index_drop(PhysWallIndex *ix);
 int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max);
 

@@ -9,10 +9,19 @@ folder and writes what the Vita would write to `ux0:data/OpenUG2/cache`:
 
 - `cache/tiles/<TRACK>_v5.pak` + `.idx` -- the prebuilt world tiles
 - `cache/<TRACK>.BUN.compact` -- the compact bundle copies
+- `cache/<TRACK>.BUN.compact.strip` + `cache/<STEM>.focus` -- the 1 MB
+  bundle world tiles keep and the track's start, so even the first load
+  never reads the 57 MB copy (`converter/conv_extras.c`)
+- `cache/mods_<CAR>.bin` -- each player car's parts lists (~330 ms a car
+  on the Vita the first time it is loaded); cars with no model in the
+  install (vinyl-only folders) are skipped
+- `cache/shop_vNN.bin` -- the shop screens and art (`src/shop.c`
+  `shop_build_cache`)
 
 for STREAML4RA (city), L4RB/L4RD (drag), L4RC (drift), L4RF (Street X),
 L4RG (URL). The output is byte-identical to the simulator's own boot
-conversion (checked 2026-10-18; mesh counts match the Vita's logs).
+conversion (checked 2026-10-18; mesh counts match the Vita's logs; strip,
+focus, mods and shop files checked identical to the simulator's 2026-10-25).
 World detail is set to low, as the Vita's default.
 
 ## Use
@@ -32,13 +41,18 @@ index goes up last, so a cut-off transfer reads as "not converted" (the Vita
 then converts that track itself) instead of as a broken set.
 
 Not converted here: shader binaries (GPU-specific, the Vita compiles them),
-the shop cache (built in seconds on first shop visit), texclass lists
-(learned while playing).
+texclass lists (learned while playing).
+
+shop.c is linked whole for its cache builder; what the rest of the shop
+calls (career, profiles, music ...) is stubbed in `conv_stubs.c` and stops
+the tool with the name if ever reached.
 
 ## Build
 
     ./converter/build_converter.sh   # -> converter/build/UG2Converter.exe
 
 zig cc, SDL2 linked statically (`SDL2_DIR`, default the simulator's). A
-`WTILE_VERSION` bump or a change to the conversion code needs a rebuild of
-the tool too.
+`WTILE_VERSION` bump, a `SHOP_CACHE` version bump (shop.c) or a change to the
+conversion code needs a rebuild of the tool too, or the Vita ignores the old
+files and builds its own. New game symbols the shop starts calling show up
+as link errors: add them to `conv_stubs.c`.

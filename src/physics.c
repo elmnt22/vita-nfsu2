@@ -958,26 +958,27 @@ static int cw_resolve_one(int o, float *pos, float *vel, const float obst[][4],
 #define CWI_CELL 32.0f
 #define CWI_MARGIN 4.0f
 #define CWI_QCAP 2048
-static struct {
+struct PhysWallIndex {
     const float (*obst)[4]; const float (*obz)[2]; int n;
     float x0, y0; int gw, gh;
     int *start, *list, *big, nbig;   /* big: rects spanning too many cells */
-} g_cwi;
+};
+static PhysWallIndex g_cwi;
 
-void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int nobst) {
-    free(g_cwi.start); free(g_cwi.list); free(g_cwi.big);
-    memset(&g_cwi, 0, sizeof g_cwi);
-    if (!obst || nobst <= 0) return;
+/* The index for an obstacle array, built on any thread (the streaming
+   worker builds the next area's): NULL when it would stay linear. */
+PhysWallIndex *phys_wall_index_make(const float (*obst)[4], const float (*obz)[2], int nobst) {
+    if (!obst || nobst <= 0) return NULL;
     float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f;
     for (int o=0;o<nobst;o++) {
-        if(!(obst[o][0]<=obst[o][2] && obst[o][1]<=obst[o][3]))return; /* odd rect: stay linear */
+        if(!(obst[o][0]<=obst[o][2] && obst[o][1]<=obst[o][3]))return NULL; /* odd rect: stay linear */
         x0=fminf(x0,obst[o][0]);y0=fminf(y0,obst[o][1]);
         x1=fmaxf(x1,obst[o][2]);y1=fmaxf(y1,obst[o][3]);
     }
     int gw=1+(int)((x1-x0)/CWI_CELL), gh=1+(int)((y1-y0)/CWI_CELL);
-    if (gw<=0 || gh<=0 || (long)gw*gh > (1L<<22)) return;
+    if (gw<=0 || gh<=0 || (long)gw*gh > (1L<<22)) return NULL;
     int *count=calloc((size_t)gw*gh+1,sizeof *count), *big=malloc((size_t)nobst*sizeof *big);
-    if (!count||!big) {free(count);free(big);return;}
+    if (!count||!big) {free(count);free(big);return NULL;}
     long total=0; int nbig=0;
     #define CWI_SPAN(o,cx0,cy0,cx1,cy1) int cx0=(int)((obst[o][0]-x0)/CWI_CELL), \
         cy0=(int)((obst[o][1]-y0)/CWI_CELL), cx1=(int)((obst[o][2]-x0)/CWI_CELL), \
@@ -989,7 +990,7 @@ void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int no
     }
     for (int c=0;c<gw*gh;c++) count[c+1]+=count[c];
     int *list=malloc((size_t)(total?total:1)*sizeof *list), *fill=malloc((size_t)gw*gh*sizeof *fill);
-    if (!list||!fill) {free(count);free(big);free(list);free(fill);return;}
+    if (!list||!fill) {free(count);free(big);free(list);free(fill);return NULL;}
     memcpy(fill,count,(size_t)gw*gh*sizeof *fill);
     for (int o=0;o<nobst;o++) {
         CWI_SPAN(o,cx0,cy0,cx1,cy1);
@@ -998,8 +999,24 @@ void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int no
     }
     #undef CWI_SPAN
     free(fill);
-    g_cwi.obst=obst;g_cwi.obz=obz;g_cwi.n=nobst;g_cwi.x0=x0;g_cwi.y0=y0;g_cwi.gw=gw;g_cwi.gh=gh;
-    g_cwi.start=count;g_cwi.list=list;g_cwi.big=big;g_cwi.nbig=nbig;
+    PhysWallIndex *ix=calloc(1,sizeof *ix);
+    if (!ix) {free(count);free(big);free(list);return NULL;}
+    ix->obst=obst;ix->obz=obz;ix->n=nobst;ix->x0=x0;ix->y0=y0;ix->gw=gw;ix->gh=gh;
+    ix->start=count;ix->list=list;ix->big=big;ix->nbig=nbig;
+    return ix;
+}
+void phys_wall_index_drop(PhysWallIndex *ix) {
+    if (!ix) return;
+    free(ix->start); free(ix->list); free(ix->big); free(ix);
+}
+/* the frame thread: ix (taken over; NULL clears) becomes the index */
+void phys_wall_index_install(PhysWallIndex *ix) {
+    free(g_cwi.start); free(g_cwi.list); free(g_cwi.big);
+    memset(&g_cwi, 0, sizeof g_cwi);
+    if (ix) { g_cwi = *ix; free(ix); }
+}
+void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int nobst) {
+    phys_wall_index_install(phys_wall_index_make(obst, obz, nobst));
 }
 
 static int cwi_int_cmp(const void *a,const void *b){int x=*(const int*)a,y=*(const int*)b;return (x>y)-(x<y);}
@@ -1130,7 +1147,7 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max) {
     int nobst = 0;
     for (int i = 0; i < s->count && nobst < max; i++) {
-        if (s->meshes[i].world_role == 2) continue;
+        if (s->meshes[i].world_role == 2 || s->meshes[i].world_role == 3) continue;   /* 3: a smokeable prop */
         int sc = s->meshes[i].scen, baked_props=embedded_prop_mesh(&s->meshes[i]);
         int prop_check = 0;
         if (sc != N2_SC_NONE) {                 /* named: decide semantically */

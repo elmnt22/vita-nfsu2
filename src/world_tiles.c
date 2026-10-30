@@ -2,6 +2,7 @@
 #include "world.h"
 #include "world_instance.h"
 #include "nfsu2.h"
+#include "smokeable.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -996,7 +997,7 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
     if (payload != data + sizeof hdr && !scr) free(payload);
     out->bytes = total + (size_t)nsel * (sizeof *geoms + sizeof *out->m);
     /* drop the decoder's hold: from here the meshes keep the block alive */
-    if (__atomic_sub_fetch(&blk->refs, 1, __ATOMIC_ACQ_REL) == 0) { free(blk->data); free(blk->geoms); free(blk); }
+    if (__atomic_sub_fetch(&blk->refs, 1, __ATOMIC_ACQ_REL) == 0) n2_block_free(blk);
     return 1;
 }
 
@@ -1777,7 +1778,7 @@ static int wt_downgrade(WtLoaded *t) {
     size_t bytes = total + (size_t)n * (sizeof *geoms + sizeof *ms);
     wt_release(t);
     t->m = ms; t->n = n; t->bytes = bytes; t->ground = 1;
-    if (__atomic_sub_fetch(&blk->refs, 1, __ATOMIC_ACQ_REL) == 0) { free(blk->data); free(blk->geoms); free(blk); }
+    if (__atomic_sub_fetch(&blk->refs, 1, __ATOMIC_ACQ_REL) == 0) n2_block_free(blk);
     return 1;
 }
 
@@ -1961,6 +1962,9 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                 if (near && role == 2) continue;
                 if (near) role = 0; else if (role == 1) drop_vcol = 1;
             }
+            /* a smokeable's scenery instance: kept (textures, its meshes) but
+               drawn by smokeable.c, not batched */
+            if (role != 1 && m->scen_has && smk_is_prop(m->scen_region, m->scen_index)) role = 3;
             if (!wt_push(scene, m, role, drop_vcol)) return 0;
         }
     }

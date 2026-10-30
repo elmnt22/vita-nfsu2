@@ -268,6 +268,8 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
  * GL thread, and before pointing the loader at different archives in the same
  * process (the Vita venue track switch does). */
 void world_texture_cache_clear(void);
+/* A texture the cache holds, by key (0 = not bound); mode: its N2_DRAW_* */
+GLuint world_texture_lookup(uint32_t key, unsigned char *mode);
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */

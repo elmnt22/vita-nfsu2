@@ -213,6 +213,33 @@ void     aitraffic_report(const AiWorld *w);
 extern const char *(*airacer_poly_name)(int id);   /* diagnostics: a wall polygon's barrier group */   /* log: traffic standing still */
 /* once a frame after the cars: the intersections and the teleporter */
 void     aitraffic_frame(AiWorld *w, float dt);
+/* free roam's random encounters (aiencounter.c, 0x53f000 / 0x42edf0): the
+   three racers added out of the world; the manager's tick after the
+   teleporter (mode 0 or 7); a placed car's pose comes from aitraffic_pose */
+void     aienc_add(AiWorld *w, AiRacer *r);
+void     aienc_frame(AiWorld *w);
+AiRacer *aienc_candidate(const AiWorld *w);   /* the car the player may challenge (HUD event 9), NULL none */
+int      airacer_off(const AiRacer *r);        /* out of the world (0x5f6e20) */
+int      airacer_hilite(const AiRacer *r);     /* car FX +0x208c */
+int      airacer_poofed(const AiRacer *r);     /* car +0x998 */
+/* a poofed car's blink (car +0x974 / +0x978): 1 while it lasts */
+int      airacer_blinking(const AiRacer *r);
+/* the Engage button in free roam (joy event 0xbf): 1 if the challenge was
+   taken (the Outrun starts on the next tick) */
+int      aienc_engage(AiWorld *w);
+void     aienc_units(AiWorld *w, int kmh);   /* 0x83aa1a: the Outrun's limit 300 m, else 304.9 */
+/* in an Outrun (mode 7): the player's distance from the leader
+   (GetDistanceFromLeader 0x4c9450, > 0 behind), the limit, the player's
+   standing; 0 none */
+int      aienc_outrun(const AiWorld *w, float *dist, float *limit, int *rank);
+/* the last Outrun's end for the player (6 won, 7 lost) and a count of them */
+int      aienc_result(const AiWorld *w, int *seq);
+/* the player's Outrun is over (mode 7 until EndGetAway): its reason
+   (6 won, 7 lost) and time (1/4000 s); 0 none */
+int      aienc_over(const AiWorld *w, int *reason, int *ftime);
+/* the getaway arrow (0x5f3ae0): 1 with the leader's position when the
+   player is more than 60 m behind it in an Outrun */
+int      aienc_arrow(AiWorld *w, float target[3]);
 
 /* ---- the race's reference times (0x5f6e70 / 0x5edd90) ------------------
    The race route located for the table: reset (0x5da2f0), locate a point
@@ -230,6 +257,33 @@ typedef struct {
    fraction a second) of bin i of 256, out[2 + 2i] the time to reach it */
 void  ainet_reftime(const AiNet *n, const float start[3], float route_len, const AiRefLoc *L, float out[513]);
 float ainet_reftime_at(const float tab[513], float d);
+
+/* ---- the GPS ---------------------------------------------------------------
+   The GPS's PathfindingManager (PC 0x81cbc0) + the human RealController's GPS
+   path following (UpdateGPSFuturePoints 0x42a360), on the free-roam AiNet. */
+typedef struct AiGps AiGps;
+AiGps *aigps_new(const AiNet *net);
+void   aigps_free(AiGps *g);
+/* SubmitRequest 0x40c440 for the player (postedness 2, algorithm 1): from the car
+   (pos, 2D forward unit vector) to target (the zone's GPS point). Ignored if busy. */
+void   aigps_submit(AiGps *g, const float pos[3], const float fwd[2], const float target[3]);
+/* CancelRequest 0x4131f0: request dropped, controller GPS state 0 */
+void   aigps_cancel(AiGps *g);
+/* once per sim step: Service 0x4268a0 (A* sliced at 0.6 ms of the
+   performance counter a call), then UpdateGPSFuturePoints for the player's
+   car: arrival (30 m 2D / 4 m z -> state 0 + cancel), re-route when off the
+   path, the GPS future points 30 + max(1.5 v, 100) m ahead. speed in m/s. */
+void   aigps_tick(AiGps *g, const float pos[3], const float fwd[2], float speed);
+int    aigps_req_status(const AiGps *g);  /* PFM +4: 0 idle, 1 searching, 2 found, 3 no path, 4 no start */
+int    aigps_last_result(const AiGps *g); /* PFM +8 (kept across resubmits, cleared by a cancel) */
+int    aigps_ctrl_state(const AiGps *g);  /* RealController +0x3e4: 0 none, 1 following, 3 no path */
+/* RenderGPSArrow 0x5f3cb0's aim: WantToDisplayGPSArrow + GetDL + GetWorldPosition(D +
+   max(speed*1.5,100), L=0); 1 = out valid. */
+int    aigps_arrow_point(const AiGps *g, const float pos[3], float speed, float out[3]);
+int    aigps_path(const AiGps *g, float *xyz, int max); /* debug: the solved route's points (xyz NULL = count) */
+/* optional: half the car-space box's width (0x5ec250; default 1 m), the
+   off-path tolerance of UpdateGPSFuturePoints */
+void   aigps_set_halfwidth(AiGps *g, float half_wid);
 
 #ifdef __cplusplus
 }

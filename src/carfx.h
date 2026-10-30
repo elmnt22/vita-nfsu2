@@ -14,6 +14,8 @@ typedef struct {
 } CarFxMat;
 
 typedef struct { float pos[3], r_in, r_out; uint32_t rgba; } CarFxLight;
+/* the world's light list was rebuilt or grew in place (carfx_sh's light grid) */
+void carfx_lights_changed(void);
 
 /* GLOBALB.BUN light materials (0x00135200 records). Returns how many loaded. */
 int carfx_load_materials(const unsigned char *d, long len);
@@ -35,5 +37,13 @@ const CarFxMat *carfx_default(void);
  * start of each element). Returns the number of track lights used. */
 int carfx_sh(float sh[10][4], const float pos[3], const float camfwd[3],
              const void *lights, int nlights, int stride);
+
+/* Shaper light rigs (SetShaperLights): load the 0x0003B700 chunk payload,
+ * then pick one by name hash (bStringHash of the uppercase name, see
+ * carfx_rig_hash); 0 / unknown = the in-game rig 0x7f3e10. */
+typedef struct { uint32_t hash; float l[3][7]; } CarFxRig;
+int carfx_load_rigs(const unsigned char *d, long len);
+int carfx_use_rig(uint32_t hash);
+uint32_t carfx_rig_hash(const char *name);
 
 #endif

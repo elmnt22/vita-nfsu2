@@ -31,12 +31,22 @@ typedef struct {
     unsigned char rival; /* race opponent or free-roam outrun racer */
     float heading;       /* radians, world +X = 0, CCW (car +0x40c) */
 } HudMapCar;
+/* a career trigger zone's minimap element (Minimap::AddUnlockedTriggerZone
+   PC 0x4ec8c0): its TrackPathZone box centre, MinimapElementType 5..0x12
+   (0x4ac1e0 of the radar filter 0x500de0), a sponsor event's
+   MINIMAP_ICON_CROSS (0x4ac460) and its SyncBlink script (zone +0x14:
+   0 Static, 1 Normal, 2 Dramatic, 0x4ac620) */
+typedef struct {
+    float x, y;
+    int   type, cross, blink;
+} HudMapZone;
 
 typedef struct {
     /* --- drivetrain readouts --- */
     float speed_kmh;          /* REAL: PHYS_KMH(speed) */
     float rpm, rpm_redline;   /* PROVISIONAL: the virtual AUDIO gearbox */
     int   gear;               /* <0 reverse, 0 neutral, 1..n forward */
+    int   gear_out;           /* car +0x448 == 0 (gearbox mid-shift): orange gear */
     int   nitro_active;       /* REAL, but binary: there is no tank model */
 
     /* --- availability. 0 = no live system; draw the empty state. --- */
@@ -95,6 +105,11 @@ typedef struct {
     int   rt_on, rt_now;
     int   lap_start, lap_last, lap_best, lap_new;
     int   split_on, split_new, split_gap;
+    int   split_mode;         /* the Split Time option (player +0x14): 0 Leader 1 Lap Record 2 Best Lap 3 Last Lap */
+    /* the Race / Explore Map option (0x83aa1b race, 0x83aa1c free roam):
+       map_off = 0 Off (DetermineHudFeatures 0x600090 drops the minimap),
+       map_static = 1 Static (Minimap::Tick 0x4ca840 turns it only at 2 Rotate) */
+    int   map_off, map_static;
     int   lb_on, lb_n;
     struct { char name[24]; int gap, me; } lb[8];
     int   position, cars;     /* 0 = unknown/no opponents */
@@ -118,6 +133,19 @@ typedef struct {
        record's +0xba heading in degrees): STARTLINEINDICATOR (0x4ec950) */
     int   map_start;
     float map_start_x, map_start_y, map_start_deg;
+    /* career free roam: the renderable zone elements (IsRenderable 0x4ca6d0
+       already applied) and Minimap::Tick's reach in window units: 10 in
+       free roam with stage 0 / a world challenge / the GPS on, else 1
+       (0x78e090); 0 = 1 */
+    const HudMapZone *map_zones;
+    int   map_zone_n;
+    float map_far;
+    /* MinimapWrapper::UpdateGPS 0x4c8410 (GPSManager active in career free
+       roam): GetGPSStatus 0..4, the controller following a route (state 1/2),
+       the target's minimap art position (GPSManager +0x20) and its reach
+       (GetScreenPositionForWorldCoordinate 0x4cae60: 10 or 1) */
+    int   gps_on, gps_status, gps_following;
+    float gps_x, gps_y, gps_far;
 
     /* --- navigation --- */
     int   nav_active;         /* a destination is set AND a route was solved */
@@ -126,12 +154,44 @@ typedef struct {
     float nav_dist_m;
 
     /* --- message indicator (free roam only) --- */
-    int   message_waiting;    /* engine never sets this yet; see HUD_MSG_* */
+    int   message_waiting;    /* plain HUDs' FE_SMS gate (G_SMS); the indicator HUD uses sms_* */
+    /* career free roam's SMS (SMSMessageManager::Update 0x4db8c0, GC 80113978;
+       0 elsewhere): sms_unread = SMSMessageQueue +0x1404 (GetNumMessagesUnread
+       fast); sms_env = the newest unread message's SMSMessageData +5 category
+       (UpdateSMS's loop: slots count-1 down to 1, never 0; 0 none = the mail);
+       sms_stage0 = Stage0StateManager HasControl (0x502420: 0x13 holds in 2) */
+    int   sms_unread, sms_env, sms_stage0;
+    /* free roam (the EventIndicator's feature): engage = a challenger waits
+       (event 9, TryToEngagePlayer); outrun = race mode 7 with the player's
+       distance from the leader (GetDistanceFromLeader 0x4c9450, > 0
+       behind), the limit (GetGetAwayDistance) and the player's standing */
+    int   roam, engage, outrun, outrun_rank;
+    float outrun_d, outrun_limit;
+    /* the career world challenge running (DetermineHudFeatures bit 4,
+       ShouldShowCountdownTimer): ShowcaseCountdown with the seconds left */
+    int   wc_on;
+    float wc_left;
+    /* ShowcaseState::IsInMagazineMode (ShowcaseState +0x28 GC / +0x1d PC):
+       1 while the photo screen UI_ShowCase_Preview (ShowcaseMagazineDialog)
+       is up -- its ctor GC 800e8a08 / PC 4ce770 calls SetMagazineMode(1),
+       LeaveThisScreen GC 800e9198 and the dtor GC 800e8c10 SetMagazineMode(0).
+       Player::DetermineHudFeatures (GC 802158f8 / PC 600090) then returns 0
+       (as it does for IsInPreviewMode, the "Control Car" option inside the
+       same screen): every HUD feature is off, so the driving HUD draws
+       nothing, the showcase reward indicator included (it waits, see
+       hud_showcase_reward). */
+    int   magazine;
 
     /* --- drift race: what the retail drift widgets read (NULL otherwise) --- */
     const struct HudDrift *drift;
     /* --- drag race: what the retail drag widgets read (NULL otherwise) --- */
     const struct HudDrag *drag;
+    /* --- a Test Track test run: the DynoTuningStats panel (NULL otherwise) --- */
+    const struct HudDyno *dyno;
+    /* --- the style moment popups of HUD_SingleRace (CunningStuntSpread,
+       0x4da900 -> 0x4c88e0 / 0x4da710 -> 0x4ab780); NULL: the HUD feature
+       0x20000 (the player's Score option, 0x83aa67) is off --- */
+    const struct HudStyle *style;
 
     /* --- the player's options (options.h; 0 = the shown / MPH state) --- */
     int   kmh;                /* 0x83aa1a: 1 KM/H (0x5ea8b0), 0 MPH */
@@ -149,6 +209,7 @@ typedef struct HudDrag {
     float redline;            /* engine record +4 (P +0x1f4) */
     float ang0, ang1;         /* car record +0x7f0 [+0xc] / [+0x10]: the needle's sweep, deg */
     int   phys;               /* car +0x28 == 1: the physics mover (else no shift grading) */
+    int   gear_out;           /* car +0x448 == 0 (gearbox mid-shift): gear drawn 0xffff8000 */
     int   shifting;           /* drivetrain +0x48 (0x5ecd70) */
     int   cut;                /* drivetrain +0x5c > 0 (0x5ece20) */
     float grade;              /* drivetrain +0x68 (0x5ecea0) */
@@ -159,7 +220,43 @@ typedef struct HudDrag {
     int   nos; float nos_v;   /* a nitrous system; 0x5925b0 (the bottle, 0..1) */
     int   race_state;         /* *0x890118: 4 racing */
     int   mph;                /* the profile's units (0x83aa1a 0: mph) */
+    int   tuning;             /* 0x89e7e6: a Test Track run (StartCarTuningRace 0x526970) */
 } HudDrag;
+
+/* The Test Track's test run: DynoTuningStats (HUD feature 0x800 of
+ * DetermineTuningHUDFeatures GC 80216658; ctor 80112aec, Setup 80112c30,
+ * Update 80113208 / PC 4c9ce0) reads the player's RacingCarStats (race
+ * entry +0x1a0, 0x5f7410). Times in 1/4000 s, 0 = none. */
+typedef struct HudDyno {
+    int   kind;               /* 0 drag, 1 drift, 2 the rest (Setup's three branches) */
+    int   setting;            /* GetCurrentTuningSetting: 0 circuit, 3 street X, 4 URL (the title) */
+    float burnout;            /* stats +0x28, m (-1 none) */
+    int   t60;                /* stats +8: race time at 60 mph (100 km/h metric) */
+    float qm_speed;           /* stats +0x10: m/s at the quarter mile, -1 none */
+    int   qm_time;            /* stats +0x14 */
+    float g_cur, g_max;       /* stats +0x24 / +0x20 */
+    float speed;              /* |car speed| m/s (the drag panel's 72f68cc9) */
+    int   best_lap;           /* RacingCar::GetBestLapTime */
+    int   best_score;         /* GetBestLapScore (drift) */
+    float best_drift, best_drift_s;   /* drift moment +0x44 / +0x40 */
+    int   now, last_cross;    /* the race clock, GetLastStartLineCrossingTime (0 none) */
+    int   new_lap;            /* RacingCar +0xd */
+} HudDyno;
+
+/* The player's style moments shown this frame (the accumulator's shown list,
+ * 0x56fd10), for the SP_Trick_Point / SP_Trick_Type popups. */
+typedef struct HudStyle {
+    int n;
+    struct {
+        int index;            /* moment +0xc */
+        int cont;             /* table +6 */
+        int state;            /* +0x14 */
+        float cur, mult;      /* +0x24, +0x1c */
+        uint32_t label;       /* table +0 */
+    } m[39];
+    int show_pts;             /* +0x79: the player's bottle > 0 and 0x89e7e7 */
+    int clock;                /* the game clock, 4000 ticks a second (0x86518c) */
+} HudStyle;
 
 /* The player's drift state, as SPEED2.EXE's drift HUD widgets read it each
  * frame (0x4da590 angle/messages, 0x4da900 -> 0x4c85d0 style points,
@@ -219,9 +316,17 @@ void hud_screen_label(Hud *h, const char *name, uint32_t label);   /* 0x50c900 *
 void hud_screen_label_h(Hud *h, uint32_t obj, uint32_t label);     /* the object by its name hash */
 void hud_screen_text_h(Hud *h, uint32_t obj, const char *text);
 void hud_screen_script_h(Hud *h, uint32_t obj, const char *script);
+/* a script event of the screen to the game (target -1, e.g. EXIT_COMPLETE
+   0xe1fde1d1 after FORWARD): 1 and taken if it was sent */
+int  hud_screen_game_msg(Hud *h, uint32_t msg);
 void hud_screen_hide_h(Hud *h, uint32_t obj, int hide);
+/* the screen's strings wrap at their Sw width (0x51c110, the FEng string layout); off by
+   default: the screens ported before it keep their layout until checked */
+void hud_screen_wrap(Hud *h, int on);
+int  hud_screen_break(Hud *h, const char *name, float width, const char *txt, char (*out)[160], int max);   /* CTextScroller lines */
 const char *hud_screen_string(const Hud *h, uint32_t label);      /* English.bin */
 void hud_screen_script(Hud *h, const char *name, const char *script);
+void hud_screen_script_once(Hud *h, const char *name, const char *script);   /* unless already running */
 void hud_screen_hide(Hud *h, const char *name, int hide);
 /* an object's position (centre for images, the text anchor for strings)
    and size (images: pixels, strings: scale) as authored, i.e. as a screen
@@ -240,6 +345,22 @@ int  hud_screen_res(Hud *h, const char *name, const char *resname);
 /* every object that has `script` starts it (an FEng message such as the
    screen manager's FadeIn on show) */
 void hud_screen_script_all(Hud *h, const char *script);
+/* objects by package index (FEngFindObject once, then the FEng setters):
+   -1 = no such object, the setters ignore it */
+int  hud_screen_find(const Hud *h, const char *name);
+int  hud_screen_find_h(const Hud *h, uint32_t obj);
+void hud_screen_obj_pos(Hud *h, int o, float x, float y);      /* FEngSetCenter (absolute for a top-level object) */
+void hud_screen_obj_size(Hud *h, int o, float w, float ht);    /* FEngSetSize */
+void hud_screen_obj_rot(Hud *h, int o, float deg);             /* FEngSetRotationZ */
+void hud_screen_obj_color(Hud *h, int o, uint32_t argb);       /* FEngSetColor 0xAARRGGBB */
+void hud_screen_obj_hide(Hud *h, int o, int hide);             /* FEngSetVisible / Invisible */
+void hud_screen_obj_script(Hud *h, int o, const char *script); /* FEngSetScript */
+int  hud_screen_obj_msg(Hud *h, int o, const char *msg);   /* an FEng message (FEHashUpper(msg)); responses run */
+void hud_screen_obj_uv(Hud *h, int o, float u0, float v0, float u1, float v1);   /* the image's uv rectangle */
+void hud_screen_obj_xtex(Hud *h, int o, int which);            /* FEngSetTextureHash: 0 own, 1 MINIMAP_ICON_CROSS, 2 MINIMAP_ICON_TICK */
+void hud_screen_obj_tex_of(Hud *h, int o, int src);            /* o drawn with src's texture (FEImage +0x24 copied) */
+uint32_t hud_screen_obj_argb(const Hud *h, int o);             /* the authored colour */
+int  hud_screen_obj_box(const Hud *h, int o, float *x, float *y, float *w, float *ht);   /* authored centre / size */
 /* An IconScroller (0x543a90 with OPTION_MASTER / "option_") on a screen: the
  * n icons (TPK keys, from `bundle`) in a row centred on OPTION_MASTER, 40
  * apart, the selected one pulsing (0x538760), the others at 0.8 size --
@@ -247,6 +368,48 @@ void hud_screen_script_all(Hud *h, const char *script);
 int  hud_screen_strip(Hud *h, const char *dataroot, const char *bundle, const uint32_t *keys, int n);
 void hud_screen_strip_select(Hud *h, int sel);
 void hud_screen_strip_lock(Hud *h, int i, int lock);
+int  hud_screen_strip_more(Hud *h, const char *dataroot, const char *bundle, const uint32_t *keys, int n);   /* the missing icons from another bundle */
+/* 0x50c990 with a texture from a file: the object `obj` drawn with the TPK
+   texture `texname` of `path` (opaque: its alpha forced to 255, as the
+   TRACKMAP textures need); up to 2 per screen. 0 = not loaded */
+int  hud_screen_tex_file(Hud *h, uint32_t obj, const char *path, const char *texname, int opaque);
+/* the same with the texture's bin hash (bStringHash of its name) given
+   directly, e.g. a MagazineSetup's mast / extra keys in
+   FRONTEND/MAGAZINES_STREAMING_{LOW,HIGH}.bin (compressed-index JDLZ TPKs).
+   Calling it again for an object already overridden replaces that slot. */
+int  hud_screen_tex_key(Hud *h, uint32_t obj, const char *path, uint32_t key, int opaque);
+int  hud_screen_strip_tex(Hud *h, uint32_t obj, int i);   /* the object drawn with strip icon i */
+/* FEngSetTextureHash for a screen: hud_screen_keys loads TPK keys from a
+   bundle into the screen's own table (up to 16 in all, callable again,
+   freed by hud_free; returns the number found); hud_screen_obj_key draws
+   object o with key's texture -- one loaded so, else the package's own
+   resource with that key; an unknown key leaves o as it is */
+int  hud_screen_keys(Hud *h, const char *dataroot, const char *bundle, const uint32_t *keys, int n);
+void hud_screen_obj_key(Hud *h, int o, uint32_t key);
+/* The free-roam EventIndicator's events (EventIndicator::AddEvent 0x4c9170 /
+   RemoveEvent 0x4dab80) for the HUD that has it, applied on its next frame:
+   EventIndicatorType 1..0x14 (career zones by career_zone_indicator, 0x14 the
+   stage-0 intro with its param in s). The random encounter (9) comes from
+   HudState.engage. hud_event_reset: every slot empty (a new free roam). */
+void hud_event_add(int type, int param);
+void hud_event_remove(int type);
+void hud_event_reset(void);
+/* FEngHud::ShowShowcaseReward (PC 0x4ac170, GC 80114df0) ->
+   ShowcaseRewardIndicator::QueueMessage (GC 80108b90): call it where the
+   showcase cash is paid (PlayerCareerState::NotifyShowcaseCompleted PC
+   0x541210, from ChooseMagazineForShowcase at photo-screen entry) with the
+   showcase kind (record +0x24: 1/3 magazine, 2/4 DVD), the base reward
+   (record +0x26) and the star part (ftol(stars * purse + 0.005)). Queued in
+   class statics (messageQueued, mMagType, baseReward, starRatingReward,
+   mDelayFrames = 4); the in-game HUD's Cash_Reward string then shows
+   "Bank Reward for Magazine/DVD: <base + star>" with its ZoomIn script once
+   the widget's feature (hi 0x80) has been on for 4 frames -- i.e. after the
+   photo screen closes (HudState.magazine back to 0). A second call before
+   it shows replaces the first (one set of statics). */
+void hud_showcase_reward(int kind, int base, int star);
+/* FEngHud::ShowPickedUpBank: a bank zone's cash -- "Bank Reward: <cash>"
+   (Cash_Bank, Cash_Animate) over the money box, UI sound 0x11 */
+void hud_bank_pickup(int cash);
 /* bPrintf "%$d": 12,345 (0x43e950, '$' = locale digit grouping) */
 void hud_num(char *out, int cap, int v);
 /* 0x577240 -> 0x576d30 (English): a race time in 1/4000 s, " 1:23.45" */
@@ -289,7 +452,11 @@ typedef struct {
 } HudMenu;
 void hud_draw_menu(Hud *h, const RProg *rp, GpuMesh *quad, const HudMenu *m,
                    int width, int height);
+/* a polyline in FEng space (640x480 centred, y down), colour 0xAARRGGBB */
+void hud_fe_lines(const RProg *rp, GpuMesh *quad, int width, int height,
+                  const float *xy, int n, uint32_t argb, float thick);
 /* One large centred line (countdown, FINISHED), optional smaller line below. */
+void hud_draw_movie(const RProg *rp, GpuMesh *quad, GLuint tex, int tw, int th, int width, int height);
 void hud_draw_banner(Hud *h, const RProg *rp, GpuMesh *quad, const char *text,
                      const char *sub, int width, int height);
 
@@ -361,5 +528,12 @@ int hud_map_pick(float ndc_x, float ndc_y,
  * This is what keeps proportions and safe margins identical across aspects. */
 void hud_place(float aspect, float anchor_x, float anchor_y,
                float off_x, float off_y, float *ndc_x, float *ndc_y);
+
+/* The pad glyphs the console FNGs' $JOY_EVENT_...$ prompts draw as (a
+ * 64x64 RGBA texture, made on first use): the face buttons, the d-pad with
+ * its up/down or left/right arms lit, the left / right stick. */
+enum { HUD_PAD_CROSS, HUD_PAD_CIRCLE, HUD_PAD_TRIANGLE, HUD_PAD_SQUARE,
+       HUD_PAD_DPAD_UD, HUD_PAD_DPAD_LR, HUD_PAD_LSTICK, HUD_PAD_RSTICK, HUD_PAD_N };
+GLuint hud_pad_glyph(int b);
 
 #endif

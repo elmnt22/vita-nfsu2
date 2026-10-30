@@ -126,3 +126,11 @@ void glGetProgramBinary(GLuint program, GLsizei cap, GLsizei *length, GLenum *fo
     if (length) *length = 0;
     if (format) *format = 0;
 }
+
+/* the game objects allocate through the simulator's Vita heap model
+   (sim_pre.h); the converter uses the PC heap */
+void *sim_malloc(size_t n) { return malloc(n); }
+void *sim_calloc(size_t c, size_t n) { return calloc(c, n); }
+void *sim_realloc(void *q, size_t n) { return realloc(q, n); }
+void  sim_free(void *p) { free(p); }
+char *sim_strdup(const char *s) { return _strdup(s); }

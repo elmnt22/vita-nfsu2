@@ -19,6 +19,9 @@ static const unsigned char *g_combo[64]; static int g_ncombo[64], g_ntype;   /* 
 static float g_lim[30];                                  /* 0x34a32 (0x86b3d0) */
 static int g_ready;
 static unsigned char *g_copy; static long g_copylen;
+/* the brands (chunk 0x34a14, 0x44 bytes): +0 brand string (DECAL_ICON_%s),
+   +0x20 display name, +0x40 hash (0x4fff40 / 0x4fff00 look a hash up) */
+static const unsigned char *g_brand; static int g_nbrand;
 
 static uint32_t rd32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static int32_t  rds32(const unsigned char *p) { return (int32_t)rd32(p); }
@@ -43,7 +46,7 @@ static const unsigned char *pkg_find(int cat, int lvl)                  /* 0x500
 int perf_init(const unsigned char *g, long len)
 {
     free(g_copy); g_copy = NULL;
-    g_npkg = 0; g_ntype = 0; g_ready = 0;
+    g_npkg = 0; g_ntype = 0; g_ready = 0; g_nbrand = 0;
     memset(g_part, 0, sizeof g_part);
     /* keep the chunks we point into */
     g_copy = (unsigned char *)malloc((size_t)len);
@@ -70,6 +73,8 @@ int perf_init(const unsigned char *g, long len)
             g_combo[g_ntype] = g + body + 4;
             if ((long)g_ncombo[g_ntype] * 16 + 4 > (long)sz) g_ncombo[g_ntype] = (int)((sz - 4) / 16);
             g_ntype++; got |= 2;
+        } else if (id == 0x34a14 && !g_nbrand && sz % 0x44 == 0) {     /* the brand list */
+            g_brand = g + body; g_nbrand = (int)(sz / 0x44);
         } else if (id == 0x34a32 && sz >= sizeof g_lim) {
             for (int i = 0; i < 30; i++) g_lim[i] = rdf(g + body + 4 * i);
             got |= 4;
@@ -88,8 +93,45 @@ int perf_init(const unsigned char *g, long len)
     return g_ready;
 }
 int perf_ready(void) { return g_ready; }
+/* a part's brands: +0xc count, +0x10 hashes (ChooseBrandsScreen 0x521e90 / 0x53b960) */
+int perf_part_brands(int idx, unsigned int *out, int max)
+{
+    if (idx < 0 || idx >= PERF_NPARTS || !g_part[idx]) return 0;
+    int n = rds32(g_part[idx] + 0xc);
+    if (n < 0) n = 0;
+    if (n > 8) n = 8;
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) out[i] = rd32(g_part[idx] + 0x10 + 4 * i);
+    return n;
+}
+const char *perf_brand_str(unsigned int hash, int display)
+{
+    for (int i = 0; i < g_nbrand; i++) {
+        const unsigned char *b = g_brand + i * 0x44;
+        if (rd32(b + 0x40) == hash) return (const char *)b + (display ? 0x20 : 0);
+    }
+    return "";
+}
+/* is_brand_in_any_perf_package (GC 8012f894): a brand on any package's part */
+int perf_brand_in_package(unsigned int brand)
+{
+    for (int i = 0; i < PERF_NPARTS; i++) {
+        unsigned int b[8]; int n = perf_part_brands(i, b, 8);
+        for (int k = 0; k < n; k++) if (b[k] == brand) return 1;
+    }
+    return 0;
+}
 float perf_rating_min(void) { return g_lim[10]; }
 float perf_rating_max(void) { return g_lim[11]; }
+float perf_handling_min(void) { return g_lim[28]; }                  /* GetPhysicsExtrema +0x70 */
+float perf_handling_max(void) { return g_lim[29]; }                  /* +0x74 */
+int perf_type_rating_range(int type, float *lo, float *hi)              /* 0x59a450 */
+{
+    if (type < 0 || type >= g_ntype || g_ncombo[type] <= 0) return 0;
+    *lo = rdf(g_combo[type]);
+    *hi = rdf(g_combo[type] + (g_ncombo[type] - 1) * 16);
+    return 1;
+}
 
 /* ---- fitting ---------------------------------------------------------------- */
 void perf_clear(PerfParts *pp) { memset(pp, 0, sizeof *pp); }
@@ -122,14 +164,17 @@ void perf_fit_level(PerfParts *pp, int cat, int level)                  /* 0x5a6
 {
     for (int i = 0; i < g_npkg; i++) {                                  /* 0x5a6450 -> 0x5a6400(pkg, 0) */
         const unsigned char *k = g_pkg + i * PKG_SIZE;
-        if (pkg_cat(k) != cat) continue;
+        if (cat != -1 && pkg_cat(k) != cat) continue;
         for (int j = 0; j < pkg_n(k); j++) part_set(pp, pkg_part(k, j), 0, 0);
     }
-    for (int lvl = 1; lvl <= level; lvl++) {
-        const unsigned char *k = pkg_find(cat, lvl);
-        if (!k) continue;
-        for (int j = 0; j < pkg_n(k); j++) part_set(pp, pkg_part(k, j), 1, 0);
-    }
+    /* cat -1: every category 0..9 at each level in turn */
+    int c0 = cat == -1 ? 0 : cat, c1 = cat == -1 ? 9 : cat;
+    for (int lvl = 1; lvl <= level; lvl++)
+        for (int c = c0; c <= c1; c++) {
+            const unsigned char *k = pkg_find(c, lvl);
+            if (!k) continue;
+            for (int j = 0; j < pkg_n(k); j++) part_set(pp, pkg_part(k, j), 1, 0);
+        }
 }
 
 int perf_pkg_parts(int cat, int level, int idx[4], unsigned int name[4], int price[4])
@@ -153,6 +198,10 @@ void perf_fit_pkg(PerfParts *pp, int cat, int level)                     /* 0x52
 void perf_fit_part(PerfParts *pp, int idx)                               /* 0x5213d0 */
 {
     if (idx >= 0 && idx < PERF_NPARTS && g_part[idx]) part_set(pp, g_part[idx], 1, 0);
+}
+void perf_set_part(PerfParts *pp, int idx, int on)                       /* 0x599680(idx, on, 0) */
+{
+    if (idx >= 0 && idx < PERF_NPARTS && g_part[idx]) part_set(pp, g_part[idx], on != 0, 0);
 }
 void perf_power(const unsigned char *built, float raw[2], float norm[2])  /* 0x5b5810 / 0x5b56e0 */
 {
@@ -405,8 +454,28 @@ void perf_build(const unsigned char *rec, PerfParts *pp, unsigned char *out)
         I[5] = (z * z + x * x) * m * 0.0833333f;
         I[10] = (x * x + y * y) * m * 0.0833333f;
     }
-    /* 0x5997e0 (visual parts' physics: kits, hoods, spoilers) adds nothing
-       without visual parts -- the opponents' stock look */
+    /* ApplyJunkmanUpgrades (PC 0x5997e0, GC 801c4f30), after the inertia
+       (which it leaves as built): the record's deltas P+0x2b0.. by the
+       installed paths. Path 1 sets the split, 5 and 9 do nothing. The
+       nitrous add is kept at P+0x33c (unused by every car) for
+       n2sim_set_nitrous, which rewrites P+0x2ac from the bottle. */
+    {
+        const unsigned char *j = pp->junk;
+        if (j[0]) OF(0x110) *= 1.0f - SF(0x2b0);
+        if (j[1]) OF(0x1c0) = SF(0x2b4);
+        OF(0x33c) = 0;
+        if (j[2]) { OF(0x2ac) += SF(0x2b8); OF(0x33c) = SF(0x2b8); }
+        if (j[6]) OF(0x274) += SF(0x2bc);
+        if (j[8]) {
+            OF(0xdc) += SF(0x2c0); OF(0xfc) += SF(0x2c4);
+            OF(0xe0) += SF(0x2c8); OF(0x100) += SF(0x2cc);
+        }
+        for (int k = 0; k < 9; k++) {
+            if (j[3]) OF(0x200 + 4 * k) += SF(0x2d0 + 4 * k);
+            if (j[7]) OF(0x200 + 4 * k) += SF(0x2f4 + 4 * k);
+            if (j[4]) { OF(0x200 + 4 * k) += SF(0x318 + 4 * k); OF(0x224 + 4 * k) += SF(0x318 + 4 * k); }
+        }
+    }
 }
 #undef SF
 #undef OF

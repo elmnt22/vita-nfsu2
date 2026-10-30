@@ -1244,7 +1244,11 @@ static int tr_tele_drag(AiWorld *w, AiRacer *r, const AiSeen *h, float dist)
     return 1;
 }
 /* 0x4112a0: the human is slow (< 30 m/s) with a standing traffic car
-   within 250 m of progress */
+   within 250 m of progress. In free roam every car's progress (+0x8fc) is
+   0: FinishedLoadingPart1 0x57a650 -> 0x5d9a60 zeroes the route count
+   (+0x2c), so UpdatePosition's 0x5d57a0(pos, 1) finds no node and 0x5d9e30
+   writes 0 -- one standing traffic car stops the teleports whenever the
+   player is under 30 m/s, as in the original */
 static int tr_jam(const AiWorld *w, const AiSeen *h)
 {
     if (!(h->v->absv < 30.0f)) return 0;                                /* 0x783bf4 */

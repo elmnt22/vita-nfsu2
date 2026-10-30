@@ -761,7 +761,8 @@ static void eng_update(AiSnd *a, float dt)
     /* vt+0x24 0x46f7d0: rpm */
     float r = a->sh != 0 ? a->srpm.val : a->at ? a->arpm.val : a->out.rpm;
     a->eprev = a->erpm;
-    a->erpm = r + a->rpmw + a->rpmw;      /* + the spawn bump +0x1c8 (not ported, 0) */
+    a->erpm = r + a->rpmw + a->rpmw;      /* + the bump +0x1c8: 0 for AI (only the player's
+                                             physics ctl 0x470940 arms it; AIPhysics vt+0x18 is a ret) */
     /* vt+0x28 0x45c710: load */
     if (a->sh != 0) avg_fill(&a->lf, a->sthr.val);
     else if (a->at) avg_fill(&a->lf, a->athr.val);
@@ -865,7 +866,8 @@ static int stitch_load(const char *dataroot)
 }
 
 /* the bottom-out stitches (0x47ea30: 0x4e.. on landing, 0x56.. on a tilt,
-   0x2e.. on surface 6) */
+   0x2e.. as well while the nearest view 0x459ac0 is in camera zone 6, the
+   jump cam) */
 static const int k_bo_first[3] = { 0x4e, 0x56, 0x2e };
 
 /* the voices: AI car k uses g_fxvoice[k * 10 ..], traffic slot i
@@ -878,11 +880,15 @@ enum { FT_HORN, FT_STEREO, FT_WOOSH, FT_BO = FT_WOOSH + 4, FT_BOEND = FT_BO + 13
 static void fx_start(AudioFxVoice *v, int set, int clip, int loop, float delay, float pitch)
 {
     v->set = set; v->clip = clip; v->loop = loop; v->delay = delay; v->pitch = pitch;
-    v->gain = 0; v->done = 0;
+    v->gain = 0; v->done = 0; v->pan = 0;
     v->on = 1;
     v->trig++;
 }
-static void fx_stop(AudioFxVoice *v) { v->on = 0; v->gain = 0; }
+static void fx_stop(AudioFxVoice *v) { v->on = 0; v->gain = 0; v->pan = 0; }
+/* azimuth (0 front, 0x4000 right, 0x8000 back, 0x10000 = 360 deg) -> stereo
+   pan -1..1. GUESS: the mixer output's pan word (0x45e3b0, +2) is filled by
+   code not decoded; sin of the camera azimuth stands in for it */
+static float az_pan(unsigned az) { return sinf((float)(az & 0xffff) * (6.2831853f / 65536.0f)); }
 /* the port's levels for effects the player also has (audio.c: squeal 0.45,
    rubber 0.35, nitrous 0.35 of the player's engine) over the effect
    mixer's 0.6; the mixmaps set the rest (the turbo too: the player's now
@@ -1279,6 +1285,8 @@ int carsfx_ai_turbo_banks(int tbank[CARSFX_AI_MAX])
 #define CO_SMP 12           /* samples of the largest collision stitch */
 #define FXC(h, j) (&g_fxvoice[200 + (h) * CO_SMP + (j)])
 #define FXS(r) (&g_fxvoice[200 + CO_HITS * CO_SMP + (r)])
+#define CO_SLOSH 8          /* water-drum slosh sets of 3 voices */
+#define FXW(k, j) (&g_fxvoice[200 + CO_HITS * CO_SMP + CO_REC + 2 + (k) * 3 + (j)])
 
 typedef struct {
     int on, src, a, b, poly, rec;
@@ -1287,7 +1295,8 @@ typedef struct {
 } CoEff;
 typedef struct {
     int on, eff;                /* +0x24 the contact effect, -1 = gone */
-    int kind;                   /* 0x459680: 0 car vs world, 1 car vs car */
+    int kind;                   /* 0x459680: 0 car vs world, 1 car vs car, 2 a smokeable */
+    int prop, cat;              /* kind 2: +0x134 the smokeable (caller's id), +0x130 its category */
     CarSfxCollCar car[2];       /* the pair's cars (b: car vs car only) */
     int init, nohit, sreq;      /* +0x18 +0x20 +0x22 */
     int type, flags, sel;       /* +0x124, +0x128, +0x118 (0 = car[0], 1 = car[1]) */
@@ -1298,14 +1307,18 @@ typedef struct {
     int hb;                     /* the hit's voice block */
     StitchPlay sp;
     Pos3D p3;
+    int ws;                     /* +0x14c: its slosh set, -1 = none */
 } CoRec;
 static CoEff g_coe[CO_EFF];
 static CoRec g_cor[CO_REC];
 static int g_co_hbused[CO_HITS];
 static int g_co_pq[CO_REC], g_co_npq;               /* the queue (owner +4) */
 static unsigned g_co_rr[6];                          /* 0x82cbd8 .. 0x82cbec */
+static unsigned g_co_rrs[19];                        /* the smokeables' per category (0x479b40) */
 static float g_co_lastn[3], g_co_lastp[3];           /* 0x82bcb0, 0x82bcc0 */
 static float g_co_cam[3];                            /* the camera (0x5f1160) */
+static int g_co_wowner[CO_SLOSH];                    /* slosh set k: owning record + 1, 0 = none */
+static int (*g_co_slosh_claim)(int prop);
 static int g_co_live;                                /* sounds allowed (not paused) */
 
 /* the hit strength curves (0x469e50: hits 0..1 over 0..3, x 0x7884f4 per
@@ -1367,8 +1380,13 @@ static void co_init(CoRec *r, const CoEff *e)
 {
     memcpy(r->p, e->p0, sizeof r->p);
     memcpy(r->n0, e->nrm, sizeof r->n0);
+    if (r->kind == 2) {                                   /* 0x47a960: no car, flags 0 */
+        r->flags = r->car[0].id >= 0 ? 0x10 | (r->car[0].human != 0) : 0;
+        r->type = r->flags & 0x10 ? 7 : 8;                /* GetSurfaceType 0x4598b0 */
+    } else {
     r->flags = 0x10 | (r->car[0].human || (r->kind == 1 && r->car[1].human));
     r->type = r->kind == 1 ? co_type_cc(r) : co_type_cw(r, e->nrm);
+    }
     r->dist = co_dist(r->p, g_co_cam);
     r->hit = r->scr = 0;
     /* +0x118: the human player's car if one is in it, else the faster */
@@ -1398,6 +1416,18 @@ static void co_init(CoRec *r, const CoEff *e)
 static int co_filter(CoRec *r, const CoEff *e)
 {
     if (r->nohit) return 0;
+    if (r->kind == 2) {          /* ShouldBeginImpact (GC 800835e4): the player's, or
+                                    strength over 9; one hit per prop at a time (the
+                                    walk stops at the first record of no smokeable) */
+        if (!(r->flags & 1) && !(r->str > 9)) return 0;
+        for (int i = 0; i < CO_REC; i++) {
+            const CoRec *o = &g_cor[i];
+            if (!o->on || o->eff < 0) continue;
+            if (o->kind != 2) return 1;
+            if (o->prop == r->prop && o->hit) return 0;
+        }
+        return 1;
+    }
     if (r->kind != 0) return 1;
     float ln[3], n[3];
     co_norm(ln, g_co_lastn); co_norm(n, e->nrm);
@@ -1428,6 +1458,14 @@ static int co_stitch(CoRec *r)
     int i = ftol((float)s * 0.15625f);
     i = i > 0 ? (i > 19 ? 19 : i) : 0;
     int m = -ftol(k_coll_curve[i] * -4.0f), rr;
+    if (r->kind == 2) {                                   /* 0x479b40 */
+        static const short base[19] = {                   /* type 7; type 8 = +6 */
+            259, 199, 259, 124, 139, 94, 94, 259, 259, 229, 214, 229, 244, 259, 259, 154, 274, 169, 109 };
+        int c = r->cat >= 0 && r->cat < 19 ? r->cat : 0;
+        int hard = ftol(k_coll_curve[i] * -2.0f);         /* 0 or -1 */
+        rr = (int)(g_co_rrs[c]++ % 3);
+        return base[c] + (r->type == 8 ? 6 : 0) + rr - 3 * hard;
+    }
     if (r->kind == 1) {
         if (r->type == 0) { rr = (int)(g_co_rr[0]++ % 4); return 6 + rr + 4 * m; }
         if (r->type == 1) { rr = (int)(g_co_rr[1]++ % 4); return 0x16 + rr + 4 * m; }
@@ -1470,6 +1508,52 @@ static void co_hit_start(CoRec *r)                    /* 0x46a540 */
     g_co_hbused[r->hb] = 1;
     stitch_start(FXC(r->hb, 0), CO_SMP, 0, id, &r->sp);
 }
+/* stSmokableCollision::BeginImpact 0x46ae00, after the hit (0x46a540): a
+   WATER_DRUM whose motion emitters have started and that has not sloshed
+   yet gets three SND_BarrelSplash instances (FX_ROADNOISE_TRANS, member
+   data {variant 3, vol, pitch, pan, 1, 0}) */
+static const int k_slosh_pitch[3] = { 2000, 4000, 7000 };   /* 0x481fe0: 0x1000 = 1.0 */
+static void co_slosh_begin(CoRec *r)
+{
+    if (r->kind != 2 || r->cat != 5 || r->ws >= 0 || !g_co_slosh_claim || !g_co_slosh_claim(r->prop)) return;
+    for (int k = 0; k < CO_SLOSH; k++) {
+        int busy = g_co_wowner[k] != 0;
+        for (int j = 0; j < 3; j++) busy |= FXW(k, j)->on;
+        if (busy) continue;
+        g_co_wowner[k] = (int)(r - g_cor) + 1;
+        r->ws = k;
+        for (int j = 0; j < 3; j++) fx_start(FXW(k, j), AFX_SPLASH, 0, 0, 0, (float)k_slosh_pitch[j] / 4096.0f);
+        printf("coll: water drum slosh (prop %d, set %d)\n", r->prop, k);
+        return;
+    }
+}
+/* Update 0x481fe0: vol = the record's volume x 17000 (0x7ecf90) >> 15, with a
+   car in it x the car's speed map (0x82bcd0: 15..60 mph -> 16002..32767);
+   the first instance found finished is released and the rest wait a frame.
+   A released record's instances play out (the sound system holds them). */
+static void co_slosh_update(CoRec *r, int objvol, float ref)
+{
+    if (r->ws < 0) return;
+    int vol = objvol * 17000 >> 15;
+    if (r->flags & 0x10) {
+        float t = (r->car[r->sel].speed * 2.237f - 15.0f) / 45.0f;
+        t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+        vol = vol * ftol(16002.0f + t * (32767.0f - 16002.0f)) >> 15;
+    }
+    vol = vol < 0 ? 0 : vol > 0x7fff ? 0x7fff : vol;
+    for (int j = 0; j < 3; j++) {
+        AudioFxVoice *v = FXW(r->ws, j);
+        if (!v->on) continue;
+        if (v->done) { fx_stop(v); return; }
+        v->gain = fx_gain(vol, ref, 0.6f);
+        v->pan = az_pan(r->p3.az[0]);               /* member +0x10 = record +0xc8 */
+    }
+}
+static void co_begin_impact(CoRec *r)                 /* vt BeginImpact */
+{
+    co_hit_start(r);
+    co_slosh_begin(r);
+}
 static void co_end(CoRec *r)                          /* 0x46a1a0 */
 {
     if (r->ended) return;
@@ -1483,13 +1567,15 @@ static void co_free(CoRec *r)
     co_hit_stop(r);
     fx_stop(FXS(r - g_cor));
     if (r->eff >= 0 && g_coe[r->eff].rec == (int)(r - g_cor)) g_coe[r->eff].rec = -1;
+    if (r->ws >= 0) g_co_wowner[r->ws] = 0;               /* its sloshes play out */
     memset(r, 0, sizeof *r);
-    r->hb = -1; r->eff = -1;
+    r->hb = -1; r->eff = -1; r->ws = -1;
 }
 
 static void co_reset(void)
 {
     for (int i = 0; i < CO_REC; i++) co_free(&g_cor[i]);
+    for (int k = 0; k < CO_SLOSH; k++) for (int j = 0; j < 3; j++) fx_stop(FXW(k, j));
     memset(g_coe, 0, sizeof g_coe);
     memset(g_co_hbused, 0, sizeof g_co_hbused);
     g_co_npq = 0;
@@ -1500,11 +1586,9 @@ static int co_key(const CoEff *e, int src, int a, int b, int poly)
     return e->on && e->src == src && e->a == a && e->b == b && e->poly == poly;
 }
 
-void carsfx_coll_hit(int src, int a, int b, int poly, const float point[3], const float impulse[3],
-                     float slide, const CarSfxCollCar *ca, const CarSfxCollCar *cb)
+static void co_contact(int src, int a, int b, int poly, const float point[3], const float impulse[3],
+                       float slide, const CarSfxCollCar *ca, const CarSfxCollCar *cb, int kind, int prop, int cat)
 {
-    if (!g_co_live || !ca) return;
-    if (b >= 0 && !cb) return;
     int ei = -1;
     for (int i = 0; i < CO_EFF && ei < 0; i++) if (co_key(&g_coe[i], src, a, b, poly)) ei = i;
     if (ei < 0) {                                         /* 0x5a9b10 -> 0x5a9430 */
@@ -1519,8 +1603,9 @@ void carsfx_coll_hit(int src, int a, int b, int poly, const float point[3], cons
                 if (g_cor[r].on) continue;
                 CoRec *R = &g_cor[r];
                 memset(R, 0, sizeof *R);
-                R->on = 1; R->eff = ei; R->hb = -1;
-                R->kind = b >= 0;                         /* 0x459680 */
+                R->on = 1; R->eff = ei; R->hb = -1; R->ws = -1;
+                R->kind = kind;                           /* 0x459680 */
+                R->prop = prop; R->cat = cat;
                 e->rec = r;
                 break;
             }
@@ -1536,7 +1621,8 @@ void carsfx_coll_hit(int src, int a, int b, int poly, const float point[3], cons
     if (e->rec < 0) return;
     CoRec *r = &g_cor[e->rec];
     if (r->ended) return;
-    r->car[0] = *ca;
+    if (ca) r->car[0] = *ca;
+    else { memset(&r->car[0], 0, sizeof r->car[0]); r->car[0].id = -1; }
     if (cb) r->car[1] = *cb;
     /* 0x4797b0 */
     if (!r->init) co_init(r, e);
@@ -1545,9 +1631,27 @@ void carsfx_coll_hit(int src, int a, int b, int poly, const float point[3], cons
             if (g_co_npq < CO_REC) { g_co_pq[g_co_npq++] = e->rec; r->pend = 1; }
         } else r->nohit = 1;                              /* vt+0x1c */
     }
-    /* 0x469de0: the scrape when the slide reaches the curve's start (0) */
-    if (!r->scr && slide >= 0.0f) r->sreq = 1;
+    /* 0x469de0: the scrape when the slide reaches the curve's start (0);
+       a smokeable's never begins (ShouldBeginScrape GC 0) */
+    if (!r->scr && slide >= 0.0f && r->kind != 2) r->sreq = 1;
 }
+
+void carsfx_coll_hit(int src, int a, int b, int poly, const float point[3], const float impulse[3],
+                     float slide, const CarSfxCollCar *ca, const CarSfxCollCar *cb)
+{
+    if (!g_co_live || !ca) return;
+    if (b >= 0 && !cb) return;
+    co_contact(src, a, b, poly, point, impulse, slide, ca, cb, b >= 0, -1, 0);
+}
+
+void carsfx_coll_prop(int src, int a, int b, int poly, const float point[3], const float impulse[3],
+                      const CarSfxCollCar *car, int prop, int cat)
+{
+    if (!g_co_live) return;
+    co_contact(src, a, b, poly, point, impulse, 0.0f, car, NULL, 2, prop, cat);
+}
+
+void carsfx_set_slosh_claim(int (*claim)(int prop)) { g_co_slosh_claim = claim; }
 
 void carsfx_coll_pairs(int src, const int (*pairs)[3], int n)
 {
@@ -1584,7 +1688,7 @@ static void co_start_queued(void)
     int playing = 0;
     for (int i = 0; i < CO_REC; i++) playing += g_cor[i].on && g_cor[i].hit;
     if (g_co_npq + playing <= CO_HITS) {
-        for (int i = 0; i < g_co_npq; i++) co_hit_start(&g_cor[g_co_pq[i]]);
+        for (int i = 0; i < g_co_npq; i++) co_begin_impact(&g_cor[g_co_pq[i]]);
     } else {
         int A[CO_REC], B[CO_REC], all[CO_REC], na, nb, nall = 0;
         na = co_order(A, g_co_pq, g_co_npq);
@@ -1597,7 +1701,7 @@ static void co_start_queued(void)
             if (a->flags & 1) { if (!(b->flags & 1)) steal = 1; }
             else if (b->flags & 1) go = 0;
             else if (a->dist < b->dist) steal = 1;
-            if (steal) { co_hit_stop(b); co_hit_start(a); stole = 1; }
+            if (steal) { co_hit_stop(b); co_begin_impact(a); stole = 1; }
             if (!stole || ib == 0) break;
             ib--; ia++;
             if (!go) break;
@@ -1629,6 +1733,8 @@ static void co_update(float dt, const CarSfxListener *L, float ref)
                slot 9 (pitch 0x1000: 0x45e3d0 changes it only in a pause) */
             if (r->hit && r->hb >= 0)
                 stitch_update(FXC(r->hb, 0), &r->sp, mix_objvol(5, 0x40050000u, r->type, L->mode, r->p3.d, r->p3.az), ref);
+            if (r->ws >= 0)                               /* the record's volume (+0xc0) */
+                co_slosh_update(r, mix_objvol(5, 0x40050000u, r->type, L->mode, r->p3.d, r->p3.az), ref);
             if (r->scr) {                                 /* 0x479970 */
                 ramp_step(&r->fade, dt);
                 if (!r->ended && e) r->sstr = co_curve(e->slide, 40.0f);   /* 0x479ad0 */
@@ -1650,6 +1756,9 @@ static void co_update(float dt, const CarSfxListener *L, float ref)
         } else if (r->eff < 0) r->ended = 1;              /* never in range */
         if (!r->hit && !r->scr && r->ended) co_free(r);
     }
+    for (int k = 0; k < CO_SLOSH; k++)                    /* released sloshes that ran out */
+        if (!g_co_wowner[k])
+            for (int j = 0; j < 3; j++) if (FXW(k, j)->on && FXW(k, j)->done) fx_stop(FXW(k, j));
 }
 
 /* ---- the field ----------------------------------------------------------- */
@@ -1830,6 +1939,637 @@ static void player_turbo(float dt, const CarSfxListener *L, float ref)
                  L->mode, dt, ref);
 }
 
+/* ---- CARSFX_RoadNoise on the player's car (type 0x10060: map class 1
+   object 0x40010060, channels 0 right loop, 1 left loop, 2 / 3 right / left
+   transition, 4 / 5 the base loops). Voices g_fxvoice 302.. ---- */
+#define FXR(j) (&g_fxvoice[302 + (j)])
+enum { FR_LOOP_R, FR_LOOP_L, FR_BASE_R, FR_BASE_L, FR_TRANS_R, FR_TRANS_L };
+/* RoadNoiseVolumes 0x7ecf4c, by loop */
+static const int k_rn_vol[8] = { 15000, 24000, 32000, 24000, 24000, 5000, 19000, 32500 };
+/* RoadNoiseVolGraph 0x82c69c (static init 0x77c460: 5 points at 0x7f09b0), mph -> vol */
+static const float k_rn_graph[5][2] = { { 0, 0 }, { 60, 28000 }, { 100, 32500 }, { 150, 24500 }, { 175, 18000 } };
+typedef struct { float y0, y1, x0, x1; } RnSlope;     /* Slope::GetValue 0x4599e0 */
+static const RnSlope k_rn_pitch = { 1500, 4500, 0, 100 },      /* RoadNoiseSpeedToPitch 0x7f09d8 */
+                     k_rn_tvol = { 20000, 32767, 12, 60 },     /* RoadNoiseTransitionVolSlope 0x7f0978 */
+                     k_rn_tpitch = { 3600, 4400, 12, 60 };     /* RoadNoiseTransitionPitchSlope 0x7f0994 */
+static float rn_slope(const RnSlope *s, float x)
+{
+    float t = (x - s->x0) / (s->x1 - s->x0);
+    t = t > 0 ? (t < 1 ? t : 1) : 0;
+    return s->y0 + (s->y1 - s->y0) * t;
+}
+static float rn_graph(float x)                         /* Graph::GetValue 0x576790 */
+{
+    if (x <= k_rn_graph[0][0]) return k_rn_graph[0][1];
+    if (x >= k_rn_graph[4][0]) return k_rn_graph[4][1];
+    int i = 0;
+    while (i < 3 && x > k_rn_graph[i + 1][0]) i++;
+    return k_rn_graph[i][1] + (x - k_rn_graph[i][0]) * (k_rn_graph[i + 1][1] - k_rn_graph[i][1]) /
+                              (k_rn_graph[i + 1][0] - k_rn_graph[i][0]);
+}
+static int rn_loop(int t)                              /* 0x45f940: terrain -> loop / volume index */
+{
+    switch (t) {
+    case 1: case 3: return 5;
+    case 2: case 0xd: return 4;
+    case 7: case 0x1a: return 7;
+    case 8: case 10: case 0xf: return 0;
+    case 0xb: case 0xc: case 0x11: return 2;
+    case 0xe: return 3;
+    case 0x10: return 1;
+    case 0x19: return 6;
+    default: return -1;
+    }
+}
+static int rn_trans(int t) { return t == 0xb || t == 0x10 ? 0 : t == 0xe ? 2 : -1; }   /* 0x45f9d0 */
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static struct {
+    int on, terr[2], prev[2], loop[2];   /* side 0 left (wheel ctl +0xb0, FL/RL), 1 right (+0xb4, FR/RR) */
+    int vol[2], pitch[2];                /* +0x100 / +0xfc, +0x108 / +0x104 */
+    float logt;
+} g_rn;
+static Pos3D g_rn_p3;
+static void rn_stop(void)
+{
+    for (int j = 0; j < 6; j++) fx_stop(FXR(j));
+    memset(&g_rn, 0, sizeof g_rn);
+}
+/* PlayTransition 0x4731c0: a one-shot of FX_ROADNOISE_TRANS variant `type`
+   (clips 11..13) on side s (0 left: channel 3, 1 right: channel 2), volume
+   by type and speed, pitch by speed. The stitch AUD_RoadTransitions it also
+   starts is not ported (GAPS). */
+static void rn_transition(int type, int s, float mph, int mode, float ref)
+{
+    int base = type == 0 || type == 1 ? 12000 : type == 2 || type == 3 ? 0x5fb4 : 0x7fff;
+    int v = base * ftol(rn_slope(&k_rn_tvol, mph)) >> 15;
+    v = mix_objvol(1, 0x40010060u, s ? 2 : 3, mode, g_rn_p3.d, g_rn_p3.az) * v >> 15;
+    AudioFxVoice *fv = FXR(s ? FR_TRANS_R : FR_TRANS_L);
+    int clip = 11 + clampi(type, 0, 15);
+    if (clip > 13) { fx_stop(fv); return; }   /* the table holds 3 variants */
+    fx_start(fv, AFX_ROAD, clip, 0, 0, (float)clampi(ftol(rn_slope(&k_rn_tpitch, mph)), 0, 0x1fff) / 4096.0f);
+    fv->gain = fx_gain(clampi(v, 0, 0x7fff), ref, 0.6f);
+    printf("[road] transition %d side %c clip %d vol %d mph %.0f\n", type, s ? 'R' : 'L', clip, v, mph);
+}
+static void player_road(float dt, const CarSfxListener *L, float ref)
+{
+    if (!L->coll || !L->pwheels) { if (g_rn.on) rn_stop(); return; }
+    if (!g_rn.on || !FXR(FR_BASE_L)->on) {   /* InitSFX 0x472e50: the two base loops, FX_ROADNOISE variant 4
+                                                (carsfx_race_end stops every voice) */
+        memset(&g_rn, 0, sizeof g_rn);
+        memset(&g_rn_p3, 0, sizeof g_rn_p3);
+        g_rn.on = 1; g_rn.loop[0] = g_rn.loop[1] = -1;
+        fx_start(FXR(FR_BASE_R), AFX_ROAD, 4, 1, 0, 1);
+        fx_start(FXR(FR_BASE_L), AFX_ROAD, 4, 1, 0, 1);
+    }
+    /* MAPOUTPUT map 0, object 0x40010060: master 7 (level 1625) feeds slots
+       0..3, master 9 (1075) slots 6/7 and master 8 slots 4/5 -- the base
+       loops -- at level 10000 (-100 dB). Its input 0xb2013005 = class-1 mix
+       event 5 (range +10000, A/R 0x91a3), triggered by 0x40010092 =
+       CARSFX_Rain (0x10090) field 2, set by 0x461890 while the rain plays:
+       the base loops are the wet-road layer, silent while dry (the port has
+       no rain) */
+    pos3d_update(&g_rn_p3, L->car, L, dt);
+    /* SFXCTL_Wheel (0x8008f9d4): slip vectors summed per side over the
+       wheels on the ground (+0x90 = FR+RR, +0x98 = FL+RL), friction use
+       |car +0x3d4| per wheel (+0xa0..+0xac); terrain per side
+       (GenerateTerrainTypes 0x8008fb08: kept while the side's wheels disagree) */
+    float sv[2][2] = { { 0, 0 }, { 0, 0 } };   /* [0] left, [1] right */
+    for (int w = 0; w < 4; w++) {
+        if (!L->pcontact[w]) continue;
+        int sd = w == 1 || w == 2;
+        sv[sd][0] += L->pslipv[w][0]; sv[sd][1] += L->pslipv[w][1];
+    }
+    float fr[4];
+    for (int w = 0; w < 4; w++) fr[w] = fabsf(L->pfric[w]);
+    int down[2] = { L->pcontact[0] || L->pcontact[3], L->pcontact[1] || L->pcontact[2] };   /* +0xe8 / +0xe9 */
+    int nt[2] = { L->psurface[0] == L->psurface[3] ? L->psurface[0] : g_rn.terr[0],
+                  L->psurface[1] == L->psurface[2] ? L->psurface[1] : g_rn.terr[1] };
+    /* GenerateRoadNoise 0x4735e0 */
+    float mph = L->pspeed * 2.237f;
+    float A = (float)(ftol(rn_graph(mph)) * 0x7fff >> 15), P = rn_slope(&k_rn_pitch, mph);
+    float mL = fminf(hypotf(sv[0][0], sv[0][1]) * 0.01f, 0.15f), mR = fminf(hypotf(sv[1][0], sv[1][1]) * 0.01f, 0.15f);
+    float vL = (1 + mL) * A * (1 + fminf((fr[3] + fr[0]) * 0.5f * 1.0f * 0.1f, 0.1f));
+    float vR = (1 + 0.1f) * (1 + mR) * A;   /* the right side's bump factor is the constant 1 + 0.1 */
+    float pL = (1 + fminf(hypotf(sv[0][0], sv[0][1]) * 0.01f, 0.2f)) * P * (1 + fminf((fr[3] + fr[0]) * 0.5f * 0.15f, 0.15f));
+    float pR = (1 + fminf(hypotf(sv[1][0], sv[1][1]) * 0.01f, 0.2f)) * P * (1 + fminf((fr[2] + fr[1]) * 0.5f * 0.15f, 0.15f));
+    g_rn.vol[0] = ftol(vL > 32000 ? 32000 : vL); g_rn.vol[1] = ftol(vR > 32000 ? 32000 : vR);
+    g_rn.pitch[0] = ftol(pL > 6000 ? 6000 : pL); g_rn.pitch[1] = ftol(pR > 6000 ? 6000 : pR);
+    /* ProcessUpdate 0x47cdb0: a side whose terrain changed restarts its loop
+       (loop -1 releases it) and plays a transition: leaving terrain 0xb / 0x10
+       = 1, else entering one = rn_trans */
+    for (int sd = 0; sd < 2; sd++) {
+        if (nt[sd] == g_rn.terr[sd]) continue;
+        g_rn.prev[sd] = g_rn.terr[sd]; g_rn.terr[sd] = nt[sd];
+        int lp = rn_loop(nt[sd]), tr = rn_trans(nt[sd]);
+        int out = g_rn.prev[sd] != 1 && (g_rn.prev[sd] == 0xb || g_rn.prev[sd] == 0x10) ? 1 : -1;
+        AudioFxVoice *fv = FXR(sd ? FR_LOOP_R : FR_LOOP_L);
+        g_rn.loop[sd] = lp;
+        /* the loops' variant table (+0xe18) holds 7: loop 7 (terrain 7 / 0x1a) has no sample here (GAPS) */
+        if (lp < 0 || lp > 6) fx_stop(fv);
+        else fx_start(fv, AFX_ROAD, lp, 1, 0, 1);
+        printf("[road] side %c terrain %d -> %d loop %d\n", sd ? 'R' : 'L', g_rn.prev[sd], nt[sd], lp);
+        if (down[sd] && (out != -1 || tr != -1)) rn_transition(out != -1 ? out : tr, sd, mph, L->mode, ref);
+    }
+    const unsigned out = 0x40010060u;
+    for (int sd = 0; sd < 2; sd++) {   /* 0 left: loop channel 1, base 5; 1 right: 0, 4 */
+        AudioFxVoice *lv = FXR(sd ? FR_LOOP_R : FR_LOOP_L), *bv = FXR(sd ? FR_BASE_R : FR_BASE_L);
+        int li = g_rn.loop[sd];
+        int v = li >= 0 && li < 8 ? mix_objvol(1, out, sd ? 0 : 1, L->mode, g_rn_p3.d, g_rn_p3.az) *
+                                    (k_rn_vol[li] * g_rn.vol[sd] >> 15) >> 15 : 0;
+        if (!down[sd]) v = 0;
+        lv->gain = fx_gain(clampi(v, 0, 0x7fff), ref, 0.6f);
+        lv->pitch = (float)clampi(g_rn.pitch[sd], 0, 0x1fff) / 4096.0f;
+        /* the base loops both take the left volume (+0x100) x RoadNoiseVolumes[4] */
+        int b = mix_objvol(1, out, sd ? 4 : 5, L->mode, g_rn_p3.d, g_rn_p3.az) * (g_rn.vol[0] * 24000 >> 15) >> 15;
+        bv->gain = fx_gain(clampi(b, 0, 0x7fff), ref, 0.6f);
+        bv->pitch = lv->pitch;
+        AudioFxVoice *tv = FXR(sd ? FR_TRANS_R : FR_TRANS_L);
+        if (tv->on && tv->done) fx_stop(tv);
+    }
+}
+
+/* ---- CARSFX_BottomOut on the player's car (type 0x100b0: class 1 object
+   0x400100b0). UpdateParams 0x47ed80 / ProcessUpdate 0x47f100 are the
+   traffic bottom-out's own (the same vtable slots): touchdowns -> stitch
+   0x4e.. / 0x56.. (LandJumpPlay 0x47ea30, voice +0xb4, channel 0). The
+   strength it passes (the wheels' travel past 0.4 x 31.75) only feeds
+   n - 4 * (int)(x * -1/128), always n, so it is not computed. Event 5
+   (0x5f5d8f: bump-stop impulses over the surface range, x 32767; handler
+   0x469bc0 keeps param >> 8) -> BottomOutPlay 0x47ec60: stitch 0x4e + (0..3
+   in turn, its own counter 0x82cbfc) on voice +0xb0 unless that one still
+   plays. ---- */
+#define FXB(j) (&g_fxvoice[308 + (j)])
+#define FXZ(j) (&g_fxvoice[336 + (j)])
+enum { FB_LAND = 0, FB_EVT = 13, FB_END = 26 };
+static struct { int on, down[4], tilt, l_on, e_on, z_on; float air[4]; StitchPlay l_sp, e_sp, z_sp; } g_pbo;
+static unsigned g_bo_evt_n, g_bo_zone_n;                /* 0x82cbfc, 0x82cbf0 */
+static Pos3D g_pbo_p3;
+static void player_bottom(float dt, const CarSfxListener *L, float ref)
+{
+    if (!L->coll || !L->pwheels) {
+        if (g_pbo.on) { stitch_stop(FXB(FB_LAND), &g_pbo.l_sp); stitch_stop(FXB(FB_EVT), &g_pbo.e_sp); stitch_stop(FXZ(0), &g_pbo.z_sp); }
+        memset(&g_pbo, 0, sizeof g_pbo);
+        return;
+    }
+    if (!g_pbo.on) { memset(&g_pbo, 0, sizeof g_pbo); memset(&g_pbo_p3, 0, sizeof g_pbo_p3); g_pbo.on = 1; }
+    pos3d_update(&g_pbo_p3, L->car, L, dt);
+    float now = g_fxtime;
+    if (L->pbottom > 0 && !g_pbo.e_on) {                 /* 0x47ec60 */
+        unsigned n = g_bo_evt_n % 4;
+        g_bo_evt_n = n + 1;
+        g_pbo.e_on = stitch_start(FXB(FB_EVT), FB_END - FB_EVT, 0, 0x4e + (int)n, &g_pbo.e_sp) > 0;
+        printf("[bottom] event 5 param %d -> stitch %d\n", L->pbottom >> 8, 0x4e + (int)n);
+    }
+    const int *w = L->pcontact;
+    int c0 = !!w[0], c1 = !!w[1], c2 = !!w[2], c3 = !!w[3];
+    int pair[4] = { c0 && c1, c2 && c3, c1 && c2, c3 && c0 };
+    int down = c0 + c1 + c2 + c3;
+    if (!g_pbo.tilt && L->pupz < 0.9f && down < 4) g_pbo.tilt = 1;
+    int land = (pair[0] && g_pbo.air[0] > 0.05f && !g_pbo.down[0]) || (pair[1] && g_pbo.air[1] > 0.05f && !g_pbo.down[1]);
+    int mode = -1;
+    if (!g_pbo.tilt) { if (land) mode = 0; }
+    else if ((pair[0] && !g_pbo.down[0]) || (pair[1] && !g_pbo.down[1]) ||
+             (pair[2] && !g_pbo.down[2]) || (pair[3] && !g_pbo.down[3])) mode = 1;
+    else if (land) mode = 0;
+    if (mode >= 0) {                                    /* 0x47ea30 */
+        stitch_stop(FXB(FB_LAND), &g_pbo.l_sp);
+        unsigned n = g_bo_n[mode] % 4;
+        g_bo_n[mode] = n + 1;
+        g_pbo.l_on = stitch_start(FXB(FB_LAND), FB_EVT - FB_LAND, 0, k_bo_first[mode] + (int)n, &g_pbo.l_sp) > 0;
+        printf("[bottom] land mode %d -> stitch %d\n", mode, k_bo_first[mode] + (int)n);
+        if (L->pjumpcam) {                              /* view +0x58 == 6: stitch 0x2e.. on +0xb8, channel 2 */
+            stitch_stop(FXZ(0), &g_pbo.z_sp);
+            unsigned z = g_bo_zone_n % 4;
+            g_bo_zone_n = z + 1;
+            g_pbo.z_on = stitch_start(FXZ(0), 13, 0, k_bo_first[2] + (int)z, &g_pbo.z_sp) > 0;
+        }
+    }
+    if (down == 4 && g_pbo.tilt) g_pbo.tilt = 0;
+    for (int p = 0; p < 4; p++) {
+        if (!pair[p]) {
+            if (g_pbo.down[p]) { g_pbo.down[p] = 0; g_pbo.air[p] = now; }
+            g_pbo.air[p] += dt;
+        } else g_pbo.down[p] = 1;
+    }
+    int ov = mix_objvol(1, 0x400100b0u, 0, L->mode, g_pbo_p3.d, g_pbo_p3.az);   /* 0x47f100: channel 0 */
+    if (g_pbo.l_on && !(g_pbo.l_on = stitch_update(FXB(FB_LAND), &g_pbo.l_sp, ov, ref))) stitch_stop(FXB(FB_LAND), &g_pbo.l_sp);
+    if (g_pbo.e_on && !(g_pbo.e_on = stitch_update(FXB(FB_EVT), &g_pbo.e_sp, ov, ref))) stitch_stop(FXB(FB_EVT), &g_pbo.e_sp);
+    if (g_pbo.z_on && !(g_pbo.z_on = stitch_update(FXZ(0), &g_pbo.z_sp,
+                                                   mix_objvol(1, 0x400100b0u, 2, L->mode, g_pbo_p3.d, g_pbo_p3.az), ref)))
+        stitch_stop(FXZ(0), &g_pbo.z_sp);
+}
+
+/* ---- CARSFX_SparkChatter (PC vt 0x78acb0): the CSIS class CAR_Sputter of
+   the player's SOUND/ENGINE/SWTN_CAR_xx_MB.abk (SetupSFX 0x45f6e0: file and
+   volume scale +8 from the table 0x7f3040 by the engine slot CSTATE +0x7c).
+   The class is an EA AEMS patch: x86 code (module descriptor = class entry
+   of the header +0x38 table + 0x20: +4 code, +8 instance template, +0xc
+   size, +0x18.. its players' template offsets) that only calls operators
+   by index (the call displacement; table 0x817fe0) on its state (template
+   + 0x18) and moves their results between fields. It is run here by
+   reading that code: call / load eax / store eax / store byte / add esi.
+   Member data (ProcessUpdate 0x45f800, InitSFX 0x485130) from state +0x28:
+   engine slot index (record 0x7f0de0 +8), this, rpm, volume (Q15 output 0
+   x table +8 >> 15), azimuth, 0, 0, throttle x 10.24, the event 9 toggle
+   (UpdateParams 0x45f780: gear N or first only), 0, CSTATE +0xb0 +0x78 set;
+   the byte after it is set by each SetMemberData. The patch ticks every
+   gVariableTimerPeriod = 20 ms (0x724c20: -1 -> 20). Its players are
+   bank players (SNDAEMSI_playerplaybank) of the abk's own samples, options
+   pitchmult (0x1000 = 1), vol (0..0x7fff), azimuth (not used: mono fx
+   voices); its ControlClass output (CAR_SputOutput -> 0x47ccd0 -> +0xf8 ->
+   UpdateMixerOutputs 0x45f760) is a mixer input the port's mixmap does
+   not decode (GAPS). ---- */
+#define FXS(j) (&g_fxvoice[334 + (j)])
+enum { AE_CALL, AE_LOAD, AE_STORE, AE_SETB };
+typedef struct { unsigned char k, op; short imm; int at; } AeIns;
+static struct {
+    unsigned char *file; long flen;
+    unsigned char *mem; int msize;
+    AeIns ins[160]; int nins;
+    int ok, dead, idx, vscale, row, nply, ply[2], child, out, toggle, flag;
+    unsigned loops;
+    float tick;
+} g_sp;
+static Pos3D g_sp_p3;
+static unsigned g_sp_rnd[6];                              /* iSNDrandom state */
+
+static int ae_i(const unsigned char *p) { int v; memcpy(&v, p, 4); return v; }
+static void ae_w(unsigned char *p, int v) { memcpy(p, &v, 4); }
+static unsigned short ae_h(const unsigned char *p) { unsigned short v; memcpy(&v, p, 2); return v; }
+static void ae_wh(unsigned char *p, unsigned short v) { memcpy(p, &v, 2); }
+static float ae_f(const unsigned char *p) { float v; memcpy(&v, p, 4); return v; }
+static void ae_wf(unsigned char *p, float v) { memcpy(p, &v, 4); }
+static int ae_round(float x) { return (int)lrintf(x); }   /* fistp, round to nearest */
+
+static unsigned ae_rand(void)                             /* iSNDrandom (GC 802dcf30) */
+{
+    unsigned *r = g_sp_rnd;   /* 0 seed, 1..4 = DAT_80430b08..b14, 5 = b18 */
+    unsigned o1 = r[1], o2 = r[2], o3 = r[3];
+    unsigned c = 0, u2 = r[5] + r[4];
+    if (u2 < r[5] || u2 < r[4]) c = 1;
+    r[4] = u2;
+    unsigned u3 = u2 + r[3] + c;   r[3] = u3;
+    unsigned u4 = u3 + r[2] + (u3 < o3); r[2] = u4;
+    unsigned u5 = u4 + r[1] + (u4 < o2); r[1] = u5;
+    unsigned x = u5 + r[0] + (u5 < o1);
+    r[5]++; r[0] = x;
+    if (r[5]) return x;
+    if (++r[4]) return x;
+    if (++r[3]) return x;
+    if (++r[2]) return x;
+    if (++r[1]) return x;
+    return r[0] = x + 1;
+}
+
+static int ae_player_no(int at) { return at == g_sp.ply[0] ? 0 : at == g_sp.ply[1] ? 1 : -1; }
+
+/* SNDAEMSI_updateplayer (0x720d57) with the bank player's play / update /
+   stop (playerplaybank, playerupdatebank, playerstopbank) on an fx voice */
+static int ae_player(unsigned char *s, int at, float ref)
+{
+    int p = ae_player_no(at);
+    AudioFxVoice *v = p >= 0 ? FXS(p) : NULL;
+    int st = ae_i(s + 0x18);
+    st = st < 0 ? 0 : st > 2 ? 2 : st;
+    signed char slot = (signed char)s[0x10];
+    int nopt = s[0xe];
+    if (st != (signed char)s[0xc]) {
+        if (st == 0) {
+            if (slot >= 0) { if (v) fx_stop(v); s[0x10] = 0xff; }
+        } else if (st == 1) {
+            if (slot >= 0) { if (v) v->on = 1; }
+            else if (!((signed char)s[0xc] == 2 && s[0xd] == 1)) {
+                const unsigned char *lst = g_sp.file + ae_i(s + 4);
+                int n = ae_i(lst), k = ae_i(s + 0x14);
+                k = k >= n ? n - 1 : k < 0 ? 0 : k;
+                const unsigned char *e = lst + 4 + 12 * k;
+                s[0x10] = e[0];
+                int clip = ae_i(e + 4), vol = 0x7fff, pm = 0x1000, az = 0;
+                for (int o = 0; o < nopt; o++) {
+                    unsigned char *op = s + 0x1c + 12 * o;
+                    int x = ae_i(op + 8);
+                    if (op[0] == 0) pm = x < 0 ? 0 : x > 0xffff ? 0xffff : x;
+                    else if (op[0] == 2) vol = x < 0 ? 0 : x > 0x7fff ? 0x7fff : x;
+                    else if (op[0] == 3) az = x;
+                    ae_w(op + 4, x);
+                }
+                if (v && e[0] == 0 && clip >= 0 && clip < 32) {
+                    fx_start(v, AFX_SWTN, clip, (int)(g_sp.loops >> clip & 1), 0.0f, (float)pm / 4096.0f);
+                    v->gain = fx_gain(vol, ref, 0.6f);
+                    v->pan = az_pan((unsigned)az);
+                    ae_w(s + 8, 1);
+                    printf("[sputter] player %d sample %d pitch %d vol %d\n", p, clip, pm, vol);
+                } else { ae_w(s + 8, -1); s[0x10] = 0xff; }
+            }
+        } else if (slot >= 0 && v) v->on = 0;            /* pause */
+        s[0xd] = s[0xc];
+        s[0xc] = (unsigned char)st;
+    }
+    int r = st;
+    if (st == 1 && (signed char)s[0x10] >= 0) {          /* playerupdatebank */
+        if (!v || v->done || !v->on) { s[0x10] = 0xff; r = 0; }
+        else {
+            for (int o = 0; o < nopt; o++) {
+                unsigned char *op = s + 0x1c + 12 * o;
+                int x = ae_i(op + 8);
+                if (x == ae_i(op + 4)) continue;
+                ae_w(op + 4, x);
+                if (op[0] == 0) v->pitch = (float)(x < 0 ? 0 : x > 0xffff ? 0xffff : x) / 4096.0f;
+                else if (op[0] == 2) v->gain = fx_gain(x < 0 ? 0 : x > 0x7fff ? 0x7fff : x, ref, 0.6f);
+                else if (op[0] == 3) v->pan = az_pan((unsigned)x);
+            }
+            r = 1;
+        }
+    }
+    return (signed char)s[0x10] < 0 ? 0 : r;
+}
+
+static int ae_op(int op, unsigned char *s, int at, float ref)
+{
+    switch (op) {
+    case 0: { int r = ae_i(s + 0x10); ae_w(s + 0x10, 0); return r; }   /* ClassDestructor */
+    case 1: return ae_i(s + 0x14);                                      /* ClassData */
+    case 4:                                                             /* destroy */
+        if (ae_i(s + 0xc)) {
+            g_sp.dead = 1;
+            for (int p = 0; p < 2; p++) fx_stop(FXS(p));
+        }
+        return 0;
+    case 6: {                                                           /* counter */
+        int in = ae_i(s + 0x14);
+        if (in >= ae_i(s) && in <= ae_i(s + 4)) return in;
+        if (ae_i(s + 0x10) > 0) {
+            int c = ae_i(s + 8) + (signed char)s[0xc];
+            ae_w(s + 8, c > ae_i(s + 4) ? ae_i(s) : c < ae_i(s) ? ae_i(s + 4) : c);
+        }
+        return ae_i(s + 8);
+    }
+    case 7:                                                             /* random */
+        if (ae_i(s + 0xc)) {
+            unsigned m = (unsigned)ae_i(s + 4);
+            ae_w(s + 8, (int)(m ? ae_rand() % m : 0) + ae_i(s));
+        }
+        return ae_i(s + 8);
+    case 8: {                                                           /* randomshuffle */
+        if (!ae_i(s + ae_h(s))) return ae_i(s + 0xc);
+        unsigned lo = ae_h(s + 8), rng = (unsigned)(ae_h(s + 0xa) - (signed char)s[3]) - lo;
+        unsigned k = (rng ? ae_rand() % rng : 0) + lo;
+        if (s[2] == 1) {
+            ae_w(s + 0xc, s[0x10 + k]);
+            s[0x10 + k] = s[0x10 + lo];
+            s[0x10 + ae_h(s + 8)] = s[0xc];
+        } else {
+            ae_w(s + 0xc, ae_h(s + 0x10 + 2 * k));
+            ae_wh(s + 0x10 + 2 * k, ae_h(s + 0x10 + 2 * lo));
+            ae_wh(s + 0x10 + 2 * ae_h(s + 8), ae_h(s + 0xc));
+        }
+        ae_w(s + 0xc, ae_i(s + 0xc) + ae_i(s + 4));
+        ae_wh(s + 8, (unsigned short)(ae_h(s + 8) + 1));
+        if (ae_h(s + 8) < ae_h(s + 0xa)) s[3] = 0;
+        else { ae_wh(s + 8, 0); s[3] = 1; }
+        return ae_i(s + 0xc);
+    }
+    case 10: {                                                          /* rangetrig */
+        int in = ae_i(s + 0x14);
+        if (in < ae_i(s) || in > ae_i(s + 4)) {
+            if (in >= ae_i(s + 8) && in <= ae_i(s + 0xc)) s[0x10] = 0;
+        } else if (!s[0x10]) { s[0x11] = 1; s[0x10] = 1; return 1; }
+        s[0x11] = 0;
+        return 0;
+    }
+    case 13:                                                            /* merge */
+        for (int k = 0; k < s[0]; k++) if (ae_i(s + 4 + 4 * k)) return 1;
+        return 0;
+    case 15: {                                                          /* table */
+        int in = ae_i(s + 0xc);
+        if (in == ae_i(s + 4)) return ae_i(s + 8);
+        ae_w(s + 4, in);
+        const unsigned char *t = g_sp.file + ae_i(s);
+        int mn = ae_i(t + 4), mx = ae_i(t + 8), n = ae_h(t + 2);
+        int x = (in < mn ? mn : in > mx ? mx : in) - mn, r;
+        float step = ae_f(t + 0xc);
+#define AE_TV(j) (t[0] == 2 ? (int)(short)ae_h(t + 0x10 + 2 * (j)) : t[0] == 1 ? (int)(signed char)t[0x10 + (j)] : ae_i(t + 0x10 + 4 * (j)))
+        if (step == 1.0f) r = AE_TV(x);
+        else {
+            float f = (float)x * step;
+            int i = ae_round(f - 0.5f), j = i + 1 < n ? i + 1 : n - 1;
+            float fr = f - (float)i, a = (float)AE_TV(i), b = (float)AE_TV(j);
+            r = ae_round((b - a) * fr + a);
+        }
+#undef AE_TV
+        ae_w(s + 8, r);
+        return r;
+    }
+    case 16: {                                                          /* delayline */
+        unsigned char *in = s + ae_h(s);
+        int size = ae_h(s + 2);
+        if (ae_i(in + 4) != ae_i(s + 8)) {
+            ae_w(s + 8, ae_i(in + 4));
+            if (ae_i(in + 4) < 0) ae_w(in + 4, 0);
+            int n = ae_round((float)ae_i(in + 4) / 20.0f);
+            if (n >= size) n = size - 1;
+            ae_wh(s + 4, (unsigned short)(ae_h(s + 6) + n));
+        }
+        if (ae_h(s + 4) >= size) ae_wh(s + 4, (unsigned short)(ae_h(s + 4) - size));
+        if (ae_h(s + 6) >= size) ae_wh(s + 6, 0);
+        ae_w(s + 0xc + 4 * ae_h(s + 4), ae_i(in));
+        int r = ae_i(s + 0xc + 4 * ae_h(s + 6));
+        ae_wh(s + 4, (unsigned short)(ae_h(s + 4) + 1));
+        ae_wh(s + 6, (unsigned short)(ae_h(s + 6) + 1));
+        return r;
+    }
+    case 21: {                                                          /* scale */
+        float x = (float)ae_i(s + 8);
+        for (int k = 1; k < s[0]; k++) x *= (float)ae_i(s + 8 + 4 * k);
+        return ae_round(x * ae_f(s + 4));
+    }
+    case 22: {                                                          /* add */
+        int x = ae_i(s + 4);
+        for (int k = 1; k < s[0]; k++) x += ae_i(s + 4 + 4 * k);
+        return x;
+    }
+    case 27: return ae_player(s, at, ref);
+    case 28: {                                                          /* oscillator */
+        int per = ae_i(s + 8);
+        if (per <= 0) return 0;
+        float step = 20.0f / (float)per, amp = (float)ae_i(s + 0xc), ph = ae_f(s + 4), v;
+        while (ph >= 1.0f) ph -= 1.0f;
+        if (s[0] == 0) {
+            int a = ae_round(ph * 1024.0f), q = a >> 8 & 3, i = a & 0xff;
+            static const unsigned short *tb;
+            static unsigned short sn[257];
+            if (!tb) { for (int k = 0; k <= 256; k++) sn[k] = (unsigned short)lrintf(sinf((float)k * 0.0061359233f) * 65535.0f); tb = sn; }
+            int sv = q == 0 ? tb[i] : q == 1 ? tb[256 - i] : q == 2 ? -tb[i] : -tb[256 - i];
+            v = (float)sv * amp * 1.5258789e-5f;
+        } else if (s[0] == 1) v = ph < 0.5f ? 0.0f : amp;
+        else if (s[0] == 2) v = amp * ph;
+        else v = ph > 0.5f ? (1.0f - ph) * amp * 2.0f : ph * amp * 2.0f;
+        ae_wf(s + 4, step + ph);
+        return ae_round(v);
+    }
+    case 30: {                                                          /* addmax */
+        int x = ae_i(s + 8);
+        for (int k = 1; k < s[0]; k++) x += ae_i(s + 8 + 4 * k);
+        return x > ae_i(s + 4) ? ae_i(s + 4) : x;
+    }
+    case 31: { int x = ae_i(s + 4) - ae_i(s + 8); return x < ae_i(s) ? ae_i(s) : x; }   /* subtractmin */
+    case 35: return ae_round((float)ae_i(s + 8) * (float)ae_i(s + 4) * ae_f(s));          /* scale2 */
+    case 38:                                                            /* ControlClass: CAR_SputOutput */
+        if (s[0xc]) return 0;                                           /* (no ranges in this patch) */
+        if (ae_i(s + 0x14)) { g_sp.child = 0; g_sp.out = 0; }
+        else if (ae_i(s + 0x10)) { if (!g_sp.child) g_sp.child = 1; }
+        else if (g_sp.child) g_sp.out = ae_i(s + 0x18);
+        return g_sp.child;
+    }
+    return 0;
+}
+
+/* read the module's code into instructions (the subset it is made of) */
+static int ae_decode(const unsigned char *d, long len, int code)
+{
+    int esi = 0, pc = code, n = 0;
+#define AE_D32(o) ((int)(d[o] | d[(o) + 1] << 8 | d[(o) + 2] << 16 | (unsigned)d[(o) + 3] << 24))
+    while (pc + 8 < len && n < (int)(sizeof g_sp.ins / sizeof *g_sp.ins)) {
+        const unsigned char *c = d + pc;
+        AeIns *i = &g_sp.ins[n];
+        if (c[0] == 0x56) { pc++; continue; }                                     /* push esi */
+        if (c[0] == 0x5e) { pc++; continue; }                                     /* pop esi */
+        if (c[0] == 0xc3) return n;                                               /* ret */
+        if (c[0] == 0x8b && c[1] == 0x74 && c[2] == 0x24) { pc += 4; continue; }  /* mov esi,[esp+8] */
+        if (c[0] == 0xe8) { i->k = AE_CALL; i->op = (unsigned char)AE_D32(pc + 1); i->at = esi; n++; pc += 5; continue; }
+        if ((c[0] == 0x83 || c[0] == 0x81) && (c[1] == 0xc6 || c[1] == 0xc4)) {   /* add esi / esp */
+            int v = c[0] == 0x83 ? (signed char)c[2] : AE_D32(pc + 2);
+            if (c[1] == 0xc6) esi += v;
+            pc += c[0] == 0x83 ? 3 : 6; continue;
+        }
+        if (c[0] == 0x89 || c[0] == 0x8b || c[0] == 0xc6) {                       /* eax <-> [esi+d], byte [esi+d] */
+            int mod = c[1] >> 6, rm = c[1] & 7, reg = c[1] >> 3 & 7, dsp, l;
+            if (rm != 6 || reg != 0 || mod == 3) break;
+            dsp = mod == 0 ? 0 : mod == 1 ? (signed char)c[2] : AE_D32(pc + 2);
+            l = 2 + (mod == 1 ? 1 : mod == 2 ? 4 : 0);
+            i->k = c[0] == 0x89 ? AE_STORE : c[0] == 0x8b ? AE_LOAD : AE_SETB;
+            i->at = esi + dsp;
+            if (c[0] == 0xc6) { i->imm = c[l]; l++; }
+            n++; pc += l; continue;
+        }
+        break;
+    }
+#undef AE_D32
+    printf("[sputter] module code: unknown byte %02x at +%x\n", d[pc], pc);
+    return -1;
+}
+
+int carsfx_player_car(const char *dataroot, int row)
+{
+    free(g_sp.file); free(g_sp.mem);
+    memset(&g_sp, 0, sizeof g_sp);
+    for (int p = 0; p < 2; p++) fx_stop(FXS(p));
+    if (row < 0 || row >= 33) row = 18;
+    int slot = k_row_engine[row];                       /* CSTATE +0x7c (stock engine) */
+    /* 0x7f3040 {name, ?, volume}: slots 0..40 -> SWTN_CAR_<slot>; 0x7f0de0 +8 = slot */
+    static const unsigned short k_swtn_vol[41] = {
+        18500, 18000, 14500, 12500, 18500, 19500, 22500, 20000, 22000, 24500, 20000, 22000, 18000, 14000,
+        14000, 18000, 20000, 24500, 14500, 13750, 13000, 18500, 16000, 15000, 16000, 20000, 20000, 20000,
+        24000, 24000, 22000, 16500, 20000, 16500, 17500, 17500, 19500, 22000, 18500, 18000, 17000 };
+    char path[512];
+    snprintf(path, sizeof path, "%s/SOUND/ENGINE/SWTN_CAR_%02d_MB.abk", dataroot, slot);
+    int nclip = audio_load_swtn_bank(path, &g_sp.loops);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); g_sp.flen = ftell(f); fseek(f, 0, SEEK_SET);
+    g_sp.file = g_sp.flen > 0x100 ? (unsigned char *)malloc((size_t)g_sp.flen) : NULL;
+    int ok = g_sp.file && fread(g_sp.file, 1, (size_t)g_sp.flen, f) == (size_t)g_sp.flen;
+    fclose(f);
+    const unsigned char *d = g_sp.file;
+    long cls = -1;
+    if (ok && !memcmp(d, "ABKC", 4)) {
+        long t = ae_i(d + 0x38);
+        int n = t > 0 && t + 4 < g_sp.flen ? ae_i(d + t) : 0;
+        for (int k = 0; k < n && t + 16 + 12 * k <= g_sp.flen; k++) {
+            long nm = ae_i(d + t + 8 + 12 * k);
+            if (nm > 0 && nm + 16 < g_sp.flen && !strcmp((const char *)d + nm + 4, "CAR_Sputter")) cls = ae_i(d + t + 4 + 12 * k);
+        }
+    }
+    if (cls < 0 || cls + 0x60 > g_sp.flen) { printf("[sputter] %s: no CAR_Sputter\n", path); return 0; }
+    const unsigned char *md = d + cls + 0x20;
+    int code = ae_i(md + 4), tmpl = ae_i(md + 8), size = ae_i(md + 0xc);
+    if (code <= 0 || tmpl <= 0 || size <= 0x60 || tmpl + size > g_sp.flen) return 0;
+    g_sp.mem = (unsigned char *)malloc((size_t)size);
+    memcpy(g_sp.mem, d + tmpl, (size_t)size);
+    g_sp.msize = size;
+    g_sp.nply = md[0] < 2 ? md[0] : 2;
+    for (int p = 0; p < g_sp.nply; p++) g_sp.ply[p] = ae_i(md + 0x18 + 4 * p) - 0x18;
+    g_sp.nins = ae_decode(d, g_sp.flen, code);
+    for (int k = 0; k < g_sp.nins; k++) {
+        const AeIns *i = &g_sp.ins[k];
+        if (i->at < 0 || i->at >= size - 0x18) g_sp.nins = -1;
+        if (i->k == AE_CALL && !(i->op <= 1 || i->op == 4 || i->op == 6 || i->op == 7 || i->op == 8 || i->op == 10 ||
+                                 i->op == 13 || i->op == 15 || i->op == 16 || i->op == 21 || i->op == 22 ||
+                                 (i->op >= 27 && i->op <= 28) || i->op == 30 || i->op == 31 || i->op == 35 || i->op == 38)) {
+            printf("[sputter] operator %d not ported\n", i->op);
+            g_sp.nins = -1;
+        }
+        if (g_sp.nins < 0) break;
+    }
+    g_sp.idx = slot; g_sp.vscale = k_swtn_vol[slot]; g_sp.row = row;
+    g_sp.ok = g_sp.nins > 0;
+    printf("[sputter] %s: CAR_Sputter %d instructions, %d players, %d samples (loops %x), vol %d\n",
+           path, g_sp.nins, g_sp.nply, nclip, g_sp.loops, g_sp.vscale);
+    return g_sp.ok;
+}
+
+/* SetMemberData: the member data at state +0x28 and the update byte */
+static void sp_member(const CarSfxListener *L, int vol, int az)
+{
+    unsigned char *m = g_sp.mem + 0x18 + 0x28;
+    int rpm = ftol(L->prpm), thr = ftol(L->pthr * 10.24f);
+    ae_w(m, g_sp.idx);
+    ae_w(m + 4, 1);                                     /* this */
+    ae_w(m + 8, rpm < 0 ? 0 : rpm > 10000 ? 10000 : rpm);
+    ae_w(m + 0xc, vol < 0 ? 0 : vol > 0x8013 ? 0x8013 : vol);
+    ae_w(m + 0x10, az < 0 ? 0 : az > 0x10000 ? 0x10000 : az);
+    ae_w(m + 0x14, 0); ae_w(m + 0x18, 0);
+    ae_w(m + 0x1c, thr < 0 ? 0 : thr > 0x400 ? 0x400 : thr);
+    ae_w(m + 0x20, g_sp.toggle);
+    ae_w(m + 0x28, 1);                                  /* CSTATE +0xb0 +0x78 (GUESS: set) */
+    m[0x2c] = 1;
+}
+
+static void player_sputter(float dt, const CarSfxListener *L, float ref)
+{
+    if (!g_sp.ok || g_sp.dead || !L->pwheels) {
+        if (g_sp.ok) for (int p = 0; p < 2; p++) if (FXS(p)->on) fx_stop(FXS(p));
+        g_sp.flag = 0;
+        return;
+    }
+    pos3d_update(&g_sp_p3, L->car, L, dt);
+    int vol = mix_objvol(1, 0x40010040u, 0, L->mode, g_sp_p3.d, g_sp_p3.az) * g_sp.vscale >> 15;
+    int az = (int)(g_sp_p3.az[0] & 0xffff);
+    if (L->pspark) g_sp.flag = 1;                       /* handler 0x469bc0: CSTATE +0xf0 */
+    if (g_sp.flag && (L->pgear == 1 || L->pgear == 2)) {   /* CSTATE +0x50 = gear */  /* UpdateParams 0x45f780 */
+        if (g_sp.toggle == 1) g_sp.toggle = 0;
+        else { g_sp.flag = 0; g_sp.toggle = 1; }
+        printf("[sputter] event 9 -> toggle %d (rpm %.0f, vol %d)\n", g_sp.toggle, L->prpm, vol);
+        sp_member(L, vol, az);
+    }
+    sp_member(L, vol, az);                              /* ProcessUpdate 0x45f800 */
+    g_sp.tick += dt;
+    if (g_sp.tick > 0.2f) g_sp.tick = 0.2f;
+    for (; g_sp.tick >= 0.02f && !g_sp.dead; g_sp.tick -= 0.02f) {
+        unsigned char *b = g_sp.mem + 0x18;
+        int eax = 0;
+        for (int k = 0; k < g_sp.nins && !g_sp.dead; k++) {
+            const AeIns *i = &g_sp.ins[k];
+            switch (i->k) {
+            case AE_CALL:  eax = ae_op(i->op, b + i->at, i->at, ref); break;
+            case AE_LOAD:  eax = ae_i(b + i->at); break;
+            case AE_STORE: ae_w(b + i->at, eax); break;
+            case AE_SETB:  b[i->at] = (unsigned char)i->imm; break;
+            }
+        }
+    }
+}
+
 void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int nai,
                    const CarSfxCar *tr, int ntr)
 {
@@ -1923,4 +2663,7 @@ void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int n
     }
     if (g_co_live) co_update(dt, L, ref);
     player_turbo(dt, L, ref);
+    player_road(dt, L, ref);
+    player_bottom(dt, L, ref);
+    player_sputter(dt, L, ref);
 }
