@@ -1,5 +1,6 @@
 /* wcoll.c — the retail NFSU2 collision world (see wcoll.h). */
 #include "wcoll.h"
+#include "resource.h"
 
 #include <float.h>
 #include <math.h>
@@ -89,8 +90,18 @@ typedef struct {
 
 #define WC_NSLOT 520             /* 26 section letters x 20 */
 
+/* a drivable section's visible-section record (chunk 0x34153, 0xa4 bytes:
+   +8 s16 section, +0xc its boundary (FindBoundary, filled at load), +0x10
+   count, +0x14 the visible sections as s16, at most 72) */
+typedef struct {
+    int section, bnd, n;
+    short vis[72];
+} VisRec;
+
 struct WColl {
     Pack *packs; int npacks;
+    VisRec *vis; int nvis;
+    int *vorder;                 /* VisibleSectionManager +0x10: the drivable sections, most recently found first */
     int slot[WC_NSLOT];          /* 0x88f768: pack per section slot (0x5d3c10) */
     Bound *bnd; int nbnd;
     int *order;                  /* the boundary list, most recently found first */
@@ -157,6 +168,19 @@ static void load_bounds(WColl *w, const unsigned char *d, long len)
                 }
                 q += 0x24 + n * 8;
             }
+        } else if (id == 0x34153 && !w->vis) {
+            /* VisibleSectionManager::Loader (GC 8020b628): the drivable
+               sections' visible-section lists */
+            int cnt = (int)(sz / 0xa4);
+            w->vis = (VisRec *)calloc((size_t)(cnt > 0 ? cnt : 1), sizeof *w->vis);
+            for (int i = 0; w->vis && i < cnt; i++) {
+                const unsigned char *r = d + o + 8 + 0xa4 * i;
+                VisRec *v = &w->vis[w->nvis++];
+                int n = (int)rd32(r + 0x10);
+                v->section = rds16(r + 8); v->bnd = -1;
+                v->n = n < 0 ? 0 : n > 72 ? 72 : n;
+                for (int k = 0; k < v->n; k++) v->vis[k] = rds16(r + 0x14 + 2 * k);
+            }
         } else if (id == 0x80034150u) {
             load_bounds(w, d + o + 8, sz);
         } else if (id == 0x3412f) {
@@ -187,8 +211,16 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
     int cap = 0;
     long off = 0;
     unsigned char hdr[8];
-    while (fseek(f, off, SEEK_SET) == 0 && fread(hdr, 1, 8, f) == 8) {
-        uint32_t id = rd32(hdr), sz = rd32(hdr + 4);
+    /* the bundle's chunk index (resource.c): only the collision packs are read */
+    int nix = 0;
+    ResChunk *ix = res_chunk_index(stream_bun, &nix);
+    for (int k = 0; ix ? k < nix : 1; k++) {
+        uint32_t id, sz;
+        if (ix) { id = ix[k].id; sz = ix[k].size; off = (long)ix[k].off; }
+        else {
+            if (fseek(f, off, SEEK_SET) != 0 || fread(hdr, 1, 8, f) != 8) break;
+            id = rd32(hdr); sz = rd32(hdr + 4);
+        }
         if (id == 0x80034130u) {
             /* keep the payload's file alignment: the header sub-chunk is
                found by aligning its absolute offset */
@@ -225,8 +257,9 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
                 } else free(raw);
             }
         }
-        off += 8 + (long)sz;
+        if (!ix) off += 8 + (long)sz;
     }
+    free(ix);
     fclose(f);
 
     f = fopen(track_bun, "rb");
@@ -245,6 +278,15 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
     }
     w->order = (int *)malloc((size_t)w->nbnd * sizeof *w->order);
     for (int i = 0; i < w->nbnd; i++) w->order[i] = i;
+    if (w->nvis) {   /* each record's boundary (FindBoundary(section) at load) */
+        w->vorder = (int *)malloc((size_t)w->nvis * sizeof *w->vorder);
+        for (int i = 0; i < w->nvis; i++) {
+            if (w->vorder) w->vorder[i] = i;
+            for (int b = 0; b < w->nbnd && w->vis[i].bnd < 0; b++)
+                if (w->bnd[b].section == w->vis[i].section) w->vis[i].bnd = b;
+        }
+        if (!w->vorder) w->nvis = 0;
+    }
     w->enabled = (unsigned char *)calloc((size_t)(w->ngroups > 256 ? w->ngroups : 256), 1);
     printf("wcoll: %d collision packs, %d drivable section boundaries, %d barrier groups\n",
            w->npacks, w->nbnd, w->ngroups);
@@ -257,6 +299,7 @@ void wcoll_free(WColl *w)
     for (int i = 0; i < w->npacks; i++) free(w->packs[i].data);
     for (int i = 0; i < w->nbnd; i++) free(w->bnd[i].xy);
     free(w->packs); free(w->bnd); free(w->order); free(w->groups); free(w->enabled);
+    free(w->vis); free(w->vorder);
     free(w);
 }
 
@@ -390,6 +433,33 @@ static int bound_find_locked(WColl *w, const float *p, float *near_dist)
     if (b < 0) bound_nearest(w, p, near_dist);
     __sync_lock_release(&g_wc_order_lock);
     return b;
+}
+
+/* VisibleSectionManager::FindDrivableSection(bVector2) 0x5e00d0 (GC
+   8020bdc8): the first drivable section (most recently found first) whose
+   boundary holds p (0x43d410 box, 0x5d6dd0 polygon) moves to the front;
+   else FindClosestBoundary 0x5db770 under 0.1 m (0x784358) gives the
+   section by number (FindDrivableSection(int) GC 8020be90); else none. */
+int wcoll_visible_sections(WColl *w, const float p[2], const short **list)
+{
+    if (!w || !w->nvis) return -2;                      /* no section data */
+    for (int k = 0; k < w->nvis; k++) {
+        const VisRec *v = &w->vis[w->vorder[k]];
+        if (v->bnd < 0 || !bound_inside(&w->bnd[v->bnd], p)) continue;
+        int i = w->vorder[k];
+        memmove(&w->vorder[1], &w->vorder[0], (size_t)k * sizeof *w->vorder);
+        w->vorder[0] = i;
+        *list = w->vis[i].vis;
+        return w->vis[i].n;
+    }
+    float d = 0.0f;
+    while (__sync_lock_test_and_set(&g_wc_order_lock, 1)) { }
+    int b = bound_nearest(w, p, &d);
+    __sync_lock_release(&g_wc_order_lock);
+    if (b < 0 || !(d < 0.1f)) return -1;
+    for (int i = 0; i < w->nvis; i++)
+        if (w->vis[i].section == w->bnd[b].section) { *list = w->vis[i].vis; return w->vis[i].n; }
+    return -1;
 }
 
 /* 0x5dfeb0: re-checks once p has gone 9 m past the safe radius */

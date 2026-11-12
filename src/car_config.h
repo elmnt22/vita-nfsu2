@@ -2,6 +2,7 @@
 #define OPENUG2_CAR_CONFIG_H
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 
 enum {
     N2_PART_FRONT, N2_PART_REAR, N2_PART_SKIRT, N2_PART_HOOD,

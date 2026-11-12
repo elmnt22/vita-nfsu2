@@ -77,3 +77,7 @@ nul
 /build_*/
 sim/build_*/
 *.pdb
+
+# --- Local rename backups / build error dumps ---
+_bak_rename_1109/
+*.err

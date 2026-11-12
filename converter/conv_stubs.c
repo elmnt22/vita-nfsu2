@@ -22,19 +22,25 @@ STUB(career_nshowcases) STUB(career_num_sponsors_chosen) STUB(career_owns_part) 
 STUB(career_record) STUB(career_shop_by_handle) STUB(career_shop_enterable) STUB(career_showcase) 
 STUB(career_slot_counts) STUB(career_slot_handle) STUB(career_spend) STUB(career_stage_cleared) 
 STUB(career_start) STUB(career_stock_handle) STUB(career_stock_type) STUB(career_string) 
-STUB(career_switch_car) STUB(career_url_purse) STUB(career_wc_unique_chosen) STUB(carfx_lights_changed) 
+STUB(career_switch_car) STUB(career_url_purse) STUB(career_wc_unique_chosen) 
 STUB(cstage_sponsor_choice) STUB(cstage_sponsor_done) STUB(cstage_url_done) STUB(cstage_world_done) 
-STUB(decal_at) STUB(decal_by_name) STUB(decal_count) STUB(hs_best_drift) STUB(hs_best_time) STUB(hud_num) 
+STUB(hs_best_drift) STUB(hs_best_time) STUB(hud_num) 
 STUB(hud_pad_glyph) STUB(hud_time_str) STUB(mplay_close) STUB(mplay_open) STUB(mplay_tex) STUB(mplay_update) 
 STUB(music_album) STUB(music_artist) STUB(music_default_playlist) STUB(music_play_song) 
-STUB(music_set_playlist) STUB(music_title) STUB(options_ctl_preset) STUB(options_port_str) STUB(options_save) 
-STUB(perf_build) STUB(perf_car_stats) STUB(perf_cat_level) STUB(perf_clear) STUB(perf_fit_level) 
-STUB(perf_fit_part) STUB(perf_fit_pkg) STUB(perf_init) STUB(perf_part_fitted) STUB(perf_part_worse) 
-STUB(perf_pkg_fitted) STUB(perf_pkg_parts) STUB(perf_pkg_worse) STUB(perf_power) STUB(perf_ready) 
-STUB(perf_set_part) STUB(perf_unfit_cat) STUB(profile_default) STUB(profile_delete) STUB(profile_dirty) 
+STUB(music_set_playlist) STUB(music_title) 
+STUB(profile_default) STUB(profile_delete) STUB(profile_dirty) 
 STUB(profile_drop_snapshot) STUB(profile_exists) STUB(profile_file) STUB(profile_list) STUB(profile_load) 
 STUB(profile_name) STUB(profile_named) STUB(profile_restore) STUB(profile_save) STUB(profile_set_name) 
-STUB(profile_snapshot) STUB(smk_is_prop) STUB(vinyl_at) STUB(vinyl_count) STUB(vinyl_db_load) 
-STUB(vinyl_find) 
-long long g_career[4096], g_opt[512];
-const char *const g_vb_name[64];
+STUB(profile_snapshot) STUB(smk_is_prop) 
+STUB(airace_ntypes) STUB(career_any_owned) STUB(career_completed_career) STUB(career_decal_brand_unlocked)
+STUB(career_sim_find_shops) STUB(career_speech_fe) STUB(career_speech_sponsor) STUB(career_speech_sponsor_done)
+STUB(career_speech_uniques) STUB(garage_tt_request)
+/* perfparts.c's car stats (the Performance screens) */
+STUB(n2sim_accel_curve) STUB(n2sim_accel_rating) STUB(n2sim_create) STUB(n2sim_destroy) STUB(n2sim_param)
+
+long long g_career[4096];   /* options.c, perfparts.c, vinyl.c and pcsave.c link in for the PC save import */
+
+/* world.c bumps the car lighting's light-list generation when a region's
+ * lights load (carfx.c); no cars here, so nothing to tell (11-09: the old
+ * aborting stub stopped the conversion) */
+void carfx_lights_changed(void) { }

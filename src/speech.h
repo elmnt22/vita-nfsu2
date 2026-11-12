@@ -34,6 +34,13 @@ int  speech_init(const char *dataroot);
 void speech_cmd(int kind, uint32_t a, uint32_t b);
 /* IsSpeechDone: nothing playing and nothing queued (1 without speech data) */
 int  speech_done(void);
+/* SpeechModule::IsStrmQueued: a stream is queued and not yet playing */
+int  speech_stream_queued(void);
+/* CARSFX_Rain::QueueWeatherStream: the thunder (nisaudio SoundFX_Select(4,
+   variant 1 / 2)) on the speech stream; 1 = queued, 0 = speech busy / no data */
+int  speech_weather_stream(int variant);
+/* the crash's collision stream (SoundFX_Select(2, 8)); 1 if queued */
+int  speech_collision_stream(void);
 /* once per frame on the main thread: GameSpeech::Update (pick + file reads) */
 void speech_update(void);
 /* PauseSpeech / ResumeSpeech (the in-game pause menu) */

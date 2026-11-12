@@ -1,6 +1,7 @@
 /* smokeable.c — the retail NFSU2 smackable roadside props (see smokeable.h).
  * Facts and addresses: E:/re-tools/out/SMOKEABLE.md. */
 #include "smokeable.h"
+#include "resource.h"
 #include "acid.h"
 #include "n2sim.h"
 
@@ -213,7 +214,7 @@ int smk_load(const char *root, const char *stem)
 {
     smk_free();
     {   /* A/B: no props at all (the world draws their scenery as before) */
-        FILE *off = fopen("ux0:data/OpenUG2/nosmk.txt", "r");
+        FILE *off = fopen("ux0:data/NFSU2/nosmk.txt", "r");
         if (off) { fclose(off); printf("smokeables: off (nosmk.txt)\n"); return 0; }
     }
     char path[1100];
@@ -268,12 +269,21 @@ int smk_load(const char *root, const char *stem)
     if (f) {
         long off = 0;
         unsigned char h[8];
-        while (fseek(f, off, SEEK_SET) == 0 && fread(h, 1, 8, f) == 8) {
-            uint32_t id = rd32(h), sz = rd32(h + 4);
+        /* the bundle's chunk index (resource.c): only the spawner packs are read */
+        int nix = 0;
+        ResChunk *ix = res_chunk_index(path, &nix);
+        for (int k = 0; ix ? k < nix : 1; k++) {
+            uint32_t id, sz;
+            if (ix) { id = ix[k].id; sz = ix[k].size; off = (long)ix[k].off; }
+            else {
+                if (fseek(f, off, SEEK_SET) != 0 || fread(h, 1, 8, f) != 8) break;
+                id = rd32(h); sz = rd32(h + 4);
+            }
             if (id == 0x34027u && sz < (1u << 20)) {   /* SmokeableSpawnerPack */
                 long base = off + 8, pad = ((base + 15) & ~15L) - base;
                 unsigned char *b = (unsigned char *)malloc(sz);
-                if (b && fread(b, 1, sz, f) == sz && (long)sz > pad + 0x10) {
+                if (b && (!ix || fseek(f, base, SEEK_SET) == 0) &&
+                    fread(b, 1, sz, f) == sz && (long)sz > pad + 0x10) {
                     const unsigned char *pk = b + pad;
                     int cnt = (int16_t)rd16(pk + 0x0c);
                     npack++;
@@ -300,8 +310,9 @@ int smk_load(const char *root, const char *stem)
                 }
                 free(b);
             }
-            off += 8 + (long)sz;
+            if (!ix) off += 8 + (long)sz;
         }
+        free(ix);
         fclose(f);
     }
     free(ovr);
@@ -715,6 +726,48 @@ void smk_end(const float eye[3])
     if (g_frame % 600 == 0) smk_report();
 }
 
+/* ---- replay (step 8b): the props' recorded state ------------------------ */
+static int g_rp_on;                         /* playback override active */
+static unsigned char *g_rp_bits;            /* virgin bit per spawner while on */
+static int g_rp_nbits;
+static int g_rp_n;
+static uint16_t g_rp_sp[SMK_LIVE_MAX];
+static float g_rp_M[SMK_LIVE_MAX][16];
+
+int smk_rp_nsp(void) { return g_nsp; }
+void smk_rp_virgins(unsigned char *bits)
+{
+    memset(bits, 0, (size_t)(g_nsp + 7) / 8);
+    for (int i = 0; i < g_nsp; i++) if (g_sp[i].virgin) bits[i >> 3] |= (unsigned char)(1u << (i & 7));
+}
+int smk_rp_live(int max, uint16_t *sp, float (*Mn)[16])
+{
+    int n = 0;
+    for (int i = 0; i < SMK_LIVE_MAX && n < max; i++) {
+        const SmkLive *L = &g_live[i];
+        if (!L->used || L->spawner < 0 || L->spawner >= g_nsp) continue;
+        sp[n] = (uint16_t)L->spawner;
+        model_of(L, Mn[n], NULL);
+        n++;
+    }
+    return n;
+}
+void smk_rp_set(const unsigned char *bits, int n, const uint16_t *sp, const float (*Mn)[16])
+{
+    int nb = (g_nsp + 7) / 8;
+    if (nb > g_rp_nbits) {
+        unsigned char *p = (unsigned char *)realloc(g_rp_bits, (size_t)nb);
+        if (!p) return;
+        g_rp_bits = p; g_rp_nbits = nb;
+    }
+    if (bits) memcpy(g_rp_bits, bits, (size_t)nb); else memset(g_rp_bits, 0, (size_t)nb);
+    if (n > SMK_LIVE_MAX) n = SMK_LIVE_MAX;
+    g_rp_n = n;
+    for (int i = 0; i < n; i++) { g_rp_sp[i] = sp[i]; memcpy(g_rp_M[i], Mn[i], sizeof g_rp_M[i]); }
+    g_rp_on = 1;
+}
+void smk_rp_off(void) { g_rp_on = 0; }
+
 #ifdef OPENUG2_SIM_PRE_H
 /* tests (sim/test): every spawner loaded, as if each section were resident */
 void smk_sim_present_all(void)
@@ -779,16 +832,21 @@ static int box_in_view(const float (*planes)[4], const float lo[3], const float 
 /* the live prop's model matrix: [R | pos - cg R] with z lowered by zoff
    (Smokeable::Move), applied to the scenery mesh baked at the spawner's
    matrix: G = Mnow * inverse(Mspawn) */
-static void live_matrix(const SmkLive *L, const SmkSpawner *S, float G[16])
+static void live_matrix_of(const float Mn[16], const SmkSpawner *S, float G[16])
 {
-    float Mn[16], Mi[16];
-    model_of(L, Mn, NULL);
+    float Mi[16];
     memset(Mi, 0, sizeof Mi);
     for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) Mi[i * 4 + j] = S->M[j * 4 + i];
     for (int j = 0; j < 3; j++)
         Mi[12 + j] = -(S->M[12] * S->M[j * 4] + S->M[13] * S->M[j * 4 + 1] + S->M[14] * S->M[j * 4 + 2]);
     Mi[15] = 1;
     mat_mul(Mn, Mi, G);
+}
+static void live_matrix(const SmkLive *L, const SmkSpawner *S, float G[16])
+{
+    float Mn[16];
+    model_of(L, Mn, NULL);
+    live_matrix_of(Mn, S, G);
 }
 
 void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float view_dist,
@@ -800,12 +858,22 @@ void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float vi
     for (int i = 0; i < g_nsp; i++) {
         SmkSpawner *S = &g_sp[i];
         const SmkLive *L = S->live >= 0 ? &g_live[(int)S->live] : NULL;
-        if (!S->virgin && !L) continue;
+        const float *RM = NULL;              /* replay: the recorded model matrix */
+        int virgin = S->virgin;
+        if (g_rp_on) {
+            L = NULL;
+            if ((i >> 3) < g_rp_nbits) virgin = (g_rp_bits[i >> 3] >> (i & 7)) & 1;
+            for (int k = 0; k < g_rp_n; k++) if (g_rp_sp[k] == i) { RM = g_rp_M[k]; break; }
+            if (!S->present || S->nmesh <= 0) continue;
+        }
+        if (!virgin && !L && !RM) continue;
         float lo[3], hi[3];
-        if (L) {
-            N2Body b; n2prop_body(L->b, &b);
+        if (L || RM) {
+            float pc[3];
+            if (L) { N2Body b; n2prop_body(L->b, &b); memcpy(pc, b.pos, sizeof pc); }
+            else { pc[0] = RM[12]; pc[1] = RM[13]; pc[2] = RM[14]; }
             float r = spawner_radius(S) + 0.5f;
-            for (int k = 0; k < 3; k++) { lo[k] = b.pos[k] - r; hi[k] = b.pos[k] + r; }
+            for (int k = 0; k < 3; k++) { lo[k] = pc[k] - r; hi[k] = pc[k] + r; }
         } else { memcpy(lo, S->mn, sizeof lo); memcpy(hi, S->mx, sizeof hi); }
         float dx = cam[0] < lo[0] ? lo[0] - cam[0] : cam[0] > hi[0] ? cam[0] - hi[0] : 0;
         float dy = cam[1] < lo[1] ? lo[1] - cam[1] : cam[1] > hi[1] ? cam[1] - hi[1] : 0;
@@ -817,9 +885,9 @@ void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float vi
             budget -= S->nmesh;
             if (!(g = gpu_make(i))) continue;
         }
-        if (L) {
+        if (L || RM) {
             float G[16], M2[16];
-            live_matrix(L, S, G);
+            if (RM) live_matrix_of(RM, S, G); else live_matrix(L, S, G);
             mat_mul(MVP, G, M2);
             glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, M2);
             render_model(rp, G);
@@ -841,7 +909,7 @@ void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float vi
             if (blend) glBlendFunc(GL_SRC_ALPHA, md == N2_DRAW_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
             draw_gpumesh(&g->gm[k]);
         }
-        if (L) {
+        if (L || RM) {
             glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MVP);
             render_model(rp, NULL);
         }

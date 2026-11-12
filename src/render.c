@@ -609,7 +609,7 @@ static GLuint program_cached(const char *vs, const char *fs) {
     /* binaries are per vitaGL build: the patched one gets its own names */
     extern int vgl_ug2_build __attribute__((weak));
     char path[96];
-    snprintf(path, sizeof path, "ux0:data/OpenUG2/cache/prog_%s%08x.bin",
+    snprintf(path, sizeof path, "ux0:data/NFSU2/cache/prog_%s%08x.bin",
              &vgl_ug2_build ? "u_" : "", (unsigned)h);
     GLuint p = glCreateProgram();
     FILE *f = fopen(path, "rb");
@@ -639,7 +639,7 @@ static GLuint program_cached(const char *vs, const char *fs) {
     void *buf = malloc(PROG_CACHE_MAX);
     GLsizei len = 0; GLenum fmt = 0;
     if (buf) glGetProgramBinary(p, PROG_CACHE_MAX, &len, &fmt, buf);
-    mkdir("ux0:data/OpenUG2/cache", 0777);   /* usually exists already */
+    mkdir("ux0:data/NFSU2/cache", 0777);   /* usually exists already */
     if (buf && len > 0 && len <= PROG_CACHE_MAX && (f = fopen(path, "wb"))) {
         fwrite(buf, 1, (size_t)len, f);
         fclose(f);
@@ -1292,7 +1292,7 @@ GpuMesh *upload_scene(N2Scene *s) {
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m->nidx*sizeof(uint16_t), m->idx, GL_STATIC_DRAW);
         gm[i].nidx = m->nidx; gm[i].cat = m->cat; gm[i].texkey = m->texkey;
         gm[i].trim = m->trim; gm[i].draw_mode = m->draw_mode;
-        gm[i].car_material = m->car_material;
+        gm[i].car_material = m->car_material; gm[i].win = m->car_win;
         free(nor);
         free(rounded.verts); free(rounded.idx);
     }
@@ -1314,17 +1314,22 @@ GpuMesh *upload_scene_merged(const N2Scene *s, const GpuMesh *gm, const unsigned
     if (!out || !members) { free(out); free(members); return NULL; }
     int n = 0;
     for (int i = 0; i < s->count; i++) {
-        if (!ok[i] || lead[i] != -2) continue;
+        if (!ok[i] || lead[i] != -2 || s->meshes[i].nverts > 65535) continue;
         const N2Mesh *a = &s->meshes[i];
         int nm = 0, nv = 0, ni = 0;
         for (int j = i; j < s->count; j++) {
             if (!ok[j] || lead[j] != -2) continue;
             const N2Mesh *b = &s->meshes[j];
             if (gm[j].cat != gm[i].cat || !b->vcol != !a->vcol || gm[j].texkey != gm[i].texkey ||
-                gm[j].car_material != gm[i].car_material || gm[j].trim != gm[i].trim) continue;
+                gm[j].car_material != gm[i].car_material || gm[j].trim != gm[i].trim ||
+                gm[j].draw_mode != gm[i].draw_mode) continue;
             if (nv + b->nverts > 65535) continue;          /* 16-bit indices */
             members[nm++] = j; nv += b->nverts; ni += b->nidx;
             lead[j] = -1;
+        }
+        if (nm == 1) {
+            lead[i] = -2;
+            continue;
         }
         lead[i] = (short)n;
         float *pos = (float *)malloc((size_t)nv * 5 * sizeof(float));
@@ -1357,7 +1362,7 @@ GpuMesh *upload_scene_merged(const N2Scene *s, const GpuMesh *gm, const unsigned
         glGenBuffers(1, &g->ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)ni * sizeof(uint16_t), idx, GL_STATIC_DRAW);
         g->nidx = ni; g->cat = gm[i].cat; g->texkey = gm[i].texkey; g->trim = gm[i].trim;
-        g->draw_mode = gm[i].draw_mode; g->car_material = gm[i].car_material;
+        g->draw_mode = gm[i].draw_mode; g->car_material = gm[i].car_material; g->win = gm[i].win;
         free(pos); free(nor); free(idx); free(col);
         n++;
     }
@@ -1398,8 +1403,18 @@ void render_mesh_repose(GpuMesh *g, const N2Mesh *m, const float *M) {
 typedef struct { uint64_t key; int idx, cell_x, cell_y; unsigned char group; } BSortEnt;
 /* Material provenance + reflective road: never mixed in one batch. The worker
    plan and its GL-thread check must agree on this exactly. */
+/* A far LOD stand-in (world role 2) of a tall building: the skyline. Its
+   batches are culled at the far plane instead of the shorter world view
+   distance, so the city's towers do not pop in a cell at a time at 300 m. */
+#define N2_BATCH_TALL_M 30.0f
+static int batch_tall(const N2Mesh *m) {
+    return m->world_role == 2 && m->cat != N2_ROAD && m->cat != N2_TERRAIN && m->world_bounds_valid &&
+           m->world_bounds[5] - m->world_bounds[2] >= N2_BATCH_TALL_M;
+}
 static unsigned char batch_group(const N2Mesh *m, int mode) {
-    return (unsigned char)(n2_world_batch_material_group(m, mode) | (m->reflect ? 0x80 : 0));
+    return (unsigned char)(n2_world_batch_material_group(m, mode) | (m->reflect ? 0x80 : 0) |
+                           (m->fade_in ? 0x40 : 0) |   /* never fade a road with its buildings */
+                           (batch_tall(m) ? 0x20 : 0));
 }
 static int bsort_cmp(const void *a, const void *b) {
     const BSortEnt *aa = (const BSortEnt *)a, *bb = (const BSortEnt *)b;
@@ -1676,6 +1691,8 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
             b->texkey=s->meshes[ent[i0].idx].texkey;
             b->drawmode=mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
             b->reflect=s->meshes[ent[i0].idx].reflect;   /* as the upload path below */
+            b->fade_in=s->meshes[ent[i0].idx].fade_in;
+            b->tall=batch_tall(&s->meshes[ent[i0].idx]);
             for (int c=0; c<3; c++) { b->bbox_min[c]=1e30f; b->bbox_max[c]=-1e30f; }
             int named=0;
             for (int k=i0; k<i1; k++) {
@@ -1795,6 +1812,8 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     b->texkey = s->meshes[ent[i0].idx].texkey;
     b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
     b->reflect = s->meshes[ent[i0].idx].reflect;
+    b->fade_in = s->meshes[ent[i0].idx].fade_in;
+    b->tall = (unsigned char)batch_tall(&s->meshes[ent[i0].idx]);
     int named = 0;
     for (int k = i0; k < i1; k++) {
         int sc = s->meshes[ent[k].idx].scen;
@@ -2488,17 +2507,17 @@ void render_set_bloom_level(float f) { g_bloom_f = f; }
 /* bloom and the visual treatment both post-process the finished 3D frame */
 static int bloom_wanted(void) {
     if (g_bloom_on < 0) {
-        FILE *f = fopen("ux0:data/OpenUG2/nobloom.txt", "r");
+        FILE *f = fopen("ux0:data/NFSU2/nobloom.txt", "r");
         g_bloom_on = !f; if (f) fclose(f);
-        f = fopen("ux0:data/OpenUG2/novt.txt", "r");
+        f = fopen("ux0:data/NFSU2/novt.txt", "r");
         g_vt_on = !f; if (f) fclose(f);
         /* TintColor.w = 0.2 mixes the frame ALPHA into every pixel; on PC the
            scene alpha evidently is not written (side-by-side on HW 10-09: with
            the lift blacks turn milky grey, without it matches the game), so
            the lift is opt-in for comparisons */
-        f = fopen("ux0:data/OpenUG2/vtlift.txt", "r");
+        f = fopen("ux0:data/NFSU2/vtlift.txt", "r");
         g_vt_lift = f != NULL; if (f) fclose(f);
-        f = fopen("ux0:data/OpenUG2/nospeedblur.txt", "r");
+        f = fopen("ux0:data/NFSU2/nospeedblur.txt", "r");
         g_speed.on = !f; if (f) fclose(f);
         printf("speed blur: %s\n", g_speed.on ? "on" : "off (nospeedblur.txt)");
         printf("bloom: %s; visual treatment: %s\n", g_bloom_on ? "on" : "off (nobloom.txt)",
@@ -2574,9 +2593,9 @@ static int bloom_setup(int sw, int sh) {
     g_bloom.ob = bloom_program(BLOOM_OB_FS, "overbright");
     g_bloom.blur = bloom_program(BLOOM_BLUR_FS, "blur");
     g_bloom.glow = bloom_program(BLOOM_GLOW_FS, "glow");
-    {   int lut = 0;   /* ux0:data/OpenUG2/vtlut.txt: the LUT treatment, for A/B */
+    {   int lut = 0;   /* ux0:data/NFSU2/vtlut.txt: the LUT treatment, for A/B */
 #ifdef __vita__
-        FILE *fl = fopen("ux0:data/OpenUG2/vtlut.txt", "rb");
+        FILE *fl = fopen("ux0:data/NFSU2/vtlut.txt", "rb");
         if (fl) { fclose(fl); lut = 1; }
 #endif
         g_bloom.fin[0].p = bloom_program(lut ? BLOOM_FINAL_FS : BLOOM_FINAL_POLY_FS, "final");
@@ -2609,13 +2628,13 @@ static int bloom_setup(int sw, int sh) {
     g_bloom.obblur = bloom_program(BLOOM_OBBLUR_FS, "overbright+blur");
     g_bloom.glow2 = bloom_program(BLOOM_GLOW2_FS, "blur+glow");
 #ifdef __vita__
-    {   FILE *f5 = fopen("ux0:data/OpenUG2/bloom5.txt", "rb");   /* A/B: the 5-pass chain */
+    {   FILE *f5 = fopen("ux0:data/NFSU2/bloom5.txt", "rb");   /* A/B: the 5-pass chain */
         if (f5) { fclose(f5); g_bloom.obblur = g_bloom.glow2 = 0; } }
 #endif
-    {   /* ux0:data/OpenUG2/bloomfused.txt: the fused 2-pass chain, for A/B */
+    {   /* ux0:data/NFSU2/bloomfused.txt: the fused 2-pass chain, for A/B */
         int fused = 0;
 #ifdef __vita__
-        FILE *ff = fopen("ux0:data/OpenUG2/bloomfused.txt", "rb");
+        FILE *ff = fopen("ux0:data/NFSU2/bloomfused.txt", "rb");
         if (ff) { fclose(ff); fused = 1; }
 #endif
         if (!fused) {
@@ -2888,6 +2907,19 @@ void render_scene_end(const RProg *rp, GpuMesh *quad, int screen_w, int screen_h
     glUniform1f(rp->uFogDensity, fog_density);
     if (depth) glEnable(GL_DEPTH_TEST);
     if (blend) glEnable(GL_BLEND);
+}
+
+/* The 3D frame's target while it renders into g_scene (bloom / scaled):
+   lets a pass copy the frame on the GPU (draw g_scene.tex into its own
+   texture, then rebind fbo) instead of glCopyTexSubImage2D, which vitaGL
+   runs as glReadPixels + glTexSubImage2D (GPU sync + CPU copy, ~50 ms). */
+int render_scene_target(unsigned *fbo, unsigned *tex, int *w, int *h) {
+    if (!g_scene.active || !g_scene.fbo || !g_scene.tex) return 0;
+    if (fbo) *fbo = g_scene.fbo;
+    if (tex) *tex = g_scene.tex;
+    if (w) *w = g_scene.w;
+    if (h) *h = g_scene.h;
+    return 1;
 }
 #endif
 
@@ -3300,7 +3332,7 @@ static struct {
 int render_carfx_enabled(void) {
     if (!g_cfx.checked) {
         g_cfx.checked = 1;
-        FILE *f = fopen("ux0:data/OpenUG2/oldcar.txt", "r");
+        FILE *f = fopen("ux0:data/NFSU2/oldcar.txt", "r");
         g_cfx.enabled = !f; if (f) fclose(f);
         printf("car shading: %s\n", g_cfx.enabled ? "original car.fx" : "port shader (oldcar.txt)");
     }
@@ -3658,12 +3690,12 @@ extern GLboolean vglCompressedTexImageChainUG2(GLenum internalFormat, GLsizei wi
                                                GLsizei height, GLint levels,
                                                const void *data) __attribute__((weak));
 /* 1 = DXT world textures get their stored mip chain (down to 4x4). Off when
-   ux0:data/OpenUG2/nomips.txt exists, for A/B checks without a rebuild. */
+   ux0:data/NFSU2/nomips.txt exists, for A/B checks without a rebuild. */
 static int g_tex_mips = -1;
 long g_tex_mip_count, g_tex_mip_bytes, g_tex_flat_count;
 static int tex_mips_enabled(void) {
     if (g_tex_mips < 0) {
-        FILE *f = fopen("ux0:data/OpenUG2/nomips.txt", "rb");
+        FILE *f = fopen("ux0:data/NFSU2/nomips.txt", "rb");
         g_tex_mips = (f == NULL) && vglCompressedTexImageChainUG2 != NULL;
         if (f) fclose(f);
         printf("texture mips: %s\n", g_tex_mips ? "DXT chains to 4x4 (LINEAR_MIPMAP_NEAREST)"

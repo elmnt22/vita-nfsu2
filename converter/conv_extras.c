@@ -49,7 +49,7 @@ int conv_car_mods(const char *dataroot, int i) {
     if (!car) return 0;
     char path[1024], fp[1024];
     snprintf(path, sizeof path, "%s/CARS/%s/GEOMETRY.BIN", dataroot, car);
-    snprintf(fp, sizeof fp, "ux0:data/OpenUG2/cache/mods_%s.bin", car);
+    snprintf(fp, sizeof fp, "ux0:data/NFSU2/cache/mods_%s.bin", car);
     struct stat st;
     if (stat(path, &st) != 0) return 1;   /* a car this install has no model for (vinyls only) */
     if (mods_cached(fp, (long)st.st_size)) return 1;
@@ -64,7 +64,7 @@ int conv_car_mods(const char *dataroot, int i) {
     n2_free_scene(&scene);
     free(cdata);
     if (!ok) return 0;
-    mkdir("ux0:data/OpenUG2/cache", 0777);
+    mkdir("ux0:data/NFSU2/cache", 0777);
     char tmp[1040]; snprintf(tmp, sizeof tmp, "%s.tmp", fp);
     FILE *f = fopen(tmp, "wb");
     if (!f) return 0;
@@ -87,12 +87,12 @@ static long file_len(const char *path) {
 }
 static int file_has(const char *path) { return file_len(path) > 0; }
 
-/* bun: STREAML4RA; troot: ux0:data/OpenUG2/TRACKS */
+/* bun: STREAML4RA; troot: ux0:data/NFSU2/TRACKS */
 static void strip_path(char *out, size_t cap, const char *bun) {
-    snprintf(out, cap, "ux0:data/OpenUG2/cache/%s.BUN.compact.strip", bun);
+    snprintf(out, cap, "ux0:data/NFSU2/cache/%s.BUN.compact.strip", bun);
 }
 static void focus_path(char *out, size_t cap, const char *bun) {
-    snprintf(out, cap, "ux0:data/OpenUG2/cache/%s.focus", bun + 6);
+    snprintf(out, cap, "ux0:data/NFSU2/cache/%s.focus", bun + 6);
 }
 int conv_track_extras_done(const char *bun) {
     char a[256], b[256];
@@ -135,7 +135,7 @@ const char *conv_shop_file(void) {   /* its name in the cache folder */
 }
 int conv_shop_done(void) { return file_has(shop_cache_file()); }
 int conv_shop(void) {
-    int ok = conv_shop_done() || shop_build_cache("ux0:data/OpenUG2");
+    int ok = conv_shop_done() || shop_build_cache("ux0:data/NFSU2");
     printf("converter: shop screens %s\n", ok ? "ready" : "FAILED");
     return ok;
 }

@@ -2,6 +2,7 @@
 #include <stdarg.h>
 #include "airacer.h"
 #include "world_resident.h"
+#include "wcoll.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -100,12 +101,43 @@ struct AiNet {
     const unsigned char *sectors; int nsectors; /* 0x883dbc / 0x883dc0 */
     const unsigned char *x34124; int n34124;    /* 0x883dc4 / 0x883dc8 */
     const unsigned char *order[SEC_MAX]; int norder;   /* 0x88d21c / 0x88d218: the sections in load order */
+    /* port-only search index (not in the original): the links' progress
+       values ascending with their link numbers, for human_linkgates */
+    float *lk_x; int *lk_i; int lk_n;
 };
 
 static uint32_t rd32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint16_t rdu16(const unsigned char *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static int16_t  rds16(const unsigned char *p) { return (int16_t)rdu16(p); }
 static float    rdf(const unsigned char *p) { uint32_t u = rd32(p); float f; memcpy(&f, &u, 4); return f; }
+
+/* the links' progress (+0x0, rdf) sorted, NaNs left out (no window test passes them) */
+static const float *lk_sort_x;
+static int lk_cmp(const void *a, const void *b)
+{
+    float x = lk_sort_x[*(const int *)a], y = lk_sort_x[*(const int *)b];
+    return x < y ? -1 : x > y ? 1 : *(const int *)a - *(const int *)b;
+}
+static void ainet_index_links(AiNet *net)
+{
+    net->lk_n = 0;
+    if (net->nlinks <= 0) return;
+    float *all = (float *)malloc((size_t)net->nlinks * sizeof *all);
+    int *ord = (int *)malloc((size_t)net->nlinks * sizeof *ord);
+    net->lk_x = (float *)malloc((size_t)net->nlinks * sizeof *net->lk_x);
+    net->lk_i = ord;
+    if (!all || !ord || !net->lk_x) { free(all); free(ord); free(net->lk_x); net->lk_x = NULL; net->lk_i = NULL; return; }
+    int m = 0;
+    for (int i = 0; i < net->nlinks; i++) {
+        all[i] = rdf(net->links + i * 0x20);
+        if (all[i] == all[i]) ord[m++] = i;
+    }
+    lk_sort_x = all;
+    qsort(ord, (size_t)m, sizeof *ord, lk_cmp);
+    for (int k = 0; k < m; k++) net->lk_x[k] = all[ord[k]];
+    net->lk_n = m;
+    free(all);
+}
 
 AiNet *ainet_load(const char *path)
 {
@@ -144,9 +176,10 @@ AiNet *ainet_load(const char *path)
         }
         o += 8 + (long)sz;
     }
+    ainet_index_links(net);
     return net;
 }
-void ainet_free(AiNet *n) { if (n) { free(n->data); free(n); } }
+void ainet_free(AiNet *n) { if (n) { free(n->lk_x); free(n->lk_i); free(n->data); free(n); } }
 /* the furthest route distance of any point (a circuit's lap) */
 float ainet_route_length(const AiNet *n)
 {
@@ -740,6 +773,10 @@ struct AiRacer {
     int   catch_target;        /* +0x748 the human it measures against (slot, -1) */
     char  allow_catchup;       /* +0x744 */
     float phys_time;           /* +0x734 full simulation for this long */
+    float far_hold;            /* +0x730 no far mover for this long (2 s after a touch in it, 1 s after a jump ahead) */
+    char  far;                 /* the car rides mover 4 (0x5f46a0(4) from the think) */
+    char  far_repath;          /* 0x5918a0 asked: hand the plan to mover 4 */
+    float drag260;             /* physics P +0x260 (0x4038d0's drag) */
     char  finished;            /* +0x710 */
     char  stop_why;            /* DIAG: why +0x710 was set (log only) */
     char  entry_done;          /* race entry +0x10: the race manager finished the car (0x5ee250) */
@@ -4988,6 +5025,32 @@ static AiAction *goal_choose(AiRacer *r, int cur, int prio)
     return pass_new(r, pp, car);
 }
 
+/* 0x402180: may the car ride the far mover (4)? Not in drag / drift-type
+   races, not while either mover timer runs, a plan of 3 points or more, at
+   5 m/s or more on at least one wheel, an action other than 8 / 9 / 10 / 11
+   / 13, an AI (skill != -2), 120 m or more from every view, 30 s into the
+   race and not finished. (Event 1099's drag-goal case, 0x86b320 /
+   0x86b328 == 4, is a mode the port does not have.) */
+static int far_ok(const AiRacer *r)
+{
+    const AiWorld *w = r->w;
+    if (w->drag || w->x890108 || w->drift || w->x890104) return 0;     /* 0x89e7d8 0x890108 0x89e7d9 0x890104 */
+    if (r->dplan.n <= 2) return 0;                                      /* driver +0x10 */
+    if (0 < r->far_hold || 0 < r->phys_time) return 0;                 /* 0x401820(+0x730 / +0x734) */
+    if (r->car.speed < 5.0f || r->car.wheels <= 0) return 0;            /* car +0x42c (0x783504), +0x424 */
+    if (!r->act) return 0;
+    int ty = r->act->type;
+    if (ty == 8 || ty == 9 || ty == 10 || ty == 11 || ty == 13) return 0;
+    if (r->skill == -2) return 0;                                       /* vt+0x78 */
+    float view = 99999.0f;                                              /* 0x5f1160 */
+    for (int i = 0; i < w->ncam; i++) {
+        float d = d3(r->car.pos, w->cam[i]);
+        if (d < view) view = d;
+    }
+    if (view < 120.0f || w->race_time < 30.0f) return 0;                /* 0x78350c, 0x783508 */
+    if (r->in_race && r->entry_done) return 0;                          /* 0x5ee250 */
+    return 1;
+}
 /* the think (0x42abd0, every 0.2 s at least, in the car's frame slot) */
 static void goal_think(AiRacer *r);                                     /* aiencounter.c */
 static void racer_think(AiRacer *r)
@@ -5070,6 +5133,10 @@ static void racer_think(AiRacer *r)
     tc = SDL_GetPerformanceCounter();
     racer_apply(r);
     ap_add(AP_TH_APPLY, tc);
+    /* the think's end (0x42b26c, 0x7e8d70 = 1): onto mover 4 or a new path
+       for it (0x5918a0), or back to the chooser 0x5f4400 */
+    if (far_ok(r)) { r->far = 1; r->far_repath = 1; }
+    else r->far = 0;
 out:
     r->nent = 0; r->own = -1;                                           /* 0x41bf80 */
     r->force_replan = 0;
@@ -5098,6 +5165,11 @@ static void racer_apply(AiRacer *r)
 static void racer_frame_ctrl(AiRacer *r, float dt)
 {
     AiWorld *w = r->w;
+    if (0 < r->far_hold) {                                              /* 0x42abd0: +0x730 running */
+        r->far = 0;                                                     /* mover 4 -> 0x5f4400 */
+        r->far_hold -= dt;                                              /* 0x577310 */
+        if (r->far_hold <= 0) r->far_hold = 0;
+    }
     r->think_left -= dt;
     r->nent = 0; r->own = -1;
     if (r->nos_burn && !(0 < r->nos_frac)) r->nos_burn = 0;            /* 0x59fa30: the bottle ran dry */
@@ -5249,9 +5321,81 @@ static int sec_has_lanes(const unsigned char *sec)                      /* 0x5d4
     for (int k = 0; k < 8; k++) if (sec[0x84 + k]) return 1;
     return 0;
 }
+/* TopologyCoordinate wall tests (HandleReset 0x6009a0, GetNearestRoutePoint
+   flag 0x1000). The polygons are the 0x5e0d30 gather (wcoll_gather); the
+   cached interest box is p +- (r + 0.5) (SetInterestBBox 0x5e6fa0). */
+static WColl *s_topo_w;                     /* set for one road_search(.., 0x1000) */
+static const float *s_topo_car;             /* car +0x60 for that search (NULL: the controller's car.pos) */
+static WCollPoly s_topo_poly[160];          /* BuildTrackPolygons keeps at most 160 */
+/* PointInShaft 0x5d35b0: q lies over the polygon -- every edge's
+   cross(v_i - q, v_i+1 - q) . n >= 0 (0x43d1e0 = a x b); d = -(v0 - q) . n */
+static int topo_shaft(const WCollPoly *p, const float q[3], float *dist)
+{
+    float e[4][3];
+    for (int i = 0; i < p->nv; i++) for (int k = 0; k < 3; k++) e[i][k] = p->v[i][k] - q[k];
+    for (int i = 0; i < p->nv; i++) {
+        const float *a = e[i], *b = e[(i + 1) % p->nv];
+        float c0 = a[1] * b[2] - a[2] * b[1], c1 = a[2] * b[0] - a[0] * b[2], c2 = a[0] * b[1] - a[1] * b[0];
+        if (c0 * p->n[0] + c1 * p->n[1] + c2 * p->n[2] < 0.0f) return 0;
+    }
+    if (dist) *dist = -(e[0][0] * p->n[0] + e[0][1] * p->n[1] + e[0][2] * p->n[2]);
+    return 1;
+}
+static int topo_gather(WColl *w, const float c[3], float r)
+{
+    WCollCtx gc; wcoll_ctx_init(&gc);
+    float mn[2] = { c[0] - r - 0.5f, c[1] - r - 0.5f }, mx[2] = { c[0] + r + 0.5f, c[1] + r + 0.5f };
+    return wcoll_gather(w, &gc, c, mn, mx, s_topo_poly, 160);
+}
+/* SegmentIntersectsPossiblyLong 0x5e7ed0: pieces of at most 30 m (0x7a4644),
+   each with its own interest box (mid, len / 2); TopologyCoordinate::
+   SegmentIntersects 0x5d3920 tests ALL gathered polygons two-sided
+   (0x5d37f0 -> 0x5d36f0: the ends strictly either side of the plane, the
+   crossing p1 + |a| / (|a| + |b|) (p2 - p1) in the shaft). 0x5d37f0's bbox
+   cull and nearest-hit distance do not change a yes / no answer. */
+static int topo_seg_hits(WColl *w, const float p1[3], const float p2[3])
+{
+    float dv[3] = { p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2] };
+    float len = sqrtf(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
+    int n = 1;
+    if (!(len < 30.0f)) { n = (int)(len / 30.0f); if ((float)n < len / 30.0f) n++; }
+    for (int s = n - 1; s >= 0; s--) {                  /* from p2 toward p1 */
+        float a[3], b[3], mid[3];
+        for (int k = 0; k < 3; k++) {
+            a[k] = p1[k] + dv[k] * (float)s / (float)n;
+            b[k] = p1[k] + dv[k] * (float)(s + 1) / (float)n;
+            mid[k] = 0.5f * (a[k] + b[k]);
+        }
+        int np = topo_gather(w, mid, 0.5f * len / (float)n);
+        for (int i = 0; i < np; i++) {
+            const WCollPoly *p = &s_topo_poly[i];
+            float da = (a[0] - p->v[0][0]) * p->n[0] + (a[1] - p->v[0][1]) * p->n[1] + (a[2] - p->v[0][2]) * p->n[2];
+            float db = (b[0] - p->v[0][0]) * p->n[0] + (b[1] - p->v[0][1]) * p->n[1] + (b[2] - p->v[0][2]) * p->n[2];
+            if (!(da * db < 0.0f)) continue;
+            float t = fabsf(da) / (fabsf(da) + fabsf(db)), x[3];
+            for (int k = 0; k < 3; k++) x[k] = a[k] + (b[k] - a[k]) * t;
+            if (topo_shaft(p, x, NULL)) return 1;
+        }
+    }
+    return 0;
+}
+/* PointIsCloserThanThisToWall 0x5e8110: interest box (p, 2 dist); only the
+   flag-0x2 wall list (+0x2e4, count +0x2e8); over one with |d| <= dist */
+static int topo_near_wall(WColl *w, const float p[3], float dist)
+{
+    int np = topo_gather(w, p, 2.0f * dist);
+    for (int i = 0; i < np; i++) {
+        float d;
+        if ((s_topo_poly[i].flags & 2) && topo_shaft(&s_topo_poly[i], p, &d) && fabsf(d) <= dist) return 1;
+    }
+    return 0;
+}
 /* 0x40f180: the nearest route point over all sections. flags as 0x5e2e40,
    and 0x40: the car inside the road at it; 0x80 / 0x100: sections with /
-   without traffic lanes; 0x800: within 100 m; 0x2000: height within 4 m */
+   without traffic lanes; 0x800: within 100 m; 0x2000: height within 4 m;
+   0x1000 (0x40f390): a candidate under 90 m (0x784e8c) whose point (no +1 m,
+   0x401a00) cannot see the car (+0x60) past the topology or lies within
+   1.5 m of a wall is passed over */
 static Pt *road_search(const AiRacer *r, unsigned flags)
 {
     const AiWorld *w = r->w;
@@ -5274,6 +5418,15 @@ static Pt *road_search(const AiRacer *r, unsigned flags)
             float lat, al;
             pt_outside2(n, p, q, w->reversed, &lat, &al);
             if (!(lat < 0) || !(al < 0)) continue;
+        }
+        if (d < bd && (flags & 0x1000) && s_topo_w && d < 90.0f) {
+            float pz[3] = { pt_x(p), pt_y(p), pt_z(p) };
+            int sh = topo_seg_hits(s_topo_w, pz, s_topo_car ? s_topo_car : q), nw = sh ? 0 : topo_near_wall(s_topo_w, pz, 1.5f);
+#ifdef OPENUG2_SIM_PRE_H
+            printf("reset repick: cand d %.1f pt (%.1f %.1f %.2f) car (%.1f %.1f %.2f) seg %d wall %d\n", (double)d,
+                   (double)pz[0], (double)pz[1], (double)pz[2], (double)(s_topo_car ? s_topo_car : q)[0], (double)(s_topo_car ? s_topo_car : q)[1], (double)(s_topo_car ? s_topo_car : q)[2], sh, nw);
+#endif
+            if (sh || nw) continue;
         }
         if (d < bd) { bd = d; best = p; }
     }
@@ -5321,16 +5474,47 @@ static int human_dirflag(const AiRacer *r)
    0..300 m past the link's progress): when the gate's road is not the one
    it is on, take the gate road's nearest point ahead (inside the road,
    height within 5 m) */
-static void human_linkgates(AiRacer *r)
+#ifdef OPENUG2_SIM_PRE_H
+static long g_lg_cand, g_lg_calls;   /* LKCHECK: links tested per call */
+#endif
+static Pt *lg_scan(AiRacer *r, int use_index)
 {
     const AiWorld *w = r->w;
     const AiNet *n = w->net;
     Pt *best = NULL;
     float bd = 0;
-    /* (the tests are side-effect free and ANDed: the cheap ones go first --
-       in free roam the loop covers the whole city's links every tick) */
-    if (!(1.0f < r->car.speed)) return;
-    for (int i = 0; i < n->nlinks; i++) {
+    /* port-only speed-up, same result: off a circuit the window is a plain
+       progress range, so only the links the sorted index puts in it (padded
+       2 m against rounding) are tested -- in link order, as the full loop */
+    int cand[256], nc = -1;
+    if (use_index && !w->circuit && n->lk_x && n->lk_n == n->nlinks) {
+        /* d > 0 is exactly x < progress (x > progress reversed) for finite
+           floats; the 300 m end is padded 2 m against rounding */
+        float pr = r->progress;
+        int lo = 0, hi = n->lk_n;
+        if (!w->reversed) {   /* x in [pr - 302, pr) */
+            float p0 = pr - 302.0f;
+            while (lo < hi) { int m = (lo + hi) / 2; if (n->lk_x[m] < p0) lo = m + 1; else hi = m; }
+        } else {              /* x in (pr, pr + 302] */
+            while (lo < hi) { int m = (lo + hi) / 2; if (n->lk_x[m] <= pr) lo = m + 1; else hi = m; }
+        }
+        nc = 0;
+        for (int k = lo; k < n->lk_n && (w->reversed ? n->lk_x[k] <= pr + 302.0f : n->lk_x[k] < pr); k++) {
+            if (nc == 256) { nc = -1; break; }
+            int v = n->lk_i[k], q = nc++;
+            while (q > 0 && cand[q - 1] > v) { cand[q] = cand[q - 1]; q--; }
+            cand[q] = v;
+        }
+    }
+    int cnt = nc >= 0 ? nc : n->nlinks;
+#ifdef OPENUG2_SIM_PRE_H
+    { static int said; if (use_index && nc < 0 && said++ < 3) printf("lkcheck: full scan (circuit %d, index %d of %d, progress %.1f)\n", w->circuit, n->lk_n, n->nlinks, r->progress); }
+#endif
+#ifdef OPENUG2_SIM_PRE_H
+    if (use_index) { g_lg_cand += cnt; g_lg_calls++; }
+#endif
+    for (int c = 0; c < cnt; c++) {
+        int i = nc >= 0 ? cand[c] : c;
         Lk *l = n->links + i * 0x20;
         float d = progress_diff(w, r->progress, rdf(l));
         if (w->reversed) d = -d;
@@ -5352,6 +5536,26 @@ static void human_linkgates(AiRacer *r)
             if (bd < db) { bd = db; best = g[1]; }
         }
     }
+    return best;
+}
+static void human_linkgates(AiRacer *r)
+{
+    const AiWorld *w = r->w;
+    const AiNet *n = w->net;
+    /* (the tests are side-effect free and ANDed: the cheap ones go first --
+       in free roam the loop covers the whole city's links every tick) */
+    if (!(1.0f < r->car.speed)) return;
+    Pt *best = lg_scan(r, 1);
+#ifdef OPENUG2_SIM_PRE_H   /* test aid (simulator): OPENUG2_LKCHECK compares with the full loop */
+    {   static int on = -1; static long nchk, nbad;
+        if (on < 0) on = getenv("OPENUG2_LKCHECK") != NULL;
+        if (on) {
+            Pt *ref = lg_scan(r, 0);
+            nchk++; if (ref != best) nbad++;
+            if (ref != best || nchk == 1 || nchk % 600 == 0) printf("lkcheck: %ld ticks, %ld differ, %.1f of %d links tested a call\n", nchk, nbad, g_lg_calls ? (double)g_lg_cand / g_lg_calls : 0.0, n->nlinks);
+        }
+    }
+#endif
     if (!best) return;
     int cur = (r->rpt && sec_of(n, r->rpt)) ? rdu16(sec_of(n, r->rpt) + 10) : -1;
     if ((int)(pt_flags(best) & 0x7ff) == cur) return;
@@ -5619,6 +5823,7 @@ AiRacer *airacer_new(AiWorld *w, int slot, int skill, const N2Sim *sim, int suv,
     r->mass = n2sim_param(sim, 0x110);
     r->aero = n2sim_param(sim, 0x264) + n2sim_param(sim, 0x268);
     r->grip = (n2sim_param(sim, 0xdc) + n2sim_param(sim, 0xfc)) * 0.5f;
+    r->drag260 = n2sim_param(sim, 0x260);
     ring_init(&r->prog5, 5);                                            /* 0x7e957c */
     ring_init(&r->prog10, 10);
     r->perf.vmax = n2sim_accel_curve(sim, r->perf.acc);
@@ -5789,6 +5994,140 @@ int airacer_reset_pose(AiRacer *r, float pos[3], float *heading, float *speed)
     r->want_reset = 0;
     return 1;
 }
+/* Player::HandleReset 0x6009a0's route reset (-> Car::ResetToRoutePoint
+   0x5fbed0). The speed is the car's (+0x42c, >= 0) times the way . the car's
+   forward (+0x90), at most 8 m/s: the way is the locator's direction (car
+   +0x900, race_dir) when a race route is loaded (0x88f2be), else the route
+   point's own way, reversed when the controller runs backward (+0x10 == 0,
+   GetPreviousPoint). The heading is the point's way, reversed (-1) when the
+   section runs backward (+0x70 bit 1) in a race, or when the controller runs
+   backward in free roam. The controller starts over as the AI's (vt+0x18 /
+   vt+0x34). */
+int airacer_player_reset_pose(AiRacer *r, const float *race_dir, struct WColl *wc, const float box[3], const float org[3],
+                              float pos[3], float *heading, float *speed, int *repicked)
+{
+    const AiNet *n = r->w->net;
+    Pt *p = r->rpt;
+    if (repicked) *repicked = 0;
+    if (!p) return 0;
+    const unsigned char *sec = sec_of(n, p);
+    int back = race_dir ? sec && (rd32(sec + 0x70) & 2) : !r->rdir;
+    float d[2];
+    if (race_dir) { d[0] = race_dir[0]; d[1] = race_dir[1]; }
+    else { d[0] = pt_dx(p); d[1] = pt_dy(p); if (!r->rdir) pt_backdir(n, p, d); }
+    float k = d[0] * r->car.fwd[0] + d[1] * r->car.fwd[1];
+    if (k <= 0) k = 0;
+    float v = r->car.speed <= 0 ? 0 : r->car.speed;
+    float s = k * v;
+    if (!(s < 8.0f)) s = 8.0f;                                          /* 0x8021cc */
+    /* 0x600b58..0x600cfa: the point 1 m up (short +0x12 << 13); when the
+       segment from it to the car's box centre crosses the topology
+       (SegmentIntersectsPossiblyLong(pt, box, 0, 0, 1)) or it lies within
+       1.5 m of a wall (0x5e8110), GetNearestRoutePoint(car, 0x1020, car
+       +0x8fc) picks the point (no +1 m, 0x401a00) and the way: with a race
+       route its section's +0x70 bit 1 backward, else backward when its way .
+       the car's forward (+0x90) < 0. Skipped (wc NULL) when
+       IsTooFarFromDragTrack 0x5eaec0. Then the 150 m (0x78a584) test from the
+       box centre (0x600cfa). */
+    float pt[3] = { pt_x(p), pt_y(p), pt_z(p) + 1.0f };
+#ifdef OPENUG2_SIM_PRE_H
+    if (wc && box) {   /* sim check: the tests at this reset, and a through-the-ground / in-the-air pair */
+        float lo[3] = { box[0], box[1], box[2] - 50.0f }, hi[3] = { box[0], box[1], box[2] + 3.0f }, hi2[3] = { box[0], box[1], box[2] + 1.0f };
+        printf("reset topo: seg %d wall %d (point %.1f %.1f %.1f, box %.1f %.1f %.1f) | selftest down %d up %d\n",
+               topo_seg_hits(wc, pt, box), topo_near_wall(wc, pt, 1.5f), (double)pt[0], (double)pt[1], (double)pt[2],
+               (double)box[0], (double)box[1], (double)box[2], topo_seg_hits(wc, hi2, lo), topo_seg_hits(wc, hi2, hi));
+    }
+    int force_repick = wc && box && getenv("OPENUG2_RS_FORCE_REPICK") != NULL;   /* sim: run the re-pick path */
+#else
+    const int force_repick = 0;
+#endif
+    if (wc && box && (force_repick || topo_seg_hits(wc, pt, box) || topo_near_wall(wc, pt, 1.5f))) {
+        s_topo_w = wc; s_topo_car = org;
+        Pt *q = road_search(r, 0x1020);
+        s_topo_w = NULL; s_topo_car = NULL;
+#ifdef OPENUG2_SIM_PRE_H
+        printf("reset repick: %s\n", q ? "picked" : "none");
+#endif
+        if (q) {
+            p = q; sec = sec_of(n, p);
+            pt[0] = pt_x(p); pt[1] = pt_y(p); pt[2] = pt_z(p);
+            if (race_dir) back = sec && (rd32(sec + 0x70) & 2);
+            else back = pt_dx(p) * r->car.fwd[0] + pt_dy(p) * r->car.fwd[1] < 0.0f;   /* 0x401a60 */
+            if (repicked) *repicked = 1;
+        }
+    }
+    if (box) {
+        float dx = pt[0] - box[0], dy = pt[1] - box[1], dz = pt[2] - box[2];
+        if (!(sqrtf(dx * dx + dy * dy + dz * dz) < 150.0f)) return 0;   /* -> the saved pose */
+    }
+    r->rpt = p;                       /* ResetToRoutePoint 0x5fbed0 runs from this point */
+    float o[2] = { pt_dx(p), pt_dy(p) };
+    if (back) pt_backdir(n, p, o);
+    pos[0] = pt_x(p); pos[1] = pt_y(p); pos[2] = pt_z(p);
+    *heading = atan2f(o[1], o[0]);
+    *speed = s;
+    r->rdir = !back;
+    r->think_left = (float)r->index * 0.1f * -0.0454545f;
+    for (int i = 0; i < 16; i++) r->linkmem[i] &= ~3u;
+    r->finished = 0;
+    r->at_end = 0;
+    r->drv->cmd = 1;
+    fl_reset(&r->L);
+    r->reset_time = r->w->time;
+    r->want_reset = 0;
+    return 1;
+}
+/* HandleReset 0x600d0b..0x600d81, a drag race (0x89e7d8 || 0x890108): the lane
+   = GetNearestTrafficLane 0x40f4a0(car, car +0x60, point, section +0x70 bit 1,
+   0xff, 0xff) -- the traffic lane (2..5 forward, 6..9 backward, section byte
+   +0x82 + lane set) whose offset (0x401c40) is nearest the car's lateral
+   (car - point) x (dy, -dx) (backward: the backward direction 0x401aa0),
+   backward ones returned - 4 and turned back by MakeDrivingLineNumberBackwards
+   0x403db0 (2..5 -> 6..9) -- then TrackRoutePoint::GetForwardsDrivingLineOffset
+   0x5e2da0: a forward lane (0x403d60 / 0x403d80) its 0x401c40 offset, else the
+   lateral, in the forward frame, of GetBackwardPosition 0x5dd430(0, offset).
+   ResetToRoutePoint places the car at GetForwardPosition(0, that) (0x5fbf0a). */
+static void pt_pos3(const AiNet *n, Pt *p, int back, float along, float lat, float *o);
+static float drag_reset_lat(const AiNet *n, Pt *p, const float carpos[2]);
+float airacer_drag_reset_offset(const AiRacer *r, const float carpos[2], float out[3])
+{
+    const AiNet *n = r ? r->w->net : NULL;
+    Pt *p = r ? r->rpt : NULL;
+    if (!n || !p) return 0.0f;
+    float off = drag_reset_lat(n, p, carpos);
+    pt_pos3(n, p, 0, 0.0f, off, out);             /* GetForwardPosition(0, off) */
+    return off;
+}
+static float drag_reset_lat(const AiNet *n, Pt *p, const float carpos[2])
+{
+    const unsigned char *sec = sec_of(n, p);
+    if (!sec) return 0.0f;
+    int back = (rd32(sec + 0x70) >> 1) & 1;
+    float d[2];
+    if (!back) { d[0] = pt_dx(p); d[1] = pt_dy(p); }
+    else pt_backdir(n, p, d);
+    float c = (carpos[0] - pt_x(p)) * d[1] - (carpos[1] - pt_y(p)) * d[0];
+    int first = back ? 6 : 2, best = -1;
+    float bd = 8.999999e9f;
+    for (int lane = first; lane < first + 4; lane++) {
+        if (!sec[0x82 + lane]) continue;
+        float e = fabsf(pt_laneoff(p, lane) - c);
+        if (e < bd) { bd = e; best = lane; }
+    }
+    if (best < 0) return 0.0f;                    /* -1: offset 0 (0x600d6b) */
+    /* best is already 6..9 for a backward section (- 4 then + 4) */
+    if (best >= 2 && best < 6) return pt_laneoff(p, best);
+    float o[3];
+    pt_pos3(n, p, 1, 0.0f, pt_laneoff(p, best), o);
+    return (o[0] - pt_x(p)) * pt_dy(p) - (o[1] - pt_y(p)) * pt_dx(p);
+}
+int airacer_route_point(const AiRacer *r, float pos[3])
+{
+    Pt *p = r ? r->rpt : NULL;
+    if (!p) return 0;
+    pos[0] = pt_x(p); pos[1] = pt_y(p); pos[2] = pt_z(p);
+    return 1;
+}
 /* the car was put down elsewhere (0x5fbd60): the controller finds its road
    again (vt+0x30(1), 0x42cdc0) and starts over (vt+0x34, 0x40d550) */
 void airacer_put_down(AiRacer *r)
@@ -5824,13 +6163,73 @@ void airacer_contact(AiRacer *r, int other, int other_is_car, float other_absv, 
 }
 void airacer_touched_human(AiRacer *r)                                  /* 0x402450 */
 {
+    if (r->far) { r->far_hold = 2.0f; r->far = 0; }                    /* on mover 4: +0x730 = 2 s (0x783510) */
     r->phys_time = 5.0f;                                                /* 0x7e8d60 x 4000 */
+}
+void airacer_far_hold(AiRacer *r, float sec)                            /* 0x591540 */
+{
+    r->far_hold = sec;
+}
+int airacer_far_repath(AiRacer *r)
+{
+    int k = r->far && r->far_repath;
+    r->far_repath = 0;
+    return k;
+}
+/* 0x5918a0's driver side: 0x405120 respaces the plan's points evenly by
+   length (in place, plan +0x1c4 = the length, +0x1b8 / +0x1bc = 0), then the
+   points, the driver's +0x230 / +0x234 and 0x4038d0's acceleration at the
+   car's speed less the drag (its mover-4 grade term is the path's, added
+   by n2sim_far_path). PerfConfig +0x10 (a speed above which only the drag
+   is left) is taken as unset: its writer was not found. */
+int airacer_far_plan(AiRacer *r, float draft, float (*p)[3], float *len, float *vtarget, float *x234, float *acc)
+{
+    AiPlan *P = &r->dplan;
+    int n = P->n;
+    if (n < 2) return n < 0 ? 0 : n;
+    if (n > PLAN_MAX) n = PLAN_MAX;
+    if (2 < n) {                                                        /* 0x405120 */
+        float d[PLAN_MAX], tot = 0, q[PLAN_MAX][3];
+        for (int i = 0; i < n; i++) {
+            if (0 < i) tot += d3(P->p[i], P->p[i - 1]);
+            d[i] = tot;
+        }
+        for (int k = 0; k < n; k++) {
+            float x = (float)k * tot * (1.0f / (float)(n - 1)), f;       /* 0x576790 over (d[i], i) */
+            if (x < d[0]) f = 0;
+            else if (d[n - 1] <= x) f = (float)(n - 1);
+            else {
+                f = 0;
+                for (int i = 0; i < n - 1; i++)
+                    if (d[i] <= x && x < d[i + 1]) {
+                        f = fabsf(d[i + 1] - d[i]) <= 1e-6f ? (float)i + 0.5f
+                          : (x - d[i]) / (d[i + 1] - d[i]) + (float)i;
+                        break;
+                    }
+            }
+            int i = (int)f;                                             /* 0x405020 */
+            float u = f - (float)i;
+            if (u == 0 || n - 1 <= i) memcpy(q[k], P->p[i < n ? i : n - 1], sizeof q[k]);
+            else for (int c = 0; c < 3; c++) q[k][c] = P->p[i][c] * (1.0f - u) + P->p[i + 1][c] * u;
+        }
+        for (int k = 0; k < n; k++) memcpy(P->p[k], q[k], sizeof q[k]);
+        P->len = tot;
+        P->cur_time = 0; P->x1bc = 0;
+    }
+    for (int i = 0; i < n; i++) memcpy(p[i], P->p[i], sizeof p[i]);
+    *len = P->len;
+    *vtarget = r->drv->vtarget;                                         /* vt+0x74 0x40fff0 */
+    *x234 = r->drv->x234;                                               /* vt+0x78 0x410000 */
+    float v = r->car.speed / (0 < r->car_catchup ? r->car_catchup : 1.0f);   /* car +0x468 */
+    *acc = car_accel_at(r, v) - ((1.0f - draft) * r->drag260 * v * v) / r->mass;   /* 0x4038d0 */
+    return n;
 }
 int airacer_mover(const AiRacer *r)                                     /* 0x5f4400 */
 {
     if (r->traffic) return r->tmover;
     const AiWorld *w = r->w;
     if (r->entry_done) return N2_MOVER_PHYSICS;                        /* 0x42c0c0: a finished entry (0x5ee250) -> 0x5f46a0(1) */
+    if (r->far) return N2_MOVER_FAR;                                   /* 0x5f46a0(4) */
     if (0 < r->phys_time || w->drag || w->x890108 || w->drift || w->x890104 || w->x890114) return N2_MOVER_PHYSICS;
     return N2_MOVER_MELLO;
 }
@@ -7004,4 +7403,33 @@ int aigps_path(const AiGps *g, float *xyz, int max)
         else p = pt_next(n, p, dir);
     }
     return c;
+}
+
+/* ---- the controller's FuturePoints for the jump cam (jumpcam.c) ---------- */
+int airacer_fp_count(const AiRacer *r) { return r ? r->L.n : 0; }
+float airacer_fp_dist(const AiRacer *r, int i)
+{
+    return r && i >= 0 && i < r->L.n && r->L.p[i] ? r->L.p[i]->dist : 0.0f;
+}
+int airacer_fp_closest(const AiRacer *r, const float pos[3])
+{
+    if (!r || !r->w || !r->w->net || r->L.n <= 0) return -1;
+    int lane = r->ls.lane > 0 ? r->ls.lane : 0;
+    return fl_closest(r->w->net, &r->L, pos, 1, lane, 0, 0);
+}
+int airacer_fp_pos(const AiRacer *r, int i, int what, float inset, float out[3])
+{
+    if (!r || !r->w || !r->w->net || i < 0 || i >= r->L.n || !r->L.p[i]) return 0;
+    const AiNet *n = r->w->net;
+    const FPoint *f = r->L.p[i];
+    if (!pt_at(n, f->sec, f->pt)) return 0;
+    int lane = r->ls.lane > 0 ? r->ls.lane : 0;                         /* vt+0x1c, & (lane < 1) - 1 */
+    switch (what) {
+    case 0: fp_point(n, f, out, f->dist, 0, -1); break;                 /* 0x412470: -(lane offset + shift) */
+    case 1: fp_point(n, f, out, f->dist, fp_right(n, f, lane) - inset, lane); break;
+    case 2: fp_point(n, f, out, f->dist, fp_left(n, f, lane) + inset, lane); break;
+    case 3: fp_point(n, f, out, f->dist, f->lo[0], 0); break;
+    default: fp_point(n, f, out, f->dist, f->hi[0], 0); break;
+    }
+    return 1;
 }

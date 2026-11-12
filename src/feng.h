@@ -40,6 +40,7 @@ typedef struct {
     unsigned just;
     int      lead, wrapw;         /* Sl leading between lines, Sw wrap width (0 none) */
     char     text[FENG_TEXT];     /* authored placeholder, ASCII */
+    uint32_t label;               /* 'SH': the FEString's language label hash (0 none) */
     /* the SA tag as stored, the object data the scripts animate (obj+0x2c):
        words 0..3 colour as ints B,G,R,A (0..255), 4..6 pivot, 7..9
        position, 10..13 rotation quaternion, 14..16 size, 17..20 uv */
@@ -102,6 +103,9 @@ typedef struct {
 
 /* bStringHash: h = h*33 + c from 0xffffffff. */
 uint32_t feng_hash(const char *s);
+/* FEString label hashes: each text object's authored placeholder replaced by the language
+   string of its label (sh sorted, as English.bin's table is); see feng.c */
+void feng_apply_labels(FengPackage *pk, const uint32_t *sh, const char *const *st, int n, int all);
 /* FEHashUpper (0x505450): the same over the upper-cased string -- object and
    script names ("SP_DRIFT_TOTAL", "FadeIn") are hashed this way. */
 uint32_t feng_hash_upper(const char *s);
@@ -122,7 +126,8 @@ typedef struct {
 /* a script event the package sent to the game (SendMessageToGame GC 80147b20,
    e.g. EXIT_COMPLETE 0xe1fde1d1 at the end of FORWARD): 1 and taken if queued */
 int  feng_anim_game_msg(FengAnim *a, uint32_t msg);
-/* every object to its authored data, hidden as authored, INIT running */
+/* every object to its authored data, hidden as authored (flag bit 0 only:
+   bit 31 never hides in the game, see feng.c), INIT running */
 void feng_anim_init(FengAnim *a, const FengPackage *p);
 /* 0x51cf70: switch obj to script `hash` (a name hash, feng_hash_upper);
    restart: back to its start even when it already runs. 0 = no such script */
@@ -150,7 +155,8 @@ void feng_anim_uv(FengAnim *a, int obj, float u0, float v0, float u1, float v1);
 /* The screen placement of an animated object, through its parent groups
  * (0x51b0b0 / 0x52c5d0): colour (0..1) multiplied down the chain, the
  * object's centre, its scale (size, x group sizes) and rotation (radians,
- * clockwise). hidden: it or a parent is hidden. */
+ * clockwise). hidden: its own bit 0, or a parent group's alpha word is 0
+ * (RenderGroup 0x52c5d0; a group's own hidden bit is not tested). */
 typedef struct { float rgba[4]; float x, y, sx, sy, angle; int hidden; } FengPlace;
 void feng_anim_place(const FengAnim *a, int obj, FengPlace *out);
 /* TPK key of a resource: hash of its upper-cased name without extension. */

@@ -86,6 +86,10 @@ void n2sim_collision(N2Sim *s);
    ends 0.1 s after all four wheels are down (ResetDampenMode 0x5fc050). */
 void n2sim_set_dampen(N2Sim *s, int mode);
 int  n2sim_dampen(const N2Sim *s);
+/* car +0x3c -> +0x18, the car body's live Collisions (carcoll_body_collisions),
+   set before each step: ResetDampenMode's collision mode 2 and the
+   hydraulics skip (0x5a2fd0) read it */
+void n2sim_set_body_collisions(N2Sim *s, int n);
 int  n2sim_drag(const N2Sim *s);    /* n2sim_set_drag's flag */
 /* Drafting, car +0x4dc (0x5ebd80 / 0x5ebc20): the slipstream of every other
    car (n of them, s itself skipped), 0..0.9; set it on each car before it
@@ -93,6 +97,7 @@ int  n2sim_drag(const N2Sim *s);    /* n2sim_set_drag's flag */
 float n2sim_draft(const N2Sim *s, N2Sim *const *cars, int n);
 void  n2sim_set_draft(N2Sim *s, float d);
 float n2sim_get_draft(const N2Sim *s);
+float n2sim_take_bottom(N2Sim *s);   /* the largest bump-stop sum since the last take, then 0 */
 /* 1 once after a nitrous press that was a purge (gas off or under 5 mph,
    0x5ecdb0): the racer's SPRAY SHOW (15) */
 int   n2sim_nos_spray(N2Sim *s);
@@ -110,6 +115,14 @@ int  n2sim_dyno(const N2Sim *s);
 /* One frame (0x5b72d0): pre-step, int(dt/0.0044)+1 substeps, publish.
    In the Mellovator (0x5aad90) int(dt/(1/70))+1 substeps. */
 void n2sim_step(N2Sim *s, float dt);
+/* World::SetTimeScale (*0x890080 +0x108, 0x5ea280; World::GetTimestep 0x5ea360
+   returns the frame time x it): every world step's dt is scaled by it --
+   n2sim_step and carcoll_begin apply it (the jump cam's slow motion 0.4,
+   jumpcam.c). 1 normally. */
+void  n2sim_set_time_scale(float scale);
+float n2sim_time_scale(void);
+/* the desired rain intensity at (x, y) (rain_desired_at); NULL = dry */
+extern float (*n2sim_rain_at)(float x, float y);
 
 /* Which car model runs the car (car +0x28, switched by 0x5f46a0): the full
    simulation, or the Mellovator -- the original's cheaper model for AI
@@ -125,7 +138,24 @@ void n2sim_step(N2Sim *s, float dt);
    wheels only hold the car up); each frame the driver 0x5a44a0 sets the
    body's velocity toward the scene's target (n2sim_nis_target). */
 #define N2_MOVER_NIS     5
+/* mover 4 (ctor 0x5a9030, vtable 0x7a2144, frame 0x59ec80): a far AI
+   racer (120 m or more from every view, 30 s into the race) rides its
+   driver's plan as a timed spline -- no forces, no collisions; the pose
+   comes from the ground under the wheels (0x5f5010). */
+#define N2_MOVER_FAR     4
 void n2sim_set_mover(N2Sim *s, int mover);
+/* 0x5918a0 + 0x591690: a new path for mover 4 -- the driver's plan points
+   (already respaced, 0x405120), its length (plan +0x1c4), the driver's
+   target speed and its second value (vt+0x74 / vt+0x78: +0x230 / +0x234)
+   and 0x4038d0's acceleration at the car's speed without its grade term
+   (mover 4 adds the path's own, 0x591620). n < 2 leaves the car without
+   a path (+0x48 = 0). */
+void n2sim_far_path(N2Sim *s, const float (*p)[3], int n, float len, float vtarget, float x234, float acc);
+/* the frame found no path to ride (0x59ec80's else branch: re-path) */
+int  n2sim_far_want(N2Sim *s);
+/* 0x59ea20 > 1 m this frame: the path drops away faster than the car could
+   fall -- the controller's +0x730 is set for 1 s (0x591540), and taken */
+int  n2sim_far_take_jump(N2Sim *s);
 /* 0x5a40a0: the scene's car target this frame -- the point (x, y) the
    car's centre of mass is to reach, the heading (16-bit angle), how many
    targets came before this one (slot place count, 0 on the first) and the
@@ -179,6 +209,8 @@ float n2sim_accel_rating(const N2Sim *s);
 float n2sim_accel_curve(const N2Sim *s, float out[64]);
 /* A float of the car's physics record (P + off). */
 float n2sim_param(const N2Sim *s, int off);
+/* The brake pedal this frame, 0..1 (Car::UpdateBrakelightsState 0x5f62b0 reads it). */
+float n2sim_brake(const N2Sim *s);
 /* AI catch-up multiplier (car +0x468), 1 = none. */
 void n2sim_set_catchup(N2Sim *s, float mult);
 /* The race type the car's physics and the player's controller branch on:
@@ -216,6 +248,8 @@ float n2sim_last_shift(const N2Sim *s);
 float n2sim_shift_q(const N2Sim *s, float rpm, int gear);
 float n2sim_shift_win(const N2Sim *s, int gear);
 int   n2sim_shifting(const N2Sim *s);
+/* a shift in progress to a higher gear (+0x48 set, target +0x38 > gear +0x3c) */
+int   n2sim_shift_up(const N2Sim *s);
 int   n2sim_shift_cut(const N2Sim *s);
 
 /* What the rest of the game needs. pos is the car origin (record frame), on

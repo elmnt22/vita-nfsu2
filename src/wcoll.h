@@ -49,6 +49,12 @@ int  wcoll_enable_group(WColl *w, const char *name);
 void wcoll_clear_groups(WColl *w);
 const char *wcoll_poly_group(const WColl *w, int id);   /* diagnostics */
 
+/* VisibleSectionManager::FindDrivableSection 0x5e00d0: the visible-section
+ * list (chunk 0x34153) of the drivable section under p (xy). Returns its
+ * count with *list set, -1 when p is in none, -2 when the track has no
+ * section data. Main thread. */
+int wcoll_visible_sections(WColl *w, const float p[2], const short **list);
+
 /* 0x5e72e0: height of the collision surface under p (p[2] is the reference
  * height; a layer up to 1 m above it still counts). found = 0 when the point
  * has no polygon (or no live pack): then the result is p[2], surface 1 and

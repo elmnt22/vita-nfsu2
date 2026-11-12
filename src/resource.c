@@ -253,7 +253,7 @@ static long pin_build(int fd, long flen, unsigned char *out, ResPixStub *stub, i
 static void pin_cache_path(const char *path, char *out, size_t cap) {
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
-    snprintf(out, cap, "ux0:data/OpenUG2/cache/%s.compact", base);
+    snprintf(out, cap, "ux0:data/NFSU2/cache/%s.compact", base);
 }
 static int pin_cache_load(const char *cpath, const char *path, long flen, const char *want) {
     int fd = open(cpath, O_RDONLY);
@@ -276,7 +276,7 @@ static int pin_cache_load(const char *cpath, const char *path, long flen, const 
     return 1;
 }
 static void pin_cache_save(const char *cpath, long flen, const char *magic) {
-    mkdir("ux0:data/OpenUG2/cache", 0777);
+    mkdir("ux0:data/NFSU2/cache", 0777);
     char tmp[1110]; snprintf(tmp, sizeof tmp, "%s.tmp", cpath);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return;
@@ -530,4 +530,114 @@ unsigned char *res_take(const char *path, long *len) {
     res_kept_len = 0;
     res_kept_path[0] = 0;
     return d;
+}
+
+/* ---- top-level chunk index (res_chunk_index) ---------------------------- */
+#include <SDL.h>
+#define CIX_MAGIC "OUG2CI01"
+#define CIX_SLOTS 4
+static struct { char path[512]; long flen; ResChunk *c; int n; unsigned use; } g_cix[CIX_SLOTS];
+static unsigned g_cix_clock;
+static SDL_atomic_t g_cix_lock;   /* spin lock (the Vita SDL shim has no SDL_SpinLock) */
+static void cix_lock(void) { while (!SDL_AtomicCAS(&g_cix_lock, 0, 1)) SDL_Delay(0); }
+static void cix_unlock(void) { SDL_AtomicSet(&g_cix_lock, 0); }
+
+static void cix_cache_path(const char *path, char *out, size_t cap) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    snprintf(out, cap, "ux0:data/NFSU2/cache/%s.idx", base);
+}
+
+static ResChunk *cix_build(const char *path, long flen, int *count) {
+    char cpath[600];
+    cix_cache_path(path, cpath, sizeof cpath);
+    FILE *cf = fopen(cpath, "rb");
+    if (cf) {   /* magic, source length, count, entries */
+        char magic[8]; int32_t hdr[2];
+        ResChunk *c = NULL;
+        if (fread(magic, 1, 8, cf) == 8 && !memcmp(magic, CIX_MAGIC, 8) &&
+            fread(hdr, sizeof hdr, 1, cf) == 1 && hdr[0] == (int32_t)flen && hdr[1] > 0 &&
+            (c = (ResChunk *)malloc((size_t)hdr[1] * sizeof *c)) != NULL &&
+            fread(c, sizeof *c, (size_t)hdr[1], cf) == (size_t)hdr[1]) {
+            fclose(cf);
+            *count = hdr[1];
+            return c;
+        }
+        free(c);
+        fclose(cf);
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    Uint32 t0 = SDL_GetTicks();
+    int n = 0, cap = 0;
+    ResChunk *c = NULL;
+    long off = 0;
+    unsigned char h[8];
+    /* the loaders' walk: every header from 0 until one cannot be read */
+    while (fseek(f, off, SEEK_SET) == 0 && fread(h, 1, 8, f) == 8) {
+        if (n == cap) {
+            cap = cap ? cap * 2 : 4096;
+            ResChunk *g = (ResChunk *)realloc(c, (size_t)cap * sizeof *c);
+            if (!g) { free(c); fclose(f); return NULL; }
+            c = g;
+        }
+        uint32_t sz = (uint32_t)h[4] | (uint32_t)h[5] << 8 | (uint32_t)h[6] << 16 | (uint32_t)h[7] << 24;
+        c[n].id = (uint32_t)h[0] | (uint32_t)h[1] << 8 | (uint32_t)h[2] << 16 | (uint32_t)h[3] << 24;
+        c[n].size = sz; c[n].off = (uint32_t)off;
+        n++;
+        off += 8 + (long)sz;
+    }
+    fclose(f);
+    if (!n) { free(c); return NULL; }
+    mkdir("ux0:data/NFSU2/cache", 0777);
+    char tmp[620]; snprintf(tmp, sizeof tmp, "%s.tmp", cpath);
+    FILE *wf = fopen(tmp, "wb");
+    if (wf) {
+        int32_t hdr[2] = { (int32_t)flen, n };
+        int ok = fwrite(CIX_MAGIC, 1, 8, wf) == 8 && fwrite(hdr, sizeof hdr, 1, wf) == 1 &&
+                 fwrite(c, sizeof *c, (size_t)n, wf) == (size_t)n;
+        ok = fclose(wf) == 0 && ok;
+        remove(cpath);
+        if (!ok || rename(tmp, cpath)) remove(tmp);
+    }
+    printf("chunk index: %s, %d chunks in %u ms (cached)\n", path, n, SDL_GetTicks() - t0);
+    *count = n;
+    return c;
+}
+
+ResChunk *res_chunk_index(const char *path, int *count) {
+    if (count) *count = 0;
+    if (!path || !count || strlen(path) >= sizeof g_cix[0].path) return NULL;
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 8) return NULL;
+    long flen = (long)st.st_size;
+    cix_lock();
+    int s = -1;
+    for (int i = 0; i < CIX_SLOTS; i++)
+        if (g_cix[i].c && g_cix[i].flen == flen && !strcmp(g_cix[i].path, path)) { s = i; break; }
+    if (s < 0) {
+        int n = 0;
+        ResChunk *c = cix_build(path, flen, &n);   /* under the lock: one walk per file */
+        if (!c) { cix_unlock(); return NULL; }
+        s = 0;
+        for (int i = 1; i < CIX_SLOTS; i++) if (g_cix[i].use < g_cix[s].use) s = i;
+        free(g_cix[s].c);
+        snprintf(g_cix[s].path, sizeof g_cix[s].path, "%s", path);
+        g_cix[s].flen = flen; g_cix[s].c = c; g_cix[s].n = n;
+    }
+    g_cix[s].use = ++g_cix_clock;
+    ResChunk *out = (ResChunk *)malloc((size_t)g_cix[s].n * sizeof *out);
+    if (out) { memcpy(out, g_cix[s].c, (size_t)g_cix[s].n * sizeof *out); *count = g_cix[s].n; }
+    cix_unlock();
+    return out;
+}
+
+int res_chunk_find(const ResChunk *ix, int n, long off) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if ((long)ix[m].off == off) return m;
+        if ((long)ix[m].off < off) lo = m + 1; else hi = m - 1;
+    }
+    return -1;
 }

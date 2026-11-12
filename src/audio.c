@@ -1,6 +1,7 @@
 /* audio.c — OpenUG2 Audio module implementation. */
 #include "audio.h"
 #include "music.h"
+#include "reverb.h"
 #include <assert.h>
 #include <math.h>
 #include <ctype.h>
@@ -26,11 +27,14 @@ volatile float g_hit = 0.0f;
 volatile float g_skid = 0.0f;
 volatile float g_skid3[3];
 volatile int g_skid3_on;
+volatile int g_pskid_patch;
+volatile float g_skid3s[2][3];
 volatile int g_turbo_fitted = 1;
 volatile float g_turbo_boost = 0.0f;
 volatile float g_speed_frac = 0.0f;
 volatile int g_nitro = 0;
 volatile int g_purge = 0;
+volatile int g_sput_out = 0;
 static volatile int g_shift_event;   /* gearbox: +1 upshift, -1 downshift */
 static volatile int g_audio_hold, g_audio_held, g_audio_live;
 
@@ -342,14 +346,39 @@ static int car_audio_row(const char *carname) {
         if (!strcmp(carname, k_audio_row[i].car)) return k_audio_row[i].row;
     return 18;
 }
-static const unsigned char k_row_engine[33] = {
-    18, 6, 25, 29, 22, 22, 18, 31, 6, 39, 31, 25, 29, 14, 38, 15, 4, 26, 22, 23, 14, 39, 23, 23, 4, 10, 10, 4, 33, 9, 26, 28, 28 };
-static const unsigned char k_row_gear[33] = {
-    0, 4, 5, 0, 0, 0, 0, 0, 4, 12, 0, 4, 0, 8, 12, 1, 0, 4, 0, 0, 8, 12, 0, 0, 0, 1, 1, 1, 0, 5, 5, 4, 5 };
+/* the 0x7f2230 records' +0 (engine slot) and +4 (shift bank) at row x 4 +
+   level (CarPreSetup 0x4593b0: the engine slot by the engine sound level
+   EAXCar +0x94; 0x45c376: the player's shift bank by the transmission
+   level EAXCar +0xa4) */
+static const unsigned char k_row_slot[33][4] = {
+    { 18, 2, 20, 20 }, { 6, 7, 8, 8 }, { 25, 26, 27, 27 }, { 29, 21, 24, 24 }, { 22, 2, 19, 19 }, { 22, 4, 5, 0 },
+    { 18, 2, 19, 19 }, { 31, 32, 36, 37 }, { 6, 7, 8, 8 }, { 39, 13, 41, 41 }, { 31, 32, 36, 37 }, { 25, 26, 27, 27 },
+    { 29, 21, 24, 24 }, { 14, 12, 12, 35 }, { 38, 13, 41, 42 }, { 15, 16, 17, 17 }, { 4, 5, 40, 40 }, { 26, 9, 27, 1 },
+    { 22, 40, 5, 0 }, { 23, 36, 37, 37 }, { 14, 12, 12, 35 }, { 39, 13, 41, 41 }, { 23, 36, 37, 37 }, { 23, 36, 37, 37 },
+    { 4, 40, 20, 20 }, { 10, 11, 11, 1 }, { 10, 11, 11, 1 }, { 4, 5, 0, 0 }, { 33, 34, 37, 37 }, { 9, 27, 1, 1 },
+    { 26, 9, 27, 1 }, { 28, 30, 7, 0 }, { 28, 30, 7, 0 } };
+static const unsigned char k_row_gear[33][4] = {
+    { 0, 1, 2, 3 }, { 4, 5, 6, 7 }, { 5, 5, 6, 7 }, { 0, 1, 2, 3 }, { 0, 1, 2, 3 }, { 0, 1, 2, 3 },
+    { 0, 1, 2, 3 }, { 0, 1, 2, 3 }, { 4, 5, 6, 7 }, { 12, 13, 14, 15 }, { 0, 1, 2, 3 }, { 4, 5, 6, 7 },
+    { 0, 1, 2, 3 }, { 8, 9, 10, 11 }, { 12, 13, 14, 15 }, { 1, 2, 3, 3 }, { 0, 1, 2, 3 }, { 4, 5, 6, 7 },
+    { 0, 1, 2, 3 }, { 0, 1, 2, 3 }, { 8, 9, 10, 11 }, { 12, 13, 14, 15 }, { 0, 1, 2, 3 }, { 0, 1, 2, 3 },
+    { 0, 1, 2, 3 }, { 1, 1, 2, 3 }, { 1, 1, 2, 3 }, { 1, 1, 2, 3 }, { 0, 1, 2, 3 }, { 5, 6, 6, 7 },
+    { 5, 6, 7, 11 }, { 4, 5, 6, 7 }, { 5, 5, 6, 7 } };
+/* the player's levels the engine / shift sounds follow (audio_set_player_engine_level)
+   and the ones the loaded sounds were built for */
+static int g_peng_want, g_ptrans_want, g_peng_lvl = -1, g_ptrans_lvl = -1;
+static int lvl03(int l) { return l < 0 ? 0 : l > 3 ? 3 : l; }
+int audio_set_player_engine_level(int engine_level, int trans_level) {
+    g_peng_want = lvl03(engine_level); g_ptrans_want = lvl03(trans_level);
+    return (g_peng_lvl >= 0 && g_peng_lvl != g_peng_want) || (g_ptrans_lvl >= 0 && g_ptrans_lvl != g_ptrans_want);
+}
+int audio_player_engine_level(void) { return g_peng_want; }
+int audio_row_engine_slot(int row, int level) { return k_row_slot[row >= 0 && row < 33 ? row : 18][lvl03(level)]; }
+int audio_slot_file(int slot) { return slot == 41 ? 14 : slot == 42 ? 12 : slot; }   /* 0x7f0de0 +8 */
 /* Engine slots (0x7f0de0, 0x4c each): the Gnsu20 sweep and the decel sweep
  * (record +0x10 flag, +0x14 index into the decel table at 0x7f1aa8; flag 0
  * = no decel recording, the accel sweep plays on the overrun too). */
-static const struct { const char *gin, *dcl; } k_engine_slot[41] = {
+static const struct { const char *gin, *dcl; } k_engine_slot[43] = {
     { "GIN_HondaS2000_Church.gin", "GIN_S2000_Church_DCL.gin" },       /* 0 */
     { "GIN_Ferrari_360.gin", "GIN_Ferrari_360_DCL.gin" },              /* 1 */
     { "GIN_Trueno_AE86.gin", "GIN_Trueno_DCL.gin" },                   /* 2 */
@@ -391,6 +420,8 @@ static const struct { const char *gin, *dcl; } k_engine_slot[41] = {
     { "GIN_Hummer.gin", NULL },                                        /* 38 */
     { "GIN_Porsche_Cayenne.gin", "GIN_Porsche_Cayenne_DCL.gin" },      /* 39 */
     { "GIN_Acura_ITR.gin", "GIN_Acura_ITR_DCL.gin" },                  /* 40 */
+    { "GIN_MustSal_Ramp_V2_CD.gin", "GIN_Mustang_Saleen_DCL.gin" },    /* 41 (CAR_14's files) */
+    { "GIN_Mustang_Drag.gin", "GIN_Mustang_Drag_DCL.gin" },            /* 42 (CAR_12's files) */
 };
 static const char *const k_gear_bank[16] = {
     "GEAR_SML_Base", "GEAR_SML_Lev1", "GEAR_SML_Lev2", "GEAR_SML_Lev3",
@@ -407,8 +438,9 @@ int audio_load_ginsu_sweeps(const char *dataroot, const char *carname) {
     }
     char dirp[512], up_car[64], up_f[256];
     snprintf(dirp, sizeof dirp, "%s/SOUND/ENGINE", dataroot);
-    {   /* the game's own choice: car row -> stock engine slot */
-        int slot = k_row_engine[car_audio_row(carname)];
+    {   /* the game's own choice: car row x 4 + engine sound level -> engine slot */
+        int slot = k_row_slot[car_audio_row(carname)][g_peng_want];
+        g_peng_lvl = g_peng_want;
         char path[768];
         snprintf(path, sizeof path, "%s/%s", dirp, k_engine_slot[slot].gin);
         if (gin_load(path, &g->accel_sweep)) {
@@ -418,8 +450,8 @@ int audio_load_ginsu_sweeps(const char *dataroot, const char *carname) {
                 ok = gin_load(path, &g->decel_sweep);
             }
             if (!ok) { g->decel_sweep = g->accel_sweep; g->decel_is_alias = 1; }
-            printf("engine sounds: slot %d %s + %s\n", slot, k_engine_slot[slot].gin,
-                   ok ? k_engine_slot[slot].dcl : "(no decel)");
+            printf("engine sounds: slot %d (row %d, engine sound level %d) %s + %s\n", slot, car_audio_row(carname),
+                   g_peng_want, k_engine_slot[slot].gin, ok ? k_engine_slot[slot].dcl : "(no decel)");
             goto loaded;
         }
     }
@@ -600,21 +632,39 @@ static int abk_clip(const char *path, int want, Clip *out) {
 }
 
 int audio_load_shift_bank(const char *dataroot, const char *carname) {
-    const char *bank = k_gear_bank[k_row_gear[car_audio_row(carname)]];
+    const char *bank = k_gear_bank[k_row_gear[car_audio_row(carname)][g_ptrans_want]];
+    g_ptrans_lvl = g_ptrans_want;
     char path[512];
     snprintf(path, sizeof path, "%s/SOUND/SHIFTING/%s.abk", dataroot, bank);
     clip_free(&g_shift_clip[0]); clip_free(&g_shift_clip[1]);
     g_shift_pos = -1.0f;
     int n = abk_clip(path, 0, &g_shift_clip[0]) + abk_clip(path, 1, &g_shift_clip[1]);
-    printf("shift sounds: %s, %d clips (%.2f / %.2f s)\n", bank, n,
+    printf("shift sounds: %s (transmission level %d), %d clips (%.2f / %.2f s)\n", bank, g_ptrans_want, n,
            g_shift_clip[0].n / (g_shift_clip[0].rate > 0 ? g_shift_clip[0].rate : 1.0f),
            g_shift_clip[1].n / (g_shift_clip[1].rate > 0 ? g_shift_clip[1].rate : 1.0f));
     return n > 0;
 }
 
+static char g_skid_root[512], g_skid_name[16];
+static int skid_load(const char *bank);
 int audio_load_skid_bank(const char *dataroot) {
-    char path[512];
-    snprintf(path, sizeof path, "%s/SOUND/SKIDS/SKID_PAV_MB.abk", dataroot);
+    snprintf(g_skid_root, sizeof g_skid_root, "%s", dataroot);
+    return skid_load("SKID_PAV");
+}
+int audio_set_skid_bank(const char *bank) {
+    if (!g_skid_root[0] || !strcmp(bank, g_skid_name)) return g_skid_name[0] && !strcmp(bank, g_skid_name);
+    return skid_load(bank);
+}
+/* the bank's sounds 0..4 (FX_SKID's sample players use 0..4 in all four
+   banks: SKID_PAV 4,3,2,4,1,4, SKID_PAV2 0,4,4,3,2,1,4, SKIDS_DRIFT
+   4,2,3,1,0, SKIDS_DRIFT2 4,2,3,0,1). They are set AFX_SKID, which the
+   player's FX_SKID patch instance plays (carsfx.c player_skid, R2 11-01);
+   the hand mix below (SKID_PAV's pairing) is only the fallback when the
+   bank's program does not load (or OPENUG2_PSKID_HAND) */
+static int skid_load(const char *bank) {
+    char path[640];
+    snprintf(g_skid_name, sizeof g_skid_name, "%s", bank);
+    snprintf(path, sizeof path, "%s/SOUND/SKIDS/%s_MB.abk", g_skid_root, bank);
     clip_free(&g_skid_clip);
     int ok = abk_clip(path, 0, &g_skid_clip);
     /* FX_SKID's sample players use clips 4,3,2,4,1,4: three tonal squeals
@@ -622,8 +672,13 @@ int audio_load_skid_bank(const char *dataroot) {
     {   static const int want[4] = { 1, 2, 3, 4 };
         for (int k = 0; k < 4; k++) clip_free(&g_skidk[k]);
         int nk = abk_clips(path, want, 4, g_skidk);
-        printf("skid sound: FX_SKID clips 1-4 %s\n", nk == 4 ? "loaded" : "missing"); }
-    printf("skid sound: %s (%.2f s, loop %u-%u)\n", ok ? "SKID_PAV_MB" : "synth",
+        unsigned bytes = g_skid_clip.n * 2u;
+        for (int k = 0; k < 4; k++) bytes += g_skidk[k].n * 2u;
+        printf("skid sound: player %s_MB, FX_SKID clips 1-4 %s, %u KB PCM\n", bank, nk == 4 ? "loaded" : "missing",
+               bytes / 1024); }
+    for (int k = 0; k < 4; k++) g_skidk_pos[k] = 0.0f;
+    g_skid_pos = 0.0f;
+    printf("skid sound: %s (%.2f s, loop %u-%u)\n", ok ? bank : "synth",
            ok ? g_skid_clip.n / g_skid_clip.rate : 0.0f, g_skid_clip.loop_start, g_skid_clip.loop_end);
     return ok;
 }
@@ -649,9 +704,17 @@ int audio_load_collision_bank(const char *dataroot) {
     return n;
 }
 
-static const unsigned char k_row_turbo[33] = {
-    0, 6, 6, 3, 3, 0, 0, 0, 6, 12, 0, 6, 0, 12, 12, 6, 3,
-    6, 3, 0, 12, 12, 3, 0, 0, 6, 6, 3, 0, 6, 6, 6, 6 };
+/* 0x7f2238 (record +8 of 0x7f2230) at row x 4 + turbo level: the turbo
+   bank (0x45eb30: [(level + row * 4) * 12 + 0x7f2238]) */
+static const unsigned char k_row_turbo[33][4] = {
+    { 0, 0, 1, 2 }, { 6, 7, 8, 8 }, { 6, 6, 7, 8 }, { 3, 3, 4, 5 }, { 3, 3, 4, 5 }, { 0, 0, 1, 2 },
+    { 0, 0, 1, 2 }, { 0, 0, 1, 2 }, { 6, 7, 8, 8 }, { 12, 12, 13, 14 }, { 0, 0, 1, 2 }, { 6, 6, 7, 8 },
+    { 0, 0, 1, 2 }, { 12, 12, 13, 14 }, { 12, 12, 13, 14 }, { 6, 7, 8, 8 }, { 3, 3, 4, 5 }, { 6, 6, 7, 8 },
+    { 3, 4, 5, 5 }, { 0, 0, 1, 2 }, { 12, 12, 13, 14 }, { 12, 12, 13, 14 }, { 3, 3, 4, 5 }, { 0, 0, 1, 2 },
+    { 0, 0, 1, 5 }, { 6, 7, 8, 8 }, { 6, 6, 7, 8 }, { 3, 3, 4, 5 }, { 0, 0, 1, 2 }, { 6, 7, 8, 8 },
+    { 6, 6, 7, 8 }, { 6, 6, 7, 8 }, { 6, 6, 7, 8 } };
+/* 0x45eb30 indexes with the raw level (0..3 in the parts data) */
+static int turbo_lvl(int l) { return l < 0 ? 0 : l > 3 ? 3 : l; }
 /* SPEED2.EXE 0x7f3338: 24-byte entries {bank, whine rate at no boost, at
  * full boost, third rate (unused here), 40.0f, 0.5f}. Read here as
  * playback Hz for the 22050 Hz whine loop (our reading; not traced in code). */
@@ -691,10 +754,18 @@ static Voice g_bov, g_nos_voice, g_purge_voice;
 static Clip g_turbo_whine, g_bov_clip[3];
 static int g_pturbo_rec = -1;
 int audio_player_turbo_rec(void) { return g_pturbo_rec; }
+/* the player's levels (audio_set_player_perf) and what is loaded */
+static int g_pturbo_lvl, g_pnos_lvl, g_pturbo_row = -1, g_pnos_bank = -1;
+static char g_proot[512];
+static int turbo_load_row(const char *dataroot, int row);
 
 int audio_load_turbo_bank(const char *dataroot, const char *carname) {
-    int row = car_audio_row(carname);
-    int t = k_row_turbo[row];
+    return turbo_load_row(dataroot, car_audio_row(carname));
+}
+static int turbo_load_row(const char *dataroot, int row) {
+    int t = k_row_turbo[row][turbo_lvl(g_pturbo_lvl)];
+    if (dataroot != g_proot) snprintf(g_proot, sizeof g_proot, "%s", dataroot);
+    g_pturbo_row = row;
     char path[512];
     snprintf(path, sizeof path, "%s/SOUND/TURBO/%s_MB.abk", dataroot, k_turbo_bank[t].bank);
     g_bov.c = NULL;   /* under audio_hold: nothing is mixing */
@@ -706,7 +777,7 @@ int audio_load_turbo_bank(const char *dataroot, const char *carname) {
     g_turbo_whine = c[0];
     for (int i = 0; i < 3; i++) g_bov_clip[i] = c[i + 1];
     g_pturbo_rec = n ? t : -1;
-    printf("turbo sounds: %s (row %d), %d clips\n", k_turbo_bank[t].bank, row, n);
+    printf("turbo sounds: %s (row %d, turbo level %d), %d clips\n", k_turbo_bank[t].bank, row, turbo_lvl(g_pturbo_lvl), n);
     return n;
 }
 
@@ -727,8 +798,19 @@ static Clip g_road_clip[14], g_wind_clip[3], g_nos_clip[3], g_purge_clip[3];
    FE_COMMON is loaded whole; FE_MB samples on first use. */
 #define FE_COMMON_N 0x17
 #define FE_MB_N (0x5e - 0x17)
-static Clip g_fecom[FE_COMMON_N], g_femb[FE_MB_N];
+/* by bank sound; the id -> bank sound maps are the PlayCommonSample /
+   PlayFrontEndSample players' sample lists (member 0 = the id goes
+   straight to the players' list index, clamped to the list's end) */
+static Clip g_fecom[32], g_femb[80];
+static int g_fecom_map[FE_COMMON_N], g_femb_map[FE_MB_N];
 static char g_femb_path[512];
+static int abk_bank_sel(const char *path, Clip *out, int max, int want);
+static int abk_list(const char *path, const char *cls, int ply, int *out, int max);
+/* list[min(id, n - 1)] (SNDAEMSI_playerplaybank) */
+static void fe_map(const char *path, const char *cls, int *map, int nmap) {
+    int lst[96], n = abk_list(path, cls, 0, lst, 96);
+    for (int i = 0; i < nmap; i++) map[i] = n > 0 ? lst[i < n ? i : n - 1] : 0;
+}
 #define FE_VOICES 4
 static struct { const Clip *volatile c; float pos; } g_fev[FE_VOICES];
 static volatile int g_game_mute;
@@ -736,21 +818,30 @@ static volatile int g_game_mute;
 int audio_load_fe_banks(const char *dataroot) {
     char path[512];
     snprintf(path, sizeof path, "%s/SOUND/GLOBAL/FE_COMMON_MB.abk", dataroot);
-    int want[FE_COMMON_N];
-    for (int i = 0; i < FE_COMMON_N; i++) want[i] = i;
-    int n = abk_clips(path, want, FE_COMMON_N, g_fecom);
+    int n = abk_bank_sel(path, g_fecom, 32, -1);
+    fe_map(path, "PlayCommonSample", g_fecom_map, FE_COMMON_N);
     snprintf(g_femb_path, sizeof g_femb_path, "%s/SOUND/FE/FE_MB.abk", dataroot);
-    printf("audio: FE_COMMON_MB %d samples\n", n);
+#if OPENUG2_REVERB
+    reverb_load(dataroot);   /* SOUND/FXEDIT: the reverb patches (reverb.c) */
+#endif
+    for (int i = 0; i < 80; i++) clip_free(&g_femb[i]);
+    fe_map(g_femb_path, "PlayFrontEndSample", g_femb_map, FE_MB_N);
+    printf("audio: FE_COMMON_MB %d samples; id -> bank sound:", n);
+    for (int i = 0; i < FE_COMMON_N; i++) printf(" %d", g_fecom_map[i]);
+    printf("; FE_MB id 0x17.. ->");
+    for (int i = 0; i < FE_MB_N; i++) printf(" %d", g_femb_map[i]);
+    printf("\n");
     return n;
 }
 
 void audio_fe_play(int id) {
     const Clip *c = NULL;
     if (id < 0) return;
-    if (id < FE_COMMON_N) c = &g_fecom[id];
+    if (id < FE_COMMON_N) { int b = g_fecom_map[id]; c = b > 0 && b < 32 ? &g_fecom[b] : NULL; }
     else if (id < 0x5e) {
-        Clip *k = &g_femb[id - FE_COMMON_N];
-        if (!k->s && g_femb_path[0]) abk_clip(g_femb_path, id - FE_COMMON_N, k);
+        int b = g_femb_map[id - FE_COMMON_N];
+        Clip *k = b > 0 && b < 80 ? &g_femb[b] : NULL;
+        if (k && !k->s && g_femb_path[0]) abk_bank_sel(g_femb_path, g_femb, 80, b);
         c = k;
     }
     if (!c || !c->s || !c->n) return;
@@ -815,27 +906,70 @@ static void fe_voices_mix(float *acc, int n) {
     }
 }
 
+/* SetupLoadData 0x465830: table 0x7ed1a0 {Nitrous_00, Nitrous_01} by the
+   nitrous level (obj +0xac): 2 or 3 -> 1, else 0 */
+static int nos_bank_of(int level) { return level == 2 || level == 3; }
+/* the player's FX_NITROUS / FX_PURGE clips from bank b (no audio_hold:
+   the callers hold or run before audio_init) */
+static int pnos_load(const char *dataroot, int b) {
+    char path[512];
+    g_nos_voice.c = NULL; g_purge_voice.c = NULL;
+    for (int i = 0; i < 3; i++) { clip_free(&g_nos_clip[i]); clip_free(&g_purge_clip[i]); }
+    /* FX_NITROUS (both banks): player 0 = list position 2 (bank sound 3),
+       state 1 in the template = the engage; players 2/3 = position 0 (bank
+       sound 1) = the burn loops; player 1 = position 1 (bank sound 2),
+       started by the release member = the release. abk_clips index = bank
+       sound - 1: engage 2, loop 0, release 1 (p2A 10-31d; it had engage and
+       release swapped) */
+    static const int nos_ids[3] = { 2, 0, 1 };
+    snprintf(path, sizeof path, "%s/SOUND/NOS/Nitrous_0%d_MB.abk", dataroot, b);
+    int n = abk_clips(path, nos_ids, 3, g_nos_clip);
+    {   /* FX_PURGE: player 0 = position 5 (bank sound 6), state 1 = the
+           engage; players 1/2 = position 3 (bank 4) the loops; player 3 =
+           position 4 (bank 5), started by the release member = the release */
+        static const int purge_ids[3] = { 5, 3, 4 };
+        abk_clips(path, purge_ids, 3, g_purge_clip); }
+    g_pnos_bank = b;
+    unsigned bytes = 0;
+    for (int i = 0; i < 3; i++) bytes += (g_nos_clip[i].n + g_purge_clip[i].n) * 2u;
+    printf("nitrous sounds: player Nitrous_0%d (nitrous level %d), engage/loop/release %u/%u/%u samples, %u KB PCM\n",
+           b, g_pnos_lvl, g_nos_clip[0].n, g_nos_clip[1].n, g_nos_clip[2].n, bytes / 1024);
+    return n;
+}
+
+void audio_set_player_perf(int turbo_level, int nos_level) {
+    int tchg = turbo_lvl(turbo_level) != turbo_lvl(g_pturbo_lvl);
+    g_pturbo_lvl = turbo_level; g_pnos_lvl = nos_level;
+    if (!g_proot[0]) return;                     /* nothing loaded yet: the loaders read the levels */
+    int b = nos_bank_of(nos_level);
+    int treload = tchg && g_pturbo_row >= 0 && k_row_turbo[g_pturbo_row][turbo_lvl(turbo_level)] != g_pturbo_rec;
+    if (b == g_pnos_bank && !treload) return;
+    audio_hold(1);
+    if (b != g_pnos_bank) pnos_load(g_proot, b);
+    if (treload) turbo_load_row(g_proot, g_pturbo_row);   /* by the row it last loaded */
+    audio_hold(0);
+}
+
 int audio_load_env_banks(const char *dataroot) {
     char path[512]; int n = 0;
-    g_nos_voice.c = NULL; g_purge_voice.c = NULL;
     for (int i = 0; i < 14; i++) clip_free(&g_road_clip[i]);
-    for (int i = 0; i < 3; i++) { clip_free(&g_wind_clip[i]); clip_free(&g_nos_clip[i]); clip_free(&g_purge_clip[i]); }
+    for (int i = 0; i < 3; i++) clip_free(&g_wind_clip[i]);
+    snprintf(g_proot, sizeof g_proot, "%s", dataroot);
     /* FX_ROADNOISE loops = variant table +0xe18 (bank entries 1..7 = clips 0..6),
        its +0xe70 table (clips 7..10), FX_ROADNOISE_TRANS = +0xea4 (clips 11..13);
        played by carsfx.c (CARSFX_RoadNoise) as set AFX_ROAD */
-    static const int road_ids[14] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 }, wind_ids[3] = { 0, 1, 2 }, nos_ids[3] = { 1, 0, 2 };
+    static const int road_ids[14] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 }, wind_ids[3] = { 0, 1, 2 }, nos_ids[3] = { 2, 0, 1 };
     snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/ROADNOISE_00_MB.abk", dataroot);
     int nroad = abk_clips(path, road_ids, 14, g_road_clip);
     n += nroad > 0;
     snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/WIND_00_MB.abk", dataroot);
     n += abk_clips(path, wind_ids, 3, g_wind_clip);
-    snprintf(path, sizeof path, "%s/SOUND/NOS/Nitrous_00_MB.abk", dataroot);
-    n += abk_clips(path, nos_ids, 3, g_nos_clip);
-    {   static const int purge_ids[3] = { 4, 3, 5 };   /* FX_PURGE: 4 engage, 3 loop, 5 release */
-        abk_clips(path, purge_ids, 3, g_purge_clip); }
-    printf("environment sounds: %d of 7 clips (road %d of 14 clips, clip 0 %u, wind %u/%u/%u, nitrous %u/%u/%u samples)\n", n,
+    /* the player's nitrous bank by its nitrous level (audio_set_player_perf) */
+    n += pnos_load(dataroot, nos_bank_of(g_pnos_lvl));
+    printf("environment sounds: %d of 7 clips (road %d of 14 clips, clip 0 %u, wind %u/%u/%u, nitrous engage/loop/release "
+           "= bank sounds %d/%d/%d (%u/%u/%u samples), purge = %d/%d/%d)\n", n,
            nroad, g_road_clip[0].n, g_wind_clip[0].n, g_wind_clip[1].n, g_wind_clip[2].n,
-           g_nos_clip[0].n, g_nos_clip[1].n, g_nos_clip[2].n);
+           nos_ids[0] + 1, nos_ids[1] + 1, nos_ids[2] + 1, g_nos_clip[0].n, g_nos_clip[1].n, g_nos_clip[2].n, 6, 4, 5);
     return n;
 }
 
@@ -859,11 +993,12 @@ int audio_load_ai_banks(const char *dataroot, const int *slot, int n) {
         g_aibank[b].ok = 0;
         if (b >= n || slot[b] < 0) continue;
         char path[512];
-        snprintf(path, sizeof path, "%s/SOUND/ENGINE/CAR_%02d_ENG_MB_SPU.abk", dataroot, slot[b]);
+        snprintf(path, sizeof path, "%s/SOUND/ENGINE/CAR_%02d_ENG_MB_SPU.abk", dataroot, audio_slot_file(slot[b]));
         int got = abk_clips(path, want, 7, g_aibank[b].c);
         g_aibank[b].ok = got == 7;
         ok += g_aibank[b].ok;
-        printf("car sounds: AI engine bank %d = CAR_%02d_ENG_MB_SPU (%d of 7 loops)\n", b, slot[b], got);
+        printf("car sounds: AI engine bank %d = slot %d, CAR_%02d_ENG_MB_SPU (%d of 7 loops)\n", b, slot[b],
+               audio_slot_file(slot[b]), got);
     }
     memset(g_cvs, 0, sizeof g_cvs);
     return ok;
@@ -882,14 +1017,14 @@ int audio_load_traffic_clip(const char *dataroot) {
 /* ---- the other cars' sample effects (g_fxvoice, set by carsfx.c) ---- */
 AudioFxVoice g_fxvoice[AUDIO_FXVOICES];
 static Clip g_env_clip[8], g_woosh_clip[16], g_collall[94], g_scrape_clip, g_splash_clip;
-typedef struct { Clip c[4]; } AiTurboBank;
+typedef struct { Clip c[8]; } AiTurboBank;   /* by bank index */
 static AiTurboBank g_aiturbo[8];
 /* audio thread: cursor (negative = delay still running), last trig seen,
    smoothed gain */
 typedef struct { float pos, gain; unsigned trig; int live; } FxVoiceState;
 static FxVoiceState g_fvs[AUDIO_FXVOICES];
 
-int audio_row_turbo(int row) { return row >= 0 && row < 33 ? k_row_turbo[row] : 0; }
+int audio_row_turbo(int row, int level) { return row >= 0 && row < 33 ? k_row_turbo[row][turbo_lvl(level)] : 0; }
 
 int audio_load_carfx_banks(const char *dataroot, const int *coll, int ncoll) {
     char path[512]; int n = 0;
@@ -931,28 +1066,130 @@ int audio_load_carfx_banks(const char *dataroot, const int *coll, int ncoll) {
     return n;
 }
 
+static int abk_bank(const char *path, Clip *out, int max);
 int audio_load_ai_turbo_banks(const char *dataroot, const int *tbank, int n) {
-    static const int want[4] = { 0, 1, 2, 3 };
     int ok = 0;
     for (int b = 0; b < 8; b++) {
-        for (int k = 0; k < 4; k++) clip_free(&g_aiturbo[b].c[k]);
+        for (int k = 0; k < 8; k++) clip_free(&g_aiturbo[b].c[k]);
         if (b >= n || tbank[b] < 0 || tbank[b] >= 15) continue;
         char path[512];
         snprintf(path, sizeof path, "%s/SOUND/TURBO/%s_MB.abk", dataroot, k_turbo_bank[tbank[b]].bank);
-        int got = abk_clips(path, want, 4, g_aiturbo[b].c);
-        ok += got == 4;
-        printf("car sounds: AI turbo bank %d = %s (%d of 4 clips)\n", b, k_turbo_bank[tbank[b]].bank, got);
+        int got = abk_bank(path, g_aiturbo[b].c, 8);   /* FX_TURBO's list: bank sounds 1..5 */
+        ok += got > 0;
+        printf("car sounds: AI turbo bank %d = %s (%d sounds)\n", b, k_turbo_bank[tbank[b]].bank, got);
     }
     for (int v = 0; v < AUDIO_FXVOICES; v++) g_fvs[v].live = 0;
     return ok;
 }
 
-static Clip g_swtn_clip[32];
+/* every sound of an .abk bank by its bank index: the BNKl header's u16
+   count at +6 and its table at +0x14 (entry i = self-relative offset of
+   sound i's PT header, 0 = none). Entry 0 is 0 in every bank of the game,
+   so abk_clips' running index k is bank sound k + 1; the AEMS patches'
+   sample lists name bank sounds. */
+static int abk_bank_sel(const char *path, Clip *out, int max, int want) {
+    for (int i = 0; i < max; i++) if (want < 0 || i == want) clip_free(&out[i]);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    unsigned char *d = len > 0x40 ? (unsigned char *)malloc((size_t)len) : NULL;
+    if (!d || fread(d, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(d); return 0; }
+    fclose(f);
+    long boff = !memcmp(d, "ABKC", 4) ? (long)rd32(d + 0x18) : -1;
+    if (boff < 0 || boff + 0x18 > len || memcmp(d + boff, "BNKl", 4)) { free(d); return 0; }
+    int cnt = d[boff + 6] | d[boff + 7] << 8, loaded = 0;
+    for (int i = 0; i < cnt && i < max; i++) {
+        long a = boff + 0x14 + 4 * i;
+        if ((want >= 0 && i != want) || a + 4 > len || !rd32(d + a)) continue;
+        long p = a + (long)rd32(d + a);
+        if (p < 0 || p + 0x40 > len || memcmp(d + p, "PT\0\0", 4)) continue;
+        uint32_t off = 0, count = 0, rate = 22050, ls = 0, le = 0;
+        long q = p + 4;
+        while (q < p + 0x40) {
+            int tag = d[q++];
+            if (tag == 0xFF || tag == 0xFE) break;
+            if (tag == 0xFD) continue;
+            int nlen = d[q++]; uint32_t v = 0;
+            for (int k = 0; k < nlen && k < 4; k++) v = v << 8 | d[q + k];
+            q += nlen;
+            if (tag == 0x84) rate = v; else if (tag == 0x85) count = v;
+            else if (tag == 0x88) off = v; else if (tag == 0x86) ls = v;
+            else if (tag == 0x87) le = v;
+        }
+        if (!count || !off || boff + (long)off + (long)count / 2 > len) continue;
+        out[i].s = (int16_t *)malloc(count * sizeof(int16_t));
+        if (!out[i].s) continue;
+        eaxa_decode(d + boff + off, out[i].s, count);
+        out[i].n = count; out[i].rate = (float)rate;
+        out[i].loop_start = ls < count ? ls : 0;
+        out[i].loop_end = le > ls && le < count ? le : 0;
+        loaded++;
+    }
+    free(d);
+    return loaded;
+}
+static int abk_bank(const char *path, Clip *out, int max) { return abk_bank_sel(path, out, max, -1); }
+
+/* the sample list of player ply of the AEMS class cls (the module
+   descriptor = class entry of the header +0x38 table + 0x20; its players'
+   template offsets at +0x18; a player's +4 = its list {n, n x {bank byte,
+   bank sound, ?}}): out[pos] = the bank sound list position pos plays
+   (0 = none). Returns the list length. */
+static int abk_list(const char *path, const char *cls, int ply, int *out, int max) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    unsigned char *d = len > 0x40 ? (unsigned char *)malloc((size_t)len) : NULL;
+    if (!d || fread(d, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(d); return 0; }
+    fclose(f);
+    int n = 0;
+    long t = (long)rd32(d + 0x38);
+    int nc = !memcmp(d, "ABKC", 4) && t > 0 && t + 4 <= len ? (int)rd32(d + t) : 0;
+    for (int k = 0; k < nc && t + 16 + 12 * k <= len; k++) {
+        long c = (long)rd32(d + t + 4 + 12 * k), nm = (long)rd32(d + t + 8 + 12 * k);
+        if (nm <= 0 || nm + 4 + (long)strlen(cls) >= len || strcmp((const char *)d + nm + 4, cls)) continue;
+        if (c <= 0 || c + 0x40 > len || ply >= d[c + 0x20]) break;
+        long po = (long)rd32(d + c + 0x28) + (long)rd32(d + c + 0x38 + 4 * ply);
+        long lst = po > 0 && po + 8 <= len ? (long)rd32(d + po + 4) : 0;
+        if (lst <= 0 || lst + 4 > len) break;
+        int cnt = (int)rd32(d + lst);
+        for (int i = 0; i < cnt && i < max && lst + 16 + 12 * i <= len; i++)
+            out[n++] = d[lst + 4 + 12 * i] == 0 ? (int)rd32(d + lst + 8 + 12 * i) : 0;
+        break;
+    }
+    free(d);
+    return n;
+}
+
+static Clip g_swtn_clip[32], g_pnos_clip[2][16], g_pskid_clip[2][16], g_prain_clip[16], g_pwind_clip[16], g_pmain_clip[32];
+int audio_load_patch_bank(int set, const char *path) {
+    Clip *c = set == AFX_PNOS ? g_pnos_clip[0] : set == AFX_PNOS1 ? g_pnos_clip[1] : set == AFX_PSKID ? g_pskid_clip[0] :
+              set == AFX_PSKID1 ? g_pskid_clip[1] :
+              set == AFX_PRAIN ? g_prain_clip : set == AFX_PWIND ? g_pwind_clip : set == AFX_PMAIN ? g_pmain_clip : NULL;
+    if (!c) return 0;
+    int max = set == AFX_PMAIN ? 32 : 16;
+    audio_hold(1);
+    for (int v = 0; v < AUDIO_FXVOICES; v++) if (g_fxvoice[v].set == set) { g_fxvoice[v].on = 0; g_fvs[v].live = 0; }
+    int n = 0;
+    if (path) n = abk_bank(path, c, max);
+    else for (int i = 0; i < max; i++) clip_free(&c[i]);
+    audio_hold(0);
+    if (set == AFX_PNOS || set == AFX_PNOS1) {   /* the bank's PCM (the Vita's audio budget) */
+        unsigned bytes = 0;
+        for (int i = 0; i < max; i++) bytes += c[i].n * 2u;
+        printf("[aipatch] nitrous set %d: %d sounds, %u KB PCM%s\n", set - AFX_PNOS, n, bytes / 1024, path ? "" : " (freed)");
+    }
+    if (set == AFX_PSKID || set == AFX_PSKID1) {
+        unsigned bytes = 0;
+        for (int i = 0; i < max; i++) bytes += c[i].n * 2u;
+        printf("[aipatch] skid set %d: %d sounds, %u KB PCM%s\n", set - AFX_PSKID, n, bytes / 1024, path ? "" : " (freed)");
+    }
+    return n;
+}
+
 int audio_load_swtn_bank(const char *path, unsigned *loops) {
-    int want[32];
-    for (int i = 0; i < 32; i++) { clip_free(&g_swtn_clip[i]); want[i] = i; }
     for (int v = 0; v < AUDIO_FXVOICES; v++) if (g_fxvoice[v].set == AFX_SWTN) g_fvs[v].live = 0;
-    int n = abk_clips(path, want, 32, g_swtn_clip);
+    int n = abk_bank(path, g_swtn_clip, 32);
     unsigned m = 0;
     for (int i = 0; i < 32; i++) if (g_swtn_clip[i].loop_end > 0) m |= 1u << i;
     if (loops) *loops = m;
@@ -965,18 +1202,30 @@ static const Clip *fx_clip(int set, int k) {
     case AFX_ENV:   return k < 8 ? &g_env_clip[k] : NULL;
     case AFX_WOOSH: return k < 16 ? &g_woosh_clip[k] : NULL;
     case AFX_COLL:  return k < 94 ? &g_collall[k] : NULL;
-    case AFX_NOS:   /* g_nos_clip holds clips 1, 0, 2 */
+    case AFX_NOS:   /* g_nos_clip holds engage, loop, release: k = 0 loop, 1 engage, 2 release */
         return k == 0 ? &g_nos_clip[1] : k == 1 ? &g_nos_clip[0] : k == 2 ? &g_nos_clip[2] : NULL;
     case AFX_SKID:  return k == 0 ? &g_skid_clip : k <= 4 ? &g_skidk[k - 1] : NULL;
     case AFX_SCRAPE: return k == 0 ? &g_scrape_clip : NULL;
     case AFX_SPLASH: return k == 0 ? &g_splash_clip : NULL;
     case AFX_ROAD:  return k < 14 ? &g_road_clip[k] : NULL;
     case AFX_SWTN:  return k < 32 ? &g_swtn_clip[k] : NULL;
+    case AFX_PNOS:  return k < 16 ? &g_pnos_clip[0][k] : NULL;
+    case AFX_PNOS1: return k < 16 ? &g_pnos_clip[1][k] : NULL;
+    case AFX_PSKID: return k < 16 ? &g_pskid_clip[0][k] : NULL;
+    case AFX_PSKID1: return k < 16 ? &g_pskid_clip[1][k] : NULL;
+    case AFX_PRAIN: return k < 16 ? &g_prain_clip[k] : NULL;
+    case AFX_PWIND: return k < 16 ? &g_pwind_clip[k] : NULL;
+    case AFX_PMAIN: return k < 32 ? &g_pmain_clip[k] : NULL;
     case AFX_PTURBO: return k == 0 ? &g_turbo_whine : k <= 3 ? &g_bov_clip[k - 1] : NULL;
     default:
-        if (set >= AFX_TURBO && set < AFX_TURBO + 8 && k < 4) return &g_aiturbo[set - AFX_TURBO].c[k];
+        if (set >= AFX_TURBO && set < AFX_TURBO + 8 && k < 8) return &g_aiturbo[set - AFX_TURBO].c[k];
         return NULL;
     }
+}
+
+int audio_fx_loop(int set, int k) {
+    const Clip *c = fx_clip(set, k);
+    return c && c->loop_end > 0;
 }
 
 /* one buffer of an effect voice into acc[0..n) (mid) and side[0..n) (right
@@ -1008,6 +1257,28 @@ static void fx_voice_mix(int v, float *acc, float *side, int n) {
         km = 0.5f * (gl + gr); ks = 0.5f * (gr - gl);
     }
     float g0 = st->gain, dg = (g1 - g0) / (float)n;
+    if (g0 == 0.0f && g1 == 0.0f) {
+        /* silent for the whole buffer: every sample would add 0, so only
+           the cursor moves -- the same steps as below (loop_next's wrap,
+           the one-shot's end), without reading or mixing the clip */
+        uint32_t ls = c->loop_end ? c->loop_start : 0, le = c->loop_end ? c->loop_end : c->n - 1;
+        for (int i = 0; i < n; i++) {
+            if (st->pos < 0.0f) {
+                st->pos += 1.0f;
+                if (st->pos > 0.0f) st->pos = 0.0f;
+                continue;
+            }
+            if (loop) {
+                if (st->pos >= (float)le || st->pos < 0.0f) st->pos = (float)ls;
+                st->pos += step;
+                if (st->pos >= (float)le) st->pos -= (float)(le - ls);
+            } else {
+                if (st->pos >= (float)c->n - 1.0f) { st->live = 0; fv->done = 1; break; }
+                st->pos += step;
+            }
+        }
+        return;                               /* st->gain stays 0 = g1 */
+    }
     for (int i = 0; i < n; i++) {
         g0 += dg;
         if (st->pos < 0.0f) {                 /* the stitch delay */
@@ -1032,7 +1303,7 @@ static void fx_voice_mix(int v, float *acc, float *side, int n) {
 /* one buffer of a car voice, added into acc[0..n). The loops play like the
    player's .abk path (idle below ~2200 rpm, 3 rpm bands, accel vs decel by
    load), at the voice's pitch; then the 1-pole low-pass. */
-static void car_voice_mix(int v, float *acc, int n) {
+static void car_voice_mix(int v, float *acc, float *side, int n) {
     AudioCarVoice *cv = &g_carvoice[v];
     CarVoiceState *st = &g_cvs[v];
     int on = cv->on, bank = cv->bank;
@@ -1068,13 +1339,20 @@ static void car_voice_mix(int v, float *acc, int n) {
         lvl = 1.6f * 0.6f;                /* the player's .abk gain at a mid master volume */
     }
     float al = fc >= 20000.0f ? 1.0f : 1.0f - expf(-6.2831853f * (fc > 50.0f ? fc : 50.0f) / 44100.0f);
+    float p = cv->pan, km = 1.0f, ks = 0.0f;
+    if (p > 1e-3f || p < -1e-3f) {             /* as fx_voice_mix */
+        if (p > 1.0f) p = 1.0f; if (p < -1.0f) p = -1.0f;
+        float a = (p + 1.0f) * 0.785398f, gl = cosf(a) * 1.414214f, gr = sinf(a) * 1.414214f;
+        km = 0.5f * (gl + gr); ks = 0.5f * (gr - gl);
+    }
     float g0 = st->gain, dg = (g1 - g0) / (float)n;
     for (int i = 0; i < n; i++) {
         float s = 0.0f;
         for (int l = 0; l < nl; l++) s += loop_next(cl[l], &st->pos[idx[l]], step[l]) * w[l];
         st->lp += (s - st->lp) * al;
         g0 += dg;
-        acc[i] += st->lp * g0 * lvl;
+        acc[i] += st->lp * g0 * lvl * km;
+        side[i] += st->lp * g0 * lvl * ks;
     }
     st->gain = g1;
 }
@@ -1176,6 +1454,7 @@ int carsfx_curve(unsigned type, unsigned x, int db);   /* carsfx.h: 0x468160 */
 #define MIX_REF_MB   (-300)
 #define MUS_FE_MB    (-1100)
 #define MUS_IG_MB    (-900)
+#define AMB_MB       (-200)   /* master 4, out 0x40000020 = SFXObj_Ambience (InitSFX: sub type 2) */
 static float mb_gain(int mb) { return powf(10.0f, (float)mb / 2000.0f); }
 /* the speech level: GetMasterVolume(1) = master * speech (GC 0x8007b23c) */
 #define SPEECH_MIX 1.0f
@@ -1191,6 +1470,10 @@ static MixEvt g_evt_mus_fe = { -810, 0x8005, 0x8011 },   /* evt 11 -> Music ch0 
               g_evt_mus_ig = { -1320, 0x8003, 0x802f },  /* evt 9 -> sub1 (clamp -1320) -> ch1 */
               g_evt_fe_ig = { -900, 0x2005, 0x2011 },    /* evt 2 -> SFX_Common */
               g_evt_fe_fe = { -689, 0x2008, 0x2011 };    /* evt 5 -> SFX_Common */
+/* The cars' mixmap events and ctls (map 1 / 3 / 5, e.g. the sputter's
+   ASR 0xa1013000 ducking master 0x40010000) run in carsfx.c md_update;
+   the player's engine reads their sum as g_eng_dyn_mb. */
+volatile int g_speech_state;
 static volatile int g_fe_side = 1;
 void audio_set_frontend(int fe) { g_fe_side = fe ? 1 : 0; }
 static void evt_atr(MixEvt *e, int trig) {   /* UpdateATREvent */
@@ -1212,11 +1495,25 @@ static void evt_atr(MixEvt *e, int trig) {   /* UpdateATREvent */
     int c = carsfx_curve((w >> 12) & 0xf, (unsigned)(int)x, 0);
     e->env = e->range < 0 ? c : 0x7fff - c;
 }
-/* UpdateEvtMixCtl: the event's level in mB (0 = idle) */
-static int evt_update(MixEvt *e, int trig, float dt, float scale) {
+static void evt_asr(MixEvt *e, unsigned sus) {   /* UpdateASREvent 800b6708: a one-shot pulse */
+    float A = (float)(e->att & 0xfff) * 16.666670f, S = (float)(sus & 0xfff) * 16.666670f,
+          R = (float)(e->rel & 0xfff) * 16.666670f, x;
+    unsigned w;
+    if (A <= e->t) {
+        if (e->t - A <= S) { e->env = 0; return; }
+        float el = e->t - (A + S);
+        if (R <= el) { e->env = 0x7fff; e->t = 0.0f; return; }
+        x = 32767.0f - el * 32767.0f / R; w = e->rel;
+        if (x < 0.0f) x = 0.0f; if (x > 32767.0f) x = 32767.0f;
+    } else { x = e->t * 32767.0f / A; w = e->att; }
+    int c = carsfx_curve((w >> 12) & 0xf, (unsigned)(int)x, 0);
+    e->env = e->range < 0 ? c : 0x7fff - c;
+}
+/* UpdateEvtMixCtl: the event's level in mB (0 = idle); sus >= 0 = ASR */
+static int evt_update2(MixEvt *e, int trig, float dt, float scale, int sus) {
     if (e->t == 0.0f && !trig) { e->on = 0; e->trel = 0.0f; return e->out = 0; }
     e->t += dt * 1000.0f;
-    evt_atr(e, trig);
+    if (sus >= 0) evt_asr(e, (unsigned)sus); else evt_atr(e, trig);
     float k = (32767.0f - (float)e->env) * (1.0f / 32768.0f);
     int o;
     if (!e->on) o = (int)(k * (float)e->range);
@@ -1225,6 +1522,7 @@ static int evt_update(MixEvt *e, int trig, float dt, float scale) {
     e->out = o;
     return (int)(scale * (float)o);
 }
+static int evt_update(MixEvt *e, int trig, float dt, float scale) { return evt_update2(e, trig, dt, scale, -1); }
 static volatile int g_duck_log_mus, g_duck_log_fe;   /* last levels, for the sim log */
 void audio_duck_levels(int *mus, int *fe) { if (mus) *mus = g_duck_log_mus; if (fe) *fe = g_duck_log_fe; }
 #ifdef OPENUG2_SIM_PRE_H
@@ -1233,6 +1531,7 @@ void audio_duck_levels(int *mus, int *fe) { if (mus) *mus = g_duck_log_mus; if (
    effect voices and the car voices (the bus gains applied) */
 static int g_simwav;
 static double g_sm_acc[4], g_sm_pk[4]; static int g_sm_n, g_sm_sp; static unsigned g_sm_t;
+static double g_rv_us, g_rv_e, g_rv_es; static int g_rv_live, g_rv_n;   /* OPENUG2_REVERB_LOG: the reverb's share of the mixer, its level */
 static void sim_mix_stats(const float *mus, float lvmus, const float *spk, float lvsp, const float *fxb,
                           const float *cars, float lvfx, int n, int ncar, int sp_on, int dmus, int dfe)
 {
@@ -1335,21 +1634,36 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
     memset(fe, 0, sizeof(float) * (size_t)ncar);
     fe_voices_mix(fe, ncar);
     /* the speech first: its playing flag triggers the map-0 ducks */
-    static float fxb[4096], fxs[4096], spk[4096];
+    static float fxb[4096], fxs[4096], spk[4096], cars_s[4096];
     memset(spk, 0, sizeof(float) * (size_t)ncar);
     const int sp_on = speech_mix(spk, ncar);   /* the speech stream runs over the front end too (crib / FE calls) */
     const int fes = g_fe_side;
+    g_speech_state = sp_on ? (fes ? 1 : 2) : 0;   /* SFXObj_Speech +4 / +8 for carsfx.c's events */
     const float dts = (float)n / 44100.0f, dsc = g_lv_speech * g_lv_master;
     /* both events run every buffer (their release outlives a FE/IG switch);
        evt 9 reaches ch1 through sub1, clamped to -1320 */
     int d_mfe = evt_update(&g_evt_mus_fe, sp_on && fes, dts, dsc),
         d_mig = evt_update(&g_evt_mus_ig, sp_on && !fes, dts, dsc),
         d_fe = evt_update(&g_evt_fe_ig, sp_on && !fes, dts, dsc) + evt_update(&g_evt_fe_fe, sp_on && fes, dts, dsc);
+    d_mig += g_mus_ext_mb;   /* sub1's car-class inputs (nitrous, collisions, jump cam, speed ctl) */
     if (d_mig < -1320) d_mig = -1320;
+    if (d_mig > 0) d_mig = 0;   /* sub1's up 0 */
     const int dmus = fes ? d_mfe : d_mig;
     g_duck_log_mus = dmus; g_duck_log_fe = d_fe;
+    /* an ambience bed on the stream channel: SetupAmbientStreams sets the
+       stream's volume from SFXObj_Ambience's output (map 0 master 4,
+       0x40000020, -200 mB: the SFX slider (MasterVol f3 = settings +0x10,
+       PC 0x471a23), the speech ducks evt 2 / 5 = d_fe), not the music
+       object's (the music sliders f0 / f1). Its class-1 inputs (dyn 9,
+       evts 0x17 / 0x18) join from carsfx.c (g_amb_ext_mb); the master
+       clamps to [-level - 10000, +level] */
+    const int bed = music_ambience_bed() >= 0;
+    int d_amb = AMB_MB + d_fe + g_amb_ext_mb;
+    if (d_amb > -AMB_MB) d_amb = -AMB_MB;
+    if (d_amb < AMB_MB - 10000) d_amb = AMB_MB - 10000;
     const float lvm = g_lv_master,
-                lvmus = 0.62f * mb_gain((fes ? MUS_FE_MB : MUS_IG_MB) - MIX_REF_MB + dmus) * g_lv_music * g_lv_master,
+                lvmus = bed ? 0.62f * mb_gain(d_amb - MIX_REF_MB) * g_lv_sfx * g_lv_master
+                            : 0.62f * mb_gain((fes ? MUS_FE_MB : MUS_IG_MB) - MIX_REF_MB + dmus) * g_lv_music * g_lv_master,
                 gfe = mb_gain(d_fe);   /* the FE_COMMON sounds' duck */
     if (!g_lv_stereo)   /* Mono: both channels the songs' mid */
         for (int i = 0; i < n; i++) mus[i * 2] = mus[i * 2 + 1] = 0.5f * (mus[i * 2] + mus[i * 2 + 1]);
@@ -1369,12 +1683,25 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
     memset(cars, 0, sizeof(float) * (size_t)ncar);
     memset(fxb, 0, sizeof(float) * (size_t)ncar);
     memset(fxs, 0, sizeof(float) * (size_t)ncar);
-    for (int v = 0; v < AUDIO_CARVOICES; v++) car_voice_mix(v, cars, ncar);
+    memset(cars_s, 0, sizeof(float) * (size_t)ncar);
+    for (int v = 0; v < AUDIO_CARVOICES; v++) car_voice_mix(v, cars, cars_s, ncar);
     for (int v = 0; v < AUDIO_FXVOICES; v++) fx_voice_mix(v, fxb, fxs, ncar);
-    if (!g_lv_stereo) memset(fxs, 0, sizeof(float) * (size_t)ncar);   /* Mono */
+    if (!g_lv_stereo) {                                                  /* Mono */
+        memset(fxs, 0, sizeof(float) * (size_t)ncar);
+        memset(cars_s, 0, sizeof(float) * (size_t)ncar);
+    }
     const float lve = g_lv_engine, lvt = g_lv_tire, lvs = g_lv_sfx;
+    /* master 0x40010000's mixmap inputs (sub 5: sputter / bottom-out /
+       nitrous / collision / traffic ducks, the speech duck, the view ctl) */
+    master *= mb_gain(g_eng_dyn_mb);
 #ifdef OPENUG2_SIM_PRE_H
     sim_mix_stats(mus, lvmus, spk, lvsp, fxb, cars, lvs * 0.62f * lvm, n, ncar, sp_on, dmus, d_fe);
+#endif
+#if OPENUG2_REVERB
+    static float rvin[4096], rvl[4096], rvr[4096], pre[2 * 4096], rvw0;
+    const int rv_on = g_reverb_on;
+    const float rvw1 = rv_on ? reverb_send_level() : 0.0f, rvdw = (rvw1 - rvw0) / (float)(n > 0 ? n : 1);
+    float rvw = rvw0;
 #endif
     for (int i = 0; i < n; i++) {
         /* engine inertia: revs chase the target (~110ms), load a bit faster */
@@ -1578,6 +1905,8 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
         hp += (nz - hp) * 0.5f;
         sq += 920.0/44100.0; if (sq >= 1.0) sq -= 1.0;
         float scr;
+        if (g_pskid_patch) scr = 0.0f;   /* the player's FX_SKID instance plays the skids (carsfx.c player_skid) */
+        else
         if (g_skid3_on && g_skidk[0].n && g_skidk[3].n) {
             /* retail FX_SKID: channel c plays squeal clip 3-c (wheelspin 3,
                cornering 2, slide/brake 1), each with the rubber clip 4 */
@@ -1620,12 +1949,23 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
         }
         float s = (eng + (i < ncar ? cars[i] : 0.0f)) * lve + scr * lvt +
                   (env + thud*0.8f + (i < ncar ? fxb[i] : 0.0f)) * lvs + (i < ncar ? fe[i] * gfe : 0.0f);
+#if OPENUG2_REVERB
+        /* fx bus 0: the car engines' send (SNDfxlevel(voice, 0, 0x82b078 x
+           vol >> 23) from the engine objects 0x473e60 / 0x474030); GUESS:
+           the send is the engine's dry signal x the wet level (the voice
+           volume term of SNDPLATFORM_setfxlevel not applied twice) */
+        rvw += rvdw;
+        rvin[i] = (eng + (i < ncar ? cars[i] : 0.0f)) * lve * rvw;
+#endif
         /* master gain ~1.8x the old 11000/32768, with a soft knee above
            half scale instead of hard clipping when everything plays at once */
         for (int c = 0; c < 2; c++) {
-            float x = (s + (i < ncar ? (c ? fxs[i] : -fxs[i]) * lvs : 0.0f)) * 0.62f * lvm +
-                      mus[i * 2 + c] * lvmus + (i < ncar ? spk[i] : 0.0f) * lvsp,
-                  ax = x < 0.0f ? -x : x;
+            float x = (s + (i < ncar ? (c ? fxs[i] : -fxs[i]) * lvs + (c ? cars_s[i] : -cars_s[i]) * lve : 0.0f)) * 0.62f * lvm +
+                      mus[i * 2 + c] * lvmus + (i < ncar ? spk[i] : 0.0f) * lvsp;
+#if OPENUG2_REVERB
+            if (rv_on) { pre[i * 2 + c] = x; continue; }   /* the knee after the fx buses are added */
+#endif
+            float ax = x < 0.0f ? -x : x;
             if (ax > 0.5f) {
                 float o = ax - 0.5f;
                 ax = 0.5f + o / (1.0f + 2.0f * o);   /* -> 1.0 asymptotically */
@@ -1636,6 +1976,39 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
             out[i * 2 + c] = (int16_t)v;
         }
     }
+#if OPENUG2_REVERB
+    rvw0 = rvw1;
+    if (rv_on) {
+        /* SNDMIXI_modlapifxadd: the patch's output channels into the mix
+           (level puVar7[0x1a + i]; GUESS: 1.0, its setter not found), then
+           the bus is cleared */
+#ifdef OPENUG2_SIM_PRE_H
+        uint64_t rt0 = SDL_GetPerformanceCounter();
+#endif
+        int live = reverb_process(rvin, rvl, rvr, n < 4096 ? n : 4096);
+#ifdef OPENUG2_SIM_PRE_H
+        g_rv_us += (double)(SDL_GetPerformanceCounter() - rt0) * 1e6 / (double)SDL_GetPerformanceFrequency();
+        g_rv_live += live;
+#endif
+        const float lvo = 0.62f * lvm;
+#ifdef OPENUG2_SIM_PRE_H
+        if (live) for (int i = 0; i < n; i++) { float a = rvl[i] * lvo, b = rvin[i] * 0.62f * lvm; g_rv_e += a * a; g_rv_es += b * b; }
+        g_rv_n += n;
+#endif
+        for (int i = 0; i < n; i++)
+            for (int c = 0; c < 2; c++) {
+                float x = pre[i * 2 + c] + (live ? (c ? rvr[i] : rvl[i]) * lvo : 0.0f), ax = x < 0.0f ? -x : x;
+                if (ax > 0.5f) {
+                    float o = ax - 0.5f;
+                    ax = 0.5f + o / (1.0f + 2.0f * o);   /* -> 1.0 asymptotically */
+                    x = x < 0.0f ? -ax : ax;
+                }
+                int v = (int)(x * 32767.0f);
+                if (v > 32767) v = 32767; if (v < -32768) v = -32768;
+                out[i * 2 + c] = (int16_t)v;
+            }
+    }
+#endif
 }
 
 #ifdef __vita__
@@ -1644,7 +2017,29 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
 /* audio thread cost: CPU time spent mixing vs audio time produced */
 static volatile uint64_t g_mix_us, g_mix_samples;
 static void audio_cb(void *ud, Uint8 *stream, int len) {
-#ifdef __vita__
+#ifdef OPENUG2_SIM_PRE_H
+    /* sim aid (OPENUG2_REVERB_LOG): the mixer's time per buffer and the
+       reverb's part of it, every ~10 s (OPENUG2_REVERB_OFF = the dry mix) */
+    static double mix_us; static int bufs, live0;
+    uint64_t t0 = SDL_GetPerformanceCounter();
+    audio_mix(ud, stream, len);
+    {   double us = (double)(SDL_GetPerformanceCounter() - t0) * 1e6 / (double)SDL_GetPerformanceFrequency();
+        mix_us += us;
+        g_mix_us += (uint64_t)us;   /* audio_cost_pct as on the Vita */
+        g_mix_samples += (uint64_t)(len / 4);
+    }
+    if (++bufs >= 430) {
+        static int log = -1;
+        if (log < 0) log = getenv("OPENUG2_REVERB_LOG") != NULL;
+        if (log)
+            printf("[reverb] cost: mixer %.1f us per %d-sample buffer, reverb %.1f us (%d of %d buffers live) = %.1f%% of the dry mix, patch %d send %.3f"
+                   " | dB rms send %.1f wet L %.1f\n",
+                   mix_us / bufs, len / 4, g_rv_us / bufs, g_rv_live - live0, bufs,
+                   mix_us > g_rv_us ? 100.0 * g_rv_us / (mix_us - g_rv_us) : 0.0, reverb_patch(), reverb_send_level(),
+                   10.0 * log10(g_rv_es / (g_rv_n + 1) + 1e-12), 10.0 * log10(g_rv_e / (g_rv_n + 1) + 1e-12));
+        mix_us = 0.0; g_rv_us = 0.0; bufs = 0; live0 = g_rv_live = 0; g_rv_e = g_rv_es = 0.0; g_rv_n = 0;
+    }
+#elif defined(__vita__)
     uint64_t t0 = sceKernelGetProcessTimeWide();
     audio_mix(ud, stream, len);
     g_mix_us += sceKernelGetProcessTimeWide() - t0;

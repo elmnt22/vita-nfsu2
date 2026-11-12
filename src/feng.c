@@ -22,6 +22,40 @@ uint32_t feng_hash(const char *s) {
     return h;
 }
 
+/* FEString label hash ('SH'): the game draws the language string of the label over the
+   authored placeholder -- UI_Status_Region's first label is authored in Danish ("Status for
+   gennemf<o-slash>relse af region:", label 838feef5 = "Region Completion Status:"). Kept: labels not
+   in the table or empty, $token$ placeholders (the port's pad prompts), and strings too long
+   for the text field */
+void feng_apply_labels(FengPackage *pk, const uint32_t *sh, const char *const *st, int n, int all)
+{
+    if (!pk || !sh || !st || n <= 0) return;
+    /* another language: every label, as the game draws them (the authored text is English);
+       English keeps the port's narrower pass below */
+    int other = n2_lang() != 0;
+    if (other) all = 1;
+    for (int i = 0; i < pk->nobj; i++) {
+        FengObj *o = &pk->obj[i];
+        /* only placeholders authored in another language (a non-ASCII character, loaded as '?'):
+           elsewhere the port's screens set their texts as the game does (a general switch to the
+           labels changes ~50 authored texts, GAPS F2.6 note) */
+        if (o->type != FENG_STRING || !o->label || o->text[0] == '$' || (!all && !strchr(o->text, '?'))) continue;
+        int lo = 0, hi = n - 1;
+        while (lo <= hi) {
+            int m = (lo + hi) >> 1;
+            if (sh[m] < o->label) lo = m + 1;
+            else if (sh[m] > o->label) hi = m - 1;
+            else {
+                size_t len = st[m] ? strlen(st[m]) : 0;
+                int ascii = 1;
+                for (size_t k = 0; k < len; k++) if ((unsigned char)st[m][k] >= 128) ascii = 0;
+                if ((ascii || other) && len && len < FENG_TEXT) memcpy(o->text, st[m], len + 1);
+                break;
+            }
+        }
+    }
+}
+
 uint32_t feng_hash_upper(const char *s) {
     uint32_t h = 0xffffffffu;
     for (; *s; s++) {
@@ -171,6 +205,7 @@ static void parse_object(const unsigned char *d, long o, long end,
                 } else if (!memcmp(d + t, "Sj", 2) && ts >= 4) ob->just = n2_u32(v);
                 else if (!memcmp(d + t, "Sl", 2) && ts >= 4) ob->lead = (int)n2_u32(v);
                 else if (!memcmp(d + t, "Sw", 2) && ts >= 4) ob->wrapw = (int)n2_u32(v);
+                else if (!memcmp(d + t, "SH", 2) && ts >= 4) ob->label = n2_u32(v);
                 t += 4 + ts;
             }
         } else if (!memcmp(d + o, "Scrp", 4)) parse_script(d, body, bend, p, ob);
@@ -362,6 +397,23 @@ int feng_load_package(const unsigned char *bun, long len, const char *name,
             }
             free(unpacked);
             if (ok) {
+                /* cFEng::PackageWasLoaded's platform pass, the console one (GC 8014de24 ->
+                   FEngHidePCObjects::Callback 8014ddc4): every object with flag 0x8 (the PC
+                   mouse buttons / arrows / filter text) is FEngSetInvisible'd -- bit 0 |
+                   0x400000, recursing into a group's children -- and loses 0x10000000. Game
+                   code may show one again (EventEngageDialog::Setup's Button3). The PC pass
+                   (0x51c860, flag 0x40 console prompts) is not applied: the Vita is a console. */
+                static unsigned char pc_hid[FENG_MAX_OBJ];
+                int nhid = 0;
+                for (int i = 0; i < out->nobj; i++) {
+                    FengObj *ob = &out->obj[i];
+                    int own = (ob->flags & 8u) != 0;
+                    int par = ob->parent >= 0 && ob->parent < i && pc_hid[ob->parent];
+                    pc_hid[i] = (unsigned char)(own || par);
+                    if (own) ob->flags &= ~0x10000000u;
+                    if (own || par) { ob->flags |= 1u | 0x400000u; nhid++; }
+                }
+                if (nhid) printf("feng: %s platform pass hid %d PC objects (flag 0x8)\n", name, nhid);
                 printf("feng: %s %d objects, %d scripts, %d tracks, %d key words%s\n", name, out->nobj,
                        out->nscr, out->ntrk, out->nkeyw, g_feng_trunc ? " -- TRUNCATED (FENG_MAX_* too small)" : "");
                 found = keep_tables(out); break;
@@ -489,7 +541,12 @@ void feng_anim_init(FengAnim *a, const FengPackage *p) {
     memcpy(a->keyw, p->keyw, (size_t)p->nkeyw * sizeof *a->keyw);
     for (int i = 0; i < p->nobj; i++) {
         memcpy(a->data[i], p->obj[i].data, sizeof a->data[i]);
-        a->hidden[i] = (p->obj[i].flags & 0x80000001u) != 0;
+        /* bit 0 is the only hide bit (FEngIsVisible 0x50c9e0, cFEng::
+           RenderObject 0x51c670 / GC 8014d928). Bit 31 is tested only by
+           RenderGroup (0x52c5d0 / GC 80147728) while FEngine+0 == 0, and the
+           cFEng ctor (0x5372e0 / GC 8014d468 -> SetExecution 80145958) sets
+           it to 1 for good: bit 31 never hides in the game. */
+        a->hidden[i] = (p->obj[i].flags & 1u) != 0;
         a->cur[i] = (short)find_script(p, i, FENG_SCR_INIT);
         a->t[i] = 0;
         if (a->cur[i] >= 0) script_eval(a, i);
@@ -709,7 +766,10 @@ void feng_anim_place(const FengAnim *a, int obj, FengPlace *out) {
         ang += ga;
         int gcol[4] = { g[2], g[1], g[0], g[3] };
         for (int k = 0; k < 4; k++) col[k] = (gcol[k] * col[k] + 0x80) >> 8;
-        hidden |= a->hidden[q];
+        /* RenderGroup 0x52c5d0 skips a group's subtree only on its alpha
+           word 0; a group's own bit 0 is not tested (FEngSetInvisible
+           0x50ca00 sets it on the children too) */
+        if (g[3] == 0) hidden = 1;
     }
     for (int k = 0; k < 4; k++) {
         int v = col[k] < 0 ? 0 : col[k] > 255 ? 255 : col[k];

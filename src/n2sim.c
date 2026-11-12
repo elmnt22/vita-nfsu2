@@ -36,10 +36,10 @@ static const float CLUTCH_RATE[4] = { -3, 0, 1.5f, 0 };               /* 0x7fc29
 static const float TACH_FALL[8] = { 2.5f,2.5f,2.5f,2.5f,15,15,15,15 }; /* 0x7a1a2c */
 
 #define PI_F      3.14159265f
-#define U16RAD    9.58738e-5f      /* 0x784240 */
+#define U16RAD    9.58738019e-05f  /* 0x784240 */
 #define RAD2U16   10430.378f
-#define RPM       9.5493f          /* 0x7a1d28 rad/s -> rpm */
-#define RPM2RAD   0.10472f         /* 0x7a1d38 */
+#define RPM       9.549304f        /* 0x7a1d28 rad/s -> rpm (float 0x4118c9e0) */
+#define RPM2RAD   0.104719669f     /* 0x7a1d38 (float 0x3dd67750) */
 #define MPH       2.237f           /* 0x78426c */
 #define HMIN      0.0044f          /* 0x7fc070 */
 
@@ -67,11 +67,55 @@ static float graph(const float *p, int n, float x)                     /* 0x5767
     return p[1];
 }
 /* 0x43c350: sine through the game's 16-bit angle */
-static float sin16(float x) { return sinf((float)(unsigned short)(int)(x * RAD2U16) * U16RAD); }
+/* 0x43c2b0: the game's sine of a 16-bit angle, a 9th-order Taylor series on
+   [-pi/2, pi/2) (not sinf: at 90 degrees it gives 1.0000035, which the
+   steering and wheel matrices carry) */
+static float sin_u16(unsigned short u)
+{
+    float x = (float)u * U16RAD, sg = 1.0f;
+    if (!(x < 4.71238899f)) x -= 6.28318548f;                          /* 0x786da0 / 0x786d9c */
+    else if (!(x < 1.57079637f)) { x -= 3.14159274f; sg = -1.0f; }     /* 0x784254 / 0x786d98 */
+    float x2 = x * x, x3 = x2 * x, x5 = x3 * x2, x7 = x5 * x2;
+    float a = x - x3 * 0.166666672f;                                    /* 0x786d94 */
+    a = a + x5 * 0.00833333377f;                                        /* 0x786d90 */
+    a = a - x7 * 0.000198412701f;                                       /* 0x786d8c */
+    a = a + x7 * x2 * 2.75573188e-06f;                                  /* 0x786d88 */
+    return a * sg;
+}
+/* 0x43c350: sine of radians through the 16-bit angle (truncated, 0x75bed4) */
+static float sin16(float x) { return sin_u16((unsigned short)(int)(x * RAD2U16)); }
+/* bFastATan 0x43c570: the angle of (x, y) in 16-bit units from the 256-entry
+   octant table at 0x7eacb0 (x 32, the index truncated: 0x75bed4) */
+static const unsigned char FAST_ATAN[256] = {
+    0, 1, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14, 15, 17, 18, 19, 20, 22, 23, 24, 26, 27, 28, 29, 31, 32, 33, 34, 36, 37, 38, 39,
+    41, 42, 43, 44, 46, 47, 48, 49, 51, 52, 53, 54, 56, 57, 58, 59, 61, 62, 63, 64, 65, 67, 68, 69, 70, 72, 73, 74, 75, 76,
+    78, 79, 80, 81, 82, 84, 85, 86, 87, 88, 89, 91, 92, 93, 94, 95, 96, 98, 99, 100, 101, 102, 103, 105, 106, 107, 108, 109,
+    110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 136,
+    137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160,
+    161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 176, 177, 178, 179, 180, 181, 182, 183,
+    184, 185, 186, 187, 187, 188, 189, 190, 191, 192, 193, 194, 195, 195, 196, 197, 198, 199, 200, 201, 201, 202, 203, 204,
+    205, 206, 206, 207, 208, 209, 210, 210, 211, 212, 213, 214, 214, 215, 216, 217, 218, 218, 219, 220, 221, 222, 222, 223,
+    224, 225, 225, 226, 227, 228, 228, 229, 230, 231, 231, 232, 233, 233, 234, 235, 236, 236, 237, 238, 238, 239, 240, 241,
+    241, 242, 243, 243, 244, 245, 245, 246, 247, 247, 248, 249, 249, 250, 251, 251, 252, 253, 253, 254, 255, 255
+};
+static unsigned short fast_atan(float x, float y)
+{
+    int q = 0;
+    if (x < 0.0f) { q = 1; x = -x; }
+    if (y < 0.0f) { q ^= 3; y = -y; }
+    unsigned a;
+    if (y < x) a = (unsigned)FAST_ATAN[(int)(y / x * 256.0f) & 0xff] << 5;
+    else if (x < y) a = 0x4000u - ((unsigned)FAST_ATAN[(int)(x / y * 256.0f) & 0xff] << 5);
+    else a = y == 0.0f ? 0u : 0x2000u;
+    if (q == 0) return (unsigned short)a;
+    if (q == 3) return (unsigned short)(0u - a);
+    if (q == 1) return (unsigned short)(0x8000u - a);
+    return (unsigned short)(a + 0x8000u);
+}
 /* 0x43c570 + wrap to (-pi, pi] */
 static float atan2w(float x, float y)
 {
-    float a = (float)(unsigned short)(int)lrintf(atan2f(y, x) * RAD2U16) * U16RAD;
+    float a = (float)fast_atan(x, y) * U16RAD;
     if (a > PI_F) a -= 2*PI_F;
     return a;
 }
@@ -105,6 +149,65 @@ static void mmul(float *o, const float *a, const float *b)             /* 0x4013
             t[r*4+c] = a[r*4]*b[c] + a[r*4+1]*b[4+c] + a[r*4+2]*b[8+c] + a[r*4+3]*b[12+c];
     memcpy(o, t, sizeof t);
 }
+/* The retail operation order. SPEED2.EXE runs its physics with the x87 at
+   single precision (Direct3D 9 sets it at CreateDevice 0x5b9b95, flags 0x50
+   without FPU_PRESERVE), so every add / multiply rounds to a float, like
+   this C code; only the association differs. These helpers keep it, so that
+   the port reproduces the original bit for bit (harness E:/re-tools/emu/acc). */
+/* 0x441000: o = v * M + M[12..14] (row vector) */
+static void xf441(float *o, const float *v, const float *m)
+{
+    float x = ((v[2]*m[8] + v[1]*m[4]) + v[0]*m[0]) + m[12];
+    float y = ((v[2]*m[9] + v[0]*m[1]) + v[1]*m[5]) + m[13];
+    float z = ((v[2]*m[10] + v[0]*m[2]) + v[1]*m[6]) + m[14];
+    o[0] = x; o[1] = y; o[2] = z;
+}
+/* 0x441000 on the rotation only (translation row 0, 1) */
+static void xf441R(float *o, const float *v, const float *m)
+{
+    float x = ((v[2]*m[8] + v[1]*m[4]) + v[0]*m[0]) + 0.0f;
+    float y = ((v[2]*m[9] + v[0]*m[1]) + v[1]*m[5]) + 0.0f;
+    float z = ((v[2]*m[10] + v[0]*m[2]) + v[1]*m[6]) + 0.0f;
+    o[0] = x; o[1] = y; o[2] = z;
+}
+/* 0x441000 on the transposed rotation (0x43c9d0 with the translation column
+   zeroed): o = v * M^T */
+static void xf441T(float *o, const float *v, const float *m)
+{
+    float x = (v[2]*m[2] + v[1]*m[1]) + v[0]*m[0];
+    float y = (v[2]*m[6] + v[0]*m[4]) + v[1]*m[5];
+    float z = (v[2]*m[10] + v[0]*m[8]) + v[1]*m[9];
+    o[0] = x + 0.0f; o[1] = y + 0.0f; o[2] = z + 0.0f;
+}
+/* 0x4013f0: o = a * b (4x4 row-major), each element summed in the
+   compiled order */
+static const unsigned char MM_K[16][4] = {
+    {0,3,2,1},{3,1,2,0},{2,0,3,1},{3,2,0,1}, {2,3,1,0},{2,0,1,3},{3,2,1,0},{3,2,0,1},
+    {2,3,1,0},{2,0,1,3},{3,2,1,0},{3,2,0,1}, {2,3,1,0},{2,0,1,3},{3,2,1,0},{3,2,0,1} };
+static void mmul4013(float *o, const float *a, const float *b)
+{
+    float t[16];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            const unsigned char *k = MM_K[r*4+c];
+            float s = a[r*4+k[0]]*b[k[0]*4+c] + a[r*4+k[1]]*b[k[1]*4+c];
+            s = s + a[r*4+k[2]]*b[k[2]*4+c];
+            t[r*4+c] = s + a[r*4+k[3]]*b[k[3]*4+c];
+        }
+    memcpy(o, t, sizeof t);
+}
+static void transpose4(float *o, const float *m)                       /* 0x43c9d0 */
+{
+    float t[16];
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) t[c*4+r] = m[r*4+c];
+    memcpy(o, t, sizeof t);
+}
+/* |v| summed z, y, x */
+static float len3r(const float *v) { return sqrtf((v[2]*v[2] + v[1]*v[1]) + v[0]*v[0]); }
+/* |v| summed x, z, y */
+static float len3xzy(const float *v) { return sqrtf((v[0]*v[0] + v[2]*v[2]) + v[1]*v[1]); }
+/* |v| summed y, z, x */
+static float len3yzx(const float *v) { return sqrtf((v[1]*v[1] + v[2]*v[2]) + v[0]*v[0]); }
 static void ident(float *m) { memset(m, 0, 64); m[0] = m[5] = m[10] = m[15] = 1; }
 static void inv3(float *o, const float *m)                              /* 0x43c7c0, no translation */
 {
@@ -115,13 +218,19 @@ static void inv3(float *o, const float *m)                              /* 0x43c
     o[4] = -c1*r; o[5] = (m[10]*m[0] - m[8]*m[2])*r;  o[6] = -(m[6]*m[0] - m[4]*m[2])*r;
     o[8] = c2*r;  o[9] = -(m[9]*m[0] - m[8]*m[1])*r;  o[10] = (m[5]*m[0] - m[4]*m[1])*r;
 }
+static void normalize43cf10(float *o, const float *v)                  /* 0x43cf10: v * (1 / |v|) */
+{
+    float l = len3(v);
+    if (l == 0) { o[0] = 1; o[1] = o[2] = 0; return; }
+    float r = 1.0f / l, z = v[2];
+    o[0] = r * v[0]; o[1] = r * v[1]; o[2] = z * r;
+}
 static void orthonormalize(float *m)                                   /* 0x5bb0d0 */
 {
-    float x[3], y[3], z[3], l = len3(m);
-    if (l != 0) { x[0] = m[0]/l; x[1] = m[1]/l; x[2] = m[2]/l; } else { x[0] = 1; x[1] = x[2] = 0; }
+    float x[3], y[3], z[3];
+    normalize43cf10(x, m);
     cross(z, x, m + 4);
-    l = len3(z);
-    if (l != 0) { z[0] /= l; z[1] /= l; z[2] /= l; } else { z[0] = 1; z[1] = z[2] = 0; }
+    normalize43cf10(z, z);
     cross(y, z, x);
     memset(m, 0, 64);
     memcpy(m, x, 12); memcpy(m + 4, y, 12); memcpy(m + 8, z, 12); m[15] = 1;
@@ -184,6 +293,7 @@ typedef struct {                       /* Engine, 0xb0 B, vtable 0x7a235c */
     int   limiter;                     /* +0x88 */
     float heat;                        /* +0x8c over-rev heat (drag): -1 off, 2 blown */
     float power;                       /* +0x90 */
+    Curve nos;                         /* +0x60 nitrous torque, 0x7fbf38 over idle..redline */
 } Engine;
 
 typedef struct {                       /* DriveTrain, 0xf4 B, vtable 0x7a2508 */
@@ -242,6 +352,29 @@ typedef struct {                       /* Melov8r, 0x250 B, vtable 0x7a2560 */
     int   rest; float rest_t;          /* mover +0x5c +0x58 */
 } Mello;
 
+/* 0x574830..0x574f40: a Hermite blend from the value it holds (p0, t0) to
+   a target (p1, t1) over `dur` seconds (0x30 bytes; the 2-D form is two of
+   them). Setting p0 or p1 to a new value restarts it (state 2); with
+   `loop` 0 it then runs once (state 1) and stops on the target (0). */
+typedef struct { float p0, t0, p1, t1, a, b, c, d, t, dur, end; short state, loop; } Blend1;
+/* mover 4's state (0x5a9030, 0x4c bytes) */
+#define FAR_MAXPTS 20                  /* the driver plan's 20 points */
+typedef struct {
+    float P[FAR_MAXPTS + 2][4];        /* +0x14 the spline (0x57a300 type 2): P[1..n], ends P[0] / P[n+1] */
+    int   n;                           /* spline +0x1e */
+    int   dirty;                       /* spline +0x18 */
+    float t;                           /* +0x0c seconds on this path */
+    float k;                           /* +0x10 spline points per metre */
+    float s0, v0, a;                   /* +0x1c +0x20 +0x24: s(t) = s0 + v0 t + a t^2 / 2 */
+    Blend1 lat;                        /* +0x18 the offset from the path, blended out */
+    Blend1 hx, hy;                     /* +0x28 the velocity 0.4 s ahead (heading) */
+    float ring[30], rsum, ravg;        /* +0x30 0x579f20(30): the path's lateral acceleration */
+    unsigned char rcount, ridx;
+    char  slide;                       /* +0x34 over the tyres' lateral grip (0x591950) */
+    char  has_path;                    /* +0x48 */
+    char  want, jump;                  /* port: the caller re-paths / sets the controller's +0x730 */
+} FarMv;
+
 struct N2Sim {
     unsigned char rec[N2_REC_SIZE];
     const float *P;                    /* rec + 0x110 */
@@ -263,7 +396,8 @@ struct N2Sim {
     float st_max, st_prev;             /* steering +0x80 +0x84 */
     float in_dt, vtop;                 /* last frame step; 0x5b5930 top speed */
     double hit_time;                   /* carstate+0x3c -> +0x140, last crash */
-    int   dampen;                      /* car +0x38 DampenMode: 0 normal, 1 crash, 2 airborne */
+    int   dampen;                      /* car +0x38 DampenMode: 0 normal, 1 crash, 2 collision */
+    int   body_colls;                  /* car +0x3c -> +0x18: live Collisions (n2sim_set_body_collisions) */
     float draft;                       /* car +0x4dc (0x5ebd80, World::DoTimestep) */
     int   nos_spray;                   /* a purge press since the last n2sim_nos_spray */
     int   dampen_on; float dampen_t;   /* car +0x54c: time on four wheels since */
@@ -276,6 +410,8 @@ struct N2Sim {
     /* carstate */
     float cs_speed, cs_absv, cs_tach;  /* +0x3ec +0x3f0 +0x400 */
     float cs_bottom[4];     /* +0x330: bump-stop impulses this frame (0x5abb00, zeroed by 0x5b72d0) */
+    float bottom_latch;     /* the largest +0x330 sum since n2sim_take_bottom (see there) */
+    int   bottom_age;       /* steps since bottom_latch was set */
     int   cs_wheels, cs_contact[4], cs_surf[4];
     unsigned rng;
     struct { int valid, ok, surf; float x, y, z, n[3]; } gc[4];   /* ground, once per frame */
@@ -304,6 +440,7 @@ struct N2Sim {
     int   nis_count, nis_moving;
     float nis_fspin, nis_spinadd, nis_tq[2];
     float tm_s540;                     /* car +0x540, 0x5f50a0's smoothed speed */
+    FarMv far;                         /* mover 4 (0x5a9030) */
     /* hydraulics (0x5a2fd0): the car control's bounce +0x1ec[4] and extend
        +0x1fc[4] (set by the player's stick 0x407400 in main.c, or the
        scene's CAR_HYDRAULIC_BOUNCE / _EXTEND), the lift per wheel car
@@ -316,6 +453,7 @@ struct N2Sim {
        body is held on (+0x90), its tethered virtual position (+0xe0) and
        velocity (+0xf0) */
     int   dyno;
+    int   dyno_state;   /* RacingCar +0x1e0 (DynoManager) +4, the run's state 1..4 */
     float dy_spot[3], dy_pos[3], dy_vel[3];
 };
 
@@ -340,21 +478,24 @@ static void body_mass(N2Sim *s)                                         /* 0x59b
 }
 static void body_force(Body *b, const float *f, const float *arm)       /* 0x59bb00 */
 {
-    float F[3] = { f[0], f[1], f[2] }, t[3], l = len3(F);
+#ifdef OPENUG2_ACC_TRACE      /* the accuracy harness (E:/re-tools/emu/acc/port2.c): every body force */
+    OPENUG2_ACC_TRACE(b, f, arm);
+#endif
+    float F[3] = { f[0], f[1], f[2] }, t[3], l = len3r(F);
     if (l > 1200.0f) { l = 1200.0f / l; F[0] *= l; F[1] *= l; F[2] *= l; }
     b->F[0] += F[0]; b->F[1] += F[1]; b->F[2] += F[2];
-    cross(t, arm, F);
-    l = len3(t);
+    cross(t, arm, f);                  /* the torque uses the force before the clamp */
+    l = len3yzx(t);
     if (l > 100.0f) { l = 100.0f / l; t[0] *= l; t[1] *= l; t[2] *= l; }
     b->T[0] += t[0]; b->T[1] += t[1]; b->T[2] += t[2];
 }
 static void body_impulse(Body *b, const float *j, const float *arm)     /* 0x59bc60 */
 {
-    float J[3] = { j[0], j[1], j[2] }, t[3], l = len3(J);
+    float J[3] = { j[0], j[1], j[2] }, t[3], l = len3yzx(J);
     if (l > 1000.0f) { l = 1000.0f / l; J[0] *= l; J[1] *= l; J[2] *= l; }
     b->p[0] += J[0]; b->p[1] += J[1]; b->p[2] += J[2];
     cross(t, arm, J);
-    l = len3(t);
+    l = len3yzx(t);
     if (l > 10.0f) { l = 10.0f / l; t[0] *= l; t[1] *= l; t[2] *= l; }
     b->L[0] += t[0]; b->L[1] += t[1]; b->L[2] += t[2];
 }
@@ -363,14 +504,14 @@ static void body_deriv(Body *b, float *d)                                /* 0x59
     if (b->top_speed != 0) {           /* the record's top-speed limiter */
         float top = b->power * b->top_speed + 1.9f, pitch = b->R[2], k;
         if (b->boost) top *= 1.03f;
-        if (pitch <= 0) { pitch = -pitch; if (pitch > 0.3f) pitch = 0.3f; k = (0.1f / 0.3f) * pitch + 1; }
-        else { if (pitch > 0.3f) pitch = 0.3f; k = 1 - (0.1f / 0.3f) * pitch; }
-        if (k * top < sqrtf(b->v[1]*b->v[1] + b->v[0]*b->v[0]) * 2.23602f &&
+        if (pitch <= 0) { pitch = -pitch; if (pitch > 0.3f) pitch = 0.3f; k = ((1.1f - 1.0f) / 0.3f) * pitch + 1; }
+        else { if (pitch > 0.3f) pitch = 0.3f; k = 1 - ((1.0f - 0.9f) / 0.3f) * pitch; }
+        if (k * top < sqrtf(b->v[1]*b->v[1] + b->v[0]*b->v[0]) * 2.23602486f &&
             b->R[0]*b->F[0] + b->R[1]*b->F[1] + b->R[2]*b->F[2] > 0) {
             float l[3];
-            vmulT(l, b->F, b->R);
+            xf441T(l, b->F, b->R);
             l[0] = -(5.0f * pitch); if (l[0] > -0.5f) l[0] = -0.5f;
-            vmul(b->F, l, b->R);
+            xf441(b->F, l, b->R);
         }
     }
     memset(d, 0, 32 * sizeof *d);
@@ -393,9 +534,9 @@ static void body_deriv(Body *b, float *d)                                /* 0x59
         k = -(8.0f * b->settle);
         d[20] += k * b->p[0]; d[21] += k * b->p[1]; d[22] += k * b->p[2];
     }
-    if (b->yaw_clamp != 0) {
-        if (d[26] > b->yaw_clamp) d[26] = b->yaw_clamp;
-        else if (d[26] < -b->yaw_clamp) d[26] = -b->yaw_clamp;
+    if (b->yaw_clamp != 0) {           /* tested on the raw yaw torque +0x128, applied to the derivative */
+        if (b->T[2] > b->yaw_clamp) d[26] = b->yaw_clamp;
+        else if (-b->yaw_clamp > b->T[2]) d[26] = -b->yaw_clamp;
     }
 }
 static void body_post(Body *b)                                           /* 0x59c5f0 */
@@ -406,11 +547,14 @@ static void body_post(Body *b)                                           /* 0x59
         l = 200.0f / l;
         for (int i = 0; i < 3; i++) { b->p[i] *= l; b->v[i] = b->invmass * b->p[i]; }
     }
-    for (int i = 0; i < 3; i++) b->acc_g[i] = b->invmass * 0.102041f * b->F[i];
-    float body[3];                     /* w = L * R^T Iinv R */
-    vmulT(body, b->L, b->R);
-    vmul(body, body, b->yawI_on ? b->Iinv2 : b->Iinv);
-    vmul(b->w, body, b->R);
+    for (int i = 0; i < 3; i++) b->acc_g[i] = b->invmass * 0.102040812f * b->F[i];
+    {   /* w = L * (R^T (Iinv R)): the matrix first (0x43c990 x2), then 0x441000 */
+        float rt[16], t[16];
+        transpose4(rt, b->R);
+        mmul4013(t, b->yawI_on ? b->Iinv2 : b->Iinv, b->R);
+        mmul4013(t, rt, t);
+        xf441(b->w, b->L, t);
+    }
     l = len3(b->w);
     if (l > 250.0f) { l = 250.0f / l; b->w[0] *= l; b->w[1] *= l; b->w[2] *= l; }
     if (b->settle < 0) b->settle = 0;
@@ -437,7 +581,7 @@ static void wheel_deriv(N2Sim *s, Wheel *w, float *d)                   /* 0x59d
 static void wheel_post(Wheel *w)                                         /* 0x59d030 */
 {
     ident(w->spin);
-    float c = sin16(w->angle + 1.5708f), sn = sin16(w->angle);
+    float c = sin16(w->angle + 1.57079637f), sn = sin16(w->angle);
     w->spin[8] = sn; w->spin[2] = -sn; w->spin[0] = c; w->spin[10] = c;
     w->Fx = w->Fy = 0; w->torque = 0; w->slip = 0;
     if (w->angle > 628.318f) { w->angle -= 628.318f; if (w->angle > 6283.18f) w->angle = 0; }
@@ -467,7 +611,7 @@ static void wheel_lockcheck(Wheel *w, float f)                           /* 0x59
 }
 static float wheel_lateral(const Wheel *w, float load, float alpha)     /* 0x59d510 */
 {
-    float t = ((alpha * 57.2958f) / w->tyre[0]) * 12.0f * 0.5f;
+    float t = ((alpha * 57.2957764f) / w->tyre[0]) * 12.0f * 0.5f;
     int i = (int)t;
     float x = (0.8f * load) / w->tyre[1];
     if (i > 5) return curve(&LAT[6], x) * w->tyre[2] * 2.5f;
@@ -480,7 +624,7 @@ static void wheel_tyre(N2Sim *s, Wheel *w, int brakelimit_off)        /* 0x5a828
     if (!w->locked) w->torque += w->w > 0 ? -bf : bf;
     if (!w->locked) w->torque += w->w > 0 ? -hf : hf;
     float lv[3];
-    vmulT(lv, w->vel, w->world);
+    xf441T(lv, w->vel, w->world);
     float vf = lv[0], vl = lv[1];
     float alpha = atan2w(vf, vl);
     if (vf < 0) { alpha += PI_F; if (alpha > PI_F) alpha -= 2*PI_F; }
@@ -498,7 +642,7 @@ static void wheel_tyre(N2Sim *s, Wheel *w, int brakelimit_off)        /* 0x5a828
             w->sliding = 1;
             float fx = sl * w->kx * k, fy = -(k * w->ky * vl);
             w->Fx = fx; w->Fy = fy;
-            if (s->cs_speed * MPH < 1.0f && mu > 0.1f) { w->Fx = fx / mu; w->Fy = fy / mu; }
+            if (s->cs_speed * MPH < 1.0f && mu > 0.1f) { float r = 1.0f / mu; w->Fx = fx * r; w->Fy = r * fy; }
             w->slipv[0] = sl; w->slipv[1] = vl;
             return;
         }
@@ -522,12 +666,12 @@ static void wheel_circle(Wheel *w)                                       /* 0x59
     if (w->sliding || w->locked) w->sratio = 1;
     if (!w->contact) w->sratio = 0;
     float lv[3];
-    vmulT(lv, w->vel, w->world);
+    xf441T(lv, w->vel, w->world);
     float a = atan2w(lv[0], lv[1]);
     if (lv[0] < 0) { a += PI_F; if (a > PI_F) a -= 2*PI_F; }
     if (fabsf(lv[0]) > 1.0f) w->Fx -= sin16(a) * w->Fy * 0.15f;
     float f[3] = { w->Fx, w->Fy, w->load };                /* mode 0x7fc7fc = 1 */
-    vmul(w->force, f, w->world);
+    xf441R(w->force, f, w->world);
 }
 
 /* ---- suspension --------------------------------------------------------- */
@@ -560,7 +704,7 @@ static void susp_post(N2Sim *s, Susp *u)                                 /* 0x5a
 {
     Body *b = &s->b; Wheel *w = u->wheel;
     float mp[3];
-    vmul(mp, u->mount, b->R);
+    xf441R(mp, u->mount, b->R);
     mp[0] += b->pos[0]; mp[1] += b->pos[1]; mp[2] += b->pos[2];
     /* ground probe 0x59d250 (0x5e72e0 ground height + surface lookup) */
     float gz, n[3]; int surf;
@@ -570,7 +714,7 @@ static void susp_post(N2Sim *s, Susp *u)                                 /* 0x5a
     w->surfval = wcoll_bump(surf, mp[0], mp[1]);
     if (s->drag) surf = 1;                     /* a drag race: every surface is ROAD (0x59d250) */
     if (ok) {
-        gz += w->hoff + w->surfval;
+        gz = (gz + w->hoff) + w->surfval;
         w->surf = surf; memcpy(w->n, n, 12);
         float up = b->R[8]*n[0] + b->R[10]*n[2] + b->R[9]*n[1];
         if (up < 0.001f) { dist = -100.0f; w->surf = 0; }
@@ -586,14 +730,14 @@ static void susp_post(N2Sim *s, Susp *u)                                 /* 0x5a
     ident(m);
     memcpy(u->m, m, 64);
     u->m[12] = u->mnow[0]; u->m[13] = u->mnow[1]; u->m[14] = u->mnow[2];
-    if (u->steered) mmul(m, s->steer_m[u->idx], m);
+    if (u->steered) mmul4013(m, s->steer_m[u->idx], m);
     m[12] = u->mnow[0]; m[13] = u->mnow[1]; m[14] = u->mnow[2]; m[15] = 1;
     memcpy(w->local, m, 64);                                 /* 0x591480 */
     float r[3], t[3];
-    vmul(r, u->mnow, b->R);
+    xf441R(r, u->mnow, b->R);
     cross(t, b->w, r);
     w->vel[0] = t[0] + b->v[0]; w->vel[1] = t[1] + b->v[1]; w->vel[2] = t[2] + b->v[2];
-    mmul(w->world, m, b->world);                             /* 0x5913d0 */
+    mmul4013(w->world, m, b->world);                         /* 0x43c990, 0x5913d0 */
     if (u->contact) {
         const float *k = u->rec;
         float f = ((u->x > 0 ? u->x : 0) * k[0] + 1.0f) * k[1] * u->x
@@ -608,7 +752,7 @@ static float susp_bumpstop(N2Sim *s, Susp *u)                            /* 0x59
 {
     Body *b = &s->b; Wheel *w = u->wheel;
     float r[3], v[3];
-    vmul(r, u->mnow, b->R);
+    xf441R(r, u->mnow, b->R);
     cross(v, b->w, r);
     v[0] += b->v[0]; v[1] += b->v[1]; v[2] += b->v[2];
     float k = -(w->n[0]*v[0] + w->n[1]*v[1] + w->n[2]*v[2]);
@@ -629,6 +773,9 @@ static float susp_bumpstop(N2Sim *s, Susp *u)                            /* 0x59
 static const float NOS_STEP[3] = { 0, 1.4f, 1.7f };                    /* 0x7a1790 */
 static const float NOS_TORQUE[4] = { 1.7f, 1.0f, 1.4f, 1.7f };         /* 0x7a1798 */
 static const float NOS_GRIP[4] = { 1.7f, 1.0f, 1.4f, 1.7f };           /* 0x7a17a4 */
+/* the nitrous torque curve over idle..redline (Engine +0x60, ctor 0x5aa5a0;
+   the Mellovator's +0x180 too) */
+static const float MELLO_NOS_D[9] = { 0.3f,0.4f,0.45f,0.5f,0.55f,0.6f,0.7f,1.0f,0.7f };   /* 0x7fbf38 */
 static float nos_remaining(const N2Sim *s)                              /* 0x592480 */
 {
     return s->nos_left - (s->nos_burn ? (float)(s->time - s->nos_start) : 0.0f);
@@ -758,7 +905,7 @@ static float engine_torque(N2Sim *s)                                     /* 0x59
     float thr = e->limiter ? 0 : e->thrmul * e->thr;
     t *= thr;
     if (s->nos_stage > 0)              /* nitrous, engine +0x84 */
-        t += thr * curve(&e->torque, rpm) * PF(0x2ac) * NOS_TORQUE[s->nos_stage];
+        t += thr * ((curve(&e->nos, rpm) * PF(0x2ac)) * NOS_TORQUE[s->nos_stage]);
     if (0.6f < e->heat) {              /* over-rev heat +0x8c (0x7fbff0, 0x7a1914) */
         float h = e->heat;
         if (1.0f < h) h = 1.0f;
@@ -924,6 +1071,15 @@ static int drive_stopped(N2Sim *s)                                       /* 0x59
 {
     return s->e.thr < 0.3f && s->d.drivew <= s->e.rec[0] * RPM2RAD + 0.0001f;
 }
+/* the rain's grip loss (TuneWheelParams 0x5a4d80, MellowMover 0x5aad90):
+   1 - (1 - 0.975) x GetDesiredRainIntensity 0x5ed5d0 at mover +0x5c -> +0x60 /
+   +0x64 = carstate +0x20 / +0x24, the body position 0x5a5540 published at the
+   end of the last step (= s->b.pos here) */
+float (*n2sim_rain_at)(float x, float y);
+static float n2_rain_grip(const N2Sim *s)
+{
+    return n2sim_rain_at ? 1.0f - (1.0f - 0.975f) * n2sim_rain_at(s->b.pos[0], s->b.pos[1]) : 1.0f;   /* 0x7a19e4 */
+}
 static void drive_rand(N2Sim *s)                                         /* 0x594710 */
 {
     Drive *d = &s->d;
@@ -1046,7 +1202,7 @@ static void aero_force(N2Sim *s)                                         /* 0x59
 {
     Aero *a = &s->a; Body *b = &s->b;
     float sp = len3(b->v) / a->speedscale;
-    float k = -(((2.0f - 1.0f) * (1.0f - a->thr) + 1.0f) * a->surfdrag * a->scale * a->rec[0] * sp * a->on);
+    float k = -(((((a->surfdrag * a->scale) * a->rec[0]) * sp) * ((1.0f - a->thr) * (2.0f - 1.0f) + 1.0f)) * a->on);
     float f[3] = { k * b->v[0], k * b->v[1], k * b->v[2] }, arm[3] = { 0, 0, 0 };
     if (a->ground >= 0.5f) arm[2] = (1.0f - a->thr) * -0.1f;
     body_force(b, f, arm);
@@ -1054,7 +1210,7 @@ static void aero_force(N2Sim *s)                                         /* 0x59
     if (up < 0) up = 0;
     if (a->ground >= 0.5f) up = 1;
     float dir = 0;
-    if (sp > 0.0001f) dir = (b->R[0]*b->v[0] + b->R[1]*b->v[1] + b->R[2]*b->v[2]) / sp;
+    if (sp > 0.0001f) { float r = 1.0f / sp; dir = ((b->v[2]*r)*b->R[2] + (b->v[1]*r)*b->R[1]) + (r*b->v[0])*b->R[0]; }
     if (dir < 0) dir = 0;
     float q;
     if (s->driftlike) q = dir * dir * dir * dir;
@@ -1064,8 +1220,8 @@ static void aero_force(N2Sim *s)                                         /* 0x59
     else { float t = (a->rec[2] + a->rec[1]) * q * up * sp; df = 0.4f * t; dr = t * 0.41f; }
     float lf[3] = { 0, 0, -(df * a->on) }, lr[3] = { 0, 0, -(dr * a->on) };
     float pf[3] = { 1, 0, 0 }, pr[3] = { -1, 0, 0 }, wf[3], wp[3];
-    vmul(wf, lf, b->R); vmul(wp, pf, b->R); body_force(b, wf, wp);
-    vmul(wf, lr, b->R); vmul(wp, pr, b->R); body_force(b, wf, wp);
+    xf441R(wf, lf, b->R); xf441R(wp, pf, b->R); body_force(b, wf, wp);
+    xf441R(wf, lr, b->R); xf441R(wp, pr, b->R); body_force(b, wf, wp);
 }
 
 /* ---- the force pass and tyre solver ------------------------------------- */
@@ -1075,17 +1231,20 @@ static void tyre_solve(N2Sim *s)                                         /* 0x5a
     drive_clutch(s);
     for (int i = 0; i < 4; i++) wheel_tyre(s, &w[i], 0);
     float fb[3];
-    vmulT(fb, b->F, b->R);
+    xf441T(fb, b->F, b->R);
     const float *Ii = b->yawI_on ? b->Iinv2 : b->Iinv;
     for (int it = 0; it < 5; it++) {
-        float fx[4], fy[4], sx = fb[0], sy = fb[1], yaw = 0;
+        float fx[4], fy[4], sx = fb[0], sy = fb[1], yaw;
         for (int i = 0; i < 4; i++) {
             fx[i] = w[i].local[0] * w[i].Fx + w[i].local[4] * w[i].Fy;
             fy[i] = w[i].local[1] * w[i].Fx + w[i].local[5] * w[i].Fy;
             sx += fx[i]; sy += fy[i];
-            yaw += fy[i] * u[i].mount[0] - fx[i] * u[i].mount[1];
         }
-        float ax = sx / b->mass, ay = sy / b->mass;
+        /* the retail association (x87 at single precision rounds every op):
+           x 1/mass, and the yaw sum as one chain */
+        yaw = fy[0] * u[0].mount[0] - fx[0] * u[0].mount[1];
+        for (int i = 1; i < 4; i++) { yaw = yaw + fy[i] * u[i].mount[0]; yaw = yaw - fx[i] * u[i].mount[1]; }
+        float im = 1.0f / b->mass, ax = sx * im, ay = im * sy;
         yaw /= 1.0f / Ii[10];
         for (int i = 0; i < 4; i++) {
             Wheel *q = &w[i];
@@ -1118,7 +1277,7 @@ static const Curve DRIFT_CIRC = { 10, 0, 1, 9, DRIFT_CIRC_D };                  
 static void drift_assist(N2Sim *s)
 {
     Body *b = &s->b;
-    unsigned short va = (unsigned short)(int)lrintf(atan2f(s->cs_v[1], s->cs_v[0]) * RAD2U16);
+    unsigned short va = fast_atan(s->cs_v[0], s->cs_v[1]);   /* 0x5ac278 */
     float slip = (float)(unsigned short)(s->cs_head - va) * U16RAD;
     if (PI_F < slip) slip -= PI_F + PI_F;
     float yaw = s->cs_w[2];
@@ -1213,7 +1372,22 @@ static void dyno_forces(N2Sim *s)
     /* GUESS (not in ResolveDynoForces): no yaw on the rollers. With the
        undriven axle gripless (TuneWheelParams) nothing holds the car's heading
        and the port's car turned on the spot within a few seconds */
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_SIM_DYNO_NOHOLD drops the yaw hold; the heading logged each second */
+        static double lt; static int nohold = -1;
+        if (nohold < 0) nohold = getenv("OPENUG2_SIM_DYNO_NOHOLD") != NULL;
+        if (s->time - lt >= 1.0 || s->time < lt) {
+            lt = s->time;
+            printf("dyno: t %.1f heading %.2f deg wz %.3f pos (%.2f %.2f %.2f) off %.3f m%c", s->time,
+                   atan2f(b->R[1], b->R[0]) * 57.29578f, b->w[2], b->pos[0], b->pos[1], b->pos[2],
+                   sqrtf((s->dy_spot[0] - b->pos[0]) * (s->dy_spot[0] - b->pos[0]) +
+                         (s->dy_spot[1] - b->pos[1]) * (s->dy_spot[1] - b->pos[1])), 10);
+        }
+        if (!nohold) { b->L[2] = 0; b->w[2] = 0; }
+    }
+#else
     b->L[2] = 0; b->w[2] = 0;
+#endif
     float sp = s->dy_vel[0] * b->R[0] + s->dy_vel[1] * b->R[1] + s->dy_vel[2] * b->R[2];
     if (fabsf(sp) < 0.03f) sp = 0;
     for (int i = 0; i < 4; i++) {
@@ -1221,6 +1395,7 @@ static void dyno_forces(N2Sim *s)
         if (!driven && W_R(&s->wh[i]) > 0) s->wh[i].w = sp / W_R(&s->wh[i]);
     }
 }
+/* on: 0 = off (SetDynoMode(0)), else on, with the DynoManager's state (1..4) */
 void n2sim_set_dyno(N2Sim *s, int on)                                    /* 0x599200 */
 {
     if (!s) return;
@@ -1230,11 +1405,16 @@ void n2sim_set_dyno(N2Sim *s, int on)                                    /* 0x59
         memset(s->dy_vel, 0, sizeof s->dy_vel);
     }
     s->dyno = on != 0;
+    s->dyno_state = on;
 }
 int n2sim_dyno(const N2Sim *s) { return s && s->dyno; }
 static void force_pass(N2Sim *s)                                         /* 0x5b0520 */
 {
     Body *b = &s->b;
+    /* 0x5b052d..0x5b0554 (GC ResolveForces 801c1398): on the dyno (+0x7c) while the car's
+       DynoManager (car +0x1c -> RacingCar +0x1e0, state +4) is in state 2 (full throttle,
+       recording), engine +0x80 = 1.5 (0x7a1a20). drive_post set it this substep already */
+    if (s->dyno && s->dyno_state == 2) s->e.thrmul = 1.5f;
     aero_force(s);
     for (int i = 0; i < 4; i++) wheel_contact(s->su[i].wheel, s->su[i].contact, s->su[i].force);
     tyre_solve(s);
@@ -1288,7 +1468,7 @@ static int rest_apply(N2Sim *s)
             for (int i = 0; i < 4; i++) s->wh[i].w *= 0.95f;
         }
         if (len3(b->v) > 0.8f) s->rest_t = 0;
-        b->gravity = 9.8f;
+        b->gravity = s->dampen == 1 ? 11.0f : 9.8f;           /* car +0x38 == 1 (crash): 0x7fc084 */
         return r;
     }
     memset(b->p, 0, 12); memset(b->L, 0, 12);
@@ -1346,9 +1526,9 @@ static void steer_geometry(N2Sim *s, unsigned short ang)                /* 0x59d
     b = (L * a) / (a * (PF(0x14) - PF(0x44)) + L);
     if (neg) { float t = -a; a = -b; b = t; }
     float *m = s->steer_m[0];
-    ident(m); m[0] = sin16(a + 1.5708f); m[4] = -sin16(a); m[1] = sin16(a); m[5] = m[0];
+    ident(m); m[0] = sin16(a + 1.57079637f); m[4] = -sin16(a); m[1] = sin16(a); m[5] = m[0];
     m = s->steer_m[1];
-    ident(m); m[0] = sin16(b + 1.5708f); m[4] = -sin16(b); m[1] = sin16(b); m[5] = m[0];
+    ident(m); m[0] = sin16(b + 1.57079637f); m[4] = -sin16(b); m[1] = sin16(b); m[5] = m[0];
 }
 /* 0x5aa960, the clutch-pedal box (drivetrain +0x60 == 3) asked for a gear
    it is not in: with the clutch down (state 1) the shift starts and goes in
@@ -1435,6 +1615,7 @@ static void frame_setup(N2Sim *s, float dt)
     /* x0.85 while car +0x464 (the player's assist byte, 0 for the AI) is
        clear, outside drift-type races */
     float grip = s->gripscale * (s->driftlike ? 1.0f : 0.85f), mph = s->cs_speed * MPH;
+    grip *= n2_rain_grip(s);   /* x (1 - 0.025 Car::GetRainIntensity 0x5ed5d0) */
     const N2Input *in = &s->eff;
     if (in->handbrake < 0.5f) { s->hbramp += dt; if (s->hbramp > 1) s->hbramp = 1; }
     else { s->hbramp -= 20.0f * dt; if (s->hbramp < 0.5f) s->hbramp = 0.5f; }
@@ -1451,16 +1632,15 @@ static void frame_setup(N2Sim *s, float dt)
         float g = grip;
         if (i > 1 && !s->driftlike) {                        /* 0x5990c0 */
             float slipang = 0;
-            if (s->cs_speed >= 1.0f) {
-                float va = atan2f(b->v[1], b->v[0]), ha = atan2f(b->R[1], b->R[0]);
-                slipang = ha - va;
-                while (slipang > PI_F) slipang -= 2*PI_F;
-                while (slipang < -PI_F) slipang += 2*PI_F;
+            if (s->cs_speed >= 1.0f) {                       /* 0x591d90 */
+                unsigned short va = fast_atan(s->cs_v[0], s->cs_v[1]);
+                slipang = (float)(unsigned short)(s->cs_head - va) * U16RAD;
+                if (PI_F < slipang) slipang -= PI_F + PI_F;
             }
             float k = fabsf(b->R[2]) + 1.0f, sa = fabsf(slipang);
             float r = k;
-            if (!(w->hbrake > 0.5f && sa < 20.0f * 0.0174533f)) {
-                float f = (PF(0x280) + PF(0x284)) * (s->cs_absv / 30.0f) * sa;
+            if (!(w->hbrake > 0.5f && sa < 20.0f * 0.0174532942f)) {
+                float f = (PF(0x280) + PF(0x284)) * (sa * (s->cs_absv / 30.0f));
                 if (f > 0.35f) f = 0.35f;
                 r = f + k;
             }
@@ -1505,11 +1685,10 @@ static void shift_points(const float *gb, const float *er, float *up, float *dow
    each wheel is a spring from the probe height, a linear tyre clipped to a
    friction circle and one spin state, the engine speed follows the driven
    wheels and the gearbox shifts on fixed rpm. Substeps of at most 1/70 s. */
-static const float MELLO_NOS_D[9] = { 0.3f,0.4f,0.45f,0.5f,0.55f,0.6f,0.7f,1.0f,0.7f };   /* 0x7fbf38 */
 static const float MELLO_SPINDRAG[6] = { 0,0.05f, 2,0.322f, 20,0.5f };   /* 0x7fc8c8 -> 0x86b578 */
 static const float MELLO_ANGDAMP[6] = { 0,0, 0.1f,0, 2,20 };             /* 0x7fc8e0 -> 0x86b498 */
 static const float DRIVE_TUNE4[3] = { 1.0f, 1.2f, 1.1f };              /* 0x7fc2b8 + 0x144 k */
-#define MELLO_HMAX 0.0142857f          /* 0x7fc040 */
+#define MELLO_HMAX 0.0142857144f          /* 0x7fc040 */
 #define MELLO_CAP  4.0f                /* 0x7a1970 */
 #define MELLO_CAP_SX 2.0f              /* 0x7a1974, street X (0x5a38e0) */
 #define MELLO_CAP_URL 3.2f             /* 0x7a1978, track flag 0x2000 (0x5a38e0) */
@@ -1626,7 +1805,7 @@ static void mello_spin_deriv(N2Sim *s, float *d)                         /* 0x59
 static void mello_forces(N2Sim *s)                                       /* 0x5a38e0 */
 {
     Mello *m = &s->m; Body *b = &s->b;
-    float head = (float)(unsigned short)(int)lrintf(atan2f(b->R[1], b->R[0]) * RAD2U16) * U16RAD;
+    float head = (float)fast_atan(b->R[0], b->R[1]) * U16RAD;   /* 0x5a3a1f */
     float steer = (float)m->steer * U16RAD;
     float vabs = len3(b->v);
     for (int i = 0; i < 4; i++) {
@@ -1638,7 +1817,7 @@ static void mello_forces(N2Sim *s)                                       /* 0x5a
         if (m->contact[i]) {
             float vx = b->v[0] - r[1] * b->w[2], vy = r[0] * b->w[2] + b->v[1];
             float h = head + (i < 2 ? steer : 0);
-            float c = sin16(h + 1.5708f), sn = sin16(h);
+            float c = sin16(h + 1.57079637f), sn = sin16(h);
             float vlat = c * vy - sn * vx;
             float vlong = (c * vx + sn * vy) - wr[4] * m->spin[i];
             m->sv[i][0] = vlong; m->sv[i][1] = vlat;
@@ -1648,7 +1827,7 @@ static void mello_forces(N2Sim *s)                                       /* 0x5a
             if (mag > 6.0f) m->sliding[i] = 1;
             float fx = -(k * m->load[i] * vlong * 1.25f), fy = -(k * m->load[i] * vlat * 1.25f);
             float a = i < 2 ? steer : 0;
-            float c2 = sin16(a + 1.5708f), s2 = sin16(a);
+            float c2 = sin16(a + 1.57079637f), s2 = sin16(a);
             F[0] = fx * c2 - fy * s2;
             F[1] = fy * c2 + fx * s2;
         }
@@ -1715,9 +1894,8 @@ static int mello_rest(N2Sim *s)                                          /* 0x5a
     b->gravity = 9.8f;
     return r;
 }
-/* 0x5a2fd0, in every force pass (skipped while car +0x3c -> +0x18 > 0, a
-   per-car count that is 0 for the grid cars of an intro; the port has no
-   such count). A pair of bouncing wheels (front: FL FR, rear: RR RL) first
+/* 0x5a2fd0, in every force pass (skipped outright while car +0x3c -> +0x18
+   > 0 (jg 0x5a3373): the car body's live Collisions, s->body_colls). A pair of bouncing wheels (front: FL FR, rear: RR RL) first
    has the other pair lifted to 0.2 m; each wheel's lift follows extend x
    0.2 at 0.5 m/s up (capped at the target) and 0.5 m/s down (to 0). Once
    the lifted pair is up and no bouncing wheel hangs (compression < -0.01),
@@ -1728,6 +1906,7 @@ static void hydraulics(N2Sim *s)
     Mello *m = &s->m; Body *b = &s->b;
     const float *bo = s->hyd_bounce;
     int mask = 0;
+    if (s->body_colls > 0) return;
     if (bo[0] != 0 && bo[1] != 0) mask = 0xc;
     else if (bo[2] != 0 && bo[3] != 0) mask = 3;
     else if ((bo[2] != 0 && bo[1] != 0) || (bo[3] != 0 && bo[0] != 0)) mask = 0x20;
@@ -1854,7 +2033,8 @@ static void mello_frame(N2Sim *s, float dt)                              /* 0x5a
     b->power = s->catchup;
     m->gripm = s->catchup;                                   /* x 0x7a1990 = 1 above 30 mph */
     m->mult = s->catchup;
-    /* x (1 - 0.025 damage): no damage model */
+    /* x (1 - 0.025 rain): Car::GetRainIntensity 0x5ed5d0 (= GetDesiredRainIntensity at car +0x60 / +0x64) */
+    m->gripm *= n2_rain_grip(s);
     int n = (int)(dt / MELLO_HMAX) + 1;
     float h = dt / (float)n;
     for (int k = 0; k < n; k++) {
@@ -1901,7 +2081,7 @@ static void nis_forces(N2Sim *s)                                         /* 0x5a
                them out (0x5a38e0); the force from them is thrown away */
             float vx = b->v[0] - r[1] * b->w[2], vy = r[0] * b->w[2] + b->v[1];
             float h = head + (i < 2 ? steer : 0);
-            float c = sin16(h + 1.5708f), sn = sin16(h);
+            float c = sin16(h + 1.57079637f), sn = sin16(h);
             float vlat = c * vy - sn * vx;
             float vlong = (c * vx + sn * vy) - wr[4] * m->spin[i];
             m->sv[i][0] = vlong; m->sv[i][1] = vlat;
@@ -1987,7 +2167,7 @@ static void nis_drive(N2Sim *s, float dt)                                /* 0x5a
     float inv = 1.0f / dt;
     float v[3] = { (s->nis_tgt[0] - b->pos[0]) * inv, (s->nis_tgt[1] - b->pos[1]) * inv,
                    (s->nis_tgt[2] - b->pos[2]) * inv };
-    float yaw = inv * nis_heading_err(s->nis_head, b->R) * 0.0174533f;
+    float yaw = inv * nis_heading_err(s->nis_head, b->R) * 0.0174532942f;
     if (s->nis_count > 3) {
         /* held: an impulse at 0.2 m below the centre of mass takes up the
            horizontal velocity error, the yaw momentum takes up the yaw */
@@ -2076,8 +2256,8 @@ static void nis_enter(N2Sim *s)                                          /* 0x5b
    angle, sped up and slowed by two speed graphs; the body's height and tilt
    come from the ground under the four wheels (0x5f5010 -> 0x5f49f0) and
    the engine sound from a made-up rpm and gear (0x5f50a0). */
-static const float TM_ACC_D[4] = { 3.576f, 2.682f, 2.012f, 1.341f };      /* 0x7e95d0 */
-static const float TM_BRK_D[4] = { 6.705f, 13.411f, 20.116f, 26.822f };   /* 0x7e95e0 */
+static const float TM_ACC_D[4] = { 3.57621813f, 2.68216372f, 2.01162267f, 1.34108186f };      /* 0x7e95d0 */
+static const float TM_BRK_D[4] = { 6.70540905f, 13.4108181f, 20.1162281f, 26.8216362f };   /* 0x7e95e0 */
 static const Curve TM_ACC = { 4, 0, 24.5865f, 0.12201818f, TM_ACC_D };    /* 0x7ea03c */
 static const Curve TM_BRK = { 4, 0, 24.5865f, 0.12201818f, TM_BRK_D };    /* 0x7ea050 */
 #define TM_VMAX 24.5865f                                                  /* 0x7845a4 */
@@ -2086,7 +2266,7 @@ static const float TM_BAND[7] = { 0, 25.38f, 40.89f, 56.47f, 72.06f, 80.0f, 89.5
 static void tm_pose(N2Sim *s)                                            /* 0x5f5010 -> 0x5f49f0 */
 {
     Body *b = &s->b;
-    float c = sin16(s->tm_head + 1.5708f), sn = sin16(s->tm_head);
+    float c = sin16(s->tm_head + 1.57079637f), sn = sin16(s->tm_head);
     float R[9] = { c, sn, 0, -sn, c, 0, 0, 0, 1 }, w[4][3], gz[4], ride = 0, gsum = 0;
     int all = 1;
     for (int i = 0; i < 4; i++) {
@@ -2153,7 +2333,7 @@ static void tm_frame(N2Sim *s, float dt)                                 /* 0x40
 {
     Body *b = &s->b;
     float L = s->P[0x10 / 4] - s->P[0xa0 / 4], d = dt * s->tm_v;
-    float c = sin16(s->tm_head + 1.5708f), sn = sin16(s->tm_head);
+    float c = sin16(s->tm_head + 1.57079637f), sn = sin16(s->tm_head);
     float st = (float)s->steer_u16 * U16RAD;           /* 0x5ebf50 */
     if (st > PI_F) st -= 2 * PI_F;
     float ox = b->pos[0], oy = b->pos[1], oz = b->pos[2];
@@ -2164,7 +2344,7 @@ static void tm_frame(N2Sim *s, float dt)                                 /* 0x40
         float R = L / st;
         float cx = rx - sn * R, cy = ry + c * R;       /* turn centre on the left axis */
         float da = d / R;
-        float ca = sin16(da + 1.5708f), sa = sin16(da);
+        float ca = sin16(da + 1.57079637f), sa = sin16(da);
         float px = s->tm_x - cx, py = s->tm_y - cy;
         s->tm_x = px * ca - py * sa + cx; s->tm_y = px * sa + py * ca + cy;
         s->tm_head += da;
@@ -2196,6 +2376,294 @@ static void tm_frame(N2Sim *s, float dt)                                 /* 0x40
     }
     s->m.steer = s->steer_u16;
     s->m.thr = s->eff.throttle;
+    tm_engine(s);
+    s->m.gear = s->d.gear; s->m.rpm = s->cs_tach;
+}
+
+/* ---- mover 4: the far route mover (0x5a9030 / 0x59ec80) ---------------------
+   The car rides a Catmull-Rom spline through its driver's plan points at
+   s(t) = s0 + v0 t + a t^2 / 2 (spline units; k of them a metre). The heading
+   follows the path's velocity 0.4 s ahead through a 0.4 s blend, the car's
+   offset from the path at the re-path blends to 0 over 0.5 s, and the
+   ground under the wheels sets height and tilt (0x5f5010). The original's
+   lateral slide offset (+0x2c) and its feed are multiplied by 0 (0x7a17f0 /
+   0x7a17f8 / 0x7a17fc), so they are left out. */
+static void bl_set_p0(Blend1 *f, float v) { f->p0 = v; if (v != f->p1) f->state = 2; }   /* 0x574b10 */
+static void bl_set_t0(Blend1 *f, float v) { f->t0 = v; if (v != f->t1) f->state = 2; }   /* 0x574b50 */
+static void bl_set_p1(Blend1 *f, float v) { f->p1 = v; if (v != f->p0) f->state = 2; }   /* 0x574b90 */
+static void bl_init(Blend1 *f)
+{
+    memset(f, 0, sizeof *f);
+    f->dur = 1.0f; f->end = 1.0f; f->loop = 1;
+}
+static void bl_update(Blend1 *f, float dt)                               /* 0x574e30 (no limits) */
+{
+    if (f->state == 0 || (f->state != 1 && f->state != 2)) return;
+    if (f->state == 2) {
+        f->t = 0;
+        if (!f->loop) f->state = 1;
+        float D = f->p1 - f->p0;
+        f->d = f->p0; f->c = f->t0;
+        f->a = (f->t1 + f->t0) - (D + D);
+        f->b = (D * 3.0f - f->t1) - (f->t0 + f->t0);
+    }
+    float t = dt / f->dur + f->t;
+    f->t = t;
+    if (t < f->end) {
+        f->p0 = ((t * f->a + f->b) * t + f->c) * t + f->d;
+        f->t0 = (f->b + f->b + t * f->a * 3.0f) * t + f->c;
+    } else {
+        f->state = 0;
+        if (1.0f <= f->end) { f->p0 = f->p1; f->t0 = f->t1; }
+    }
+}
+/* the spline (as racepath.c's, 0x570240 / 0x570510 / 0x570640 type 2) */
+static const float FAR_BASIS[3][4][4] = {                               /* 0x865230 */
+    { { 0, -0.5f, 1, -0.5f }, { 1, 0, -2.5f, 1.5f }, { 0, 0.5f, 2, -1.5f }, { 0, 0, -0.5f, 0.5f } },
+    { { -0.5f, 2, -1.5f, 0 }, { 0, -5, 4.5f, 0 }, { 0.5f, 4, -4.5f, 0 }, { 0, -1, 1.5f, 0 } },
+    { { 2, -3, 0, 0 }, { -5, 9, 0, 0 }, { 4, -9, 0, 0 }, { -1, 3, 0, 0 } },
+};
+static void far_ext(const FarMv *f, int k, float o[3])                   /* 0x570510; P[k + 1] is point k */
+{
+    int n = f->n;
+    for (int c = 0; c < 3; c++) {
+        if (k < -1) o[c] = f->P[1][c] + (f->P[1][c] - f->P[2][c]) * (float)(-k);
+        else if (n < k) o[c] = f->P[n][c] + (f->P[n][c] - f->P[n - 1][c]) * (float)(k - n + 1);
+        else o[c] = f->P[k + 1][c];
+    }
+}
+static void far_eval(FarMv *f, float t, int deriv, float o[3])          /* 0x570640 */
+{
+    int n = f->n;
+    if (f->dirty) {                                                     /* 0x570240 */
+        if (n >= 2)
+            for (int c = 0; c < 3; c++) {
+                f->P[0][c] = f->P[1][c] - (f->P[2][c] - f->P[1][c]);
+                f->P[n + 1][c] = f->P[n][c] + (f->P[n][c] - f->P[n - 1][c]);
+            }
+        f->dirty = 0;
+    }
+    if (n == 0) { o[0] = o[1] = o[2] = 0; return; }
+    float fl = (float)(int)t;
+    if (fl > t) fl -= 1.0f;
+    int seg = (int)fl;
+    float u = t - fl, Q[4][3];
+    if (seg < 0 || seg >= n - 1) for (int j = 0; j < 4; j++) far_ext(f, seg - 1 + j, Q[j]);
+    else for (int j = 0; j < 4; j++) memcpy(Q[j], f->P[seg + j], sizeof Q[j]);
+    float T[4] = { 1.0f, u, u * u, u * u * u }, w[4];                   /* 0x570440 */
+    for (int j = 0; j < 4; j++)
+        w[j] = FAR_BASIS[deriv][j][0] * T[0] + FAR_BASIS[deriv][j][1] * T[1] + FAR_BASIS[deriv][j][2] * T[2] + FAR_BASIS[deriv][j][3] * T[3];
+    for (int c = 0; c < 3; c++) o[c] = w[0] * Q[0][c] + w[1] * Q[1][c] + w[2] * Q[2][c] + w[3] * Q[3][c];
+}
+static float far_s(const FarMv *f, float t) { return (t * f->a * 0.5f + f->v0) * t + f->s0; }
+static void far_pos(FarMv *f, float t, float o[3])                      /* 0x591ad0 */
+{
+    float s = far_s(f, t);
+    far_eval(f, s, 0, o);
+    if (s < 0 && o[2] < f->P[1][2]) o[2] = f->P[1][2];
+}
+static void far_vel(FarMv *f, float t, float o[3])                      /* 0x591b70: metres a second */
+{
+    float r = t * f->a + f->v0;
+    far_eval(f, far_s(f, t), 1, o);
+    o[0] *= r; o[1] *= r; o[2] *= r;
+}
+static void far_acc(FarMv *f, float t, float o[3])                      /* 0x591be0 */
+{
+    float r = t * f->a + f->v0, s = far_s(f, t), d1[3], d2[3];
+    far_eval(f, s, 1, d1);
+    far_eval(f, s, 2, d2);
+    r *= r;
+    for (int c = 0; c < 3; c++) o[c] = d2[c] * r + d1[c] * f->a;
+}
+static void unit3(float *v)                                              /* 0x43cf10 */
+{
+    float l = len3(v);
+    if (l != 0) { v[0] /= l; v[1] /= l; v[2] /= l; }
+}
+/* 0x591950: the tyres' lateral limit against the path's lateral
+   acceleration (its result is used times 0; only the flag +0x34 stays) */
+static void far_slide(N2Sim *s, float lat)
+{
+    FarMv *f = &s->far;
+    const float *P = s->P;
+    float need = (P[0xd8 / 4] + P[0xf8 / 4]) * 0.5f * P[0x110 / 4] * fabsf(lat);
+    float mu = f->slide ? P[0xe0 / 4] + P[0x100 / 4] : P[0xdc / 4] + P[0xfc / 4];
+    float have = (9.8f * P[0x110 / 4] + (f->v0 / f->k) * (P[0x268 / 4] + P[0x264 / 4]) * 0.5f) * mu * 0.5f;
+    f->slide = have < need;
+}
+/* 0x59ea20(0.5): over the next 0.45 s, how far the path drops below the
+   arc of a car leaving it now (g plus the downforce share) */
+static float far_drop(N2Sim *s, float span)
+{
+    FarMv *f = &s->far;
+    const float *P = s->P;
+    float g = ((f->v0 / f->k) * (P[0x268 / 4] + P[0x264 / 4]) * 0.5f) / P[0x110 / 4] + 9.8f;
+    float p[3], v[3];
+    far_pos(f, f->t, p);
+    far_vel(f, f->t, v);
+    float z0 = p[2], vz = v[2], t0 = 0, best = 0;
+    for (int i = 1; i < 10; i++) {
+        float dt = (float)i * span * 0.1f, tt = dt + f->t;
+        far_pos(f, tt, p);
+        float h = (((dt - t0) * -g + vz) * (dt - t0) + z0) - p[2];
+        if (h <= 0) {
+            float d1[3];
+            far_eval(f, far_s(f, tt), 1, d1);
+            vz = d1[2] * (tt * f->a + f->v0);
+            z0 = p[2]; t0 = dt;
+        } else if (best <= h) best = h;
+    }
+    return best;
+}
+static void far_enter(N2Sim *s)                                          /* 0x5a9030 */
+{
+    FarMv *f = &s->far;
+    Body *b = &s->b;
+    memset(f, 0, sizeof *f);
+    bl_init(&f->lat); bl_init(&f->hx); bl_init(&f->hy);
+    float v = s->cs_absv;                                                /* car +0x430 */
+    float h = (float)s->cs_head * U16RAD, w = 0.4f * b->w[2] * v;      /* car +0x40c, +0x118 */
+    bl_set_p0(&f->hx, cosf(h) * v); bl_set_p0(&f->hy, sinf(h) * v);
+    bl_set_t0(&f->hx, cosf(h + 1.5707964f) * w); bl_set_t0(&f->hy, sinf(h + 1.5707964f) * w);
+    f->lat.loop = f->hx.loop = f->hy.loop = 0;                          /* 0x5918a0 (no path yet) */
+    f->want = 1;
+}
+/* 0x5918a0 + 0x591690 */
+void n2sim_far_path(N2Sim *s, const float (*p)[3], int n, float len, float vtarget, float x234, float acc)
+{
+    FarMv *f = &s->far;
+    Body *b = &s->b;
+    f->lat.loop = f->hx.loop = f->hy.loop = 0;
+    f->want = 0;
+    if (n < 2) { f->has_path = 0; return; }
+    if (n > FAR_MAXPTS) n = FAR_MAXPTS;
+    for (int i = 0; i < n; i++) { f->P[i + 1][0] = p[i][0]; f->P[i + 1][1] = p[i][1]; f->P[i + 1][2] = p[i][2]; f->P[i + 1][3] = 0; }
+    f->n = n; f->dirty = 1;
+    /* 0x591690 */
+    f->t = 0;
+    f->k = (float)(n - 1) / len;
+    int best = 0;                                                       /* 0x570730 from point 0 */
+    {
+        float bd = 0;
+        for (int i = 0; i < n; i++) {
+            float d[3] = { b->pos[0] - f->P[i + 1][0], b->pos[1] - f->P[i + 1][1], b->pos[2] - f->P[i + 1][2] }, l = len3(d);
+            if (i == 0 || l < bd) { bd = l; best = i; }
+            else break;
+        }
+    }
+    float t = (float)best, stp = 1.0f, ps = 0, pe = 0;                  /* 0x5774c0, tolerance 0.005 */
+    for (int it = 0; it < 998; it++) {
+        float a[3], d[3];
+        far_eval(f, t, 0, a);
+        far_eval(f, t, 1, d);
+        float L = len3(d);
+        if (L == 0) break;
+        float e = ((b->pos[0] - a[0]) * d[0] + (b->pos[1] - a[1]) * d[1] + (b->pos[2] - a[2]) * d[2]) / L;
+        if (fabsf(e) < 0.005f) break;
+        if (ps != 0 && -((e - pe) / ps) == 0) break;
+        float sv = e / L;
+        if (sv <= -stp) sv = -stp;
+        if (stp < sv) sv = stp;
+        t += sv;
+        if (sv * ps < 0) stp *= 0.5f;
+        ps = sv; pe = e;
+    }
+    float off[3], tan[3];                                               /* 0x591570 */
+    far_eval(f, t, 0, off);
+    far_eval(f, t, 1, tan);
+    for (int c = 0; c < 3; c++) off[c] -= b->pos[c];
+    f->s0 = t;
+    unit3(tan);
+    f->v0 = s->cs_speed * f->k;                                         /* car +0x42c */
+    f->a = (vtarget * 0.899f * f->k - f->v0) / (0 < x234 ? x234 : 0.5f);   /* 0x7a1820, 0x7a17c0 */
+    float lim = (acc + -9.8f * tan[2]) * f->k;                          /* 0x4038d0 + 0x591620 */
+    if (lim < f->a) f->a = lim;
+    else if (f->a < -20.0f * f->k) f->a = -20.0f * f->k;                /* 0x7a17d0 */
+    float up[3] = { 0, 0, 1 }, side[3];
+    cross(side, tan, up);
+    bl_set_p0(&f->lat, -(off[0] * side[0] + off[1] * side[1] + off[2] * side[2]));
+    bl_set_t0(&f->lat, 0.5f * (side[0] * b->v[0] + side[1] * b->v[1] + side[2] * b->v[2]));
+    f->lat.dur = 0.5f;
+    f->hx.dur = f->hy.dur = 0.4f;
+    f->has_path = 1;
+}
+int n2sim_far_want(N2Sim *s) { return s->mover == N2_MOVER_FAR && s->far.want; }
+int n2sim_far_take_jump(N2Sim *s)
+{
+    int j = s->mover == N2_MOVER_FAR && s->far.jump;
+    s->far.jump = 0;
+    return j;
+}
+static void far_frame(N2Sim *s, float dt)                                /* 0x59ec80 */
+{
+    FarMv *f = &s->far;
+    Body *b = &s->b;
+    int stopped = 0;
+    if (0 < f->k) stopped = !(0.01f <= fabsf(f->v0 / f->k)) && !(0.01f <= fabsf(f->a / f->k));
+    if (!f->has_path || f->n < 2 || stopped || !((float)f->n > f->s0)) {
+        f->want = 1;                                                    /* 0x5918a0 */
+        memset(b->v, 0, sizeof b->v); memset(b->p, 0, sizeof b->p);     /* car +0x70 */
+        s->cs_speed = 0; s->cs_absv = 0;                                /* +0x42c, +0x430 */
+        return;
+    }
+    float o[3] = { b->pos[0], b->pos[1], b->pos[2] };
+    if (1.0f < far_drop(s, 0.5f)) f->jump = 1;                          /* 0x591540(1 s) */
+    float t = dt + f->t;
+    f->t = t;
+    float spd = (t * f->a + f->v0) / f->k;
+    float hv[3];
+    far_vel(f, t + 0.4f, hv);                                           /* 0x7a17e8 */
+    bl_set_p1(&f->hx, hv[0]); bl_set_p1(&f->hy, hv[1]);
+    bl_update(&f->hx, dt); bl_update(&f->hy, dt);                       /* 0x574f40 */
+    hv[0] = f->hx.p0; hv[1] = f->hy.p0;
+    {   /* the path's lateral acceleration 0.3 s ahead into the 30-sample mean (0x576970) */
+        float tt = t + 0.3f, v[3], ac[3], up[3] = { 0, 0, 1 }, sd[3];
+        far_vel(f, tt, v);
+        cross(sd, v, up); unit3(sd);
+        far_acc(f, tt, ac);
+        float x = ac[0] * sd[0] + ac[1] * sd[1] + ac[2] * sd[2];
+        if (f->rcount < 30) f->rcount++;
+        f->rsum += x - f->ring[f->ridx];
+        f->ring[f->ridx] = x;
+        if (30 <= ++f->ridx) f->ridx = 0;
+        f->ravg = f->rsum / (float)f->rcount;
+        far_slide(s, f->ravg);
+    }
+    unsigned short h = fast_atan(hv[0], hv[1]);                         /* 0x43c570 -> car +0x40c */
+    unsigned short h0 = s->cs_head;
+    float vn[3], up[3] = { 0, 0, 1 }, sd[3];
+    far_vel(f, t, vn);
+    cross(sd, vn, up); unit3(sd);
+    bl_set_p1(&f->lat, 0);
+    bl_update(&f->lat, dt);
+    float p[3];
+    far_pos(f, t, p);
+    for (int c = 0; c < 3; c++) b->pos[c] = p[c] + sd[c] * f->lat.p0;  /* 0x43d0c0 */
+    s->tm_head = (float)h * U16RAD;
+    tm_pose(s);                                                         /* 0x5f5010 (car +0x5cc set) */
+    float v[3] = { b->pos[0] - o[0], b->pos[1] - o[1], b->pos[2] - o[2] };
+    if (1e-4f < fabsf(dt)) { v[0] /= dt; v[1] /= dt; v[2] /= dt; }
+    else { float k = len3(v); if (k > 0) { k = spd / k; v[0] *= k; v[1] *= k; v[2] *= k; } }   /* 0x43cf90 */
+    memcpy(b->v, v, 12);                                                /* 0x592160 */
+    for (int i = 0; i < 3; i++) b->p[i] = b->mass * v[i];
+    s->cs_absv = len3(v);                                               /* +0x430 */
+    s->cs_speed = spd;                                                  /* +0x42c */
+    b->w[0] = b->w[1] = 0;
+    b->w[2] = (float)(short)(h - h0) * U16RAD / dt;                    /* +0x118 */
+    s->cs_head = h;
+    for (int i = 0; i < 3; i++) { s->cs_v[i] = b->v[i]; s->cs_w[i] = b->w[i]; }
+    for (int i = 0; i < 4; i++) {                                       /* 0x59cb90: spin = speed / radius */
+        Wheel *w = &s->wh[i];
+        w->w = spd / s->P[(0x20 + 0x30 * i) / 4];
+        w->angle += w->w * dt;
+        s->m.spin[i] = w->w; s->m.angle[i] = w->angle;
+        s->m.sliding[i] = f->slide;                                     /* wheel +0x160 = +0x34 */
+        s->m.sv[i][0] = s->m.sv[i][1] = 0; s->m.comp[i] = 0;
+    }
+    s->m.steer = s->steer_u16;
+    s->m.thr = s->eff.throttle;
+    s->tm_v = s->cs_absv;                                               /* 0x5f50a0 reads car +0x430 */
     tm_engine(s);
     s->m.gear = s->d.gear; s->m.rpm = s->cs_tach;
 }
@@ -2301,6 +2769,7 @@ N2Sim *n2sim_create(const unsigned char *rec, N2GroundFn ground, void *user)
     e->rec = s->P + 0x1f0/4;
     curve_init(&e->torque, 9, e->rec[0], e->rec[2], e->rec + 4);
     curve_init(&e->brake, 3, e->rec[0], e->rec[2], e->rec + 22);
+    curve_init(&e->nos, 9, e->rec[0], e->rec[1], MELLO_NOS_D);
     e->thrmul = 1; e->power = 1; e->heat = -1.0f;                     /* 0x7a2690 */
     Drive *d = &s->d;                                        /* 0x5af9d0 / 0x5ac7d0 */
     d->gb = s->P + 0x1b0/4;
@@ -2331,12 +2800,13 @@ N2Sim *n2sim_create(const unsigned char *rec, N2GroundFn ground, void *user)
 
 void n2sim_set_mover(N2Sim *s, int mover)                               /* 0x5f46a0 */
 {
-    if (mover != N2_MOVER_MELLO && mover != N2_MOVER_TRAFFIC && mover != N2_MOVER_NIS) mover = N2_MOVER_PHYSICS;
+    if (mover != N2_MOVER_MELLO && mover != N2_MOVER_TRAFFIC && mover != N2_MOVER_NIS && mover != N2_MOVER_FAR) mover = N2_MOVER_PHYSICS;
     if (mover == s->mover) return;
     s->mover = mover;
     if (mover == N2_MOVER_MELLO) mello_enter(s);
     else if (mover == N2_MOVER_NIS) nis_enter(s);
     else if (mover == N2_MOVER_TRAFFIC) tm_enter(s);
+    else if (mover == N2_MOVER_FAR) far_enter(s);
     else physics_enter(s);
 }
 int n2sim_mover(const N2Sim *s) { return s->mover; }
@@ -2411,6 +2881,7 @@ float n2sim_shift_win(const N2Sim *s, int gear)                             /* 0
     return SHIFT_WIN[k][gear] * s->d.win;
 }
 int n2sim_shifting(const N2Sim *s) { return s->d.shifting != 0; }
+int n2sim_shift_up(const N2Sim *s) { return s->d.shifting != 0 && s->d.target > s->d.gear; }
 int n2sim_shift_cut(const N2Sim *s) { return 0.0f < s->d.shift_t; }
 void n2sim_set_race(N2Sim *s, int driftlike, int ai, int difficulty)
 {
@@ -2469,6 +2940,7 @@ float n2sim_accel_rating(const N2Sim *s)
     return sum;
 }
 float n2sim_param(const N2Sim *s, int off) { return s->P[off / 4]; }
+float n2sim_brake(const N2Sim *s) { return s->eff.brake; }   /* controller +0x214 (0x5eb8f0) */
 void n2sim_destroy(N2Sim *s) { free(s); }
 #ifdef N2SIM_DEBUG
 #include <stdio.h>
@@ -2600,11 +3072,11 @@ static float steer_max(N2Sim *s, float x)
         slip = atan2f(b->R[1], b->R[0]) - atan2f(b->v[1], b->v[0]);
         while (slip > PI_F) slip -= 2*PI_F;
         while (slip <= -PI_F) slip += 2*PI_F;
-        slip *= 57.2958f;
+        slip *= 57.2957764f;
     }
     float aslip = fabsf(slip), vel = len3(b->v);
     if (s->sliding) { if (aslip < 5.0f || vel < 0.0f) s->sliding = 0; }
-    else if (aslip > 15.0f && vel >= 13.4108f) s->sliding = 1;
+    else if (aslip > 15.0f && vel >= 13.4108181f) s->sliding = 1;
     if (x * slip < 0 && (s->sliding || aslip > m)) {
         float k = curve(s->driftlike ? &CD : &CC, fabsf(x));
         m = aslip * k;
@@ -2641,7 +3113,7 @@ static void steer_pad(N2Sim *s, float stick, float dt)
     static const float YAWACC_G[12] = { 0,1, 1,1.1f, 2,1.2f, 3,1.25f, 4,1.3f, 5,1.35f };   /* 0x7e9f50 */
     static const Curve CP = { 21, -1, 1, 10, PAD }, CP4 = { 21, -1, 1, 10, PAD4 };
     float x = curve(s->driftlike ? &CP4 : &CP, stick);
-    float cur = (float)s->steer_u16 * 0.00549316f;
+    float cur = (float)s->steer_u16 * 0.0054931640625f;
     if (cur >= 180.0f) cur -= 360.0f;
     float gain = PF(0x270);
     if (s->driftlike && 0 < x * s->cs_yawacc) gain *= graph(YAWACC_G, 6, fabsf(s->cs_yawacc));
@@ -2842,15 +3314,16 @@ void n2sim_reset(N2Sim *s, const float pos[3], float heading)
 }
 
 /* Car::ResetDampenMode 0x5fc050 (each Car::Move): crash mode ends after
-   0.1 s (0x7a565c) on four wheels; airborne mode with four wheels down. The
-   mode 0 -> 2 switch needs car +0x3c -> +0x18, which the port does not keep
-   (0). The original times from the clock (+0x54c, 0 = unset); this sums
-   the steps. */
+   0.1 s (0x7a565c) on four wheels with no live Collision; mode 2 ends with
+   four wheels down and none; mode 0 -> 2 while the body has one (car +0x3c
+   -> +0x18 > 0, s->body_colls, 0x5fc0c6). The original times from the clock
+   (+0x54c, 0 = unset); this sums the steps. */
 static void reset_dampen(N2Sim *s, float dt)
 {
-    if (s->dampen == 2) { if (s->cs_wheels == 4) s->dampen = 0; }
+    if (s->dampen == 0) { if (s->body_colls > 0) s->dampen = 2; }
+    else if (s->dampen == 2) { if (s->body_colls == 0 && s->cs_wheels == 4) s->dampen = 0; }
     else if (s->dampen == 1) {
-        if (s->cs_wheels != 4) s->dampen_on = 0;
+        if (s->body_colls != 0 || s->cs_wheels != 4) s->dampen_on = 0;
         else if (!s->dampen_on) { s->dampen_on = 1; s->dampen_t = 0; }
         else if ((s->dampen_t += dt) >= 0.1f) s->dampen = 0;
     }
@@ -2862,6 +3335,7 @@ void n2sim_set_dampen(N2Sim *s, int mode)
     if (mode == 1) s->dampen_on = 0;
 }
 int n2sim_dampen(const N2Sim *s) { return s ? s->dampen : 0; }
+void n2sim_set_body_collisions(N2Sim *s, int n) { if (s) s->body_colls = n; }
 int n2sim_drag(const N2Sim *s) { return s && s->drag; }
 
 /* 0x5ebc20: the draft car o gives s -- o at 1 m/s or more (car +0x430),
@@ -2902,6 +3376,20 @@ float n2sim_draft(const N2Sim *s, N2Sim *const *cars, int n)
 }
 void n2sim_set_draft(N2Sim *s, float d) { s->draft = d; }
 float n2sim_get_draft(const N2Sim *s) { return s ? s->draft : 0; }
+/* Retail reads +0x330 in the same World::DoTimestep as the move that wrote it
+   (GC 80210be0: DoTimestepMove, then Car::TriggerCarTerrainEffects 0x5f5730 per
+   car), so every sim step's bump-stop hit is seen. The port's effects run once
+   per drawn frame, after 1-2 steps: they take the largest step sum since the
+   last take, then clear it; a hit nobody takes within 4 steps (no effects
+   running: front end, off-screen car) expires. GUESS: two hits in one drawn
+   frame fire once (at the larger), where retail would test each step. */
+float n2sim_take_bottom(N2Sim *s)
+{
+    if (!s) return 0;
+    float b = s->bottom_latch;
+    s->bottom_latch = 0;
+    return b;
+}
 /* MiscStyleManager 0x56f9b0's hydraulics inputs: the wheels whose bounce
    fired this step (car +0x408 = carstate +0x3c8, cleared at the step's
    start 0x5b72d0) and the wheels moving (0x5ed470: mover +0x74 in {2, 3},
@@ -2916,8 +3404,12 @@ void n2sim_hyd_counts(const N2Sim *s, int *bounced, int *moving)
     *bounced = b; *moving = m;
 }
 
+static float g_time_scale = 1.0f;                                      /* World +0x108 */
+void  n2sim_set_time_scale(float scale) { g_time_scale = scale > 0 ? scale : 1.0f; }
+float n2sim_time_scale(void) { return g_time_scale; }
 void n2sim_step(N2Sim *s, float dt)                                    /* 0x5b72d0 */
 {
+    dt *= g_time_scale;
     if (dt <= 0) return;
     if (dt > 0.1f) dt = 0.1f;
     s->in_dt = dt;
@@ -2928,6 +3420,7 @@ void n2sim_step(N2Sim *s, float dt)                                    /* 0x5b72
     if (s->mover == N2_MOVER_MELLO) { mello_frame(s, dt); return; }
     if (s->mover == N2_MOVER_NIS) { nis_frame(s, dt); return; }
     if (s->mover == N2_MOVER_TRAFFIC) { tm_frame(s, dt); return; }
+    if (s->mover == N2_MOVER_FAR) { far_frame(s, dt); return; }
     frame_setup(s, dt);
     int n = (int)(dt / HMIN) + 1;
     float h = dt / (float)n;
@@ -2937,10 +3430,13 @@ void n2sim_step(N2Sim *s, float dt)                                    /* 0x5b72
         substep(s, h);
         orthonormalize(s->b.R);
     }
+    {   float bsum = s->cs_bottom[0] + s->cs_bottom[1] + s->cs_bottom[2] + s->cs_bottom[3];
+        if (s->bottom_age < 8 && ++s->bottom_age > 4) s->bottom_latch = 0;   /* not taken for 4 steps: no drawn frame wants it */
+        if (bsum > s->bottom_latch) { s->bottom_latch = bsum; s->bottom_age = 0; } }
     /* 0x5a5540: publish to the car state */
     Body *b = &s->b;
-    s->cs_absv = len3(b->v);
-    s->cs_speed = b->v[0]*b->R[0] + b->v[1]*b->R[1] + b->v[2]*b->R[2];
+    s->cs_absv = len3xzy(b->v);
+    s->cs_speed = (b->v[2]*b->R[2] + b->v[1]*b->R[1]) + b->v[0]*b->R[0];
     int nw = 0;
     for (int i = 0; i < 4; i++) {
         s->cs_contact[i] = s->wh[i].contact;
@@ -2948,7 +3444,7 @@ void n2sim_step(N2Sim *s, float dt)                                    /* 0x5b72
         nw += s->wh[i].contact != 0;
     }
     s->cs_wheels = nw;
-    s->cs_head = (unsigned short)(int)lrintf(atan2f(b->R[1], b->R[0]) * RAD2U16);
+    s->cs_head = fast_atan(b->R[0], b->R[1]);   /* 0x5a562a */
     for (int i = 0; i < 3; i++) { s->cs_v[i] = b->v[i]; s->cs_w[i] = b->w[i]; }
     s->cs_yawacc = (b->w[2] - s->cs_wz_prev) / dt;                      /* 0x604740 */
     s->cs_wz_prev = b->w[2];
@@ -2980,7 +3476,7 @@ void n2sim_state(const N2Sim *s, N2State *o)
     o->engaged = s->mover != N2_MOVER_PHYSICS || s->d.state == 3;   /* 0x5a592b; MellowMover 0x5a2da1: 1 */
     o->vtop = s->vtop;
     o->mover = s->mover;
-    if (s->mover == N2_MOVER_MELLO || s->mover == N2_MOVER_TRAFFIC || s->mover == N2_MOVER_NIS) {
+    if (s->mover == N2_MOVER_MELLO || s->mover == N2_MOVER_TRAFFIC || s->mover == N2_MOVER_NIS || s->mover == N2_MOVER_FAR) {
         const Mello *m = &s->m;
         o->rpm = o->rpm_tach = m->rpm;
         o->throttle = m->thr;

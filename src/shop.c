@@ -9,6 +9,7 @@
 #include "vinyl.h"
 #include "n2sim.h"
 #include "profile.h"
+#include "pcsave.h"
 #include "career.h"
 #include "airace.h"
 #include "movie.h"
@@ -20,7 +21,7 @@
 #include <string.h>
 
 #ifdef __vita__
-#define SHOP_CACHE "ux0:data/OpenUG2/cache/shop_v32.bin"
+#define SHOP_CACHE "ux0:data/NFSU2/cache/shop_v32.bin"
 #else
 #define SHOP_CACHE "cache/shop_v33.bin"
 #endif
@@ -31,7 +32,7 @@
 enum { PK_CATEGORY, PK_PERFORMANCE, PK_PARTS, PK_RIMBRAND, PK_RIMS, PK_SPLASH, PK_MAIN, PK_LOADING,
        PK_QR_MODE, PK_QR_TRACK, PK_QR_OPTIONS, PK_QR_CAR, PK_OPT_MAIN, PK_OPTIONS, PK_CTL, PK_JUKE, PK_CREDITS, PK_PAINT, PK_PERF_PKG, PK_PERF_BUY,
        PK_VLAYER, PK_DECAL, PK_DECALOV, PK_DLG_S, PK_DLG_M, PK_DLG_L, PK_CHUD, PK_CHUDOV, PK_REP, PK_HELP_S, PK_HELP_M,
-       PK_PROFILE, PK_MC, PK_MC_LIST, PK_KEYBOARD, PK_START_CAREER, PK_CAREER_LOT, PK_CRIB, PK_CRIB_CARSEL, PK_CRIB_SPONSORS, PK_UNIQUE, PK_CRIB_WMAP, PK_MAG_REWARD, PK_MAG_BACK, PK_CRIB_REWARDS, PK_MAG_SELECT, PK_MAG_VIEW, PK_BRAND, PK_COUNT };
+       PK_PROFILE, PK_MC, PK_MC_LIST, PK_KEYBOARD, PK_START_CAREER, PK_CAREER_LOT, PK_CRIB, PK_CRIB_CARSEL, PK_CRIB_SPONSORS, PK_UNIQUE, PK_CRIB_WMAP, PK_MAG_REWARD, PK_MAG_BACK, PK_CRIB_REWARDS, PK_MAG_SELECT, PK_MAG_VIEW, PK_BRAND, PK_LOADING_CTL, PK_COUNT };
 static const char *const k_pk_name[PK_COUNT] = {
     "UI_ChooseCustomizeCategory.fng",       /* Car Shop, Body/Graphics/Specialties */
     "UI_ChoosePerformanceCategory.fng",     /* Performance Shop */
@@ -81,6 +82,7 @@ static const char *const k_pk_name[PK_COUNT] = {
     "UI_MagazineSelect.fng",                /* ... Show Magazines / Show DVDs (UIMagazineSelect, PC create 0x55b520) */
     "UI_MagazineView.fng",                  /* ... one saved cover photo (UIMagazineView, PC ctor 0x553be0) */
     "UI_PerformanceBrandSelect.fng",        /* Performance Shop: a bought part's brand (ChooseBrandsScreen 0x550330) */
+    "Loading_Controller.fng",               /* the console loading screen with the controls picture (GLOBALB, F1.11) */
 };
 
 /* One scroller entry: language hash, icon TPK key, what it opens. Both hashes
@@ -95,6 +97,16 @@ static const ShopEntry k_car_shop[CAT_COUNT] = {
     { 0xc6089ca7u, 0xdc99aafeu, 0 },   /* Change Paint / Vinyls       SHOP_ICON_GRAPHIC */
     { 0xc10d7979u, 0x3f40e75fu, 0 },   /* Change Interiors / Car Specialties SHOP_ICON_INTERIORS */
 };
+/* The crib's Change Parts (BeginCarCustomize entry 1): Setup__23ChooseCustomizeCategory
+   (GC 8016104c) adds the paint IconOption (type 2, 0xc6089ca7 / 0xdc99aafe) only when
+   the customize entry (803d84c8 +0x18 = DAT_803d84e0) != 1 (801611a0..801611b0), so the
+   crib shows Body / Performance / Specialties. The car-lot option (type 5, 0x7edc9715 /
+   0x8244f164) needs FEDatabase +0x125f0 == 0x100, the online mode UIQRCarSelect sets
+   (800dea84) -- never offline. */
+static const ShopEntry k_car_shop_crib[] = {
+    { 0xa92b4ae8u, 0xb802f10eu, 0 }, { 0xeca6b0ccu, 0xc56d3032u, 0 }, { 0xc10d7979u, 0x3f40e75fu, 0 },
+};
+static const int k_car_shop_crib_cat[] = { CAT_BODY, CAT_PERFORMANCE, CAT_SPECIALTIES };
 
 /* Part groups of the GLOBALB car part database (Nikki PartUnderground2). */
 enum { G_FRONT_BUMPER = 1, G_REAR_BUMPER = 2, G_LEFT_MIRROR = 30 /* WING_MIRROR */, G_WIDE_BODY = 6,
@@ -141,6 +153,15 @@ static const ShopEntry k_perf_shop_career[] = {
     { 0xa7886f38u, 0x9701bde4u, 2 }, { 0xabca6aefu, 0x06e8e477u, 8 },
     { 0xaa8959adu, 0xbaa23a28u, 6 }, { 0x758d5e3cu, 0xea57d2c4u, 0 },
     { 0xabd0ff14u, 0x06ef789cu, 4 },
+    { 0x8513f2c0u, 0x7a9b397au, PERF_TEST_TRACK },
+};
+/* Setup__23ChooseCustomizeCategory 8016104c: for customize entry 2 / 3 / 4 (BeginCarCustomize's
+   entry point, 803d84e0 -- 2 = the front end's Customize from UIQRCarSelect 800debfc; 1 the
+   crib's CCChangeParts 80304120, 0 a city shop) the Car Shop ends with the Test Track IconOption
+   (PerfMenuStartTuning: 0x34dc1bec -> 0x461a18ee -> BeginCarTuning(.., entry 2)) */
+static const ShopEntry k_car_shop_fe[] = {
+    { 0xa92b4ae8u, 0xb802f10eu, 0 }, { 0xeca6b0ccu, 0xc56d3032u, 0 },
+    { 0xc6089ca7u, 0xdc99aafeu, 0 }, { 0xc10d7979u, 0x3f40e75fu, 0 },
     { 0x8513f2c0u, 0x7a9b397au, PERF_TEST_TRACK },
 };
 /* a category's packages (0x556e60): label, icon, type -- 0 Choose
@@ -425,7 +446,7 @@ static const ShopEntry k_qr_modes[] = {
 #define O_QR_BADGE       0xb05dd708u   /* CarBadge: SECONDARY_LOGO_<type> */
 #define O_QR_FILTER      0x3e81de59u
 #define O_QR_RACE_MODE   0xa9205bd8u   /* the "Race Mode:" box */
-#define O_QR_CUSTOMIZE   0xa936c3a2u   /* help bar "Customize" (car select -> Car Shop: not ported) */
+#define O_QR_CUSTOMIZE   0xa936c3a2u   /* help bar "Customize" (Square: the Car Shop, entry 2) */
 #define O_QR_CUST_BTN    0x89782734u   /* its button icon */
 #define O_QR_MODE_BOX    0x2043aba0u   /* the race mode box's group */
 #define STR_QR_CUST_TITLE 0x61032ce5u  /* QR_TITLE_CUSTOMIZE "Customize Car Select" */
@@ -571,7 +592,7 @@ typedef struct { uint32_t hash; GLuint tex; int hide, geom; float x, y, w, h, al
 
 #define QR_NTYPE 11
 #define QR_MAX_TRACKS 64
-#define QR_MAX_CARS 40
+#define QR_MAX_CARS 64   /* the stock cars + 20 tuned slots (F2.4) */
 
 typedef struct {               /* one horizontal icon scroller */
     const ShopEntry *e; int n, sel;
@@ -631,6 +652,7 @@ struct Shop {
     FengAnim *alt_anim;
     int buy_after;                /* career_gate: the install after the buy */
     const unsigned char *cshop;   /* the engaged shop (PlayerCareerState +0x7df8): CC_MEGALOW's prices */
+    const unsigned char *fe_shop; /* the shop the front end is in (GetAmbientZone's 0x86344c), NULL none */
     int gfx_cancel;                          /* GFX_* the Square dialog cancels */
     float dim;                               /* a dialog's DIM over the screen, 0..1 */
     /* the Visual Rating box: installed / preview ratings and what they were taken from */
@@ -654,6 +676,8 @@ struct Shop {
     /* front end */
     Scroller main; int front_end, fe_action; float blink;
     char ls_line1[96], ls_line2[96], ls_line3[96];   /* PC_Loading text in place of "LOADING" (shop_loading_text) */
+    int ls_ctl;                        /* SC_LOADING shows Loading_Controller (shop_loading_pick) */
+    GLuint ls_pic; unsigned char ls_sig[64]; uint32_t ls_lab[14];   /* its Vita picture, what it was drawn for, the slots' labels */
     float text_dx, text_dy;            /* offset applied by text() (second loading line) */
     /* quick race */
     const unsigned char *trk; int ntrk;          /* GLOBALB 0x34201 records */
@@ -666,10 +690,12 @@ struct Shop {
     float map_wait; int map_ev, map_want; GLuint map_tex; float map_alpha;
     ShopCar cars[QR_MAX_CARS]; int ncars;
     short qr_car_list[QR_MAX_CARS]; int qr_ncar, qr_car_sel, qr_filter;
-    char qr_car_cur[32];
+    char qr_car_cur[32];       /* the car select's car: "<folder>", "<folder>#<slot>" a tuned one (F2.4) */
+    int qr_del;                /* F2.4: a tuned slot + 1 deleted, for shop_poll */
     int qr_car_pending; float qr_car_debounce;
     int qr_go;
     int qr_cust, cust_go;                        /* Customize Car Select (game mode 0x20), its accept */
+    int cust_qr;                                 /* cust_go from the Quick Race car select's Square (entry 2) */
     ObjOv ov[24]; int nov;                       /* draw_package's image overrides */
     unsigned char qr_rowobj[FENG_MAX_OBJ];       /* options: 1 a row object, 2 an arrow */
     uint32_t row_arrow;                          /* the rows' arrow texture */
@@ -779,7 +805,7 @@ struct Shop {
        setup's anim flags and its garage camera view */
     GLuint mag_tex[4]; int mag_flags, mag_cam_ok; float mag_cam[12];
     uint32_t mag_rig; char mag_env[16];
-    const unsigned char *mag_sc; int mag_shot;               /* the showcase on the cover, frames to its photo */
+    const unsigned char *mag_sc; int mag_shot, mag_leave;               /* the showcase on the cover, frames to its photo */
     Scroller crw; ShopEntry crw_e[3]; int crw_seen;          /* uiCribRewardOptionsMain */
     Scroller msel; ShopEntry msel_e[32]; int msel_mode, msel_seen;   /* UIMagazineSelect: 1 magazines, 2 DVDs */
     GLuint mview_tex; int mview_idx;                         /* UIMagazineView: the photo, its showcase */
@@ -815,8 +841,9 @@ static void movie_stop(Shop *s);
 
 static void load_strings(Shop *s) {
     char path[600];
-    snprintf(path, sizeof path, "%s/LANGUAGES/English.bin", s->dataroot);
+    n2_lang_path(path, sizeof path, s->dataroot);
     s->lang = n2_read_file(path, &s->langlen);
+    printf("shop: language %d %s (%s)\n", n2_lang(), k_n2_lang_name[n2_lang()], s->lang ? "loaded" : "MISSING");
     if (!s->lang) return;
     for (long o = 0; o + 8 <= s->langlen; ) {
         uint32_t id = n2_u32(s->lang + o), sz = n2_u32(s->lang + o + 4);
@@ -934,6 +961,48 @@ static int db_has_attr(const Shop *s, unsigned aoff, uint32_t key) {
         unsigned ai = p[2 + 2 * k] | p[3 + 2 * k] << 8;
         if (n2_u32(s->db + s->db_attr + ai * 8L) == key) return 1;
     }
+    return 0;
+}
+
+/* 0x610020: the models that honour EXCLUDE_UG1 (MIATA GOLF RSX RWX 350Z
+   240SX CIVIC FOCUS PEUGOT SUPRA TIBURON CELICA ECLIPSE SENTRA SKYLINE) */
+static int rr_model_ug1(uint32_t m) {
+    static const uint32_t t[] = { 0x3455d6bu, 0x163087u, 0xdb7cu, 0xdc00u, 0xac6d1u, 0x150fb80u, 0x290c04du, 0x2ca04dfu,
+                                  0x72b2e513u, 0x3b8c48au, 0x4fd0522u, 0x545aec60u, 0x7502da84u, 0x79aebfecu, 0xbe48375eu };
+    for (unsigned i = 0; i < sizeof t / sizeof *t; i++) if (t[i] == m) return 1;
+    return 0;
+}
+/* 0x6100a0: the models that honour EXCLUDE_UG2 (IS300 GTO A3 TT G35 RWY
+   CORSA PEUGOT106 LANCEREVO8 3000GT MUSTANGGT IMPREZAWRX COROLLA) */
+static int rr_model_ug2(uint32_t m) {
+    static const uint32_t t[] = { 0x30236eeu, 0xacc9u, 0x453u, 0x6e7u, 0xa86eu, 0xdc01u, 0x293fad7u,
+                                  0x4b10070au, 0x9d2eff6u, 0x2d7c9b5du, 0x35165819u, 0xcf4458f8u, 0xf77c13ebu };
+    for (unsigned i = 0; i < sizeof t / sizeof *t; i++) if (t[i] == m) return 1;
+    return 0;
+}
+/* the value of attribute `key` (0 when absent), as GetCarPartDirect reads it */
+static uint32_t db_attr_u(const Shop *s, unsigned aoff, uint32_t key) {
+    if (aoff == 0xffffu || !s->db_off || !s->db_attr) return 0;
+    const unsigned char *p = s->db + s->db_off + aoff * 2L;
+    unsigned n = p[0] | p[1] << 8;
+    for (unsigned k = 0; k < n && k < 64; k++) {
+        unsigned ai = p[2 + 2 * k] | p[3 + 2 * k] << 8;
+        if (n2_u32(s->db + s->db_attr + ai * 8L) == key) return n2_u32(s->db + s->db_attr + ai * 8L + 4);
+    }
+    return 0;
+}
+/* GetCarPartDirect 0x61b670's exclusion of a part record, by its model:
+   EXCLUDE_UG1 for 0x610020's models, EXCLUDE_UG2 for 0x6100a0's,
+   EXCLUDE_SUV for the SUVs' own models (NAVIGATOR, HUMMER, ESCALADE); the
+   generic libraries are never excluded. Every Customize list goes through
+   it (GetPartsList 8015e1d4 / the browsers: NewGetFirstCarPart -> NewGetCarPart). */
+static int part_excluded(const Shop *s, const unsigned char *r) {
+    if (r[7] >= s->nmodels) return 0;
+    uint32_t m = n2_u32(s->db + s->db_models + 4L * r[7]);
+    unsigned aoff = r[10] | r[11] << 8;
+    if (rr_model_ug1(m) && db_attr_u(s, aoff, 0xF7934315u)) return 1;   /* EXCLUDE_UG1 */
+    if (rr_model_ug2(m) && db_attr_u(s, aoff, 0xF7934316u)) return 1;   /* EXCLUDE_UG2 */
+    if ((m == 0x0219c94au || m == 0x6126dd4du || m == 0xcf704771u) && db_attr_u(s, aoff, 0xF7933C86u)) return 1;   /* EXCLUDE_SUV */
     return 0;
 }
 
@@ -1106,8 +1175,11 @@ static int part_to_buy(const Shop *s, const ShopPart *q) {
 }
 
 /* The part list for one Body Shop group, in database order: the car's own
-   parts, then the shared libraries. Parts the game excludes from UG2
-   (EXCLUDE_UG2) are left out; parts we cannot fit stay listed but locked. */
+   parts, then the shared libraries. GetPartsList 8015e1d4 walks
+   NewGetFirstCarPart / Next, so GetCarPartDirect's per-model exclusions
+   apply (part_excluded: a UG1-list car drops its EXCLUDE_UG1 kits, a
+   UG2-list car its EXCLUDE_UG2 kits and lights); parts we cannot fit stay
+   listed but locked. */
 static void build_parts(Shop *s, int group) {
     s->nparts = 0; s->part_sel = 0; s->part_group = group;
     int slot = group_slot(group), row = group_price_row(group);
@@ -1115,7 +1187,6 @@ static void build_parts(Shop *s, int group) {
     static const char *const libs[] = { NULL, "SPOILER", "SPOILER_HATCH", "SPOILER_SUV", "EXHAUST", "ROOF",
                                         "MIRRORS_BODY", "MIRRORS_POST", "MIRRORS_SUV", "MIRRORS_HUMMER" };
     int models[6], nm = 0, hidden = 0;
-    int suv = !strcmp(s->car, "ESCALADE") || !strcmp(s->car, "HUMMER") || !strcmp(s->car, "NAVIGATOR");
     models[nm++] = db_model(s, s->car);
     for (int l = 1; l <= 5; l++) {
         if ((group == G_SPOILER && l <= 3) || (group == G_EXHAUST && l == 4) ||
@@ -1132,10 +1203,9 @@ static void build_parts(Shop *s, int group) {
             unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
             if (!hash && !soff) break;
             if (model != models[mi] || grp != group) continue;
-            if (db_has_attr(s, aoff, 0xF7934316u)) continue;      /* EXCLUDE_UG2 */
+            if (part_excluded(s, r)) continue;      /* EXCLUDE_UG1 / UG2 / SUV by model (0x61b670) */
             if (db_has_attr(s, aoff, 0x721AFF7Cu) != (s->cf_mode != 0)) continue;   /* CARBONFIBRE: the Carbon Fiber menu */
             if (group == G_HOOD && (upg & 0x1f) == 5) continue;   /* split hoods: Car Specialties (0x539960) */
-            if (suv && db_has_attr(s, aoff, 0xF7933C86u)) continue;   /* EXCLUDE_SUV */
             if (s->nparts >= SHOP_MAX_PARTS) break;
             ShopPart *q = &s->parts[s->nparts];
             const char *nmstr = s->db_str ? (const char *)s->db + s->db_str + soff * 4L : "?";
@@ -1326,7 +1396,7 @@ static void build_rims(Shop *s, int b) {
                     brand = n2_u32(s->db + s->db_attr + ai * 8L + 4);
             }
         }
-        if (brand != r->key || db_has_attr(s, aoff, 0xF7934316u)) continue;
+        if (brand != r->key || part_excluded(s, rec)) continue;
         int style, inner, outer;
         if (!rim_part_parse(r->folder, hash, &style, &inner, &outer)) continue;
         if (rim_outer && outer != rim_outer) continue;
@@ -1350,9 +1420,13 @@ static void build_rims(Shop *s, int b) {
         part_cost(s, q, 13, lvl, hash);
         q->available = 1;
     }
-    /* IsRimAvailable 8015e9a0: a style stays when one of its size parts is
-       open (level 0, owned or unlocked); the style row prices / owns the
-       fitted size when it is this style, else the first size (rim_preview's) */
+    /* IsRimAvailable 8015e9a0 is per part: brand attr 0xebb03e66 == the brand,
+       outer size attr 0xce7d8db5 == the car type's +0xdc, and
+       IsPartAvailable(slot 0x1d -> entity 13); or level (+5 >> 5) 0 of the
+       STOCK brand 0x3b83203. GetPartsList 8015e428 puts every such part in
+       the list, so a style has a row as soon as one of its sizes passes
+       (CONFIRMED G5 11-01). The style row prices / owns the fitted size when
+       it is this style, else the first size (rim_preview's) */
     int kept = 0;
     for (int k = 0; k < s->nparts; k++) {
         int open = 0;
@@ -1640,35 +1714,53 @@ static void help_bar_lift(FengPackage *pk) {
     }
 }
 
+/* Streamed: the packages part read whole, then one texture at a time
+   through one reused buffer -- never the whole ~19 MB file in memory (the
+   boot opens this beside the world load). */
 static int load_cache(Shop *s) {
-    long len = 0;
-    unsigned char *d = n2_read_file(SHOP_CACHE, &len);
-    if (!d || len < 16 || memcmp(d, "OUSHOP02", 8)) { free(d); return 0; }
-    long o = 8;
-    uint32_t npk = n2_u32(d + o); o += 4;
-    long bun = o;
-    for (uint32_t i = 0; i < npk && o + 8 <= len; i++) o += 8 + (long)n2_u32(d + o + 4);
-    long bunlen = o - bun;
+    FILE *f = fopen(SHOP_CACHE, "rb");
+    if (!f) return 0;
+    unsigned char h[12];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "OUSHOP02", 8)) { fclose(f); return 0; }
+    uint32_t npk = n2_u32(h + 8);
+    long bunlen = 0;
+    for (uint32_t i = 0; i < npk; i++) {   /* the packages' extent */
+        unsigned char c[8];
+        if (fseek(f, 12 + bunlen, SEEK_SET) || fread(c, 1, 8, f) != 8) break;
+        bunlen += 8 + (long)n2_u32(c + 4);
+    }
+    unsigned char *bun = (unsigned char *)malloc((size_t)(bunlen ? bunlen : 1));
+    if (!bun || fseek(f, 12, SEEK_SET) || fread(bun, 1, (size_t)bunlen, f) != (size_t)bunlen) {
+        free(bun); fclose(f); return 0;
+    }
     for (int i = 0; i < PK_COUNT; i++) {
         s->pk[i] = (FengPackage *)malloc(sizeof *s->pk[i]);
-        if (s->pk[i] && !feng_load_package(d + bun, bunlen, k_pk_name[i], s->pk[i])) {
+        if (s->pk[i] && !feng_load_package(bun, bunlen, k_pk_name[i], s->pk[i])) {
             free(s->pk[i]); s->pk[i] = NULL;
         }
         if (s->pk[i]) help_bar_lift(s->pk[i]);
     }
-    uint32_t nt = o + 4 <= len ? n2_u32(d + o) : 0; o += 4;
+    free(bun);
+    unsigned char c[12];
+    uint32_t nt = fread(c, 1, 4, f) == 4 ? n2_u32(c) : 0;
     s->tex = (ShopTex *)calloc(nt ? nt : 1, sizeof *s->tex);
-    for (uint32_t i = 0; s->tex && i < nt && o + 12 <= len; i++) {
-        uint32_t key = n2_u32(d + o), wh = n2_u32(d + o + 4), bl = n2_u32(d + o + 8);
+    unsigned char *px = NULL; size_t cap = 0;
+    for (uint32_t i = 0; s->tex && i < nt && fread(c, 1, 12, f) == 12; i++) {
+        uint32_t key = n2_u32(c), wh = n2_u32(c + 4), bl = n2_u32(c + 8);
         int w = (int)(wh & 0xffff), h = (int)(wh >> 16);
-        o += 12;
-        if (o + (long)w * h * 4 > len) break;
+        size_t n = (size_t)w * h * 4;
+        if (n > cap) {
+            unsigned char *np = (unsigned char *)realloc(px, n);
+            if (!np) break;
+            px = np; cap = n;
+        }
+        if (fread(px, 1, n, f) != n) break;
         ShopTex *t = &s->tex[s->ntex++];
         t->key = key; t->w = w; t->h = h; t->additive = bl == 6;
-        t->tex = upload_rgba(w, h, d + o);
-        o += (long)w * h * 4;
+        t->tex = upload_rgba(w, h, px);
     }
-    free(d);
+    free(px);
+    fclose(f);
     return s->pk[PK_CATEGORY] && s->pk[PK_PARTS];
 }
 
@@ -1754,7 +1846,7 @@ enum { DA_NONE, DA_PAINT_ADD, DA_PART, DA_RIM, DA_PERF_PKG, DA_PERF_STOCK, DA_PE
        DA_LOT_BUY, DA_LOT_TRADE, DA_LOT_BROWSE, DA_LOT_EXIT,
        DA_CRIB_PLAY, DA_CRIB_MAIN, DA_CRIB_TEST, DA_CRIB_SWITCH,
        DA_PART_BUY, DA_RIM_BUY, DA_SHOP_LEAVE, DA_PERF_PKG_BUY, DA_PERF_PART_BUY, DA_GEN_BUY,
-       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
+       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_MAG_SAVE, DA_MAG_NOSAVE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY, DA_QR_DELETE };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
 static void dlg_act(Shop *s, int act);
 static void dialog(Shop *s, int pk, int nbtn, uint32_t msg, int act, uint32_t b1, uint32_t b2);
 /* PartSelectionScreen 801615f8 in the career: a part to buy -- too little
@@ -1867,17 +1959,23 @@ static void prepare_package(Shop *s, int p) {
             for (int k = 0; k < 4; k++) c[k] *= pk->obj[q].rgba[k];
         memcpy(s->rgba[p][i], c, sizeof c);
         if (o->type == FENG_GROUP) continue;
-        /* mode-specific objects (flag 0x80000000, also via a parent group)
-           are shown only by scripts for other modes */
-        int hidden = 0;
-        for (int q = i; q >= 0; q = pk->obj[q].parent) if (pk->obj[q].flags & 0x80000000u) hidden = 1;
+        /* hidden: the object's own bit 0 only (cFEng::RenderObject 0x51c670;
+           RenderGroup 0x52c5d0 tests no group hide bit, and bit 31 never
+           hides in the game: feng.c feng_anim_init). A group's alpha 0 is in c. */
+        int hidden = (o->flags & 1u) != 0;
+        /* PC_Loading's keyboard controls group (af4a85eb, "Steering (left)"
+           .. "Esc" / "E" / "Q"): no code touches it, so the PC shows it.
+           GUESS: kept hidden on the Vita -- PC_Loading is PC-only and these
+           are keyboard keys the Vita does not have (GAPS "F") */
+        if (p == PK_LOADING)
+            for (int q = o->parent; q >= 0; q = pk->obj[q].parent) if (pk->obj[q].hash == 0xaf4a85ebu) hidden = 1;
         if (o->hash == O_PRESS_START) { c[3] = 1.0f; memcpy(s->rgba[p][i], c, sizeof c); }
         /* PC_Loading's circles are authored invisible: the script fades
            them in turn, which draw_package does in code */
-        if (p == PK_LOADING && o->hash >= 0x50d98304u && o->hash <= 0x50d98308u) {
+        if ((p == PK_LOADING && o->hash >= 0x50d98304u && o->hash <= 0x50d98308u) ||
+            (p == PK_LOADING_CTL && o->hash >= 0x50d98305u && o->hash <= 0x50d98309u)) {
             c[3] = 1.0f; memcpy(s->rgba[p][i], c, sizeof c);
         }
-        if (p == PK_MAG_VIEW && o->hash == 0xd1cc9c37u) hidden = 0;   /* MagImage: FEngSetVisible once loaded */
         if (hidden || c[3] <= 0.0f) continue;
         /* pools and templates the code clones sit far off screen; the cover
            screens' U2_magazine_texture masks are centred off it but reach in */
@@ -1922,6 +2020,7 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
     }
     load_strings(s);
     load_fonts(s);
+    for (int p = 0; p < PK_COUNT; p++) feng_apply_labels(s->pk[p], s->str_hash, s->str_txt, s->nstr, 0);   /* FEString labels */
     for (int p = 0; p < PK_COUNT; p++) prepare_package(s, p);
     load_db(s);
     if (s->db) vinyl_db_load(s->db, s->dblen);
@@ -1944,7 +2043,7 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
         glBufferData(GL_ARRAY_BUFFER, QMAX * 4 * 5 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
     }
     make_program(s);
-    scroller_set(&s->top, k_car_shop, CAT_COUNT);
+    scroller_set(&s->top, k_car_shop_fe, NELEM(k_car_shop_fe));   /* the front end's (entry 2); career resets it */
     scroller_set(&s->body, k_body_shop, N_BODY);
     snprintf(s->rim_folder, sizeof s->rim_folder, "%s", rim_folder ? rim_folder : STOCK_RIM_FOLDER);
     s->rim_style = rim_style;
@@ -1959,6 +2058,8 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
    front end (16 MB cache, the part database) took 2-3 s to open just to
    show it at every track switch. Read from the same cache, seeking past
    every other package's pixels; kept by the caller for the session. */
+#define LS_CTL_NRES 12               /* Loading_Controller's resources (11) */
+#define LS_CTL_PIC_KEY 0x42226734u   /* its PS2 pad picture: the Vita one is drawn */
 static int load_cache_loading(Shop *s) {
     FILE *f = fopen(SHOP_CACHE, "rb");
     if (!f) return 0;
@@ -1975,16 +2076,19 @@ static int load_cache_loading(Shop *s) {
         }
         bun = (unsigned char *)malloc((size_t)(bunlen ? bunlen : 1));
         if (bun && !fseek(f, at, SEEK_SET) && fread(bun, 1, (size_t)bunlen, f) == (size_t)bunlen) {
-            s->pk[PK_LOADING] = (FengPackage *)malloc(sizeof *s->pk[PK_LOADING]);
-            if (s->pk[PK_LOADING] && !feng_load_package(bun, bunlen, k_pk_name[PK_LOADING], s->pk[PK_LOADING])) {
-                free(s->pk[PK_LOADING]); s->pk[PK_LOADING] = NULL;
+            static const int lp[2] = { PK_LOADING, PK_LOADING_CTL };   /* the console one: caches from before F1.11 lack it */
+            for (int k = 0; k < 2; k++) {
+                s->pk[lp[k]] = (FengPackage *)malloc(sizeof *s->pk[lp[k]]);
+                if (s->pk[lp[k]] && !feng_load_package(bun, bunlen, k_pk_name[lp[k]], s->pk[lp[k]])) {
+                    free(s->pk[lp[k]]); s->pk[lp[k]] = NULL;
+                }
             }
         }
-        const FengPackage *pk = s->pk[PK_LOADING];
+        const FengPackage *pk = s->pk[PK_LOADING], *pk2 = s->pk[PK_LOADING_CTL];
         unsigned char c[12];
         if (pk && !fseek(f, at + bunlen, SEEK_SET) && fread(c, 1, 4, f) == 4) {
             uint32_t nt = n2_u32(c);
-            s->tex = (ShopTex *)calloc((size_t)pk->nres + 1, sizeof *s->tex);
+            s->tex = (ShopTex *)calloc((size_t)pk->nres + LS_CTL_NRES + 1, sizeof *s->tex);
             long o = at + bunlen + 4;
             for (uint32_t i = 0; s->tex && i < nt && !fseek(f, o, SEEK_SET) && fread(c, 1, 12, f) == 12; i++) {
                 uint32_t key = n2_u32(c), wh = n2_u32(c + 4), bl = n2_u32(c + 8);
@@ -1994,7 +2098,9 @@ static int load_cache_loading(Shop *s) {
                 int want = 0;
                 for (int r = 0; r < pk->nres && !want; r++)
                     want = pk->res[r].type == 1 && feng_tex_key(pk->res[r].name) == key;
-                if (!want || s->ntex >= pk->nres) continue;
+                for (int r = 0; pk2 && r < pk2->nres && !want; r++)
+                    want = pk2->res[r].type == 1 && feng_tex_key(pk2->res[r].name) == key && key != LS_CTL_PIC_KEY;
+                if (!want || s->ntex >= pk->nres + LS_CTL_NRES) continue;
                 unsigned char *rgba = (unsigned char *)malloc((size_t)(px ? px : 1));
                 if (rgba && fread(rgba, 1, (size_t)px, f) == (size_t)px) {
                     ShopTex *t = &s->tex[s->ntex++];
@@ -2010,6 +2116,354 @@ static int load_cache_loading(Shop *s) {
     fclose(f);
     return ok;
 }
+/* ---------------------------------------------- F1.11 controls loading screen
+
+   The console loading screen (GC ShowLoadingScreen 80104b30): game mode 1
+   (career) picks Loading.fng or Loading_Controller.fng by bRandom(2), mode 8
+   Loading.fng, every other mode Loading_Controller.fng. Its ctor 80102cbc:
+   HideControllerConfig 80102fa4 (the picture 922a39c4, CButton_1..14 and the
+   tip be813131 -- DisplayGameTip 801030bc is an empty stub, so the tip never
+   shows), PrepToShowControllerConfig 801030c0 streams the platform's pad
+   picture (PS2 Loading_controller_ps2, GC 0x302059b8, PC
+   "LOADING_CONTROLLER_PC") and its callback ShowLoadingTip 80102f40 runs
+   SetupControllerConfig 80102dd8: CButton_%d (1..14) gets the language hash
+   of what its button does (FindButtonNameHashForFEString, table GC
+   0x8035e2c8), hidden when 0; outside the career World Map / SMS / Career
+   Statistics / Enter Shop read "Not Used" (0xf8b4303b).
+   The Vita has no picture in the game: ours is drawn here in the pad
+   pictures' style (DYNTEX: the device on a clear ground, light leader lines
+   from each control out to the 7 left / 7 right label heights). The labels
+   are the GC table's 14 actions, from g_opt's live bindings, each in the slot
+   nearest its control. GUESS: the art (no Vita art exists) and the rear
+   touch inset (the shift / hydraulics corners sit behind the device). */
+#define LSC_N 14
+#define LSC_W 256
+static const uint32_t k_lsc_obj[LSC_N] = {   /* CButton_1..7 (left, top down), CButton_8..14 (right) */
+    0xbaa4198eu, 0xbaa4198fu, 0xbaa41990u, 0xbaa41991u, 0xbaa41992u, 0xbaa41993u, 0xbaa41994u,
+    0xbaa41995u, 0xbaa41996u, 0x0f274b7eu, 0x0f274b7fu, 0x0f274b80u, 0x0f274b81u, 0x0f274b82u };
+static const struct { int act; uint32_t str; int career; } k_lsc_act[LSC_N] = {   /* the GC table's labels */
+    { OPT_ACT_STEER_L, 0xecd20f7fu, 0 },      /* Steer */
+    { OPT_ACT_THROTTLE, 0x619b23b0u, 0 },     /* Accelerate */
+    { OPT_ACT_BACK, 0x6ab80afau, 0 },         /* Brake / Reverse */
+    { OPT_ACT_HANDBRAKE, 0xb70ff4a4u, 0 },    /* Handbrake */
+    { OPT_ACT_NITROUS, 0x5e5c5f2eu, 0 },      /* Nitrous */
+    { OPT_ACT_SHIFT_UP, 0xdc1cd97du, 0 },     /* Shift Up */
+    { OPT_ACT_SHIFT_DOWN, 0x56afe190u, 0 },   /* Shift Down */
+    { OPT_ACT_CAMERA, 0xd38df194u, 0 },       /* Change Camera */
+    { OPT_ACT_LOOK_BACK, 0x13121940u, 0 },    /* Look Back */
+    { OPT_ACT_RESET, 0x1cedc132u, 0 },        /* Reset Car */
+    { OPT_ACT_ENGAGE, 0xab1032fau, 1 },       /* Enter Shop/Challenge */
+    { OPT_ACT_WORLD_MAP, 0x6026c91fu, 1 },    /* World Map */
+    { OPT_ACT_READ_SMS, 0x6ef09d0du, 1 },     /* Display SMS */
+    { OPT_ACT_CAREER_STATS, 0x70a30056u, 1 }, /* Career Statistics */
+};
+#define LSC_NOT_USED 0xf8b4303bu
+
+/* the controls, in picture pixels (body centre 128, 131) */
+static void lsc_anchor(int vb, float *x, float *y) {
+    static const float a[VB_COUNT][2] = {
+        { 0, 0 },
+        { 216, 124 }, { 226, 114 }, { 206, 114 }, { 216, 104 },   /* cross circle square triangle */
+        { 40, 80 }, { 216, 80 },                                   /* L R */
+        { 40, 105 }, { 40, 123 }, { 31, 114 }, { 49, 114 },        /* d-pad */
+        { 222, 166 }, { 207, 166 },                                /* start select */
+        { 54, 146 }, { 54, 146 },                                  /* left stick */
+        { 114, 211 }, { 142, 211 }, { 114, 223 }, { 142, 223 },    /* rear touch corners (inset) */
+    };
+    *x = a[vb][0]; *y = a[vb][1];
+}
+
+typedef struct { int k; float a, b, c, d, e, w; } LscShp;   /* 0 rrect (cx cy hw hh r; w > 0: its outline), 1 segment (x0 y0 x1 y1, half width w) */
+static float lsc_sd(const LscShp *q, float x, float y) {
+    if (q->k == 0) {
+        float r = q->e, qx = fabsf(x - q->a) - (q->c - r), qy = fabsf(y - q->b) - (q->d - r);
+        float ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0, in = qx > qy ? qx : qy;
+        float d = sqrtf(ox * ox + oy * oy) + (in < 0 ? in : 0) - r;
+        return q->w > 0 ? fabsf(d) - q->w : d;
+    }
+    float px = x - q->a, py = y - q->b, vx = q->c - q->a, vy = q->d - q->b;
+    float l2 = vx * vx + vy * vy, t = l2 > 0 ? (px * vx + py * vy) / l2 : 0;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    float dx = px - vx * t, dy = py - vy * t;
+    return sqrtf(dx * dx + dy * dy) - q->w;
+}
+/* one shape over the premultiplied canvas: colour c0 at its top, c1 at its bottom */
+static void lsc_paint(float *cv, LscShp q, uint32_t c0, uint32_t c1, float alpha) {
+    float x0, y0, x1, y1, m = q.w + 1.5f;
+    if (q.k == 0) { x0 = q.a - q.c; x1 = q.a + q.c; y0 = q.b - q.d; y1 = q.b + q.d; }
+    else { x0 = fminf(q.a, q.c); x1 = fmaxf(q.a, q.c); y0 = fminf(q.b, q.d); y1 = fmaxf(q.b, q.d); }
+    int ix0 = (int)floorf(x0 - m), ix1 = (int)ceilf(x1 + m), iy0 = (int)floorf(y0 - m), iy1 = (int)ceilf(y1 + m);
+    if (ix0 < 0) ix0 = 0;
+    if (iy0 < 0) iy0 = 0;
+    if (ix1 > LSC_W - 1) ix1 = LSC_W - 1;
+    if (iy1 > LSC_W - 1) iy1 = LSC_W - 1;
+    float h = y1 - y0 > 0 ? y1 - y0 : 1;
+    for (int y = iy0; y <= iy1; y++) {
+        float t = ((float)y + 0.5f - y0) / h;
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        float col[3];
+        for (int k = 0; k < 3; k++) {
+            float a = (float)(c0 >> (16 - 8 * k) & 255), b = (float)(c1 >> (16 - 8 * k) & 255);
+            col[k] = (a + (b - a) * t) / 255.0f;
+        }
+        for (int x = ix0; x <= ix1; x++) {
+            float cov = 0.5f - lsc_sd(&q, (float)x + 0.5f, (float)y + 0.5f);
+            if (cov <= 0) continue;
+            if (cov > 1) cov = 1;
+            float a = cov * alpha, *p = cv + ((size_t)y * LSC_W + x) * 4;
+            for (int k = 0; k < 3; k++) p[k] = col[k] * a + p[k] * (1 - a);
+            p[3] = a + p[3] * (1 - a);
+        }
+    }
+}
+static LscShp lsc_rr(float cx, float cy, float hw, float hh, float r) { LscShp q = { 0, cx, cy, hw, hh, r, 0 }; return q; }
+static LscShp lsc_rro(float cx, float cy, float hw, float hh, float r, float w) { LscShp q = { 0, cx, cy, hw, hh, r, w }; return q; }
+static LscShp lsc_seg(float x0, float y0, float x1, float y1, float w) { LscShp q = { 1, x0, y0, x1, y1, 0, w }; return q; }
+#define LSC_C(cx, cy, r) lsc_rr(cx, cy, r, r, r)
+
+static void lsc_face(float *cv, float cx, float cy, int sym) {
+    static const uint32_t col[4] = { 0x5ae0a8u, 0xff6a6au, 0x78a8ffu, 0xf08ad8u };   /* triangle circle cross square */
+    lsc_paint(cv, LSC_C(cx, cy, 5.6f), 0x4a4a50u, 0x2a2a2eu, 1);
+    lsc_paint(cv, lsc_rro(cx, cy, 5.6f, 5.6f, 5.6f, 0.5f), 0x9a9aa0u, 0x9a9aa0u, 1);
+    uint32_t c = col[sym];
+    float w = 0.6f;
+    if (sym == 0) {
+        lsc_paint(cv, lsc_seg(cx, cy - 2.8f, cx - 2.6f, cy + 1.8f, w), c, c, 1);
+        lsc_paint(cv, lsc_seg(cx, cy - 2.8f, cx + 2.6f, cy + 1.8f, w), c, c, 1);
+        lsc_paint(cv, lsc_seg(cx - 2.6f, cy + 1.8f, cx + 2.6f, cy + 1.8f, w), c, c, 1);
+    } else if (sym == 1) lsc_paint(cv, lsc_rro(cx, cy, 2.7f, 2.7f, 2.7f, w), c, c, 1);
+    else if (sym == 2) {
+        lsc_paint(cv, lsc_seg(cx - 2.4f, cy - 2.4f, cx + 2.4f, cy + 2.4f, w), c, c, 1);
+        lsc_paint(cv, lsc_seg(cx - 2.4f, cy + 2.4f, cx + 2.4f, cy - 2.4f, w), c, c, 1);
+    } else lsc_paint(cv, lsc_rro(cx, cy, 2.4f, 2.4f, 0.3f, w), c, c, 1);
+}
+static void lsc_stick(float *cv, float cx, float cy) {
+    lsc_paint(cv, LSC_C(cx, cy, 9.0f), 0x121214u, 0x121214u, 1);
+    lsc_paint(cv, LSC_C(cx, cy, 6.8f), 0x5a5a60u, 0x2e2e32u, 1);
+    lsc_paint(cv, lsc_rro(cx, cy, 6.8f, 6.8f, 6.8f, 0.5f), 0x8a8a90u, 0x8a8a90u, 1);
+}
+static void lsc_device(float *cv) {
+    /* rear touch inset: the back of the device, under it, in quarters */
+    lsc_paint(cv, lsc_rr(128, 217, 46, 20, 18), 0x26262au, 0x1c1c1eu, 0.95f);
+    lsc_paint(cv, lsc_rro(128, 217, 46, 20, 18, 0.6f), 0x8a8a90u, 0x6a6a70u, 1);
+    lsc_paint(cv, lsc_rr(128, 217, 30, 12, 2), 0x3c3c42u, 0x34343au, 1);
+    lsc_paint(cv, lsc_rro(128, 217, 30, 12, 2, 0.5f), 0x7a7a80u, 0x7a7a80u, 1);
+    lsc_paint(cv, lsc_seg(128, 205, 128, 229, 0.4f), 0x6a6a70u, 0x6a6a70u, 1);
+    lsc_paint(cv, lsc_seg(98, 217, 158, 217, 0.4f), 0x6a6a70u, 0x6a6a70u, 1);
+    /* shoulders, then the body over them */
+    lsc_paint(cv, lsc_rr(40, 81, 22, 4.5f, 4.5f), 0x9a9aa0u, 0x6a6a70u, 1);
+    lsc_paint(cv, lsc_rr(216, 81, 22, 4.5f, 4.5f), 0x9a9aa0u, 0x6a6a70u, 1);
+    lsc_paint(cv, lsc_rr(128, 131, 118, 50, 44), 0x3a3a40u, 0x1c1c20u, 1);
+    lsc_paint(cv, lsc_rro(128, 131, 118, 50, 44, 0.8f), 0xc8c8ceu, 0x8a8a90u, 1);
+    /* screen */
+    lsc_paint(cv, lsc_rr(128, 131, 61, 36, 3), 0x0c0c10u, 0x050507u, 1);
+    lsc_paint(cv, lsc_rro(128, 131, 61, 36, 3, 0.5f), 0x56565cu, 0x56565cu, 1);
+    lsc_paint(cv, lsc_rr(128, 115, 58, 18, 2), 0x2a2a34u, 0x0c0c10u, 0.35f);   /* glare */
+    /* d-pad */
+    lsc_paint(cv, lsc_rr(40, 114, 3.8f, 11, 1.2f), 0x8a8a90u, 0x6a6a70u, 1);
+    lsc_paint(cv, lsc_rr(40, 114, 11, 3.8f, 1.2f), 0x8a8a90u, 0x6a6a70u, 1);
+    lsc_paint(cv, LSC_C(40, 114, 2.0f), 0x5a5a60u, 0x5a5a60u, 1);
+    /* face buttons */
+    lsc_face(cv, 216, 104, 0); lsc_face(cv, 226, 114, 1); lsc_face(cv, 216, 124, 2); lsc_face(cv, 206, 114, 3);
+    /* sticks, PS button, select / start */
+    lsc_stick(cv, 54, 146); lsc_stick(cv, 202, 146);
+    lsc_paint(cv, LSC_C(32, 164, 3.2f), 0x7a7a80u, 0x5a5a60u, 1);
+    lsc_paint(cv, lsc_rr(207, 166, 4.5f, 2.0f, 2.0f), 0x8a8a90u, 0x6a6a70u, 1);
+    lsc_paint(cv, lsc_rr(222, 166, 4.5f, 2.0f, 2.0f), 0x8a8a90u, 0x6a6a70u, 1);
+}
+
+/* slot_y: picture y of the 7 left + 7 right labels; vb[i]: the control
+   (VB_*) of k_lsc_act[i], 0 none. Out: lab[slot] = k_lsc_act index + 1,
+   0 an empty slot. */
+/* The device art from a file when there is one: 256x256 straight-alpha RGBA
+   (loading_controller.raw, made from img/loading_controller.png by
+   tools/lsc_png.py at build time). ux0:data/NFSU2 first (art tests without
+   a reinstall), then the app's own copy. 0 = none: drawn by lsc_device. */
+static int lsc_device_file(float *cv) {
+    static const char *const k_path[2] = { "ux0:data/NFSU2/loading_controller.raw", "app0:assets/loading_controller.raw" };
+    const size_t n = (size_t)LSC_W * LSC_W * 4;
+    for (int k = 0; k < 2; k++) {
+        FILE *f = fopen(k_path[k], "rb");
+        if (!f) continue;
+        unsigned char *px = (unsigned char *)malloc(n);
+        int ok = px && fread(px, 1, n, f) == n;
+        fclose(f);
+        if (ok) {
+            for (size_t i = 0; i < (size_t)LSC_W * LSC_W; i++) {   /* to premultiplied */
+                float a = px[i * 4 + 3] / 255.0f;
+                for (int c = 0; c < 3; c++) cv[i * 4 + c] = px[i * 4 + c] / 255.0f * a;
+                cv[i * 4 + 3] = a;
+            }
+            free(px);
+            return 1;
+        }
+        free(px);
+        printf("shop: %s is not 256x256 RGBA, ignored\n", k_path[k]);
+    }
+    return 0;
+}
+static void lsc_build(unsigned char *rgba, const float *slot_y, const int *vb, int *lab) {
+    float *cv = (float *)calloc((size_t)LSC_W * LSC_W * 4, sizeof(float));
+    for (int i = 0; i < LSC_N; i++) lab[i] = 0;
+    if (!cv) { memset(rgba, 0, (size_t)LSC_W * LSC_W * 4); return; }
+    if (!lsc_device_file(cv)) lsc_device(cv);
+    if (getenv("OPENUG2_LSC_DUMP")) {   /* tools: the device layer + the label rows, for the art template */
+        FILE *df = fopen(getenv("OPENUG2_LSC_DUMP"), "wb");
+        if (df) {
+            for (size_t i = 0; i < (size_t)LSC_W * LSC_W; i++) {
+                float a = cv[i * 4 + 3];
+                unsigned char o[4];
+                for (int c = 0; c < 3; c++) { float v = a > 0 ? cv[i * 4 + c] / a : 0; o[c] = (unsigned char)(v >= 1 ? 255 : v * 255.0f + 0.5f); }
+                o[3] = (unsigned char)(a >= 1 ? 255 : a * 255.0f + 0.5f);
+                fwrite(o, 1, 4, df);
+            }
+            fclose(df);
+        }
+        for (int i = 0; i < LSC_N; i++) printf("lsc slot %d y %.1f\n", i, slot_y[i]);
+        for (int v = 1; v < VB_COUNT; v++) { float x, y; lsc_anchor(v, &x, &y); printf("lsc anchor %d %.0f %.0f\n", v, x, y); }
+    }
+    /* each bound action on its control's side; a full side gives its most
+       central ones to the other */
+    int side[LSC_N], n[2] = { 0, 0 };
+    float ax[LSC_N], ay[LSC_N];
+    for (int i = 0; i < LSC_N; i++) {
+        side[i] = -1; ax[i] = ay[i] = 0;
+        if (vb[i] <= 0 || vb[i] >= VB_COUNT) continue;
+        lsc_anchor(vb[i], &ax[i], &ay[i]);
+        side[i] = ax[i] >= 128.0f; n[side[i]]++;
+    }
+    for (int sd = 0; sd < 2; sd++)
+        while (n[sd] > 7) {
+            int best = -1;
+            for (int i = 0; i < LSC_N; i++)
+                if (side[i] == sd && (best < 0 || fabsf(ax[i] - 128.0f) < fabsf(ax[best] - 128.0f))) best = i;
+            side[best] = !sd; n[sd]--; n[!sd]++;
+        }
+    for (int sd = 0; sd < 2; sd++) {
+        int it[7], k = 0;
+        for (int i = 0; i < LSC_N; i++) if (side[i] == sd && k < 7) it[k++] = i;
+        for (int a = 1; a < k; a++)   /* by control height, then across */
+            for (int b = a; b > 0 && (ay[it[b]] < ay[it[b - 1]] || (ay[it[b]] == ay[it[b - 1]] && ax[it[b]] < ax[it[b - 1]])); b--) {
+                int t = it[b]; it[b] = it[b - 1]; it[b - 1] = t;
+            }
+        /* in that order, the slots nearest their controls */
+        float cost[8][8]; int take[8][8];
+        for (int a = 0; a <= k; a++) for (int b = 0; b <= 7; b++) { cost[a][b] = 1e9f; take[a][b] = 0; }
+        for (int b = 0; b <= 7; b++) cost[0][b] = 0;
+        for (int a = 1; a <= k; a++)
+            for (int b = a; b <= 7; b++) {
+                float c1 = cost[a][b - 1], c2 = cost[a - 1][b - 1] + fabsf(slot_y[sd * 7 + b - 1] - ay[it[a - 1]]);
+                if (c2 <= c1) { cost[a][b] = c2; take[a][b] = 1; } else cost[a][b] = c1;
+            }
+        int sl[7];
+        for (int a = k, b = 7; a > 0 && b > 0; b--) if (take[a][b]) sl[--a] = b - 1;
+        for (int a = 0; a < k; a++) {
+            int i = it[a], s = sd * 7 + sl[a];
+            lab[s] = i + 1;
+            float sy = slot_y[s], e0 = sd ? LSC_W - 1.0f : 1.0f, dy = fabsf(ay[i] - sy);
+            float ex = sd ? ax[i] + dy : ax[i] - dy;   /* level from the edge, then 45 degrees in */
+            if (!sd && ex < 6.0f) ex = 6.0f;
+            if (sd && ex > LSC_W - 6.0f) ex = LSC_W - 6.0f;
+            LscShp h = lsc_seg(e0, sy, ex, sy, 1.6f), d = lsc_seg(ex, sy, ax[i], ay[i], 1.6f);
+            lsc_paint(cv, h, 0x000000u, 0x000000u, 0.55f); lsc_paint(cv, d, 0x000000u, 0x000000u, 0.55f);
+            h.w = d.w = 0.75f;
+            lsc_paint(cv, h, 0xdcdce0u, 0xdcdce0u, 1); lsc_paint(cv, d, 0xdcdce0u, 0xdcdce0u, 1);
+            lsc_paint(cv, LSC_C(ax[i], ay[i], 2.0f), 0xf0f0f4u, 0xf0f0f4u, 1);
+        }
+    }
+    for (int i = 0; i < LSC_W * LSC_W; i++) {   /* to straight alpha */
+        float a = cv[i * 4 + 3];
+        for (int k = 0; k < 3; k++) {
+            float v = a > 0.0f ? cv[i * 4 + k] / a : 0.0f;
+            rgba[i * 4 + k] = (unsigned char)(v >= 1.0f ? 255 : v <= 0.0f ? 0 : v * 255.0f + 0.5f);
+        }
+        rgba[i * 4 + 3] = (unsigned char)(a >= 1.0f ? 255 : a * 255.0f + 0.5f);
+    }
+    free(cv);
+}
+
+/* the console screen for this load: GC ShowLoadingScreen's pick */
+void shop_loading_pick(Shop *s, int career) {
+    if (!s) return;
+    s->ls_ctl = s->pk[PK_LOADING_CTL] && (!career || (rand() >> 4 & 1));   /* bRandom(2) */
+    if (!s->ls_ctl) return;
+    const FengPackage *pk = s->pk[PK_LOADING_CTL];
+    int vb[LSC_N];
+    unsigned char sig[64]; memset(sig, 0, sizeof sig);
+    for (int i = 0; i < LSC_N; i++) {
+        int a = k_lsc_act[i].act;
+        vb[i] = g_opt.ctl[a][0] ? g_opt.ctl[a][0] : g_opt.ctl[a][1];
+        if (a == OPT_ACT_STEER_L && !vb[i]) vb[i] = g_opt.ctl[OPT_ACT_STEER_R][0] ? g_opt.ctl[OPT_ACT_STEER_R][0] : g_opt.ctl[OPT_ACT_STEER_R][1];
+        sig[i] = (unsigned char)vb[i];
+    }
+    sig[LSC_N] = (unsigned char)(career ? 2 : 1);
+    if (s->ls_pic && !memcmp(sig, s->ls_sig, sizeof sig)) return;
+    /* the label heights, in the picture (922a39c4, 256 pixels over its box) */
+    float slot_y[LSC_N];
+    int pic = feng_find(pk, 0x922a39c4u);
+    float top = pic >= 0 ? pk->obj[pic].ay - 0.5f * fabsf(pk->obj[pic].size[1]) : -97.4f;
+    float hgt = pic >= 0 ? fabsf(pk->obj[pic].size[1]) : 233.6f;
+    for (int i = 0; i < LSC_N; i++) {
+        int o = feng_find(pk, k_lsc_obj[i]);
+        float y = o >= 0 ? pk->obj[o].ay : -92.6f + 36.0f * (float)(i % 7);
+        if (o >= 0 && !(pk->obj[o].just & FENG_JUST_VCENTER)) y += 6.5f;   /* a top-aligned label's middle */
+        slot_y[i] = (y - top) / hgt * (float)LSC_W;
+    }
+    unsigned char *rgba = (unsigned char *)malloc((size_t)LSC_W * LSC_W * 4);
+    if (!rgba) { s->ls_ctl = 0; return; }
+    int lab[LSC_N];
+    lsc_build(rgba, slot_y, vb, lab);
+    if (s->ls_pic) glDeleteTextures(1, &s->ls_pic);
+    s->ls_pic = upload_rgba(LSC_W, LSC_W, rgba);
+    free(rgba);
+    for (int i = 0; i < LSC_N; i++) {
+        int a = lab[i] - 1;
+        s->ls_lab[i] = a < 0 ? 0 : k_lsc_act[a].career && !career ? LSC_NOT_USED : k_lsc_act[a].str;
+    }
+    memcpy(s->ls_sig, sig, sizeof sig);
+    printf("loading: Loading_Controller and its Vita picture, slots");
+    for (int i = 0; i < LSC_N; i++) printf(" %d", lab[i] ? vb[lab[i] - 1] : -1);
+    printf(" (VB_*)\n");
+}
+
+/* caches built before F1.11 lack Loading_Controller: from GLOBALB, once */
+static void ls_ctl_from_globalb(Shop *s) {
+    char path[600];
+    snprintf(path, sizeof path, "%s/GLOBAL/GLOBALB.BUN", s->dataroot);
+    long glen = 0, pl = 0;
+    unsigned char *gb = n2_read_file(path, &glen);
+    unsigned char *pd = gb ? extract_package(gb, glen, k_pk_name[PK_LOADING_CTL], &pl) : NULL;
+    unsigned char *one = pd ? (unsigned char *)malloc((size_t)pl + 8) : NULL;
+    if (one) {
+        uint32_t cid = 0x00030203u, csz = (uint32_t)pl;
+        memcpy(one, &cid, 4); memcpy(one + 4, &csz, 4); memcpy(one + 8, pd, (size_t)pl);
+        FengPackage *pk = (FengPackage *)malloc(sizeof *pk);
+        if (pk && feng_load_package(one, pl + 8, k_pk_name[PK_LOADING_CTL], pk)) s->pk[PK_LOADING_CTL] = pk;
+        else free(pk);
+    }
+    const FengPackage *pk = s->pk[PK_LOADING_CTL];
+    if (pk && s->tex) {   /* its art the PC_Loading set lacks */
+        uint32_t keys[LS_CTL_NRES]; FengImage img[LS_CTL_NRES]; int nk = 0;
+        memset(img, 0, sizeof img);
+        for (int r = 0; r < pk->nres && nk < LS_CTL_NRES; r++) {
+            uint32_t key = pk->res[r].type == 1 ? feng_tex_key(pk->res[r].name) : 0;
+            if (key && key != LS_CTL_PIC_KEY && !tex_find(s, key)) keys[nk++] = key;
+        }
+        if (nk) feng_tpk_load(gb, glen, keys, nk, img);
+        for (int k = 0; k < nk; k++) {
+            if (!img[k].rgba) continue;
+            ShopTex *t = &s->tex[s->ntex++];
+            t->key = keys[k]; t->w = img[k].w; t->h = img[k].h; t->additive = img[k].blend == 6;
+            t->tex = upload_rgba(img[k].w, img[k].h, img[k].rgba);
+            feng_image_free(&img[k]);
+        }
+    }
+    printf("shop: %s from GLOBALB (%s)\n", k_pk_name[PK_LOADING_CTL], pk ? "ok" : "missing");
+    free(one); free(pd); free(gb);
+}
+
 Shop *shop_open_loading(const char *dataroot) {
     Shop *s = (Shop *)calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -2022,9 +2476,11 @@ Shop *shop_open_loading(const char *dataroot) {
         shop_close(&full);
         if (!load_cache_loading(s)) { shop_close(&s); return NULL; }
     }
+    if (!s->pk[PK_LOADING_CTL]) ls_ctl_from_globalb(s);
     load_strings(s);
     load_fonts(s);
     prepare_package(s, PK_LOADING);
+    prepare_package(s, PK_LOADING_CTL);
     {   /* glyph / sprite quad batch (as shop_open) */
         enum { QMAX = 64 };
         float nrm[QMAX * 4 * 3]; unsigned short idx[QMAX * 6];
@@ -2066,6 +2522,7 @@ void shop_close(Shop **sp) {
     Shop *s = *sp;
     for (int i = 0; i < s->ntex; i++) if (s->tex[i].tex) glDeleteTextures(1, &s->tex[i].tex);
     glDeleteTextures(4, s->mag_tex);
+    if (s->ls_pic) glDeleteTextures(1, &s->ls_pic);
     if (s->mview_tex) glDeleteTextures(1, &s->mview_tex);
     for (int f = 0; f < s->nfont; f++) if (s->font[f].tex) glDeleteTextures(1, &s->font[f].tex);
     if (s->qb_vbo) glDeleteBuffers(1, &s->qb_vbo);
@@ -2133,6 +2590,10 @@ void shop_loading(Shop *s) {
 /* The quick race settings live in the profile (0x83aab4) for the session:
    kept here across front end openings. */
 static QrSet g_qr_set[QR_NTYPE]; static int g_qr_set_ok, g_qr_mode_sel, g_qr_filter;
+/* the Car Shop was opened from the Quick Race car select's Square (BeginCarCustomize
+   entry 2): CalcPrevScreenFromChooseCustomizeCategory 80160ac0 sends entries 2 / 3
+   back to UI_QRCarSelect.fng, entry 2 in game mode 2 (Quick Race) */
+static int g_cust_qr;
 static void qr_defaults(Shop *s);
 
 void shop_front_end(Shop *s) {
@@ -2160,8 +2621,20 @@ void shop_main_menu(Shop *s) {
 }
 
 static void qr_enter_cars(Shop *s);
+static void qr_build_tracks(Shop *s);
+static void qr_enter_options(Shop *s);
 void shop_customize_cars(Shop *s) {
     if (!s) return;
+    if (g_cust_qr) {   /* entry 2: the Quick Race car select again, its race as it was */
+        g_cust_qr = 0;
+        s->main.sel = 1; s->main.scroll = 1.0f;     /* Quick Race, for Back */
+        s->qr_cust = 0;
+        s->qr_type = k_qr_modes[s->qr_mode.sel].group;
+        if (s->qr_type != QR_FREERUN) { qr_build_tracks(s); qr_enter_options(s); }   /* for Back */
+        qr_enter_cars(s);
+        printf("quick race: back from the Car Shop (customize entry 2), mode %d\n", s->qr_type);
+        return;
+    }
     s->main.sel = 4; s->main.scroll = 4.0f;     /* Customize, for Back */
     s->qr_cust = 1;
     qr_enter_cars(s);
@@ -2225,7 +2698,7 @@ static int rims_locked(Shop *s) {
         uint32_t hash = n2_u32(rec);
         unsigned soff = rec[8] | rec[9] << 8, aoff = rec[10] | rec[11] << 8;
         if (!hash && !soff) break;
-        if (rec[7] != model || rec[4] != G_WHEEL || db_has_attr(s, aoff, 0xF7934316u)) continue;
+        if (rec[7] != model || rec[4] != G_WHEEL || part_excluded(s, rec)) continue;
         if (rim_outer) {
             int st, in, out;
             const char *fold = NULL;
@@ -2263,6 +2736,8 @@ static int neon_all_locked(Shop *s);
 static void car_shop_open(Shop *s, int cat) {
     static const int to[CAT_COUNT] = { SC_BODY, SC_PERFORMANCE, SC_GRAPHICS, SC_SPECIALTIES };
     s->screen = to[cat];
+    s->cust_shop = cat;   /* React__22CustomizeCategoryThing 8030e25c: gCarCustomizeManager+0x1c = the category
+                             (0 parts, 1 perf, 2 paint, 3 ICE: CalcNextScreenFromChooseCustomizeCategory 8016092c) */
     if (s->screen == SC_BODY) body_locks(s);
     if (s->screen == SC_PERFORMANCE) {
         if (s->career && s->cust_entry == 0) scroller_set(&s->cat, k_perf_shop_career, NELEM(k_perf_shop_career));
@@ -3448,12 +3923,10 @@ static void paint_swatches_open(Shop *s) {
     if ((o = feng_find(pk, O_ICON_HL)) >= 0) feng_anim_hide(a, o, 1);
     if ((o = feng_find(pk, O_PAINT_HL)) >= 0) feng_anim_hide(a, o, 0);
     if ((o = feng_find(pk, O_PAINT_GRID)) >= 0) feng_anim_set(a, o, feng_hash_upper("FadeIn"), 1);
-    if (slot == 0x3f || slot == 0x45 || slot == 0x4b || slot == 0x4c)
-        for (int k = 0; k < 2; k++)
-            if ((o = feng_find(pk, k ? O_PAINT_ARROW_R : O_PAINT_ARROW_L)) >= 0) {
-                feng_anim_set(a, o, feng_hash_upper("FadeIn"), 1);
-                feng_anim_hide(a, o, 0);
-            }
+    /* PC 0x55cc50 fades the page arrows in here for slots 0x3f/0x45/0x4b/0x4c.
+       They are flag-0x8 PC objects (mouse page arrows): the console build hides
+       them at load (GC FEngHidePCObjects 8014ddc4, feng.c platform pass) and no
+       GC code shows them, so they stay hidden. */
     feng_anim_set(a, s->paint_obj[s->paint_sel], feng_hash_upper("Highlight"), 1);
     paint_cursor(s);
     paint_preview(s);
@@ -3848,7 +4321,7 @@ static void tint_enter(Shop *s) {
         uint32_t hash = n2_u32(r);
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
-        if (r[4] != G_WINDOW_TINT || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
+        if (r[4] != G_WINDOW_TINT || part_excluded(s, r)) continue;   /* EXCLUDE_* by model */
         uint32_t mat = 0, lang = 0;
         if (!db_attr(s, aoff, 0x6ba02c05u, &mat)) continue;
         db_attr(s, aoff, 0x4732da07u, &lang);
@@ -3913,7 +4386,7 @@ static void bulb_enter(Shop *s) {
         uint32_t hash = n2_u32(r);
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
-        if (r[4] != G_HEADLIGHT_BULB || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
+        if (r[4] != G_HEADLIGHT_BULB || part_excluded(s, r)) continue;   /* EXCLUDE_* by model */
         uint32_t lang = 0;
         db_attr(s, aoff, 0x4732da07u, &lang);
         ShopPart *q = &s->parts[s->nparts];
@@ -4075,7 +4548,7 @@ static int spec_build(Shop *s, int slot) {
         int upg = r[5] | r[6] << 8;
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
-        if (r[4] != group || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
+        if (r[4] != group || part_excluded(s, r)) continue;   /* EXCLUDE_* by model */
         if (model >= 0 && r[7] != model) continue;
         uint32_t lang = 0;
         db_attr(s, aoff, 0x4732da07u, &lang);
@@ -4142,7 +4615,7 @@ static int ice_count(const Shop *s, int slot) {
         uint32_t hash = n2_u32(r), mat = 0;
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
-        if (r[4] != group || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
+        if (r[4] != group || part_excluded(s, r)) continue;   /* EXCLUDE_* by model */
         if (slot == 0x99 && !db_attr(s, aoff, 0x6ba02c05u, &mat)) continue;
         if (part_open(s, slot_ent(slot), ((r[5] | r[6] << 8) >> 5) & 7, own_key(slot, hash))) n++;
     }
@@ -4354,7 +4827,7 @@ static void neon_enter(Shop *s) {
         uint32_t hash = n2_u32(r);
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
-        if (r[4] != G_NEON || db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
+        if (r[4] != G_NEON || part_excluded(s, r)) continue;   /* EXCLUDE_* by model */
         uint32_t lang = 0, col[2];
         neon_value(s, aoff, col);
         db_attr(s, aoff, 0x4732da07u, &lang);
@@ -4524,7 +4997,7 @@ static void hud_enter(Shop *s) {
         uint32_t hash = n2_u32(r);
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!hash && !soff) break;
-        if ((r[4] != G_CUSTOM_HUD && r[4] != G_CUSTOM_HUD_PAINT) || db_has_attr(s, aoff, 0xF7934316u)) continue;
+        if ((r[4] != G_CUSTOM_HUD && r[4] != G_CUSTOM_HUD_PAINT) || part_excluded(s, r)) continue;
         if (r[4] == G_CUSTOM_HUD_PAINT) {   /* HUD_Customizer::IsColorAvailable 8017c418: entity 0x17 (filter 6 / 1) */
             if (s->hud_npal < 12 && calc_unlocked(s, 0x17, r[5] >> 5)) s->hud_pal[s->hud_npal++] = hud_paint_value(s, aoff);
             continue;
@@ -5296,20 +5769,14 @@ static void rr_slot_models(const RandRide *c, int slot, uint32_t m[2]) {
     for (int i = 0; i < 2; i++) if (m[i] == 0xffffffffu) m[i] = c->car_hash;
 }
 /* GetCarPartDirect 0x61b670's test of one record: model, group, hash (0
-   any), EXCLUDE_UG2 (and EXCLUDE_SUV for the SUVs' own models), upgrade
-   level (-1 any) */
+   any), the model's exclusion switches (part_excluded), upgrade level
+   (-1 any) */
 static int rr_part_ok(const RandRide *c, const unsigned char *r, uint32_t model, int group, uint32_t hash, int level) {
     const Shop *s = c->db;
     if (r[7] >= s->nmodels || n2_u32(s->db + s->db_models + 4L * r[7]) != model) return 0;
     if (r[4] != group || (hash && n2_u32(r) != hash)) return 0;
     if (level != -1 && (r[5] >> 5) != level) return 0;
-    unsigned aoff = r[10] | r[11] << 8;
-    uint32_t v = 0;
-    /* guess: of the exclusion switches (0x610020 / 0x6100a0) the UG2 one is on and the UG1 one off, as for the Car Shop */
-    if (db_attr(s, aoff, 0xF7934316u, &v) && v) return 0;                      /* EXCLUDE_UG2 */
-    v = 0;
-    if ((model == 0x0219c94au || model == 0x6126dd4du || model == 0xcf704771u)   /* NAVIGATOR, HUMMER, ESCALADE */
-        && db_attr(s, aoff, 0xF7933C86u, &v) && v) return 0;                   /* EXCLUDE_SUV */
+    if (part_excluded(s, r)) return 0;
     return 1;
 }
 /* NewGetCarPart 0x61b980 / NewGetNumCarParts 0x631a20: the slot's parts
@@ -5494,6 +5961,170 @@ int shop_random_ride(Shop *s, const char *car, const int perf_lvl[10], uint32_t 
     if (rim && rimsz > 0) snprintf(rim, (size_t)rimsz, "%s", fill.rim_folder);
     if (rim_style) *rim_style = fill.rim_style;
     return 1;
+}
+
+/* ---------------------------------------------------------------- a saved ride (PC save import) */
+
+/* the car type (GLOBALB 0x34600) whose name's bStringHash is h */
+static int rr_type_by_hash(uint32_t h, char car[32]) {
+    for (uint32_t o = 0; o + 0x890 <= g_rr_types_len; o += 0x890) {
+        char nm[33];
+        memcpy(nm, g_rr_types + o, 32); nm[32] = 0;
+        if (nm[0] && feng_hash(nm) == h) { if (car) snprintf(car, 32, "%s", nm); return 1; }
+    }
+    return 0;
+}
+int shop_car_type_name(const char *dataroot, uint32_t hash, char car[32]) {
+    return rr_load(dataroot) && rr_type_by_hash(hash, car);
+}
+int shop_car_type_at(const char *dataroot, int i, char car[32]) {
+    if (i < 0 || !rr_load(dataroot) || (uint32_t)(i + 1) * 0x890 > g_rr_types_len) return 0;
+    memcpy(car, g_rr_types + i * 0x890, 31); car[31] = 0;
+    return car[0] != 0;
+}
+
+/* PresetCarSlot (0x418, GC ctor 80134bfc; FillRideWith 80134e24 /
+   FillWithRide 80134f38): +0 1 = filled, +8 the car type's name hash, +0xc
+   the part hash of each CarSlot 0..0xa9 (0 none), +0x2b4 the
+   PhysicsUpgradeSpecification (0x94: +0 float levels[10], +0x28 int junkman
+   [10], +0x50 the 0x44 perf parts' installed bytes), +0x348 the tunings.
+   FillRideWith: Init(type), SetStockParts, then SetPart of every slot with
+   GetInstalledPart = NewGetCarPart(type, slot, hash) (0: NULL) -- each slot
+   into our representation as ride_fill_slot does for the presets. */
+int shop_slot_ride(const char *dataroot, const unsigned char *ps, char car[32], N2CarConfig *cfg,
+                   char rim_folder[16], int *rim_style) {
+    Shop *db = (Shop *)db_only(dataroot);
+    if (!db || !db->db || !db->db_parts || !ps || !n2_u32(ps) || !rr_load(dataroot)) return 0;
+    if (!rr_type_by_hash(n2_u32(ps + 8), car)) { printf("shop: saved ride: no car type %08x\n", (unsigned)n2_u32(ps + 8)); return 0; }
+    RandRide c = { db, feng_hash(car), rr_type(car) };
+    RideFill fill;
+    ride_fill_init(&fill, db, car, car, cfg);
+    for (int slot = 0; slot < PRESET_SLOTS; slot++) {
+        uint32_t h = n2_u32(ps + 0xc + 4 * slot);
+        const unsigned char *r = h ? rr_first(&c, slot, h, -1) : NULL;
+        if (h && !r) printf("shop: saved %s: slot 0x%02x part %08x not in the database\n", car, slot, (unsigned)h);
+        ride_fill_slot(&fill, cfg, slot, r);
+    }
+    ride_fill_done(&fill, cfg);
+    snprintf(rim_folder, 16, "%s", fill.rim_folder); *rim_style = fill.rim_style;
+    if (!perf_ready()) {
+        char path[600]; long n = 0;
+        snprintf(path, sizeof path, "%s/GLOBAL/GLOBALB.BUN", dataroot);
+        unsigned char *g = n2_read_file(path, &n);
+        if (g) { perf_init(g, n); free(g); }
+    }
+    PerfParts pp; perf_clear(&pp);
+    for (int i = 0; i < 0x44; i++) if (ps[0x2b4 + 0x50 + i]) perf_set_part(&pp, i, 1);
+    memcpy(cfg->perf, pp.fit, sizeof cfg->perf);
+    for (int i = 0; i < 10; i++) cfg->junk[i] = n2_u32(ps + 0x2b4 + 0x28 + 4 * i) != 0;
+    return 1;
+}
+
+/* MapCarPartToUnlockable 8012e8bc: a part's unlockable entity. The vinyl
+   slots by the vinyl's group (upgrade byte & 0x1f); carbon fibre (attribute
+   CARBONFIBRE) hood / roof / spoiler / mirrors their own entities (other
+   slots 0); the spinners (BRAND_NAME SPINNER) 0x21, the split hoods
+   (group 5) 0x22; else MapCarSlotToUnlockable. Slot 0x3f (by the paint's
+   kind) is never owned, so not mapped here. */
+static int part_unlockable(const Shop *s, int slot, const unsigned char *r) {
+    static const unsigned char vinyl_ent[0x1c] = {
+        0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+        0x38, 0x39, 0x3a, 0x3b, 0x41, 0x42, 0x43, 0x3c, 0x3d, 0x40, 0x3e, 0x37, 0x3f, 0x44 };
+    unsigned aoff = r[10] | r[11] << 8;
+    int g = r[5] & 0x1f;
+    uint32_t v = 0;
+    if (slot >= 0x40 && slot <= 0x43) return g < 0x1c ? vinyl_ent[g] : 0;
+    if (db_attr(s, aoff, 0x721AFF7Cu, &v) && v)   /* CARBONFIBRE */
+        return slot == 9 ? 0x4b : slot == 7 ? 0x46 : slot == 0xc ? 0x4a : slot == 0x20 ? 0x45 : 0;
+    v = 0;
+    if (slot == 0x1d && db_attr(s, aoff, 0xEBB03E66u, &v) && v == 0xc8d1a75eu) return 0x21;
+    if (slot == 9 && g == 5) return 0x22;
+    return slot_ent(slot);
+}
+/* OwnedPartInventory (0x3c0 as saved, 0x503f00): the entity words
+   (0x57), the perf bits +0x15c, the regions -- rims 0x1d / 0x1e +0x16c
+   (0x100 bytes), roof 7 +0x26c (0x10), spoiler 0xc +0x27c (0x10), mirrors
+   0x20 +0x28c (8) -- the spent cash +0x294, the hood 9 region +0x298 (8),
+   the brands +0x2a0 (0x44), slot 0xa2's region +0x3b0 (0x10). */
+#define INV_SAVED_SIZE 0x3c0
+static int inv_region(int slot, int *size) {
+    switch (slot) {
+    case 0x1d: case 0x1e: *size = 0x100; return 0x16c;
+    case 7: *size = 0x10; return 0x26c;
+    case 0xc: *size = 0x10; return 0x27c;
+    case 0x20: *size = 8; return 0x28c;
+    case 9: *size = 8; return 0x298;
+    case 0xa2: *size = 0x10; return 0x3b0;
+    default: *size = 0; return -1;
+    }
+}
+/* the position of r in the NewGetFirstCarPart / Next list of (type, slot, any
+   hash, any level), NewGetPartIndex 80243eb8; -1 not in it */
+static int rr_index(const RandRide *c, int slot, const unsigned char *r) {
+    static const unsigned char *t[RR_MAX];
+    int n = rr_parts(c, slot, 0, -1, t, RR_MAX);
+    for (int i = 0; i < n; i++) if (t[i] == r) return i;
+    return -1;
+}
+/* OwnsCarPart 801358bc of every part the car can take: GetWordToSetBitFor
+   (PC 0x503b10, GC 80135610) -- the part's index in its car type's list
+   (GetCarTypeNameHash of the part: the car for its own parts, else no type),
+   a region's word idx >> 5 bit idx & 31, else the entity's word bit idx
+   (the PC's shl: idx & 31). The owned parts' keys (own_key: the name hash)
+   go to own[]; fitted (a PresetCarSlot, may be NULL) is checked against
+   them: *fit_n of its owned-able parts above level 0, *fit_owned owned. */
+int shop_inv_owned(const char *dataroot, const char *car, const unsigned char *inv, const unsigned char *fitted,
+                   uint32_t *own, int max, int *fit_n, int *fit_owned) {
+    Shop *db = (Shop *)db_only(dataroot);
+    int nown = 0;
+    if (fit_n) *fit_n = 0;
+    if (fit_owned) *fit_owned = 0;
+    if (!db || !db->db || !db->db_parts || !inv || !car || !rr_load(dataroot)) return 0;
+    RandRide cc = { db, feng_hash(car), rr_type(car) };
+    /* a part of no car type (the shared libraries: GetCarTypeInfoFromHash
+       NULL) is indexed with type 0x2e, one past the 46 car types: 0x6101e0
+       then finds no per-car override and the slot's default models, whose
+       "the car itself" (-1) becomes a hash no part model has */
+    RandRide cn = { db, 0, NULL };
+    static const unsigned char *t[RR_MAX];
+    for (int slot = 0; slot < PRESET_SLOTS; slot++) {
+        if (!own_key(slot, 1)) continue;   /* never owned */
+        int n = rr_parts(&cc, slot, 0, -1, t, RR_MAX);
+        uint32_t fh = fitted ? n2_u32(fitted + 0xc + 4 * slot) : 0;
+        for (int i = 0; i < n; i++) {
+            const unsigned char *r = t[i];
+            uint32_t model = r[7] < db->nmodels ? n2_u32(db->db + db->db_models + 4L * r[7]) : 0;
+            int idx = model == cc.car_hash ? i : rr_type_by_hash(model, NULL) ? -2 : rr_index(&cn, slot, r);
+            if (idx == -2) {   /* another car type's part */
+                char other[32] = "";
+                rr_type_by_hash(model, other);
+                RandRide co = { db, model, rr_type(other) };
+                idx = rr_index(&co, slot, r);
+            }
+            if (idx < 0) continue;
+            int size = 0, reg = inv_region(slot, &size);
+            uint32_t w;
+            int ent = reg >= 0 ? -1 : part_unlockable(db, slot, r);
+            if (reg >= 0) {
+                if ((idx >> 5) * 4 + 4 > size) continue;
+                w = n2_u32(inv + reg + (idx >> 5) * 4);
+            } else {
+                if (ent < 0 || ent >= 0x57) continue;
+                w = n2_u32(inv + 4 * ent);
+            }
+            int owned = (w >> (idx & 31)) & 1;
+            uint32_t key = own_key(slot, n2_u32(r));
+            if (fh && n2_u32(r) == fh && (r[5] >> 5) > 0 && ent != 0) {   /* an upgrade with a price entity */
+                if (fit_n) (*fit_n)++;
+                if (owned && fit_owned) (*fit_owned)++;
+            }
+            if (!owned || !key) continue;
+            int have = 0;
+            for (int k = 0; k < nown && !have; k++) have = own[k] == key;
+            if (!have && nown < max) own[nown++] = key;
+        }
+    }
+    return nown;
 }
 
 unsigned shop_purge_preview(Shop *s) {
@@ -6374,16 +7005,29 @@ static void opt_leave(Shop *s) {
     if (g_opt.save_on && (dirty || g_opt.save_on != s->opt_save0)) mc_enter(s, 0x2042, SC_OPT_MAIN);
 }
 
+/* F2.4: a car select entry's id ("<folder>" stock, "<folder>#<slot>" tuned) */
+static void qr_car_id(const ShopCar *c, char *out, size_t cap) {
+    if (c->slot >= 0) snprintf(out, cap, "%s#%d", c->folder, c->slot); else snprintf(out, cap, "%s", c->folder);
+}
+/* the action's car from an id: the folder, and the slot when the Quick Race car select sent it */
+static void qr_car_out(const Shop *s, ShopAction *a) {
+    const char *h = strchr(s->qr_car_cur, '#');
+    snprintf(a->car, sizeof a->car, "%.*s", h ? (int)(h - s->qr_car_cur) : (int)strlen(s->qr_car_cur), s->qr_car_cur);
+    a->slot = s->screen != SC_QR_CAR ? -2 : h ? atoi(h + 1) : -1;
+}
 /* the car select's list under the filter (0x4e22e0 / 0x4eed10, no sort) */
 static void qr_build_cars(Shop *s) {
     int fid = k_qr_filters[s->qr_filter].id, n = 0, sel = 0;
     for (int i = 0; i < s->ncars && n < QR_MAX_CARS; i++) {
-        if (fid == 2 && !s->cars[i].mine) continue;           /* My Cars */
+        /* GetCarFiltered: filter 2 the tuned cars (My Cars), 1 the stock cars, 3 both */
+        if (fid == 2 && s->cars[i].slot < 0) continue;
+        if (fid == 1 && s->cars[i].slot >= 0) continue;
         /* 0x4e22e0: UnlockSystem::IsCarUnlocked(GetUnlockFilter 1) 0x534180 --
            a stock car the profile's career has not unlocked is left out (a
            customized one, "My Cars", always passes) */
-        if (!s->cars[i].mine && !career_qr_car_unlocked(airace_type_of(s->cars[i].folder))) continue;
-        if (!strcmp(s->cars[i].folder, s->qr_car_cur)) sel = n;
+        if (s->cars[i].slot < 0 && !career_qr_car_unlocked(airace_type_of(s->cars[i].folder))) continue;
+        char id[48]; qr_car_id(&s->cars[i], id, sizeof id);
+        if (!strcmp(id, s->qr_car_cur)) sel = n;
         s->qr_car_list[n++] = (short)i;
     }
     s->qr_ncar = n; s->qr_car_sel = sel;
@@ -6393,8 +7037,9 @@ void garage_tt_request(int what, int dir);   /* main.c: the garage turntable */
 static void qr_car_moved(Shop *s) {
     if (!s->qr_ncar) return;
     const ShopCar *c = &s->cars[s->qr_car_list[s->qr_car_sel]];
-    if (strcmp(c->folder, s->qr_car_cur)) {
-        snprintf(s->qr_car_cur, sizeof s->qr_car_cur, "%s", c->folder);
+    char id[48]; qr_car_id(c, id, sizeof id);
+    if (strcmp(id, s->qr_car_cur)) {
+        snprintf(s->qr_car_cur, sizeof s->qr_car_cur, "%s", id);
         s->qr_car_pending = 1; s->qr_car_debounce = 0.35f;
     }
 }
@@ -6484,8 +7129,41 @@ static void qr_input(Shop *s, int key) {
             s->qr_filter = (s->qr_filter + (key == SHOP_KEY_LTRIG ? nf - 1 : 1)) % nf;
             qr_build_cars(s);
             qr_car_moved(s);
+        } else if (key == SHOP_KEY_SQ && s->qr_cust && s->qr_ncar &&
+                   s->cars[s->qr_car_list[s->qr_car_sel]].slot >= 0) {
+            /* 0x20 + 0xc519bfc0 (800de290): a tuned car (not a career / sponsor one) ->
+               ShowTwoButtons Yes 0xf770 / No 0x61c, "delete this car?" 0x367161f5, the
+               focus on No; Yes 0x51123592 -> DeleteCurrentCar 800e081c */
+            dialog(s, DLG_AUTO, 2, 0x367161f5u, DA_QR_DELETE, STR_YES, STR_NO);
+            s->dlg_sel = 1;
+            dlg_focus(s);
+        } else if (key == SHOP_KEY_SQ && !s->qr_cust && s->qr_ncar) {
+            /* mode 2 (Quick Race) + 0xc519bfc0 (GC 800de290 / PC 0x4fc1f0): a sponsor or
+               career car returns (the port's list has neither); AbleToAddNewTunedCar is
+               asked for every car, a tuned one too -- full: ShowOneButton OK 0x639,
+               0x91921a8d + MakeFrontendSound(8) (PC; GC plays none there). Else
+               SetViewFilter(3) (All Cars), ClearHasBeenModified, BeginCarCustomize(2, ..,
+               the car), SetSelectedCar, MakeFrontendSound(8) = table 4 (select) */
+            int nt = 0;
+            for (int i = 0; i < s->ncars; i++) nt += s->cars[i].slot >= 0;
+            if (nt >= 20) {
+                dialog(s, DLG_AUTO, 1, 0x91921a8du, DA_NONE, STR_OK, 0);
+                audio_fe_play(FE_SND_SELECT);
+                break;
+            }
+            for (int k = 0; k < NELEM(k_qr_filters); k++) if (k_qr_filters[k].id == 3) s->qr_filter = k;
+            if (s->qr_car_pending) s->qr_car_debounce = 0.0f;   /* the car on screen first */
+            s->cust_go = 1; s->cust_qr = 1;
+            audio_fe_play(FE_SND_SELECT); s->snd_done = 1;
         } else if (key == SHOP_KEY_OK && s->qr_ncar) {
             if (s->qr_car_pending) s->qr_car_debounce = 0.0f;   /* the car on screen first */
+            if (s->qr_cust && s->cars[s->qr_car_list[s->qr_car_sel]].slot < 0) {
+                /* 0x20 + 0x406415e3: a stock car needs a free tuned slot (AbleToAddNewTunedCar
+                   8013424c), else ShowOneButton OK 0x639, 0x91921a8d (the garage is full) */
+                int nt = 0;
+                for (int i = 0; i < s->ncars; i++) nt += s->cars[i].slot >= 0;
+                if (nt >= 20) { dialog(s, DLG_AUTO, 1, 0x91921a8du, DA_NONE, STR_OK, 0); break; }
+            }
             if (s->qr_cust) s->cust_go = 1;                 /* mode 0x20: 0x552cc0(3) -> the Car Shop */
             else if (g_opt.p[0].ask_trans) {                /* 0x4fc1f0: Ask for Transmission (0x83aa6a) */
                 /* 0x497d50 ShowTwoButtons: "Transmission:" 0x30003d27, Manual 0x1b3a2485
@@ -6570,7 +7248,8 @@ static void qr_fill(const Shop *s, ShopQuickRace *q) {
    Delete 0x6fc73a show them through ShowMessage 0x4c6050, every one
    waiting for a button), their text from memcard/LOCALE_ENGLISH.loc. */
 enum { MCV_OFF, MCV_MSG, MCV_LIST, MCV_KB };
-enum { MCD_NONE, MCD_LOSE = 1, MCD_CREATE = 2, MCD_INFO = 3, MCD_SAVE = 5, MCD_LOAD = 6, MCD_RMC = 9 };
+enum { MCD_NONE, MCD_LOSE = 1, MCD_CREATE = 2, MCD_INFO = 3, MCD_SAVE = 5, MCD_LOAD = 6, MCD_RMC = 9,
+       MCD_PCSAVE = 0x100 /* the port's: a PC save to import (pcsave.c) */ };
 /* what a realmc message's answer leads to */
 enum { RM_OVERWRITE = 1, RM_SAVED, RM_SAVE_FAIL, RM_LOADED, RM_LOAD_FAIL, RM_DELETE_Q, RM_DELETED, RM_DELETE_FAIL };
 #define O_MC_TITLE   0x426c7b4du   /* "Memory Card" -> SAVELOAD_TITLE_PC */
@@ -6582,7 +7261,8 @@ enum { RM_OVERWRITE = 1, RM_SAVED, RM_SAVE_FAIL, RM_LOADED, RM_LOAD_FAIL, RM_DEL
 #define MCL_ROWS 8
 static int g_boot_load_done;   /* MC_Background's boot load runs once */
 
-/* realmc string N (1-based) of memcard/LOCALE_ENGLISH.loc: LOCL {tag, size,
+/* realmc string N (1-based) of memcard/LOCALE_<LANGUAGE>.loc (MemoryCard::LoadLocale
+   80105848: GetLanguageName, Chinese = ENGLISH -- no LOCALE_CHINESE): LOCL {tag, size,
    0, count, offsets from the tag}, UTF-16 */
 static const char *rmc_str(const Shop *s, int id) {
     static char out[16][128];
@@ -6590,8 +7270,14 @@ static const char *rmc_str(const Shop *s, int id) {
     if (!ok) {
         ok = 1;
         char path[600];
-        snprintf(path, sizeof path, "%s/memcard/LOCALE_ENGLISH.loc", s->dataroot);
+        snprintf(path, sizeof path, "%s/memcard/LOCALE_%s.loc", s->dataroot,
+                 n2_lang() == 9 ? "ENGLISH" : k_n2_lang_name[n2_lang()]);
         FILE *f = fopen(path, "rb");
+        if (!f) {   /* older installs copied LOCALE_ENGLISH.loc only */
+            printf("shop: %s not found, English memcard text\n", path);
+            snprintf(path, sizeof path, "%s/memcard/LOCALE_ENGLISH.loc", s->dataroot);
+            f = fopen(path, "rb");
+        }
         static unsigned char b[4096];
         long n = f ? (long)fread(b, 1, sizeof b, f) : 0;
         if (f) fclose(f);
@@ -6770,6 +7456,34 @@ static void mc_load(Shop *s, const char *name) {
     else mc_rmc(s, RM_LOAD_FAIL, 11, nm, 1);                                        /* "Unable to load %1." */
 }
 
+/* The port's PC save import (no retail flow; pcsave.h): Load in the Profile
+   Manager first offers a PC save copied to ux0:data/NFSU2/pcsave/ whose
+   name has no profile yet, with the retail SAVELOAD_CONFIRM_LOAD_THE_PROFILE
+   question ("%s" the name); Yes imports and loads it ("Load complete."),
+   No goes on to the list. */
+static char g_pcsave_path[600], g_pcsave_name[32];
+static int mc_pcsave_offer(Shop *s) {
+    if (!pcsave_find_new(PROFILE_DIR_PATH, g_pcsave_path, sizeof g_pcsave_path, g_pcsave_name)) return 0;
+    char f[400], t[512];
+    snprintf(f, sizeof f, "%s", str_get(s, 0x976bdaaau));   /* SAVELOAD_CONFIRM_LOAD_THE_PROFILE */
+    char *p = strstr(f, "%s");
+    if (p) { *p = 0; snprintf(t, sizeof t, "%s%s%s", f, g_pcsave_name, p + 2); }
+    else snprintf(t, sizeof t, "%s", f);
+    printf("memcard: PC save %s (%s) offered\n", g_pcsave_name, g_pcsave_path);
+    mc_msg(s, MCD_PCSAVE, t, 2, STR_YES, STR_NO);
+    return 1;
+}
+static void mc_list_or_none(Shop *s) {
+    if (s->mc_n == 0) mc_msg(s, MCD_INFO, str_get(s, 0xab1f0e92u), 1, STR_OK, 0);
+    else mc_list_open(s);
+}
+static void mc_pcsave_answer(Shop *s, int yes) {
+    if (!yes) { mc_list_or_none(s); return; }
+    PcSaveInfo info;
+    if (pcsave_import(g_pcsave_path, s->dataroot, PROFILE_DIR_PATH, &info)) mc_load(s, info.name);
+    else mc_rmc(s, RM_LOAD_FAIL, 11, g_pcsave_name, 1);   /* "Unable to load %1." */
+}
+
 /* InitComplete 0x4f3570 */
 static void mc_enter(Shop *s, int flags, int ret) {
     s->mc_flags = flags; s->mc_op = flags & 0xf0; s->mc_ret = ret;
@@ -6794,8 +7508,8 @@ static void mc_enter(Shop *s, int flags, int ret) {
             if (s->mc_n == 1) mc_load(s, s->mc_names[0]);     /* the one profile: no list */
             else if (s->mc_n == 0) mc_flow(s, 2);
             else mc_list_open(s);
-        } else if (s->mc_n == 0) mc_msg(s, MCD_INFO, str_get(s, 0xab1f0e92u), 1, STR_OK, 0);
-        else mc_list_open(s);
+        } else if (s->mc_op == MCOP_LOAD && mc_pcsave_offer(s)) {
+        } else mc_list_or_none(s);
         break;
     case MCOP_SAVE_CHECK: mc_flow(s, profile_named() ? 4 : 2); break;
     case MCOP_SAVE_CUR: if (!profile_named()) mc_exit(s, 1); else mc_flow(s, 5); break;
@@ -6828,6 +7542,7 @@ static void mc_answer(Shop *s, int yes) {
         kb_open(s);
         break;
     case MCD_LOAD: if (yes) mc_load(s, s->mc_names[s->mc_lsel]); else mc_cancel(s); break;
+    case MCD_PCSAVE: mc_pcsave_answer(s, yes); break;
     case MCD_RMC:
         switch (s->mc_then) {
         case RM_OVERWRITE:   /* No fails the save (0xdc12af2e): autosave off, ask again */
@@ -7104,6 +7819,7 @@ static void csel_show(Shop *s, int step) {
     int k = s->lot[s->lot_sel].kind;
     if (step) garage_tt_request(k == 2 ? 1 : k == 1 ? 2 : 0, step < 0);
     if (k == 0) lot_show(s, step != 0);
+    else s->qr_car_pending = 0;   /* R1: a car scrolled past inside the delay is never SetRideInfo'd (800d4d38) */
 }
 static void csel_enter(Shop *s) {
     memset(s->lot, 0, sizeof s->lot);
@@ -7123,6 +7839,10 @@ static void csel_enter(Shop *s) {
                 }
             break;
         }
+    if (getenv("OPENUG2_SIM_LOCKLAST")) {   /* test aid: the last slot locked (the LOCK model) */
+        CareerCar *c = career_car_slot(CAREER_NSLOTS - 1);
+        if (c && !c->has) c->locked = 1;
+    }
 #endif
     for (int i = 0; i < CAREER_NSLOTS && s->lot_n < QR_MAX_CARS; i++) {
         const CareerCar *c = career_car_slot(i);
@@ -7509,6 +8229,25 @@ static void lot_input(Shop *s, int key) {
 }
 
 int shop_platform(const Shop *s) { return s && s->platform > 0 ? s->platform : 1; }
+/* EAXS GetAmbientZone 0x46b330's front-end branch: the shop's scene (+0x40 up
+   to '.', hashed upper case; compared by name here) and record hash (+0x38) */
+int shop_fe_ambient_zone(const Shop *s, int career)
+{
+    if (!career) return 0x1c;                      /* 0x850078 != 1; 1 = the career CONFIRMED (PlayerCareerState::IsCareerFreeRoam 0x500b60: 0x850078 == 1, no race) */
+    const unsigned char *p = s ? s->fe_shop : NULL;
+    if (!p) return 0x1d;                           /* 0x863444 clear: no shop */
+    char nm[17]; int k = 0;
+    for (; k < 16 && p[0x40 + k] && p[0x40 + k] != '.'; k++) nm[k] = (char)toupper(p[0x40 + k]);
+    nm[k] = 0;
+    uint32_t h = (uint32_t)p[0x38] | (uint32_t)p[0x39] << 8 | (uint32_t)p[0x3a] << 16 | (uint32_t)p[0x3b] << 24;
+    if (!strcmp(nm, "CARLOT01")) return 0x17;
+    if (!strcmp(nm, "CRIB01")) return 0x1d;
+    if (!strcmp(nm, "PERFSHOP01")) return h == 0x7fc8d0d0u ? 0x18 : 0x1a;          /* CC_MEGALOW */
+    if (!strcmp(nm, "PARTSSHOP01")) return h == 0xb88bd8c1u || h == 0x678847a1u ? 0x17 : 0x19;   /* SH_BODYSHOP(_01) */
+    if (!strcmp(nm, "PAINTSHOP01")) return 0x1b;
+    if (!strcmp(nm, "AUDIOSHOP01")) return 0x16;
+    return 0x1c;
+}
 #ifdef OPENUG2_SIM_PRE_H
 /* test aid (simulator): the C11 career autopilot's next key for the front end -- dialogs on their
    first button, the car lot buys the first car, the crib plays; 0 = leave it alone */
@@ -7518,7 +8257,7 @@ int shop_sim_auto_key(const Shop *s) {
     if (dlg_open(s)) return s->dlg_nbtn == 2 && s->dlg_sel ? SHOP_KEY_LEFT : SHOP_KEY_OK;
     switch (s->screen) {
     case SC_CAREER_LOT: case SC_MOVIE: return SHOP_KEY_OK;
-    case SC_MAG_REWARD: return s->mag_shot <= 0 ? SHOP_KEY_OK : 0;   /* Continue once the cover photo is taken */
+    case SC_MAG_REWARD: return s->mag_shot <= 0 && !s->mag_leave ? SHOP_KEY_OK : 0;   /* Continue -> the save question */
     case SC_CRIB:
         for (int i = 0; i < s->crib.n; i++)
             if (s->crib.e[i].group == CR_PLAY) return i == s->crib.sel ? SHOP_KEY_OK : i < s->crib.sel ? SHOP_KEY_LEFT : SHOP_KEY_RIGHT;
@@ -7529,6 +8268,16 @@ int shop_sim_auto_key(const Shop *s) {
 int shop_sim_screen(const Shop *s) { return s ? s->screen : -1; }
 #endif
 int shop_on_main_menu(const Shop *s) { return s && s->screen == SC_MAIN; }
+/* The boot flow before UI_Main: UG_LS_Splash and MC_Background (0x4c51f0, the
+   boot load EnterMemcard 0x121) push no GarageMain.fng and build no ride; the
+   UIMain ctor 0x4df140 is the first to (BuildCurrentRideForPlayer from the
+   just-loaded profile, then FEngPushPackageSpecial GarageMain.fng). 1 while the
+   front end is still before that point, the loaded profile's car included. */
+int shop_boot_pending(const Shop *s) {
+    if (!s || !s->front_end) return 0;
+    return !g_boot_load_done || (s->mc_view != MCV_OFF && s->mc_op == MCOP_BOOT) ||
+           s->fe_action == SHOP_ACT_PROFILE;
+}
 
 void shop_crib_return(Shop *s, int from_main) {
     if (!s) return;
@@ -7790,10 +8539,14 @@ int shop_career_customize(Shop *s, int entry, const unsigned char *shop) {
     if (!s) return 0;
     int type = shop ? (signed char)shop[0x50] : 0;
     s->cust_entry = entry;
+    /* 8016104c: no Test Track for entry 0 / 1, no paint for entry 1 (the crib) */
+    if (entry == 1) scroller_set(&s->top, k_car_shop_crib, (int)NELEM(k_car_shop_crib));
+    else scroller_set(&s->top, k_car_shop, CAT_COUNT);
 #ifdef OPENUG2_SIM_PRE_H
     if (getenv("OPENUG2_SIM_SHOPFOUND")) career_sim_find_shops();
 #endif
     s->cshop = entry ? NULL : shop;
+    s->fe_shop = shop;
     s->career = entry ? 2 : 6;                         /* GetPartUnlockFilter: the crib 2, a shop 6 */
     s->platform = shop_scene_platform(shop);           /* GarageMainScreen: the shop's scene, else CRIB01 */
     if (entry) {                                       /* CalcFirstScreen: UI_ChooseCustomizeCategory */
@@ -7909,7 +8662,7 @@ int shop_magazine_reward(Shop *s, const unsigned char *sc) {
     }
     printf("magazine: %d of %d cover textures\n", got, nk);
     s->mag_sc = sc;
-    s->mag_shot = 30;   /* PC 0x55b498: +0x74 > 2 ticks after 0x115bbd44 (the save-photo answer; guess: at once) */
+    s->mag_shot = 0; s->mag_leave = 0;   /* no photo until the save question's yes (0x115bbd44) */
     s->front_end = 1;
     s->screen = SC_MAG_REWARD;
     return 1;
@@ -7926,13 +8679,28 @@ int shop_mag_render(const Shop *s, uint32_t *rig, char env[16], float *roll) {
     *roll = s->mag_cam[11];
     return 1;
 }
-static void mag_input(Shop *s, int key) {
-    if (key != SHOP_KEY_OK) return;                            /* 0x406415e3 only */
+/* UIMagazineReward 0x55b260: Continue (0x406415e3) asks 0x55b220 -- GenericDialog_SMALL, "Do you
+   want to save this magazine?" 0x3312f33 / "...DVD?" 0xe9641a65 (0x838578: 1 magazine 0x53dd30,
+   2 DVD 0x53dd70), Yes 0x88579775 -> 0x115bbd44, No 0xbe503981 -> 0x115bbd45. Yes: 0x7fa29c = 0,
+   +0x74 = 1; the 0x55b498 tick counts it past 2 and captures (ScreenShot 0x5c3120), then 0x523ef0
+   runs memcard op 0xcb1 (the photo into the profile save) whose done messages 0x172176e8 / 0x36fad7
+   free the shot and leave (0x54b090: StartCareerFreeRoam). No: 0x54b090 at once, nothing saved. */
+static void mag_leave(Shop *s) {
     glDeleteTextures(4, s->mag_tex); memset(s->mag_tex, 0, sizeof s->mag_tex);
     s->mag_cam_ok = 0; s->mag_flags = 0;
     printf("magazine: cover accepted\n");
-    s->mag_shot = 0;
+    s->mag_shot = 0; s->mag_leave = 0;
     career_go(s, 0);
+}
+static void mag_input(Shop *s, int key) {
+    if (key != SHOP_KEY_OK || s->mag_shot > 0 || s->mag_leave) return;   /* 0x406415e3 only */
+    int dvd = s->mag_sc && s->mag_sc[0x24] == 4;
+    dialog(s, PK_DLG_S, 2, dvd ? 0xe9641a65u : 0x3312f33u, DA_MAG_SAVE, 0x88579775u, 0xbe503981u);
+    s->dlg_act2 = DA_MAG_NOSAVE;
+}
+static void mag_dlg(Shop *s, int act) {
+    if (act == DA_MAG_SAVE) { s->mag_shot = 3; printf("magazine: save the cover photo\n"); }   /* +0x74 1 -> 3 */
+    else { printf("magazine: cover not saved\n"); mag_leave(s); }
 }
 
 /* bStringHash(str, seed): the hash carried on over str */
@@ -7988,7 +8756,8 @@ static int sc_index(const unsigned char *sc) {
     return -1;
 }
 const unsigned char *shop_cover_due(Shop *s) {
-    if (!s || s->screen != SC_MAG_REWARD || s->mag_shot <= 0 || --s->mag_shot) return NULL;
+    if (!s || s->screen != SC_MAG_REWARD || dlg_open(s) || s->mag_shot <= 0 || --s->mag_shot) return NULL;
+    s->mag_leave = 1;   /* the save's done messages leave (0x54b090) -- next update */
     return s->mag_sc;
 }
 void shop_cover_capture(const unsigned char *sc, int W, int H) {
@@ -8161,6 +8930,7 @@ int shop_career_shop(Shop *s, const unsigned char *shop) {
     lot_refresh(s);
     s->screen = SC_CAREER_LOT;
     s->platform = shop_scene_platform(shop);           /* the lot's scene: CARLOT01 */
+    s->fe_shop = shop;
     /* 0x35f8620b: CareerSpeech::HandleFESpeechEvent(4) (fe_speech_screen)
        and AllocBackupDB (IsDirty's reference) */
     profile_snapshot();
@@ -8337,6 +9107,10 @@ static uint32_t shop_sig(const Shop *s) {
     SIG(s->dloc.sel); SIG(s->dlev);
     SIG(s->scar.sel); SIG(s->career_go); SIG(s->lot_sel); SIG(s->lot_state);
     SIG(s->cwm.sel); SIG(s->cwm_stage);
+    /* the icon strips that never set snd_done on a scroll: without them here a
+       scroll played nothing (crib menu silent on HW, 11-02) */
+    SIG(s->crib.sel); SIG(s->crw.sel); SIG(s->msel.sel); SIG(s->prof.sel); SIG(s->perfpkg.sel);
+    SIG(s->cfm.sel); SIG(s->uqs.sel); SIG(s->icem.sel); SIG(s->neonm.sel);
 #undef SIG
     return h;
 }
@@ -8353,6 +9127,10 @@ void shop_input(Shop *s, int key) {
                                        FE_SND_SELECT, FE_SND_BACK, FE_SND_LEFT, FE_SND_RIGHT,
                                        FE_SND_BACK };
     if (key > 0 && key < (int)sizeof snd) audio_fe_play(snd[key]);
+#ifdef OPENUG2_SIM_PRE_H   /* test aid (simulator): OPENUG2_FESNDTRACE logs the generic key sounds */
+    if (getenv("OPENUG2_FESNDTRACE") && key > 0 && key < (int)sizeof snd)
+        printf("fesnd: screen %d key %d -> sound %d\n", (int)s->screen, key, snd[key]);
+#endif
 }
 /* ---------------------------------------------------------- visual rating */
 
@@ -8455,7 +9233,7 @@ static const unsigned char *rate_body_rec(const Shop *s, int group, int value, i
             unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
             if (!hash && !soff) break;
             if (r[7] != models[mi] || r[4] != group) continue;
-            if (db_has_attr(s, aoff, 0xF7934316u)) continue;   /* EXCLUDE_UG2 */
+            if (part_excluded(s, r)) continue;   /* EXCLUDE_* by model */
             if (db_has_attr(s, aoff, 0x721AFF7Cu) != (carbon != 0)) continue;
             int v = part_value(s->car, group, hash);
             if (v < 0 && mi > 0 && (r[5] | r[6] << 8) == 0) v = 0;
@@ -8471,7 +9249,7 @@ static const unsigned char *rate_attr_rec(const Shop *s, int group, uint32_t key
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         uint32_t v = 0;
         if (!n2_u32(r) && !soff) break;
-        if (r[4] == group && !db_has_attr(s, aoff, 0xF7934316u) && db_attr(s, aoff, key, &v) && v == val) return r;
+        if (r[4] == group && !part_excluded(s, r) && db_attr(s, aoff, key, &v) && v == val) return r;
     }
     return NULL;
 }
@@ -8555,7 +9333,7 @@ static float shop_rating(const Shop *s, const N2CarConfig *c, const char *rim_fo
         const unsigned char *r = s->db + p;
         unsigned soff = r[8] | r[9] << 8, aoff = r[10] | r[11] << 8;
         if (!n2_u32(r) && !soff) break;
-        if (db_has_attr(s, aoff, 0xF7934316u)) continue;
+        if (part_excluded(s, r)) continue;
         if (r[4] == G_HEADLIGHT_BULB && c->bulb && !(done & 0x100u) && rate_col(s, aoff, 0, 0) == c->bulb) {
             pts += rate_part(s, 0x9f, r); done |= 0x100u;
         }
@@ -8685,6 +9463,7 @@ static void dlg_act(Shop *s, int act) {
     case DA_OPT_LEAVE: opt_leave(s); break;
     case DA_LOT_BUY: case DA_LOT_TRADE: case DA_LOT_BROWSE: case DA_LOT_EXIT: lot_dlg(s, act); break;
     case DA_CRIB_PLAY: case DA_CRIB_MAIN: case DA_CRIB_TEST: crib_dlg(s, act); break;
+    case DA_MAG_SAVE: case DA_MAG_NOSAVE: mag_dlg(s, act); break;
     case DA_CRIB_SWITCH:   /* 0xd05fc3a3: SwitchCars, FORWARD */
         career_switch_car(s->lot[s->lot_sel].handle);
         printf("crib car select: the career car is now %s (slot %08x)\n",
@@ -8759,6 +9538,25 @@ static void dlg_act(Shop *s, int act) {
         break;
     case DA_PERF_PART: perf_part_yes(s); break;
     case DA_CTL_RESET: options_ctl_preset(&g_opt, 0); break;
+    case DA_QR_DELETE: {   /* 0x51123592: DeleteCurrentCar 800e081c */
+        if (!s->qr_ncar) break;
+        int sel = s->qr_car_sel, idx = s->qr_car_list[sel], slot = s->cars[idx].slot;
+        if (slot < 0) break;
+        if (s->qr_ncar >= 2) {   /* ScrollCars to the next car first (the list's last: to the left) */
+            int ns = sel == s->qr_ncar - 1 ? sel - 1 : sel + 1;
+            qr_car_id(&s->cars[s->qr_car_list[ns]], s->qr_car_cur, sizeof s->qr_car_cur);
+            garage_tt_request(0, ns < sel);
+        } else s->qr_filter = 0;   /* the only car of the filter: SetViewFilter(3), the list's first */
+        memmove(&s->cars[idx], &s->cars[idx + 1], sizeof s->cars[0] * (size_t)(s->ncars - idx - 1));
+        s->ncars--;
+        qr_build_cars(s);
+        s->qr_car_pending = 0;
+        qr_car_moved(s);
+        if (!s->qr_car_pending && s->qr_ncar) { s->qr_car_pending = 1; s->qr_car_debounce = 0.0f; }
+        s->qr_del = slot + 1;
+        printf("qr: tuned car %d deleted\n", slot);
+        break;
+    }
     case DA_TRANS_MANUAL: case DA_TRANS_AUTO:          /* 0x5f5e3886 / 0x1a2826e1, then 0xba5b5fce */
         g_opt.p[0].manual = act == DA_TRANS_MANUAL;
         printf("qr: transmission %s\n", act == DA_TRANS_MANUAL ? "manual" : "auto");
@@ -8873,13 +9671,16 @@ static uint32_t help_of(const Shop *s) {
 /* What $JOY_EVENT_FENG_BUTTON1$ is on this screen in the port: Square opens
    the split hood / doors and previews the purge, resets the graphics
    category and clears the decals (0xc519bfc0); the jukebox grabs with
-   Triangle. -1: not ported here (Customize from the car select, Player
-   Select, Switch Players, EA Messenger) -- its prompt and help line go. */
+   Triangle; the car select's Square is Customize (Quick Race, BeginCarCustomize
+   entry 2) or Delete Tuned Car (Customize mode 0x20, 0xefddc126). -1: not
+   ported here (Player Select, Switch Players, EA Messenger) -- its prompt and
+   help line go. */
 static int button1_glyph(const Shop *s) {
     switch (s->screen) {
     case SC_SPEC: return s->spec_slot == 9 || s->spec_slot == 0xa0 || s->spec_slot == 0xa2 ? HUD_PAD_SQUARE : -1;
     case SC_GRAPHICS: case SC_DLOC: case SC_DPICK: return HUD_PAD_SQUARE;
     case SC_JUKE: return HUD_PAD_TRIANGLE;
+    case SC_QR_CAR: return HUD_PAD_SQUARE;   /* 0xc519bfc0 (800de290 / 0x4fc1f0) */
     default: return -1;
     }
 }
@@ -8924,8 +9725,12 @@ static void shop_input_screen(Shop *s, int key) {
     switch (s->screen) {
     case SC_SPLASH:   /* MC_Background (0x4c51f0): the boot load, once */
         if (key == SHOP_KEY_OK) {
-            s->screen = SC_MAIN;
+            /* ChangeToNextBootFlowScreen: MC_Background runs the boot load before
+               UI_Main exists, so no garage or car shows behind it (the UIMain
+               ctor 0x4df140 builds them from the loaded profile); ExitMemcard
+               goes on to UI_Main (mc_ret) */
             if (!g_boot_load_done) { g_boot_load_done = 1; mc_enter(s, 0x121, SC_MAIN); }
+            else s->screen = SC_MAIN;
         }
         break;
     case SC_PROFILE:
@@ -8972,7 +9777,7 @@ static void shop_input_screen(Shop *s, int key) {
             else if (k_main_menu[s->main.sel].group == MM_OPTIONS) s->screen = SC_OPT_MAIN;
             else if (k_main_menu[s->main.sel].group == MM_PROFILE) profile_enter(s);
             else if (k_main_menu[s->main.sel].group == MM_CAREER) start_career_enter(s);
-            else { s->qr_cust = 1; qr_enter_cars(s); }   /* 0x4aed30: mode 0x20, UI_QRCarSelect */
+            else { s->qr_cust = 1; g_cust_qr = 0; qr_enter_cars(s); }   /* 0x4aed30: mode 0x20, UI_QRCarSelect */
         }
         else if (key == SHOP_KEY_BACK) s->screen = SC_SPLASH;
         break;
@@ -8994,7 +9799,14 @@ static void shop_input_screen(Shop *s, int key) {
     case SC_CAR_SHOP:
         if (key == SHOP_KEY_LEFT) scroller_move(&s->top, -1);
         else if (key == SHOP_KEY_RIGHT) scroller_move(&s->top, 1);
-        else if (key == SHOP_KEY_OK && !s->top.locked[s->top.sel]) car_shop_open(s, s->top.sel);
+        else if (key == SHOP_KEY_OK && !s->top.locked[s->top.sel] && s->top.e[s->top.sel].group == PERF_TEST_TRACK) {
+            /* PerfMenuStartTuning (8016104c's IconOption): the changes go to the garage first
+               (the EXIT commit, main.c), then BeginCarTuning(.., entry 2) */
+            s->tt_req = 1; s->exit_req = 1;
+            printf("car shop: Test Track -- BeginCarTuning (entry 2)%c", 10);
+        }
+        else if (key == SHOP_KEY_OK && !s->top.locked[s->top.sel])
+            car_shop_open(s, s->top.e == k_car_shop_crib ? k_car_shop_crib_cat[s->top.sel] : s->top.sel);
         else if (key == SHOP_KEY_BACK) s->exit_req = 1;
         break;
     case SC_BODY:
@@ -9179,9 +9991,13 @@ static void shop_input_screen(Shop *s, int key) {
 static int rating_shown(const Shop *s);
 static void rating_update(Shop *s);
 /* the screens' 0x35f8620b HandleFESpeechEvent sends (career only; GC
-   caller table SPEECH_GAME 1e).  Guesses: PartSelectionScreen's
-   gCarCustomizeManager+0x1c == 0 and ChoosePaintScreen's +0x28 == 2 gates
-   are not modelled */
+   caller table SPEECH_GAME 1e).  R1 11-01 gates (GC): PartSelectionScreen
+   801615f8 only when gCarCustomizeManager+0x1c (customize category) == 0
+   (parts); IceSelectionScreen 801695c4 (UI_ICEMAIN = the Specialties strip,
+   PC mode 0x838998) only when +0x24 == 0 (the top level, not the trunk
+   audio modes); ChoosePaintScreen 80177658 only when +0x28 (paint category,
+   CalcNextScreenFromChoosePaintCategory 801609c8: 0 vinyl layer, 1 decals,
+   2 UI_Paint) == 2, i.e. not the vinyl colours */
 static void fe_speech_screen(Shop *s) {
     if (s->spk_screen == s->screen + 1) return;
     if (s->spk_screen == SC_CRIB_SPONSORS + 1) career_speech_sponsor_done();   /* HandleSponsorSelectDone */
@@ -9193,13 +10009,13 @@ static void fe_speech_screen(Shop *s) {
     switch (s->screen) {
     case SC_CRIB: ev = 0x11; break;          /* uiCareerCrib */
     case SC_CAREER_LOT: ev = 4; break;       /* UICareerCarLot */
-    case SC_PARTS: ev = 2; break;            /* PartSelectionScreen */
+    case SC_PARTS: if (s->cust_shop == 0) ev = 2; break;   /* PartSelectionScreen */
     case SC_DLOC: ev = 5; break;             /* ChooseDecalCategory */
-    case SC_ICE: ev = 0x12; break;           /* IceSelectionScreen */
+    case SC_SPECIALTIES: ev = 0x12; break;   /* IceSelectionScreen, mode 0 */
     case SC_PERFORMANCE: ev = 1; break;      /* ChoosePerfCategory */
     case SC_GRAPHICS: ev = 0xf; break;       /* ChoosePaintShopCategory */
     case SC_VLAYER: ev = 0xe; break;         /* ChooseVinylLayerScreen */
-    case SC_PAINT: ev = 8; break;            /* ChoosePaintScreen */
+    case SC_PAINT: if (s->vmode < 0) ev = 8; break;   /* ChoosePaintScreen, paint category 2 */
     default: break;
     }
     if (ev >= 0) career_speech_fe(ev);
@@ -9260,6 +10076,7 @@ void shop_update(Shop *s, float dt) {
                          &s->opt_main, &s->paintcat, &s->perfpkg, &s->vlay, &s->vcat, &s->dloc, &s->prof, &s->scar, &s->cfm,
                          &s->icem, &s->neonm, &s->crib, &s->cwm };
     movie_update(s, dt);
+    if (s->screen == SC_MAG_REWARD && s->mag_leave) mag_leave(s);
     s->alt_t += dt;
     alt_update(s, dt);
     s->blink += dt;
@@ -9309,14 +10126,25 @@ int shop_poll(Shop *s, ShopAction *a) {
     if (s->qr_car_pending && s->qr_car_debounce <= 0.0f) {   /* the car select's car on the platform */
         s->qr_car_pending = 0;
         a->kind = SHOP_ACT_QR_CAR;
-        snprintf(a->car, sizeof a->car, "%s", s->qr_car_cur);
+        qr_car_out(s, a);
+        /* UICareerCribCarSelect (800d4d38): SetRideInfo of the slot's own ride -- two career
+           cars of one model are two rides (GAPS 255) */
+        a->career_handle = (s->screen == SC_CRIB_CARSEL || s->screen == SC_CAREER_LOT) && s->lot_n &&
+                           s->lot[s->lot_sel].kind == 0 ? s->lot[s->lot_sel].handle : 0;   /* the lot: a stock car's handle too */
+        return 1;
+    }
+    if (s->qr_del) {                                     /* F2.4: DeleteTunedCar */
+        a->kind = SHOP_ACT_DELETE_CAR; a->car[0] = 0; a->slot = s->qr_del - 1;
+        s->qr_del = 0;
         return 1;
     }
     if (s->cust_go && !s->qr_car_pending) {             /* Customize: the Car Shop for this car */
         s->cust_go = 0;
         g_qr_filter = s->qr_filter;
+        g_cust_qr = s->cust_qr; s->cust_qr = 0;
+        if (g_cust_qr) { memcpy(g_qr_set, s->set, sizeof g_qr_set); g_qr_set_ok = 1; g_qr_mode_sel = s->qr_mode.sel; }
         a->kind = SHOP_ACT_CUSTOMIZE;
-        snprintf(a->car, sizeof a->car, "%s", s->qr_car_cur);
+        qr_car_out(s, a);
         return 1;
     }
     if (s->qr_go && !s->qr_car_pending) {
@@ -9324,7 +10152,7 @@ int shop_poll(Shop *s, ShopAction *a) {
         memcpy(g_qr_set, s->set, sizeof g_qr_set); g_qr_set_ok = 1;
         g_qr_mode_sel = s->qr_mode.sel; g_qr_filter = s->qr_filter;
         a->kind = SHOP_ACT_QR_GO;
-        snprintf(a->car, sizeof a->car, "%s", s->qr_car_cur);
+        qr_car_out(s, a);
         qr_fill(s, &a->qr);
         return 1;
     }
@@ -9560,7 +10388,8 @@ static int pad_token(const Shop *s, const char *q, int *glyph, const char **txt,
     static const struct { const char *tok; int g; const char *txt; } k[] = {
         { "$JOY_EVENT_FENG_SELECT$", HUD_PAD_CROSS }, { "$JOY_EVENT_FENG_ACCEPT$", HUD_PAD_CROSS },
         { "$JOY_EVENT_FENG_CANCEL$", HUD_PAD_CIRCLE }, { "$JOY_EVENT_FENG_BUTTON0$", HUD_PAD_SQUARE },
-        { "$JOY_EVENT_FENG_LTRIGGER$", -1, "L" }, { "$JOY_EVENT_FENG_RTRIGGER$", -1, "R" },
+        { "$JOY_EVENT_FENG_LTRIGGER$", HUD_PAD_LBTN }, { "$JOY_EVENT_FENG_RTRIGGER$", HUD_PAD_RBTN },
+        { "$JOY_EVENT_FENG_START$", HUD_PAD_START },
         { "$JOY_EVENT_FENG_HELP$", -1, "SELECT" },
         { "$JOY_EVENT_FENG_PAD_UP$", HUD_PAD_DPAD_UD }, { "$JOY_EVENT_FENG_PAD_DOWN$", HUD_PAD_DPAD_UD },
         { "$JOY_EVENT_FENG_PAD_LEFT$", HUD_PAD_DPAD_LR }, { "$JOY_EVENT_FENG_PAD_RIGHT$", HUD_PAD_DPAD_LR },
@@ -9896,16 +10725,20 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
            circles (-44) are one strip; the per-group pin split them on a wide
            screen (text on the left edge, circles centred) */
         if (p == PK_LOADING) odc.pin = -1.0f;
+        /* Loading_Controller is one framed 4:3 layout: "LOADING" and its
+           circles / box share a corner, the labels the picture */
+        if (p == PK_LOADING_CTL) odc.pin = 0.0f;
         /* the cover screens are one 4:3 picture: the U2_magazine_texture side
            masks must meet the cover's edges, not the screen's */
         if (p == PK_MAG_REWARD || p == PK_MAG_BACK || p == PK_MAG_VIEW) odc.pin = 0.0f;
         odc.cover = o->type != FENG_STRING && fabsf(o->size[0]) >= 600.0f && fabsf(o->size[1]) >= 440.0f;
         dc = &odc;
         const float *c = s->rgba[p][i];
-        if (p == PK_LOADING) {   /* PC_Loading: animated by script in the game */
+        if (p == PK_LOADING || p == PK_LOADING_CTL) {   /* PC_Loading: animated by script in the game */
+            uint32_t c0 = p == PK_LOADING ? 0x50d98304u : 0x50d98305u;   /* Loading_Controller's run 05..09 */
             if (o->hash == 0x5b9d84dbu) continue;                    /* "EVENT HANDLER" debug text */
-            if (o->hash >= 0x50d98304u && o->hash <= 0x50d98308u) { /* the five circles, lit in turn */
-                float ph = fmodf(s->blink * 4.0f, 7.0f) - (float)(o->hash - 0x50d98304u);
+            if (o->hash >= c0 && o->hash <= c0 + 4u) {               /* the five circles, lit in turn */
+                float ph = fmodf(s->blink * 4.0f, 7.0f) - (float)(o->hash - c0);
                 float a = 1.0f - fabsf(ph) / 1.5f; if (a < 0.15f) a = 0.15f;
                 float b[4] = { c[0], c[1], c[2], a };
                 GLuint tx = o->res > 0 && o->res < pk->nres ? s->res_tex[p][o->res] : 0;
@@ -9931,6 +10764,7 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
         }
         if (o->hash == O_LOCK && !show_lock) continue;
         if (o->hash == O_PRESS_START) {   /* the script's fade, as a slow pulse */
+            if (s->mc_view != MCV_OFF) continue;   /* the boot load (MC_Background): the splash has gone on */
             float b[4] = { c[0], c[1], c[2], 0.55f + 0.45f * cosf(s->blink * 3.0f) };
             text(s, dc, p, i, o->text, b);
             continue;
@@ -9972,7 +10806,8 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
                  ov_img->geom ? ov_img->y : o->ay, o->aangle, b, 0);
             continue;
         }
-        if (o->res <= 0 || o->res >= pk->nres) continue;   /* untextured = code slots */
+        /* untextured = code slots; Loading_Controller's res 0 is its U2_Menu_Box panel */
+        if (o->res < (p == PK_LOADING_CTL ? 0 : 1) || o->res >= pk->nres) continue;
         GLuint tex = s->res_tex[p][o->res];
         if (!tex) continue;
         const ShopTex *st = tex_find(s, feng_tex_key(pk->res[o->res].name));
@@ -10582,12 +11417,17 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         const char *xt[4] = { str_get(s, s->qr_cust ? STR_QR_CUST_TITLE : STR_QR_CAR_TITLE),
                               str_get(s, k_qr_filters[s->qr_filter].str),
                               str_get(s, qr_type_str(s->qr_type)), "" };
-        t.xh = xh; t.xt = xt; t.nx = 4;
+        /* RefreshHeader 800df4d0 mode 2: 0xa936c3a2 keeps its package text (Square =
+           Customize, BeginCarCustomize entry 2) */
+        t.xh = xh; t.xt = xt; t.nx = s->qr_cust ? 4 : 3;
         s->nov = 0;
         {   /* the PC's lone Accept token sits on the Customize prompt, unlabelled */
             ObjOv *h = &s->ov[s->nov++]; memset(h, 0, sizeof *h); h->hash = 0xab9f2841u; h->hide = 1;
         }
-        if (s->qr_cust) {   /* 0x4b2310 mode 0x20: no race; the tuned-car button (new car: hidden) */
+        if (s->qr_cust && c && c->slot >= 0) {   /* RefreshHeader 800df4d0 mode 0x20, a tuned car: Delete 0xefddc126 */
+            xt[3] = str_get(s, 0xefddc126u);
+            ObjOv *h = &s->ov[s->nov++]; memset(h, 0, sizeof *h); h->hash = O_QR_MODE_BOX; h->hide = 1;
+        } else if (s->qr_cust) {   /* 0x4b2310 mode 0x20: no race; the tuned-car button (a stock car: hidden) */
             static const uint32_t ch[3] = { O_QR_MODE_BOX, O_QR_CUSTOMIZE, O_QR_CUST_BTN };
             for (int k = 0; k < 3; k++) {
                 ObjOv *h = &s->ov[s->nov++]; memset(h, 0, sizeof *h); h->hash = ch[k]; h->hide = 1;
@@ -10715,6 +11555,18 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         break;
     }
     case SC_LOADING:
+        if (s->ls_ctl && s->pk[PK_LOADING_CTL] && s->ls_pic) {   /* F1.11: SetupControllerConfig's labels, the Vita picture */
+            static uint32_t xh[LSC_N + 1]; static const char *xt[LSC_N + 1];
+            for (int i = 0; i < LSC_N; i++) { xh[i] = k_lsc_obj[i]; xt[i] = s->ls_lab[i] ? str_get(s, s->ls_lab[i]) : ""; }
+            xh[LSC_N] = 0xbe813131u; xt[LSC_N] = "";             /* the tip: DisplayGameTip is a stub */
+            t.xh = xh; t.xt = xt; t.nx = LSC_N + 1;
+            s->nov = 0;
+            ObjOv *ov = &s->ov[s->nov++]; memset(ov, 0, sizeof *ov);
+            ov->hash = 0x922a39c4u; ov->tex = s->ls_pic;
+            draw_package(s, &dc, PK_LOADING_CTL, &t, 0, NULL, 0);
+            s->nov = 0;
+            break;
+        }
         draw_package(s, &dc, PK_LOADING, &t, 0, NULL, 0);
         break;
     case SC_OPT_MAIN:

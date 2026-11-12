@@ -7,7 +7,7 @@
  * customization) and the high-score table (HighScoresDatabase 0x844adc).
  * The working copies of these are the game's own files (options.bin,
  * garage.txt, scores.bin); a profile save packs them into
- * ux0:data/OpenUG2/profiles/<NAME>/<NAME> (the PC's
+ * ux0:data/NFSU2/profiles/<NAME>/<NAME> (the PC's
  * %LOCALAPPDATA%\NFS Underground 2\<NAME>\<NAME>) with the realmc
  * container: "20CM" header, sizes, MSB-first CRC-32s (0x6fcd1c).
  *
@@ -18,9 +18,11 @@
 #define OPENUG2_PROFILE_H
 
 #ifdef __vita__
-#define PROFILE_GARAGE_FILE "ux0:data/OpenUG2/garage.txt"
+#define PROFILE_GARAGE_FILE "ux0:data/NFSU2/garage.txt"
+#define PROFILE_DIR_PATH "ux0:data/NFSU2/profiles"   /* = profile.c's PROFILE_DIR */
 #else
 #define PROFILE_GARAGE_FILE "garage.txt"
+#define PROFILE_DIR_PATH "profiles"
 #endif
 
 #define PROFILE_NAME_MAX 7          /* FUN_00555f80(.., 7, ..); MC_List: < 8 chars */

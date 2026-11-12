@@ -1063,6 +1063,113 @@ static const unsigned char *bank_find_hash(const Nis *n, unsigned h, const Bank 
     }
     return NULL;
 }
+/* ---- the same EAGL decoding for the world animations (worldanim.c) ------- */
+struct NisBanks { Bank *b; int n; };
+NisBanks *nis_banks_load(const unsigned char *d, long len)
+{
+    NisBanks *k = (NisBanks *)calloc(1, sizeof *k);
+    if (!k) return NULL;
+    for (long q = 0; q + 8 <= len;) {
+        unsigned cid = rd32(d + q), sz = rd32(d + q + 4);
+        if (q + 8 + (long)sz > len) break;
+        if (cid == 0xe34010u)
+            for (unsigned j = 0; j + 4 <= sz; j++)
+                if (!memcmp(d + q + 8 + j, "\x7f" "ELF", 4)) {
+                    Bank nb;
+                    Bank *g = (Bank *)realloc(k->b, (size_t)(k->n + 1) * sizeof *g);
+                    if (g) { k->b = g; if (bank_from_elf(d + q + 8 + j, sz - j, &nb)) k->b[k->n++] = nb; }
+                    break;
+                }
+        q += 8 + (long)sz;
+    }
+    return k;
+}
+int nis_banks_count(const NisBanks *k) { return k ? k->n : 0; }
+void nis_banks_free(NisBanks *k)
+{
+    if (!k) return;
+    for (int i = 0; i < k->n; i++) free(k->b[i].data);
+    free(k->b);
+    free(k);
+}
+struct NisChan { const Bank *bank; const unsigned char *sub[4]; Codec c11[4]; int nsub; };
+/* 0x434850 (the animation by name hash) -> 0x6e2d40 (its instance): a type
+   15 container of codec 11 / 20 / 21 parts, as char_init binds them */
+NisChan *nis_chan_bind(const NisBanks *k, unsigned h, float *frames)
+{
+    if (!k) return NULL;
+    const Bank *bk = NULL;
+    const unsigned char *a = NULL;
+    for (int b = 0; b < k->n && !a; b++) {
+        const unsigned char *D = k->b[b].data, *t = D + k->b[b].bank;
+        unsigned cnt = rd32(t + 4), pa = rd32(t + 0x10), pn = rd32(t + 0x14);
+        for (unsigned i = 0; i < cnt; i++) {
+            if (pn + 4 * i + 4 > k->b[b].len || pa + 4 * i + 4 > k->b[b].len) break;
+            unsigned no = rd32(D + pn + 4 * i), ao = rd32(D + pa + 4 * i);
+            if (no < k->b[b].len && ao + 12 <= k->b[b].len && nis_hash((const char *)D + no) == h) {
+                a = D + ao; bk = &k->b[b]; break;
+            }
+        }
+    }
+    if (!a || rd16(a) != 15) return NULL;
+    NisChan *c = (NisChan *)calloc(1, sizeof *c);
+    if (!c) return NULL;
+    c->bank = bk;
+    int cnt = (int)rd16(a + 8);
+    for (int i = 0; i < cnt && c->nsub < 4; i++) {
+        unsigned so = rd32(a + 0xc + 4 * i);
+        if (so + 0x14 > bk->len) continue;
+        const unsigned char *s = bk->data + so;
+        int ty = (int)rd16(s);
+        if (ty == 11) {
+            Codec *q = &c->c11[c->nsub];
+            if (!codec_init(q, s)) continue;
+            unsigned st = rd32(s + 4);
+            if (st + 4 > bk->len) continue;
+            q->s = bk->data + st;
+            q->nch = (int)rd16(q->s); q->bits = q->s[2];
+            q->frames = (int)rd16(s + 8);
+            if (q->nch > 160 || q->frames < 1 || (q->bits != 4 && q->bits != 8 && q->bits != 16)) continue;
+            int bad = 0;                                                /* pose slots in the scratch pose */
+            for (int g = 0; g < q->nch / 4; g++) bad |= rd16(s + 10 + 2 * g) + 4 > NIS_CHAN_POSE;
+            if (bad) continue;
+            q->cur = -1;
+        } else if (ty != 20 && ty != 21) continue;
+        c->sub[c->nsub++] = s;
+    }
+    if (frames) *frames = (float)rd16(a + 0xa);                       /* 0x6e2110 */
+    return c;
+}
+void nis_chan_eval(NisChan *c, float frame, float *pose, int npose)
+{
+    if (!c || npose > NIS_CHAN_POSE) return;
+    float t[NIS_CHAN_POSE];
+    memcpy(t, pose, sizeof(float) * (size_t)npose);
+    for (int i = 0; i < c->nsub; i++) {
+        int ty = (int)rd16(c->sub[i]);
+        if (ty == 11) codec_eval(&c->c11[i], frame, t);
+        else if (ty == 20) c20_eval(c->bank, c->sub[i], frame, t, NIS_CHAN_POSE, 3);
+        else if (ty == 21) c20_eval(c->bank, c->sub[i], frame, t, NIS_CHAN_POSE, 1);
+    }
+    memcpy(pose, t, sizeof(float) * (size_t)npose);
+}
+void nis_chan_free(NisChan *c) { free(c); }
+void nis_root_rest(float pose[24])
+{
+    for (int b = 0; b < 2; b++) {                                       /* 0x6e3c70, as slot_place */
+        float *p = pose + 12 * b;
+        memset(p, 0, 12 * sizeof *p);
+        p[0] = p[1] = p[2] = p[3] = 1.0f; p[7] = 1.0f; p[11] = 1.0f;
+    }
+}
+void nis_root_bone1(const float pose[24], float m[16])
+{
+    float m0[16];                                                       /* PoseSQTToGlobal */
+    pose_matrix(pose, m0);
+    pose_matrix(pose + 12, m);
+    m4mul(m, m0, m);
+}
+
 /* 0x437be0 for one item (type 1): 1 when it makes a character */
 static int char_init(Nis *n, NisChar *c, const unsigned char *it)
 {
@@ -1302,6 +1409,9 @@ Nis *nis_load(const char *dataroot, unsigned hash, int variant)
     /* the career start scene (ChooseAnim 800464ac type 4, IsFirstTimeInCareer):
        NIS/Scene_CareerNis1_BundleB.bun, header type 4, 405 frames */
     if (!name[0] && nis_hash("CareerNis1") == hash) snprintf(name, sizeof name, "CareerNis1");
+    /* the dyno's intro / outro (CAnimChooser event 0x1262): NIS/Scene_DynoEnter|DynoExit_BundleB.bun */
+    if (!name[0] && nis_hash("DynoEnter") == hash) snprintf(name, sizeof name, "DynoEnter");
+    if (!name[0] && nis_hash("DynoExit") == hash) snprintf(name, sizeof name, "DynoExit");
     if (!name[0]) return NULL;
     char p[1024];
     snprintf(p, sizeof p, "%s/NIS/Scene_%s_BundleB.bun", dataroot, name);

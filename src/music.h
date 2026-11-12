@@ -27,6 +27,10 @@ enum { MUSIC_OFF = 0, MUSIC_FE = 1, MUSIC_IG = 2 };
 /* opens sdat.viv and the MPF map, starts the decoder thread; 0 on failure
    (the game then runs without music) */
 int  music_init(const char *dataroot);
+/* perf: a card-read job run on the music's reader thread each loop (~4-10
+   ms apart), e.g. speech.c's clip reads, so they leave the frame thread.
+   1 = the thread runs and will call fn; 0 = no thread (do the reads inline). */
+int  music_set_io_hook(void (*fn)(void));
 /* where the game is: MUSIC_FE (front end), MUSIC_IG (driving), MUSIC_OFF
    (stops). Switching playlist starts that playlist's next song. */
 void music_set_mode(int mode);
@@ -51,6 +55,25 @@ void music_default_playlist(unsigned char song[MUSIC_SONGS], unsigned char mode[
 void music_play_song(int song);
 /* level 0..1 (the AOFEMusicVol / AOIGMusicVol slider) */
 void music_set_volume(float fe, float ig);
+
+/* The ambience beds (EAXS_PFController, SetupAmbientStreams 0x47b260): MPF
+ * events 27.. are single-sample beds on the same stream channel as the songs
+ * (the music level), one per ambient zone (table 0x7ecc10).
+ * force: EAXS_UpdateMusic 0x482180's ambience branch in game -- the in-game
+ * music level or the master level at 0, a drag (0x89e7d8 / 0x890108) or drift
+ * (0x89e7d9 / 0x890104) race; an empty in-game playlist (+0x8c) counts too.
+ * Set it before music_set_mode each frame. */
+void music_set_ambience_force(int force);
+/* in game, once a frame: the zone and volume (hundredths of a dB) at the
+   player's car (rain_ambience_at), loading = a loading screen is up */
+void music_ambience(int zone, int vol_cdb, int loading, float dt);
+/* in the front end, once a frame before music_set_mode: the shop's ambience
+   zone (shop_fe_ambient_zone); force = the beds instead of the songs
+   (EAXS_UpdateMusic's FE branch: the front-end music level 0; an empty
+   front-end playlist counts too) */
+void music_fe_ambience(int zone, int force);
+/* the bed's PATH event playing, -1 none */
+int  music_ambience_bed(void);
 
 /* audio thread: adds n frames of the song, resampled to `rate`, into the
    interleaved stereo float mix */

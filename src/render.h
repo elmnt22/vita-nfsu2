@@ -28,6 +28,7 @@ typedef struct {
     int nidx, cat, trim;
     uint32_t texkey, car_material;
     unsigned char draw_mode;  /* Optional override; zero uses the caller's mode. */
+    unsigned char win;        /* car glass: N2Mesh.car_win (1..6 window, 0 none) */
 } GpuMesh;
 
 /* ---- static-world batching: meshes merged per (256m grid cell, texture) ----
@@ -90,6 +91,9 @@ typedef struct {
                                  separate, unrelated render treatment. */
     void *shared_buffers; /* owning GPU reference; render aliases merely borrow */
     unsigned char reflect;    /* members carry N2Mesh.reflect: the wet-road pass */
+    unsigned char fade_in;    /* members carry N2Mesh.fade_in: newly arrived buildings */
+    unsigned char tall;       /* members are tall far stand-ins (N2_BATCH_TALL): culled at the far
+                                 plane, not the nearer world view distance */
 } N2Batch;
 #ifdef __vita__
 /* Road reflection target (worldreflect.fx): the scene mirrored about the
@@ -288,6 +292,9 @@ void upload_world_batches_set_normals(WorldBatchUpload *job, float *const *norma
 int  render_scene_begin(int screen_w, int screen_h, float scale);   /* 1 = scaled */
 void render_scene_end(const RProg *rp, GpuMesh *quad, int screen_w, int screen_h,
                       float fog_density);
+/* 1 while the 3D frame renders into the scene texture: its framebuffer,
+   colour texture and size (for GPU-side copies of the frame) */
+int  render_scene_target(unsigned *fbo, unsigned *tex, int *w, int *h);
 /* the screen flash: the next composites multiply the 3D frame by mul (rgb)
    before the visual treatment; NULL = none */
 void render_set_flash(const float mul[3]);

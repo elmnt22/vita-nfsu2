@@ -58,7 +58,7 @@ typedef struct {
     unsigned char have_nitro_tank;
     unsigned char have_boost;
     unsigned char have_money;
-    float nitro_tank;         /* 0..1, meaningful only if have_nitro_tank */
+    float nitro_tank;         /* 0..2 bottles (0x5925b0), meaningful only if have_nitro_tank */
     float boost;              /* -1 vacuum .. 0 .. +1 full boost, if have_boost */
     long  money;              /* meaningful only if have_money */
 
@@ -100,8 +100,12 @@ typedef struct {
        (+0x44 / +0x6c at the finish checkpoint); the events since the last
        frame (+0xd a new lap; +0xd or +0xe for the split) and the split's
        gap (0x5f82d0); the standings: each racer's name and gap to the
-       player (0x5f82d0), the player's row; lb_on = its feature (one human,
-       not drift) */
+       player (0x5f82d0), the player's row; lb_on = its feature (one human);
+       lb_drift = a drift race's board (LeaderBoard::DrawDriftScores /
+       DrawDriftPlayerNames, PC 0x4aac50 / 0x4aadc0): rows = the first four
+       of the DriftManager score list (0x864630, highest first) with their
+       score; hl = the node's +0x14 (a real car: player and AI 1, a downhill
+       set score 0) -> SetPlayerColor */
     int   rt_on, rt_now;
     int   lap_start, lap_last, lap_best, lap_new;
     int   split_on, split_new, split_gap;
@@ -110,8 +114,8 @@ typedef struct {
        map_off = 0 Off (DetermineHudFeatures 0x600090 drops the minimap),
        map_static = 1 Static (Minimap::Tick 0x4ca840 turns it only at 2 Rotate) */
     int   map_off, map_static;
-    int   lb_on, lb_n;
-    struct { char name[24]; int gap, me; } lb[8];
+    int   lb_on, lb_n, lb_drift;
+    struct { char name[24]; int gap, me, hl; float score; } lb[8];
     int   position, cars;     /* 0 = unknown/no opponents */
 
     /* --- minimap geometry: world-space polyline, borrowed, not owned --- */
@@ -311,6 +315,13 @@ int hud_custom(int style, const unsigned col[3]);
  * drawn from its live FEng state (scripts running), centred at 4:3. The
  * caller fills its strings by object name, as the game's screen code does. */
 Hud *hud_init_screen(const char *dataroot, const char *bundle, const char *package);
+/* Screens decoded ahead: the n packages (bundle[k], package[k], at most 4) are
+ * read and decoded on a worker thread, their textures then uploaded by
+ * hud_screen_prefetch_pump a few per frame; hud_init_screen of one of them
+ * takes it instead of loading (the same Hud, minus the load's stall). Slots
+ * not in the list are freed; n = 0 drops them all. GL thread only. */
+void hud_screen_prefetch(const char *dataroot, const char *const *bundle, const char *const *package, int n);
+void hud_screen_prefetch_pump(void);   /* GL thread, every frame */
 void hud_screen_text(Hud *h, const char *name, const char *text);
 void hud_screen_label(Hud *h, const char *name, uint32_t label);   /* 0x50c900 */
 void hud_screen_label_h(Hud *h, uint32_t obj, uint32_t label);     /* the object by its name hash */
@@ -533,7 +544,8 @@ void hud_place(float aspect, float anchor_x, float anchor_y,
  * 64x64 RGBA texture, made on first use): the face buttons, the d-pad with
  * its up/down or left/right arms lit, the left / right stick. */
 enum { HUD_PAD_CROSS, HUD_PAD_CIRCLE, HUD_PAD_TRIANGLE, HUD_PAD_SQUARE,
-       HUD_PAD_DPAD_UD, HUD_PAD_DPAD_LR, HUD_PAD_LSTICK, HUD_PAD_RSTICK, HUD_PAD_N };
+       HUD_PAD_DPAD_UD, HUD_PAD_DPAD_LR, HUD_PAD_LSTICK, HUD_PAD_RSTICK,
+       HUD_PAD_LBTN, HUD_PAD_RBTN, HUD_PAD_START, HUD_PAD_N };
 GLuint hud_pad_glyph(int b);
 
 #endif

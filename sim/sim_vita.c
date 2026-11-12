@@ -256,12 +256,12 @@ void vita_early_init(void) {
     SetUnhandledExceptionFilter(sim_crash);
     AddVectoredExceptionHandler(1, sim_first_chance);
     root_init();
-    sim_mkdir("ux0:data", 0); sim_mkdir("ux0:data/OpenUG2", 0); sim_mkdir("ux0:shots", 0);
+    sim_mkdir("ux0:data", 0); sim_mkdir("ux0:data/NFSU2", 0); sim_mkdir("ux0:shots", 0);
     if (!getenv("OPENUG2_SIM_CONSOLE")) {
-        freopen(sim_path("ux0:data/OpenUG2/log.txt", b, sizeof b), "w", stdout);
+        freopen(sim_path("ux0:data/NFSU2/log.txt", b, sizeof b), "w", stdout);
         setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     }
-    g_boot = fopen(sim_path("ux0:data/OpenUG2/boot.txt", b, sizeof b), "w");
+    g_boot = fopen(sim_path("ux0:data/NFSU2/boot.txt", b, sizeof b), "w");
     g_t0 = sceKernelGetProcessTimeWide();
 }
 void vita_mark(const char *fmt, ...) {
@@ -272,6 +272,7 @@ void vita_mark(const char *fmt, ...) {
 }
 void vita_crumb(const char *fmt, ...) { (void)fmt; }
 volatile int vita_wd_armed, vita_wd_sec;   /* the race-hang watchdog (Vita only) */
+volatile int vita_wd_load;                 /* ... and its boot world load arming */
 volatile unsigned vita_wd_beat;
 void vita_mark_stats(void) {}
 void vita_log_flush(void) { fflush(stdout); }
@@ -306,6 +307,7 @@ void vita_shader_failed(unsigned type, const char *src, const char *log) {
     printf("SHADER FAILED (type %u): %s\n--- source ---\n%s\n", type, log ? log : "", src ? src : "");
     fflush(stdout);
 }
+int vita_system_lang(void) { return -1; }   /* English; OPENUG2_LANG picks another */
 const char *vita_user_name(void) {
     const char *u = getenv("USERNAME");
     return u ? u : "Player";
@@ -566,6 +568,8 @@ static uint32_t btn_bit(const char *n) {
     printf("sim: unknown button %s\n", n);
     return 0;
 }
+/* test aid: game code asks for a named screenshot at the next frame end */
+void sim_shot_named(const char *name) { snprintf(g_shot_name, sizeof g_shot_name, "%s", name); }
 static void save_shot(const char *name) {
     unsigned char *rgba = malloc(SIM_W * SIM_H * 4), *rgb = malloc(SIM_W * SIM_H * 3);
     if (!rgba || !rgb) { free(rgba); free(rgb); return; }
@@ -781,10 +785,12 @@ void sim_GL_SwapWindow(SDL_Window *w) {
     if (g_frame % 30 == 0) fflush(stdout);
 }
 
-/* Restart the app (a venue change reads ux0:data/OpenUG2/venue.txt): a new
+/* Restart the app (a venue change reads ux0:data/NFSU2/venue.txt): a new
    process, the script carrying on from the next line. */
 void vita_relaunch(void) {
     char exe[MAX_PATH], line[32];
+    {   char m[1024]; FILE *f = fopen(sim_path("ux0:data/NFSU2/relaunch.tmp", m, sizeof m), "w");
+        if (f) fclose(f); }   /* as on the Vita: the Settings screen skips our own restart */
     GetModuleFileNameA(NULL, exe, sizeof exe);
     snprintf(line, sizeof line, "%d", g_line);
     SetEnvironmentVariableA("OPENUG2_SIM_LINE", line);
@@ -796,3 +802,116 @@ void vita_relaunch(void) {
     intptr_t rc = _spawnl(_P_WAIT, exe, quoted, NULL);
     exit(rc < 0 ? 1 : (int)rc);
 }
+
+/* ---- Settings screen (vita/boot_settings.inc): OPENUG2_SIM_SETTINGS=1 stands in
+   for the LiveArea button (L+R at boot is Vita only) --------------------------- */
+#include "../vita/ps_font.inc"
+#define BS_W SIM_W
+#define BS_H SIM_H
+static unsigned bs_pad(void) {
+    pump_real();
+    uint32_t b = g_kbd_buttons | g_script_buttons;
+    const Uint8 *k = SDL_GetKeyboardState(NULL);
+    for (int i = 0; i < NBTN; i++) if (k[g_btn[i].key]) b |= g_btn[i].bit;
+    unsigned o = 0;
+    if (b & P_UP) o |= 1;       if (b & P_DOWN) o |= 2;
+    if (b & P_LEFT) o |= 4;     if (b & P_RIGHT) o |= 8;
+    if (b & P_CROSS) o |= 16;   if (b & P_CIRCLE) o |= 32;
+    if (b & P_START) o |= 64;   if (b & P_L) o |= 128;   if (b & P_R) o |= 256;
+    return o;
+}
+static void bs_present(void) {
+    g_frame++;
+    if (g_shot_name[0]) { save_shot(g_shot_name); g_shot_name[0] = 0; }
+    main_fbo_present();
+    SDL_GL_SwapWindow(g_win);
+    SDL_Delay(33);
+    script_step();
+}
+static int bs_exists(const char *p) { char b[1024]; FILE *f = fopen(sim_path(p, b, sizeof b), "rb"); if (f) fclose(f); return f != NULL; }
+static void bs_touch(const char *p) { char b[1024]; FILE *f = fopen(sim_path(p, b, sizeof b), "wb"); if (f) fclose(f); }
+static void bs_remove(const char *p) { char b[1024]; remove(sim_path(p, b, sizeof b)); }
+static int rmtree_real(const char *dir) {
+    int n = 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    char path[1024];
+    while ((e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(path, &st) == 0 && (st.st_mode & S_IFDIR)) n += rmtree_real(path);
+        else if (remove(path) == 0) n++;
+    }
+    closedir(d);
+    _rmdir(dir);
+    return n;
+}
+static int bs_rmtree(const char *p) { char b[1024]; return rmtree_real(sim_path(p, b, sizeof b)); }
+/* The Settings screen's text: the Vita uses its system font (ScePvf); the
+   simulator stands in Segoe UI through stb_truetype (screenshots only). */
+#define STB_TRUETYPE_IMPLEMENTATION
+#define STBTT_STATIC
+#include "../third_party/imgui/imstb_truetype.h"
+static stbtt_fontinfo g_tt[2]; static unsigned char *g_ttdata[2]; static int g_tt_tried;
+static int bs_font_raster_s(int face, int px, unsigned cp, unsigned char *buf, int stride, int cap, void *out)
+{
+    struct { int w, h, left, top; float adv; } *g = out;
+    if (!g_tt_tried) {
+        g_tt_tried = 1;
+        static const char *files[2][2] = { { "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf" },
+                                           { "C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf" } };
+        for (int k = 0; k < 2; k++)
+            for (int j = 0; j < 2 && !g_ttdata[k]; j++) {
+                FILE *f = fopen(files[k][j], "rb");
+                if (!f) continue;
+                fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+                g_ttdata[k] = malloc((size_t)n);
+                if (fread(g_ttdata[k], 1, (size_t)n, f) != (size_t)n ||
+                    !stbtt_InitFont(&g_tt[k], g_ttdata[k], stbtt_GetFontOffsetForIndex(g_ttdata[k], 0))) { free(g_ttdata[k]); g_ttdata[k] = NULL; }
+                fclose(f);
+            }
+    }
+    face = face ? 1 : 0;
+    if (!g_ttdata[face]) return 0;
+    stbtt_fontinfo *f = &g_tt[face];
+    /* em from a capital H, as on the Vita (cap height 0.7 em) */
+    int hx0, hy0, hx1, hy1;
+    stbtt_GetCodepointBox(f, 'H', &hx0, &hy0, &hx1, &hy1);
+    float sc = hy1 > 0 ? 0.70f * (float)px / (float)hy1 : stbtt_ScaleForMappingEmToPixels(f, (float)px);
+    int x0, y0, x1, y1, adv, lsb;
+    stbtt_GetCodepointBitmapBox(f, (int)cp, sc, sc, &x0, &y0, &x1, &y1);
+    stbtt_GetCodepointHMetrics(f, (int)cp, &adv, &lsb);
+    g->adv = (float)adv * sc; g->left = x0; g->top = -y0;
+    g->w = x1 - x0; g->h = y1 - y0;
+    if (g->w > stride) g->w = stride;
+    if (g->h > cap) g->h = cap;
+    if (g->w <= 0 || g->h <= 0) { g->w = g->h = 0; return 1; }
+    stbtt_MakeCodepointBitmap(f, buf, g->w, g->h, stride, sc, sc, (int)cp);
+    return 1;
+}
+#define bs_font_raster(face, px, cp, buf, stride, cap, g) bs_font_raster_s(face, px, cp, buf, stride, cap, (void *)(g))
+static int bs_tap(int *x, int *y)   /* a mouse click stands in for a touch */
+{
+    static int down;
+    int mx, my, was = down;
+    down = (SDL_GetMouseState(&mx, &my) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+    if (!down || was) return 0;
+    int ww, wh; SDL_GetWindowSize(g_win, &ww, &wh);
+    *x = ww > 0 ? mx * BS_W / ww : mx; *y = wh > 0 ? my * BS_H / wh : my;
+    return 1;
+}
+#include "../vita/boot_settings.inc"
+
+void vita_settings_boot(void) {
+    root_init();
+    if (bs_exists("ux0:data/NFSU2/relaunch.tmp")) { bs_remove("ux0:data/NFSU2/relaunch.tmp"); return; }
+    const char *e = getenv("OPENUG2_SIM_SETTINGS");
+    if (!(e && *e == '1')) return;
+    sim_CreateWindow("OpenUG2", 0, 0, SIM_W, SIM_H, 0);
+    sim_GL_CreateContext(g_win);
+    boot_settings_run();
+    vita_relaunch();
+}
+int vita_logs_off(void) { return 0; }   /* the simulator always logs */

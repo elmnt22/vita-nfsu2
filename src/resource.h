@@ -60,4 +60,16 @@ int res_list_cars(const char *dataroot, char (*list)[64], int max,
 int res_list_circuits(const char *troot, const char *trackname,
                       char (*list)[256], int max);
 
+/* Top-level chunk list of a bundle file ({id, size, offset of the 8-byte
+ * header} per chunk, file order), as the loaders' own walks find it: from
+ * offset 0, header by header, until a header cannot be read. One walk per
+ * file size, kept in memory and cached on the card (cache/<name>.idx), so the
+ * loaders that look for a few chunk types in a 100+ MB STREAM bundle read only
+ * those instead of ~6000 headers each. Returns a malloc'd copy (caller frees)
+ * or NULL (file missing / no memory: the caller walks the file itself). */
+typedef struct { uint32_t id, size, off; } ResChunk;
+ResChunk *res_chunk_index(const char *path, int *count);
+/* First entry whose header is at offset off, or -1 */
+int res_chunk_find(const ResChunk *ix, int n, long off);
+
 #endif

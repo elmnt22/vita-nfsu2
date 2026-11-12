@@ -83,11 +83,22 @@ extern volatile float g_skid;       /* tyre-screech volume while drifting */
    0..1, played by FX_SKID's pairs; used instead of g_skid while g_skid3_on */
 extern volatile float g_skid3[3];
 extern volatile int g_skid3_on;
+/* the same per side ([0] right FR+RR = SFXCTL_Skid +0x194.., [1] left
+   FL+RL = +0x1a0..): the player's two FX_SKID instances (0x4608d0) */
+extern volatile float g_skid3s[2][3];
+/* the player's FX_SKID patch instances run (carsfx.c player_skid, fx
+   voices 531..544): the hand mix of g_skid3 / g_skid stays silent */
+extern volatile int g_pskid_patch;
 extern volatile int g_turbo_fitted; /* 0 mutes turbo whine + blow-off (main sets) */
 extern volatile float g_turbo_boost; /* turbo pressure 0..1 (main sets; drives the whine) */
 extern volatile float g_speed_frac;  /* |speed| / top speed 0..1: road + wind loops */
 extern volatile int g_nitro;         /* 1 while nitrous is burning */
 extern volatile int g_purge;         /* 1 while nitrous is purged (held at a standstill, 0x5ecdb0) */
+extern volatile int g_sput_out;      /* CAR_SputOutput value (carsfx.c): its mix event ducks the player engine */
+extern volatile int g_speech_state;  /* audio.c: bit 0 speech playing in the front end, bit 1 in game (SFXObj_Speech) */
+extern volatile int g_eng_dyn_mb;    /* carsfx.c: the mixmap inputs of master 0x40010000 (the player's engine), mB */
+extern volatile int g_amb_ext_mb;   /* carsfx.c: map 0 master 4's (ambience) class-1 inputs, mB */
+extern volatile int g_mus_ext_mb;    /* carsfx.c: map 0 sub 1's inputs from the car classes (in-game music duck), mB */
 
 /* RPM crossfade weights for the 3 bands (pure function, used by the synth
  * and the selftest). */
@@ -137,14 +148,43 @@ int audio_load_ginsu_sweeps(const char *dataroot, const char *carname);
  * pavement skid loop is global. Return 1 when loaded. */
 int audio_load_shift_bank(const char *dataroot, const char *carname);
 int audio_load_skid_bank(const char *dataroot);
+/* the player's skid bank by name (CARSFX_Skids::SetupLoadData 0x465b90:
+   0x7ed1f8 [(engine class == 2) + 2 x drift] = "SKID_PAV", "SKID_PAV2",
+   "SKIDS_DRIFT" or "SKIDS_DRIFT2"): reloads FX_SKID's bank sounds 0..4 when
+   the name changes. Inside audio_hold (or before audio_init). Returns 1
+   when that bank is loaded. */
+int audio_set_skid_bank(const char *bank);
+/* the player car's engine sound level (CarPreSetup 0x4593b0: EAXCar +0x94
+   = 3 / 2 / 1 with perf part 0x18 / 0x13 / 0xf fitted, else 0) and its
+   transmission level (+0xa4 = 0x5995e0(1), 0..3): the engine slot is the
+   0x7f2230 record at row x 4 + engine level, the shift bank (0x45c376,
+   driver type 1 only) record +4 at row x 4 + transmission level. Only
+   records them: returns 1 when the loaded engine / shift sounds were built
+   for other levels (the caller reloads them: audio_load_ginsu_sweeps,
+   audio_load_shift_bank, carsfx_player_car read the levels). */
+int audio_set_player_engine_level(int engine_level, int trans_level);
+int audio_player_engine_level(void);
+/* the engine slot (0x7f0de0 index 0..42) of an audio row at an engine sound
+   level 0..3 (0x7f2230 record +0) */
+int audio_row_engine_slot(int row, int level);
+/* an engine slot's CAR_xx / SWTN_CAR_xx file number (slot record +8: slots
+   41 and 42 reuse 14 and 12) */
+int audio_slot_file(int slot);
 /* IG_GLOBAL/MB_Stich_Collision.abk: a few heavy crunches and light knocks
  * (picked by measured length/brightness; the bank carries no labels). */
 int audio_load_collision_bank(const char *dataroot);
 /* SOUND/TURBO bank for the car: the same per-car audio row SPEED2.EXE uses
- * (car type -> row, row -> turbo bank at stock level), clip 0 = whine loop,
+ * (car type -> row, row x 4 + the turbo level set by audio_set_player_perf
+ * -> turbo bank, CARSFX_Turbo::SetupSFX 0x45eb30), clip 0 = whine loop,
  * 1-3 = blow-off; carsfx.c plays it (set AFX_PTURBO). Reload on car switch
  * (inside audio_hold). Returns clips. */
 int audio_load_turbo_bank(const char *dataroot, const char *carname);
+/* the player car's turbo (perf cat 4) and nitrous (cat 2) upgrade levels
+   (0x5995e0): SetupSFX 0x45eb30 picks the turbo bank by row x 4 + turbo
+   level, SetupSFX 0x45f210 / SetupLoadData 0x465830 the nitrous bank
+   (levels 2/3 Nitrous_01, else Nitrous_00, FX_NITROUS + FX_PURGE). Reloads
+   the bank that changed (takes audio_hold itself; main thread). */
+void audio_set_player_perf(int turbo_level, int nos_level);
 /* the loaded bank's 0x7f3338 record index (carsfx.c k_turbo_rec), -1 none */
 int audio_player_turbo_rec(void);
 /* The clips the game's FX_ROADNOISE, FX_WIND and FX_NITROUS events play. Global; load once before audio_init. Returns clips loaded. */
@@ -162,12 +202,15 @@ typedef struct {
     volatile float gain;     /* linear, relative to the player's engine */
     volatile float pitch;    /* playback ratio (Doppler, detune) */
     volatile float cutoff;   /* low-pass, Hz */
+    volatile float pan;      /* -1 left .. 0 centre .. +1 right (equal power, like the fx voices) */
 } AudioCarVoice;
 extern AudioCarVoice g_carvoice[AUDIO_CARVOICES];
 /* the car's audio row (the same table the player's turbo/shift use) */
 int audio_car_row(const char *carname);
 /* SOUND/ENGINE/CAR_xx_ENG_MB_SPU.abk for the AI engine slots slot[0..n)
-   into banks 0..n-1 (call inside audio_hold). Returns banks loaded. */
+   (0x7f0de0 index 0..42; the file is the slot record's +4 name, xx =
+   audio_slot_file) into banks 0..n-1 (call inside audio_hold). Returns
+   banks loaded. */
 int audio_load_ai_banks(const char *dataroot, const int *slot, int n);
 /* IG_GLOBAL/TRAFFIC_MB.abk clip 0 (FX_TRAFFIC). Before audio_init. */
 int audio_load_traffic_clip(const char *dataroot);
@@ -186,16 +229,36 @@ enum { AFX_ENV = 1,     /* IG_GLOBAL/ENV_COMMON_MB clips 0..7 */
        AFX_PTURBO,      /* the player's SOUND/TURBO bank (audio_load_turbo_bank), clips 0..3 */
        AFX_SPLASH,      /* IG_GLOBAL/ROADNOISE_00_MB clip 10 (SND_BarrelSplash), clip 0 here */
        AFX_ROAD,        /* IG_GLOBAL/ROADNOISE_00_MB clips 0..13 (FX_ROADNOISE / _TRANS) */
-       AFX_SWTN,        /* the player's SOUND/ENGINE/SWTN_CAR_xx_MB bank, clips 0..31 (CAR_Sputter) */
-       AFX_TURBO };     /* + n: AI turbo bank n (audio_load_ai_turbo_banks), clips 0..3 */
+       AFX_SWTN,        /* the player's SOUND/ENGINE/SWTN_CAR_xx_MB bank, bank sounds 0..31 (CAR_Sputter) */
+       AFX_PNOS,        /* the AI FX_NITROUS patch's SOUND/NOS/Nitrous_00 bank, bank sounds 0..15 */
+       AFX_PNOS1,       /* the same for Nitrous_01 (set AFX_PNOS + bank, 0x7ed1a0 index) */
+       AFX_PSKID,       /* the AI FX_SKID patch's SOUND/SKIDS bank (engine class not 2), bank sounds 0..15 */
+       AFX_PSKID1,      /* the same for the engine class 2 cars' bank (SKID_PAV2 / SKIDS_DRIFT2) */
+       AFX_PRAIN,       /* CARSFX_Rain's FX_Weather patch: IG_GLOBAL/FX_Rain_MB bank sounds 0..15 */
+       AFX_PWIND,       /* CARSFX_WindWeather's FX_WIND_Weather patch: IG_GLOBAL/WIND_00_MB bank sounds 0..15 */
+       AFX_PMAIN,       /* the URL planes' FX_MAIN_MEM patch: IG_GLOBAL/FX_MAIN_MEM_MB bank sounds 0..31 */
+       AFX_TURBO };     /* + n: AI turbo bank n (audio_load_ai_turbo_banks), bank sounds 0..7 */
 /* 0..199 the AI and traffic effects, 200.. the collisions (5 hits x 12
    stitch samples, 16 scrapes), 276/277 the player's turbo whine/blow-off,
    278.. the water-drum sloshes (8 x 3 voices), 302.. the player's road
    noise (2 loops, 2 base loops, 2 transitions), 308.. the player's
    bottom-out (13 landing + 13 bump-stop stitch samples), 334/335 the
    player's CAR_Sputter players (overrun pops), 336.. its jump-cam
-   landing stitch (13) */
-#define AUDIO_FXVOICES 349
+   landing stitch (13), 349/350 the CAR_SWTN shift sweeteners (disengage,
+   engage), 351 + 15 k the AI car k's patch players (FX_TURBO whine 2,
+   blow-off 2, FX_NITROUS 4, FX_SKID 7), 471.. the rain's FX_Weather
+   players (4), 475.. the weather wind's FX_WIND_Weather players (4),
+   479.. the planes' ENV_STATIC voices (3, CSTATEMGR_Planes' states),
+   482.. the URL planes' FX_MAIN_MEM players (3 states x 5), 497.. the
+   trains' ENV_STATIC voices (6, CSTATEMGR_Trains), 503.. the fountains'
+   (4, CSTATEMGR_Enviro), 507.. the drive-by whoosh stitches (CARSFX_DriveBy:
+   2 entry + 2 exit slots x 4 samples), 523.. the in-game car part
+   sounds (EAXCommon::PlayCarPartSnd: 2 slots x 4 stitch samples), 531..
+   the player's FX_SKID patch players (CARSFX_Skids: 2 instances x 7), 545..
+   the AI cars' second FX_NITROUS instances (8 x 4), 577 / 578 the second
+   CAR_SWTN instances (disengage / engage), 579.. the road transition
+   stitches (AUD_RoadTransitions: 2 sides x 4) */
+#define AUDIO_FXVOICES 587
 typedef struct {
     volatile int on;
     volatile int set, clip, loop;
@@ -211,15 +274,25 @@ extern AudioFxVoice g_fxvoice[AUDIO_FXVOICES];
    and the scrape loop. Before audio_init. Returns clips loaded. */
 int audio_load_carfx_banks(const char *dataroot, const int *coll, int ncoll);
 /* the AI racers' SOUND/TURBO banks (0x7f3338 index each, at most
-   CARSFX_AI_MAX distinct) into sets AFX_TURBO + 0..n-1 (inside audio_hold) */
+   CARSFX_AI_MAX distinct) into sets AFX_TURBO + 0..n-1, sounds by bank
+   index (inside audio_hold) */
 int audio_load_ai_turbo_banks(const char *dataroot, const int *tbank, int n);
-/* the player's SWTN_CAR_xx_MB.abk bank samples 0..31 into set AFX_SWTN
-   (inside audio_hold or before audio_init); bit k of *loops = clip k has
-   a loop. Returns clips loaded. */
+/* the player's SWTN_CAR_xx_MB.abk bank sounds 0..31 (by bank index, as
+   the patch sample lists name them) into set AFX_SWTN (inside audio_hold
+   or before audio_init); bit k of *loops = sound k has a loop. Returns
+   sounds loaded. */
 int audio_load_swtn_bank(const char *path, unsigned *loops);
-/* the turbo bank index (0x7f3338) of an audio row at an upgrade level
-   (0x7f2238 record +8; the AI read level 0) */
-int audio_row_turbo(int row);
+/* an AEMS patch's own bank (set AFX_PNOS, AFX_PNOS1, AFX_PSKID, AFX_PSKID1, AFX_PRAIN, AFX_PWIND or AFX_PMAIN): every sound by its
+   bank index (the BNKl table; index 0 is the null entry in every bank),
+   as the patch's sample lists name them. path NULL frees the set. Takes
+   audio_hold itself. Returns sounds loaded. */
+int audio_load_patch_bank(int set, const char *path);
+/* sound k of set has an authored loop */
+int audio_fx_loop(int set, int k);
+/* the turbo bank index (0x7f3338) of an audio row at a turbo upgrade
+   level 0..3 (0x7f2238 record +8 at row x 4 + level, 0x45eb30; the AI
+   cars' own fitted level, MatchAICarPerformanceToPlayer 0x532010) */
+int audio_row_turbo(int row, int level);
 /* One impact, strength 0..1 (from the car's sudden velocity change). */
 void audio_impact(float strength);
 

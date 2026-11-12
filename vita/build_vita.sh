@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# OpenUG2 — PS Vita build. Produces vita/build/OpenUG2.vpk.
+# OpenUG2 — PS Vita build. Produces vita/build/NFSU2Vita.vpk.
 #
 #   VITASDK=E:/vitasdk ./vita/build_vita.sh
 #
 # Needs VitaSDK with vitaGL + vitashark + mathneon installed. Install the VPK,
 # then copy your own NFSU2 data (TRACKS/, CARS/, GLOBAL/, ...) to
-# ux0:data/OpenUG2/. libshacccg.suprx must be extracted on the console.
+# ux0:data/NFSU2/. libshacccg.suprx must be extracted on the console.
 set -euo pipefail
 
 VITASDK="${VITASDK:-E:/vitasdk}"
@@ -14,8 +14,9 @@ CC="$BIN/arm-vita-eabi-gcc"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/vita/build"
 TITLE="OpenUG2"                    # file names (elf, vpk)
+VPK_NAME="NFSU2Vita"                # the release VPK's file name
 DISPLAY_TITLE="NFS Underground 2"  # name on the LiveArea / home screen
-TITLEID="OPUG20001"
+TITLEID="NFSU20001"
 VERSION="01.00"
 
 mkdir -p "$OUT/obj" "$OUT/sce_sys"
@@ -34,20 +35,28 @@ CFLAGS=(-O2 -g -std=gnu99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-u
         -DN2_GLES "-I$ROOT/vita/include" "-I$ROOT/src")
 
 SRC="src/main.c src/render.c src/physics.c src/n2sim.c src/wcoll.c src/carcoll.c src/airacer.c src/perfparts.c src/airace.c src/racepath.c src/style.c src/ai.c src/audio.c src/resource.c src/world.c
-     src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/profile.c src/vinyl.c src/partanim.c src/smokeable.c src/career.c src/movie.c src/mplay.c src/speech.c src/tuning.c vita/sdl_vita.c"
+     src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/jumpcam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/profile.c src/pcsave.c src/garage_line.c src/vinyl.c src/partanim.c src/smokeable.c src/worldanim.c src/career.c src/movie.c src/mplay.c src/speech.c src/tuning.c src/replay.c src/rain.c src/reverb.c vita/sdl_vita.c"
 
 OBJS=()
 pids=()
+# VITA_JOBS caps parallel compiles (default 2: RAM is shared with other sessions' builds; 0 = all at once)
+throttle() { local n="${VITA_JOBS:-2}"; [ "$n" -gt 0 ] || return 0
+    while [ "$(jobs -rp | wc -l)" -ge "$n" ]; do wait -n || true; done; }
+FAILMARK="$OUT/obj/.compile_failed"; rm -f "$FAILMARK"
 for s in $SRC; do
     o="$OUT/obj/$(basename "${s%.c}").o"
     OBJS+=("$o")
-    if [ ! -f "$o" ] || [ "$ROOT/$s" -nt "$o" ] || [ -n "$(find "$ROOT/src" "$ROOT/vita/include" -name '*.h' -newer "$o" -print -quit)" ]; then
+    if [ ! -f "$o" ] || [ "$ROOT/$s" -nt "$o" ] ||
+        { [ "$s" = vita/sdl_vita.c ] && [ "$ROOT/vita/vu_shim.inc" -nt "$o" ]; } ||
+        [ -n "$(find "$ROOT/src" "$ROOT/vita/include" -name '*.h' -newer "$o" -print -quit)" ]; then
         echo "CC $s"
-        "$CC" "${CFLAGS[@]}" -c "$ROOT/$s" -o "$o" &
+        throttle
+        "$CC" "${CFLAGS[@]}" -c "$ROOT/$s" -o "$o" || touch "$FAILMARK" &
         pids+=($!)
     fi
 done
-for p in "${pids[@]}"; do wait "$p"; done
+wait || true
+[ ! -e "$FAILMARK" ] || { echo "compile failed"; exit 1; }
 
 # vitaGL: vita/lib/libvitaGL.a is upstream cdbba42 built with NO_DEBUG=1
 # HAVE_VERTEX_LAYOUT_CACHE=1 plus a small patch (see vita/PORTING_NOTES.md).
@@ -57,7 +66,7 @@ if [ "${VGL:-ug2}" != stock ]; then VGL_DIR=("-L$ROOT/vita/lib"); fi
 echo "vitaGL: ${VGL:-ug2}"
 
 LIBS="-lvitaGL -lvitashark -lSceShaccCgExt -ltaihen_stub -lSceShaccCg_stub -lmathneon
-      -lSceCommonDialog_stub -lSceGxm_stub -lSceDisplay_stub -lSceAppMgr_stub -lSceAppUtil_stub
+      -lScePvf_stub -lSceCommonDialog_stub -lSceGxm_stub -lSceDisplay_stub -lSceAppMgr_stub -lSceAppUtil_stub
       -lSceSysmodule_stub -lSceKernelDmacMgr_stub -lSceCtrl_stub -lSceTouch_stub -lSceAudio_stub -lScePower_stub
       -lSceLibKernel_stub -lSceKernelThreadMgr_stub -lstdc++ -lm -lc"
 
@@ -73,9 +82,11 @@ PACK=(-s "$OUT/sce_sys/param.sfo" -b "$OUT/eboot.bin")
 while IFS= read -r f; do
     PACK+=(-a "$f=sce_sys/${f#"$ROOT/vita/sce_sys/"}")
 done < <(find "$ROOT/vita/sce_sys" -type f)
+# loading-screen controller art: img/loading_controller.png -> assets/loading_controller.raw
+python "$ROOT/tools/lsc_png.py" || echo "lsc_png failed: drawn controller used"
 # app assets (app0:assets/...): the tile conversion screen background
 while IFS= read -r f; do
     PACK+=(-a "$f=assets/${f#"$ROOT/vita/assets/"}")
 done < <(find "$ROOT/vita/assets" -type f)
-"$BIN/vita-pack-vpk" "${PACK[@]}" "$OUT/$TITLE.vpk"
-echo "built $OUT/$TITLE.vpk"
+"$BIN/vita-pack-vpk" "${PACK[@]}" "$OUT/$VPK_NAME.vpk"
+echo "built $OUT/$VPK_NAME.vpk"

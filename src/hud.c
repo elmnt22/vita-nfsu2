@@ -104,9 +104,10 @@ void hud_place(float aspect, float anchor_x, float anchor_y,
 #define FE_GEAR          0xb84589beu
 #define FE_SPEED_UNITS   0xc3383b63u   /* the tach's "KM/H" (0x4c68d0: MPH 0x8569ab44 / KM/H 0x8569a25f) */
 #define FE_SHIFT         0x25cf2f74u
-#define FE_NOS_TRACK     0x11495cd6u   /* Tach_NOS_Alpha: the N2O scale */
-#define FE_NOS_BACKING   0x11461255u
-#define FE_NOS_FILL      0x39e180c4u   /* Tach_NOS: the level, additive */
+/* NitrousGauge 0x4f6a90 (GC 8010d210): FEHashUpper names */
+#define FE_NOS_TRACK     0x11495cd6u   /* NOS_Line (+0x20): the first bottle, full, shown above one */
+#define FE_NOS_BACKING   0x11461255u   /* NOS_Fill: untouched by the gauge */
+#define FE_NOS_FILL      0x39e180c4u   /* NOS_GameBreaker (+0x24): the level under NOS_Mask */
 #define FE_MAP_MASK      0x40cdc515u   /* the dark disc = panel body */
 #define FE_MAP_BORDER    0x382d2fc9u   /* group: ring quadrant x4 */
 #define FE_MAP_SLOT      0x90fe80f3u   /* Track4000_map: where the live map goes */
@@ -141,7 +142,7 @@ enum { G_ALWAYS, G_TURBO, G_NOS, G_RACE, G_POS, G_LAPS, G_BANK, G_SMS, G_COUNT }
 enum { R_NONE, R_RPM_NEEDLE, R_TURBO_NEEDLE, R_SPEED, R_GEAR, R_SHIFT,
        R_NOS_FILL, R_MAP_SLOT, R_MAP_NORTH, R_POS_NUM, R_POS_SUFFIX, R_POS_OF,
        R_LAP_LABEL, R_LAP_NUM, R_LAP_OF, R_BANK_VALUE, R_COUNTDOWN, R_UNITS,
-       R_ANIM };   /* drift HUD: a ported widget's object, drawn from its FEng state */
+       R_ANIM, R_NOS_LINE };   /* drift HUD: a ported widget's object, drawn from its FEng state */
 
 /* Measured dial geometry: the rev scale is the shipped 3rdperson_10500lines
  * art, whose "0" sits straight below the hub and whose numerals advance
@@ -171,6 +172,9 @@ struct HudArc {
 
 typedef struct { GLuint tex; int w, h; unsigned char additive; } HudTex;
 typedef struct { GLuint tex; int aw, ah, ok; FengFont f; } HudFont;
+/* a decoded image waiting for the GL thread: its texture goes to *dst
+   (and *ok = tex != 0 for a font) -- hud_screen_prefetch */
+struct HudPendUp { GLuint *dst; int *ok; FengImage im; };
 
 struct Hud {
     FengPackage *pk;                   /* NULL: package missing, arrow only */
@@ -211,6 +215,10 @@ struct Hud {
     GLuint  fan_vbo, fan_nbo, fan_ibo;
     GLuint  qb_vbo, qb_nbo, qb_ibo;    /* dynamic quads: glyphs, N2O sector */
     struct HudDriftW *dw;              /* drift HUD: scripts + widget state */
+    /* built off the GL thread (defer): the textures wait in pend until
+       hud_pend_upload; the quad batch is made then too */
+    struct HudPendUp *pend;
+    int npend, cappend, upi, defer;
 };
 
 /* The drift HUD (HUD_Drift.fng; HUD object 0x4f8bf0). The package's FEng
@@ -457,6 +465,42 @@ static GLuint hud_upload(const FengImage *t) {
     return id;
 }
 
+/* The texture for *dst: uploaded now, or -- a Hud built off the GL thread
+   (h->defer) -- the decoded image kept (taken from *im) for hud_pend_upload.
+   ok, if given: a font's ok flag, set to tex != 0 once uploaded. */
+static void hud_upload_to(Hud *h, GLuint *dst, FengImage *im, int *ok) {
+    if (!h->defer) {
+        *dst = hud_upload(im);
+        if (ok) *ok = *dst != 0;
+        return;
+    }
+    if (h->npend == h->cappend) {
+        int cap = h->cappend ? h->cappend * 2 : 32;
+        struct HudPendUp *np = (struct HudPendUp *)realloc(h->pend, (size_t)cap * sizeof *np);
+        if (!np) return;                /* as a failed upload: no texture */
+        h->pend = np; h->cappend = cap;
+    }
+    struct HudPendUp *p = &h->pend[h->npend++];
+    p->dst = dst; p->ok = ok; p->im = *im;
+    im->rgba = NULL;                    /* the caller's feng_image_free leaves it */
+}
+/* GL thread: up to `budget` bytes of the waiting images uploaded (at least
+   one); 1 when none wait any more */
+static int hud_pend_upload(Hud *h, long budget) {
+    long done = 0;
+    while (h->upi < h->npend && (done == 0 || done < budget)) {
+        struct HudPendUp *p = &h->pend[h->upi++];
+        *p->dst = hud_upload(&p->im);
+        if (p->ok) *p->ok = *p->dst != 0;
+        done += (long)p->im.w * p->im.h * 4;
+        feng_image_free(&p->im);
+    }
+    if (h->upi < h->npend) return 0;
+    free(h->pend); h->pend = NULL;
+    h->npend = h->cappend = h->upi = 0;
+    return 1;
+}
+
 static void hud_note_missing(Hud *h, const char *what) {
     size_t used = strlen(h->missing);
     snprintf(h->missing + used, sizeof h->missing - used, "%s%s",
@@ -475,7 +519,7 @@ static void hud_classify(Hud *h) {
     static const struct { uint32_t hash; unsigned char role; } roles[] = {
         { FE_RPM_NEEDLE, R_RPM_NEEDLE }, { FE_TURBO_NEEDLE, R_TURBO_NEEDLE },
         { FE_SPEED, R_SPEED }, { FE_GEAR, R_GEAR }, { FE_SHIFT, R_SHIFT },
-        { FE_NOS_FILL, R_NOS_FILL }, { FE_MAP_SLOT, R_MAP_SLOT },
+        { FE_NOS_FILL, R_NOS_FILL }, { FE_NOS_TRACK, R_NOS_LINE }, { FE_MAP_SLOT, R_MAP_SLOT },
         { FE_MAP_NORTH, R_MAP_NORTH }, { FE_POS_NUM, R_POS_NUM },
         { FE_POS_SUFFIX, R_POS_SUFFIX }, { FE_POS_OF, R_POS_OF },
         { FE_LAP_LABEL, R_LAP_LABEL }, { FE_LAP_NUM, R_LAP_NUM },
@@ -621,7 +665,7 @@ enum { HUD_NPACK = (int)(sizeof HUD_PACKS / sizeof HUD_PACKS[0]) };
    on every open; on the Vita card re-reading these ~2.5 MB cost about half
    a second each time. Kept in memory after the first read; callers get
    their own copy to free. */
-static const char *const k_hud_cached[] = { "/InGameCommon.bun", "/InGameRace.bun", "/English.bin", "/GLOBALA.BUN" };
+static const char *const k_hud_cached[] = { "/InGameCommon.bun", "/InGameRace.bun", "", "/GLOBALA.BUN" };
 #define HUD_NCACHED (int)(sizeof k_hud_cached / sizeof k_hud_cached[0])
 static unsigned char *g_hfc_data[HUD_NCACHED];
 static long g_hfc_len[HUD_NCACHED];
@@ -629,9 +673,12 @@ static volatile int g_hfc_lock;
 static unsigned char *hud_read_file(const char *path, long *len) {
     int slot = -1;
     size_t pl = strlen(path);
+    char langf[40];   /* slot 2: the current language's file */
+    snprintf(langf, sizeof langf, "/%s.bin", k_n2_lang_file[n2_lang()]);
     for (int i = 0; i < HUD_NCACHED && slot < 0; i++) {
-        size_t cl = strlen(k_hud_cached[i]);
-        if (pl >= cl && !strcmp(path + pl - cl, k_hud_cached[i])) slot = i;
+        const char *c = i == 2 ? langf : k_hud_cached[i];
+        size_t cl = strlen(c);
+        if (pl >= cl && !strcmp(path + pl - cl, c)) slot = i;
     }
     if (slot < 0) return n2_read_file(path, len);
     unsigned char *d = NULL;
@@ -664,6 +711,68 @@ static unsigned char *hud_read_bundle(const char *path, long *len) {
     if (!u || ul <= 0) { free(u); *len = 0; return NULL; }
     *len = ul;
     return u;
+}
+
+/* Decoded art / font atlases kept between screen opens (HW 11-02: each
+   SMS / Pause / engage dialog open re-walked every pack and re-decoded its
+   art, ~0.6 s, and its fonts, ~0.16 s). Same pixels as a fresh load: an
+   entry is what the full search over the same source set found, including
+   "not found" (rgba NULL), so a fully answered load skips the packs. LRU,
+   capped; callers get their own copy. */
+#define HIC_MAX 192
+#define HIC_CAP_BYTES (4L * 1024 * 1024)
+static struct { uint32_t src, key; FengImage im; unsigned age; } g_hic[HIC_MAX];
+static int g_hic_n; static long g_hic_bytes; static unsigned g_hic_clock;
+static volatile int g_hic_lock;
+static uint32_t hic_src(const char *own, int screen, int style) {
+    uint32_t h = 2166136261u;
+    for (const char *c = own ? own : ""; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
+    return (h ^ (uint32_t)screen * 0x9e3779b9u) + (uint32_t)style * 0x85ebca6bu;
+}
+/* fill the empty slots whose key is cached; 1 when every wanted key was answered */
+static int hic_fill(uint32_t src, const uint32_t *keys, int nk, FengImage *img) {
+    int all = 1;
+    while (__sync_lock_test_and_set(&g_hic_lock, 1)) {}
+    for (int i = 0; i < nk; i++) {
+        if (!keys[i] || img[i].rgba) continue;
+        int e = -1;
+        for (int j = 0; j < g_hic_n && e < 0; j++) if (g_hic[j].src == src && g_hic[j].key == keys[i]) e = j;
+        if (e < 0) { all = 0; continue; }
+        g_hic[e].age = ++g_hic_clock;
+        const FengImage *c = &g_hic[e].im;
+        if (!c->rgba) continue;          /* known missing from these sources */
+        size_t n = (size_t)c->w * c->h * 4;
+        img[i] = *c;
+        img[i].rgba = (unsigned char *)malloc(n);
+        if (img[i].rgba) memcpy(img[i].rgba, c->rgba, n); else { img[i].w = img[i].h = 0; all = 0; }
+    }
+    __sync_lock_release(&g_hic_lock);
+    return all;
+}
+/* remember what the full search found for each wanted key */
+static void hic_store(uint32_t src, const uint32_t *keys, int nk, const FengImage *img) {
+    while (__sync_lock_test_and_set(&g_hic_lock, 1)) {}
+    for (int i = 0; i < nk; i++) {
+        if (!keys[i]) continue;
+        int dup = 0;
+        for (int j = 0; j < g_hic_n && !dup; j++) dup = g_hic[j].src == src && g_hic[j].key == keys[i];
+        if (dup) continue;
+        long n = img[i].rgba ? (long)img[i].w * img[i].h * 4 : 0;
+        if (n > HIC_CAP_BYTES / 4) continue;   /* a full-screen picture: not worth holding */
+        while (g_hic_n && (g_hic_n == HIC_MAX || g_hic_bytes + n > HIC_CAP_BYTES)) {   /* drop the oldest */
+            int o = 0;
+            for (int j = 1; j < g_hic_n; j++) if (g_hic[j].age < g_hic[o].age) o = j;
+            g_hic_bytes -= g_hic[o].im.rgba ? (long)g_hic[o].im.w * g_hic[o].im.h * 4 : 0;
+            free(g_hic[o].im.rgba);
+            g_hic[o] = g_hic[--g_hic_n];
+        }
+        FengImage c = img[i];
+        if (n) { c.rgba = (unsigned char *)malloc((size_t)n); if (!c.rgba) continue; memcpy(c.rgba, img[i].rgba, (size_t)n); }
+        g_hic[g_hic_n].src = src; g_hic[g_hic_n].key = keys[i]; g_hic[g_hic_n].im = c;
+        g_hic[g_hic_n].age = ++g_hic_clock; g_hic_n++;
+        g_hic_bytes += n;
+    }
+    __sync_lock_release(&g_hic_lock);
 }
 
 static void hud_load_art(Hud *h, const char *dataroot, const char *own) {
@@ -703,7 +812,13 @@ static void hud_load_art(Hud *h, const char *dataroot, const char *own) {
     keys[nk++] = HUD_ARROW_KEY;
     /* -1: the package's own bundle; HUD_NPACK: a screen's menu art (GLOBALB) */
     int last = h->dw && h->dw->screen ? HUD_NPACK + 1 : HUD_NPACK;
-    for (int f = own ? -1 : 0; f < last; f++) {
+    /* every package's art from the image cache (the same 4 MB LRU): whole
+       screens reopen often, and so do the race HUDs, the chyrons and the SMS
+       screens (hw_1109: ~0.6 s of art per HUD load, every race / career entry) */
+    int cached = 1;
+    uint32_t src = hic_src(own, h->dw && h->dw->screen, g_hud_style);
+    int answered = cached && hic_fill(src, keys, nk, img);
+    for (int f = own ? -1 : 0; f < last && !answered; f++) {
         char path[1024], pack[64];
         pack[0] = 0;
         if (f >= 0 && f < HUD_NPACK) snprintf(pack, sizeof pack, HUD_PACKS[f], g_hud_style);
@@ -716,11 +831,11 @@ static void hud_load_art(Hud *h, const char *dataroot, const char *own) {
         feng_tpk_load(d, len, keys, nk, img);
         free(d);
     }
+    if (cached && !answered) hic_store(src, keys, nk, img);
     for (int r = 0; r < p->nres; r++) {
         if (!need[r]) continue;
         FengImage *im = img[2*r].rgba ? &img[2*r] : &img[2*r+1];
         if (!im->rgba) { hud_note_missing(h, p->res[r].name); continue; }
-        h->rt[r].tex = hud_upload(im);
         h->rt[r].w = im->w; h->rt[r].h = im->h;
         h->rt[r].additive = im->blend == 6;
 #ifdef OPENUG2_SIM_PRE_H
@@ -745,12 +860,13 @@ static void hud_load_art(Hud *h, const char *dataroot, const char *own) {
 #endif
         if (h->o_track >= 0 && p->obj[h->o_track].res == r)
             hud_measure_arc(im, &h->nos_arc);
+        hud_upload_to(h, &h->rt[r].tex, im, NULL);   /* last: a deferred upload takes the pixels */
     }
     /* The arrow record can decode to garbage -- ARROW_MARKERA in InGameCommon
        does exactly that. HUD art is flat-shaded, so a noise test on it is
        reliable; a rejected arrow falls back to the drawn chevron. */
-    if (img[nk - 2].rgba) h->cross_tex = hud_upload(&img[nk - 2]);
-    if (h->dw && h->dw->screen && img[nk - 3].rgba) h->tick_tex = hud_upload(&img[nk - 3]);
+    if (img[nk - 2].rgba) hud_upload_to(h, &h->cross_tex, &img[nk - 2], NULL);
+    if (h->dw && h->dw->screen && img[nk - 3].rgba) hud_upload_to(h, &h->tick_tex, &img[nk - 3], NULL);
     FengImage *ar = &img[nk - 1];
     if (ar->rgba) {
         long n = (long)ar->w * ar->h;
@@ -758,7 +874,7 @@ static void hud_load_art(Hud *h, const char *dataroot, const char *own) {
         if (rgb) {
             for (long i = 0; i < n; i++) memcpy(rgb + i*3, ar->rgba + i*4, 3);
             if (hud_art_run_fraction(rgb, ar->w, ar->h) >= HUD_ART_RUN_MIN)
-                h->arrow_tex = hud_upload(ar);
+                hud_upload_to(h, &h->arrow_tex, ar, NULL);
             free(rgb);
         }
     }
@@ -771,7 +887,7 @@ static void hud_load_fonts(Hud *h, const char *dataroot) {
     const FengPackage *p = h->pk;
     memset(h->font_of, -1, sizeof h->font_of);
     char path[1024];
-    snprintf(path, sizeof path, "%s/LANGUAGES/English.bin", dataroot);
+    n2_lang_path(path, sizeof path, dataroot);
     long len = 0;
     unsigned char *lang = hud_read_file(path, &len);
     /* the front end's ConduitMdITC_TT21i is in GLOBAL/GLOBALA.BUN (FNTF + its
@@ -796,18 +912,22 @@ static void hud_load_fonts(Hud *h, const char *dataroot) {
     uint32_t keys[HUD_NFONT]; FengImage img[HUD_NFONT];
     memset(img, 0, sizeof img);
     for (int f = 0; f < nf; f++) keys[f] = h->font[f].f.atlas_key;
-    if (feng_tpk_load_file(path, keys, nf, img) < 0) {
+    /* the atlases are shared by every screen: from the image cache */
+    uint32_t src = hic_src("LanguageTextures", globa != NULL, 0);
+    int answered = hic_fill(src, keys, nf, img);
+    if (!answered && feng_tpk_load_file(path, keys, nf, img) < 0) {
         unsigned char *d = n2_read_file(path, &len);
         if (!d) { hud_note_missing(h, "LanguageTextures.bin"); free(globa); return; }
         feng_tpk_load(d, len, keys, nf, img);
         free(d);
     }
-    if (globa) { feng_tpk_load(globa, glen, keys, nf, img); free(globa); }
+    if (globa && !answered) feng_tpk_load(globa, glen, keys, nf, img);
+    free(globa);
+    if (!answered) hic_store(src, keys, nf, img);
     for (int f = 0; f < nf; f++) {
         if (img[f].rgba) {
-            h->font[f].tex = hud_upload(&img[f]);
             h->font[f].aw = img[f].w; h->font[f].ah = img[f].h;
-            h->font[f].ok = h->font[f].tex != 0;
+            hud_upload_to(h, &h->font[f].tex, &img[f], &h->font[f].ok);
         } else hud_note_missing(h, h->font[f].f.name);
         feng_image_free(&img[f]);
     }
@@ -886,16 +1006,24 @@ static void ro_init(Hud *h) {
 
 /* drift: 0 the plain HUD, 1 HUD_Drift, 2 a whole screen, 3 HUD_SingleRace,
    4 HUD_Drag (redline / maxrpm for its rev scale) */
+/* defer: built off the GL thread -- no GL call; the textures wait in h->pend
+   and the quad batch is not made (hud_pend_upload + hud_quad_batch later) */
+static Hud *hud_build(const char *dataroot, const char *const *pkg_from, int nfrom,
+                      const char *package, int drift, int turbo, float redline, float maxrpm, int defer);
+static void hud_quad_batch(Hud *h);
 static Hud *hud_init_pkg2(const char *dataroot, const char *const *pkg_from, int nfrom,
-                          const char *package, int drift, int turbo, float redline, float maxrpm);
+                          const char *package, int drift, int turbo, float redline, float maxrpm) {
+    return hud_build(dataroot, pkg_from, nfrom, package, drift, turbo, redline, maxrpm, 0);
+}
 static Hud *hud_init_pkg(const char *dataroot, const char *const *pkg_from, int nfrom,
                          const char *package, int drift, int turbo) {
     return hud_init_pkg2(dataroot, pkg_from, nfrom, package, drift, turbo, 0.0f, 0.0f);
 }
-static Hud *hud_init_pkg2(const char *dataroot, const char *const *pkg_from, int nfrom,
-                          const char *package, int drift, int turbo, float redline, float maxrpm) {
+static Hud *hud_build(const char *dataroot, const char *const *pkg_from, int nfrom,
+                      const char *package, int drift, int turbo, float redline, float maxrpm, int defer) {
     Hud *h = (Hud *)calloc(1, sizeof *h);
     if (!h) return NULL;
+    h->defer = defer;
     if (!dataroot) dataroot = ".";
     snprintf(h->dataroot, sizeof h->dataroot, "%s", dataroot);
     memset(h->font_of, -1, sizeof h->font_of);
@@ -950,7 +1078,8 @@ static Hud *hud_init_pkg2(const char *dataroot, const char *const *pkg_from, int
         if (h->dw && drift == 2) {
             feng_anim_init(&h->dw->anim, h->pk);
             dw_load_strings(h->dw, dataroot);
-        }
+        } else if (h->dw && n2_lang() != 0) dw_load_strings(h->dw, dataroot);   /* the race HUDs' labels in that language */
+        if (h->dw && h->dw->nstr) feng_apply_labels(h->pk, h->dw->sh, (const char *const *)h->dw->st, h->dw->nstr, drift == 2);
         tq[5] = SDL_GetPerformanceCounter();
         {   double ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
             printf("player HUD: %s load ms: read %.1f parse %.1f art %.1f fonts %.1f rest %.1f\n", package,
@@ -966,7 +1095,13 @@ static Hud *hud_init_pkg2(const char *dataroot, const char *const *pkg_from, int
                    h->nos_arc.a0 * 180.0f / (float)M_PI, h->nos_arc.a1 * 180.0f / (float)M_PI);
     }
 
-    /* dynamic quad batch: positions/UVs per draw, fixed normals and indices */
+    if (!defer) hud_quad_batch(h);
+    h->needle_rpm = h->needle_speed = 0.0f;
+    return h;
+}
+
+/* dynamic quad batch: positions/UVs per draw, fixed normals and indices */
+static void hud_quad_batch(Hud *h) {
     {
         float nrm[HUD_QMAX * 4 * 3];
         unsigned short idx[HUD_QMAX * 6];
@@ -986,8 +1121,6 @@ static Hud *hud_init_pkg2(const char *dataroot, const char *const *pkg_from, int
         glBindBuffer(GL_ARRAY_BUFFER, h->qb_vbo);
         glBufferData(GL_ARRAY_BUFFER, HUD_QMAX * 4 * 5 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
     }
-    h->needle_rpm = h->needle_speed = 0.0f;
-    return h;
 }
 
 /* a race HUD kept across races (the original builds its HUD per race):
@@ -1018,12 +1151,153 @@ Hud *hud_init_drag(const char *dataroot, float redline, float maxrpm) {
     return hud_init_pkg2(dataroot, from, 1, "HUD_Drag.fng", 4, 0, redline, maxrpm);
 }
 
+/* ---- screens decoded ahead (hud_screen_prefetch) ----
+   A slot: one screen package, built by the worker with hud_build(defer), its
+   images then uploaded by the pump a few per frame. hud_init_screen takes a
+   matching slot instead of loading; what it hands out is the same Hud a
+   load at that moment would build (same files, same code). */
+#define HUD_NPRE 4
+enum { PRE_FREE, PRE_QUEUED, PRE_DECODING, PRE_DECODED, PRE_READY };
+static struct {
+    char root[512], bun[64], pkg[64];
+    int style;                          /* g_hud_style it was built with */
+    Hud *h;
+    volatile int st;
+    double ms;                          /* the worker's build time */
+    long kb;                            /* decoded pixels, KB */
+    long hkb;                           /* the Hud's own structs + string table, KB (English.bin copy not counted) */
+} g_pre[HUD_NPRE];
+static SDL_Thread *g_pre_thr;
+static volatile int g_pre_run;          /* the worker is running */
+static struct { int n, set; char root[512], bun[HUD_NPRE][64], pkg[HUD_NPRE][64]; } g_pre_want;
+
+static int hud_pre_thread(void *u) {
+    (void)u;
+    for (int i = 0; i < HUD_NPRE; i++) {
+        if (!__sync_bool_compare_and_swap(&g_pre[i].st, PRE_QUEUED, PRE_DECODING)) continue;
+        Uint64 t0 = SDL_GetPerformanceCounter();
+        const char *from[1] = { g_pre[i].bun };
+        Hud *h = hud_build(g_pre[i].root, from, 1, g_pre[i].pkg, 2, 0, 0.0f, 0.0f, 1);
+        long px = 0, hb = 0;
+        if (h) {
+            for (int k = 0; k < h->npend; k++) px += (long)h->pend[k].im.w * h->pend[k].im.h * 4;
+            hb = (long)sizeof *h + (h->pk ? (long)sizeof *h->pk : 0) +
+                 (h->dw ? (long)sizeof *h->dw + (long)h->dw->nstr * (long)(sizeof *h->dw->sh + sizeof *h->dw->st) : 0);
+        }
+        g_pre[i].ms = (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+        g_pre[i].kb = px / 1024;
+        g_pre[i].hkb = hb / 1024;
+        g_pre[i].h = h;
+        __sync_synchronize();
+        g_pre[i].st = PRE_DECODED;
+    }
+    __sync_synchronize();
+    g_pre_run = 0;
+    return 0;
+}
+static void hud_pre_finish(Hud *h) {    /* GL thread: what the worker could not do */
+    if (!h || !h->defer) return;
+    hud_pend_upload(h, 0x7fffffffL);
+    hud_quad_batch(h);
+    h->defer = 0;
+}
+/* GL thread, the worker idle: the slots made to match the wanted list */
+static void hud_pre_apply(void) {
+    int queued = 0;
+    for (int i = 0; i < HUD_NPRE; i++) {
+        int keep = 0;
+        if (g_pre[i].st == PRE_FREE) continue;
+        for (int k = 0; k < g_pre_want.n && !keep; k++)
+            keep = !strcmp(g_pre[i].root, g_pre_want.root) && !strcmp(g_pre[i].bun, g_pre_want.bun[k]) &&
+                   !strcmp(g_pre[i].pkg, g_pre_want.pkg[k]) && g_pre[i].style == g_hud_style;
+        if (keep) continue;
+        hud_free(&g_pre[i].h);
+        g_pre[i].st = PRE_FREE;
+    }
+    for (int k = 0; k < g_pre_want.n; k++) {
+        int have = 0, fr = -1;
+        for (int i = 0; i < HUD_NPRE; i++) {
+            if (g_pre[i].st == PRE_FREE) { if (fr < 0) fr = i; continue; }
+            if (!strcmp(g_pre[i].bun, g_pre_want.bun[k]) && !strcmp(g_pre[i].pkg, g_pre_want.pkg[k])) have = 1;
+        }
+        if (have || fr < 0) continue;
+        snprintf(g_pre[fr].root, sizeof g_pre[fr].root, "%s", g_pre_want.root);
+        snprintf(g_pre[fr].bun, sizeof g_pre[fr].bun, "%s", g_pre_want.bun[k]);
+        snprintf(g_pre[fr].pkg, sizeof g_pre[fr].pkg, "%s", g_pre_want.pkg[k]);
+        g_pre[fr].style = g_hud_style;
+        g_pre[fr].h = NULL;
+        g_pre[fr].st = PRE_QUEUED;
+        queued++;
+    }
+    if (!queued) return;
+    g_pre_run = 1;
+    __sync_synchronize();
+    g_pre_thr = SDL_CreateThread(hud_pre_thread, "hud-prefetch", NULL);
+    if (!g_pre_thr) {                   /* no thread: the screens load when opened, as before */
+        g_pre_run = 0;
+        for (int i = 0; i < HUD_NPRE; i++) if (g_pre[i].st == PRE_QUEUED) g_pre[i].st = PRE_FREE;
+    }
+}
+void hud_screen_prefetch(const char *dataroot, const char *const *bundle, const char *const *package, int n) {
+    if (n > HUD_NPRE) n = HUD_NPRE;
+    g_pre_want.n = n < 0 ? 0 : n;
+    snprintf(g_pre_want.root, sizeof g_pre_want.root, "%s", dataroot ? dataroot : ".");
+    for (int k = 0; k < g_pre_want.n; k++) {
+        snprintf(g_pre_want.bun[k], sizeof g_pre_want.bun[k], "%s", bundle[k]);
+        snprintf(g_pre_want.pkg[k], sizeof g_pre_want.pkg[k], "%s", package[k]);
+    }
+    g_pre_want.set = 1;
+    hud_screen_prefetch_pump();         /* now, unless the worker is still busy */
+}
+void hud_screen_prefetch_pump(void) {
+    if (g_pre_thr && !g_pre_run) { SDL_WaitThread(g_pre_thr, NULL); g_pre_thr = NULL; }
+    if (g_pre_want.set && !g_pre_thr) { g_pre_want.set = 0; hud_pre_apply(); }
+    /* one slot's images a frame, ~256 KB of pixels (an upload is a copy
+       into GPU memory; the screens' art is mostly 64..256 px images) */
+    for (int i = 0; i < HUD_NPRE; i++) {
+        if (g_pre[i].st != PRE_DECODED) continue;
+        Hud *h = g_pre[i].h;
+        if (h && h->defer && !hud_pend_upload(h, 256 * 1024)) return;
+        if (h && h->defer) { hud_quad_batch(h); h->defer = 0; }
+        g_pre[i].st = PRE_READY;
+        printf("player HUD: %s ready ahead (worker %.1f ms, %ld KB of textures, %ld KB of structs)\n",
+               g_pre[i].pkg, g_pre[i].ms, g_pre[i].kb, g_pre[i].hkb);
+        return;
+    }
+}
+/* a ready (or still decoding) slot for this screen, taken; NULL: load it */
+static Hud *hud_pre_take(const char *dataroot, const char *bundle, const char *package) {
+    for (int i = 0; i < HUD_NPRE; i++) {
+        if (g_pre[i].st == PRE_FREE || strcmp(g_pre[i].pkg, package) || strcmp(g_pre[i].bun, bundle) ||
+            strcmp(g_pre[i].root, dataroot ? dataroot : ".") || g_pre[i].style != g_hud_style) continue;
+        Uint64 t0 = SDL_GetPerformanceCounter();
+        if (__sync_bool_compare_and_swap(&g_pre[i].st, PRE_QUEUED, PRE_FREE)) return NULL;   /* not begun */
+        while (g_pre[i].st == PRE_DECODING) SDL_Delay(1);   /* the worker is on it: the rest of its build */
+        __sync_synchronize();
+        Hud *h = g_pre[i].h;
+        int was = g_pre[i].st;
+        g_pre[i].h = NULL; g_pre[i].st = PRE_FREE;
+        hud_pre_finish(h);
+        printf("player HUD: %s from the prefetch (%s), %.1f ms at the open\n", package,
+               was == PRE_READY ? "ready" : "uploaded now",
+               (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)SDL_GetPerformanceFrequency());
+        return h;
+    }
+    return NULL;
+}
+
 Hud *hud_init_screen(const char *dataroot, const char *bundle, const char *package) {
     const char *from[1] = { bundle };
-    Hud *h = hud_init_pkg(dataroot, from, 1, package, 2, 0);
+    Hud *h = hud_pre_take(dataroot, bundle, package);
+    if (!h) h = hud_init_pkg(dataroot, from, 1, package, 2, 0);
     /* PC_Loading: "LOADING", its gradient and circles are one strip on the
        left edge, as the front end pins it (shop.c PK_LOADING) */
-    if (h && h->dw && !strcmp(package, "PC_Loading.fng")) h->dw->screen = 2;
+    if (h && h->dw && !strcmp(package, "PC_Loading.fng")) {
+        h->dw->screen = 2;
+        /* GUESS: its keyboard controls group (af4a85eb) stays hidden on the
+           Vita, as shop.c prepare_package does (GAPS "F") */
+        hud_screen_hide_h(h, 0xaf4a85ebu, 1);
+    }
     return h;
 }
 
@@ -1318,6 +1592,8 @@ void hud_screen_draw(Hud *h, const RProg *rp, GpuMesh *quad, int width, int heig
 void hud_free(Hud **hp) {
     if (!hp || !*hp) return;
     Hud *h = *hp;
+    for (int i = h->upi; i < h->npend; i++) feng_image_free(&h->pend[i].im);   /* never uploaded */
+    free(h->pend);
     for (int r = 0; r < FENG_MAX_RES; r++)
         if (h->rt[r].tex) glDeleteTextures(1, &h->rt[r].tex);
     for (int f = 0; f < HUD_NFONT; f++)
@@ -1465,6 +1741,7 @@ int hud_set_trackmap(Hud *h, const char *dataroot, int event,
     if (!h || !(size > 0) || !(zoom > 0)) return 0;
     h->tm_x0 = x0; h->tm_y0 = y0; h->tm_size = size; h->tm_zoom = zoom;
     if (event == h->tm_event && h->tm_tex) return 1;
+    if (!h->pk || feng_find(h->pk, FE_MAP_SLOT) < 0) return 0;  /* no minimap in this HUD */
     char path[1024], name[32];
     snprintf(path, sizeof path, "%s/TRACKS/TRACKMAP%d.BIN", dataroot ? dataroot : ".", event);
     snprintf(name, sizeof name, "TRACKMAP%d", event);
@@ -1643,7 +1920,9 @@ static GLuint g_btn_tex[BTN_N];
 static int btn_of_token(const char *t) {
     static const struct { const char *tok; int b; } k[] = {
         { "$JOY_EVENT_FENG_SELECT$", BTN_CROSS }, { "$JOY_EVENT_FENG_CANCEL$", BTN_CIRCLE },
-        { "$JOY_EVENT_FENG_BUTTON1$", BTN_TRIANGLE }, { "$JOY_EVENT_FENG_BUTTON0$", BTN_SQUARE } };
+        { "$JOY_EVENT_FENG_BUTTON1$", BTN_TRIANGLE }, { "$JOY_EVENT_FENG_BUTTON0$", BTN_SQUARE },
+        { "$JOY_EVENT_FENG_LTRIGGER$", HUD_PAD_LBTN }, { "$JOY_EVENT_FENG_RTRIGGER$", HUD_PAD_RBTN },
+        { "$JOY_EVENT_FENG_START$", HUD_PAD_START } };
     for (size_t n = 0; n < sizeof k / sizeof k[0]; n++) if (!strcmp(t, k[n].tok)) return k[n].b;
     return -1;
 }
@@ -1659,7 +1938,8 @@ static GLuint btn_tex(int b) {
     enum { S = 64 };
     static const unsigned char col[BTN_N][3] = {
         { 124, 178, 232 }, { 255, 102, 102 }, { 64, 226, 160 }, { 255, 105, 248 },
-        { 235, 235, 235 }, { 235, 235, 235 }, { 235, 235, 235 }, { 235, 235, 235 } };
+        { 235, 235, 235 }, { 235, 235, 235 }, { 235, 235, 235 }, { 235, 235, 235 },
+        { 235, 235, 235 }, { 235, 235, 235 }, { 235, 235, 235 } };
     unsigned char *img = malloc(S * S * 4);
     if (!img) return 0;
     const float c = 0.5f * S, rd = 30.0f, st = 2.6f;   /* disc radius, half stroke */
@@ -1689,6 +1969,20 @@ static GLuint btn_tex(int b) {
                 int lit = b == HUD_PAD_DPAD_UD ? ay > w : ax > w;
                 d = in ? 0.0f : 9.0f;
                 if (in && !lit) d = 1.6f;   /* half-lit: grey (see sym below) */
+            } else if (b == HUD_PAD_START) {   /* START: the Vita's small pill button, outlined */
+                d = fabsf(seg_dist(px, py, c - 11.0f, c, c + 11.0f, c) - 6.5f);
+            } else if (b == HUD_PAD_LBTN || b == HUD_PAD_RBTN) {
+                /* a shoulder button: its edge as a bar along the top, the letter below */
+                float x0 = c - 5.0f, t = c - 6.0f, m = c + 4.0f, bt = c + 14.0f;
+                d = seg_dist(px, py, c - 13.0f, c - 15.0f, c + 13.0f, c - 15.0f);
+                d = fminf(d, seg_dist(px, py, x0, t, x0, bt));
+                if (b == HUD_PAD_LBTN) d = fminf(d, seg_dist(px, py, x0, bt, c + 7.0f, bt));
+                else {
+                    d = fminf(d, fminf(seg_dist(px, py, x0, t, c + 1.0f, t), seg_dist(px, py, x0, m, c + 1.0f, m)));
+                    if (px >= c + 1.0f)
+                        d = fminf(d, fabsf(sqrtf((px - c - 1.0f) * (px - c - 1.0f) + (py - c + 1.0f) * (py - c + 1.0f)) - 5.0f));
+                    d = fminf(d, seg_dist(px, py, c, m, c + 8.0f, bt));
+                }
             } else {   /* a stick: a cap with L or R on it */
                 float x0 = c - 6.0f, t = c - 10.0f, m = c, bt = c + 10.0f;
                 d = fminf(seg_dist(px, py, x0, t, x0, bt), 99.0f);
@@ -1915,7 +2209,7 @@ static void hud_map_icon_ex(Hud *h, const HudDC *dc, int o, GLuint tex, const fl
     }
     if (!rgba) rgba = ob->rgba;
     hud_blit(dc, tex, fabsf(ob->size[0]) / 240.0f, fabsf(ob->size[1]) / 240.0f,
-             cx + mx * mr / dc->asp, cy + my * mr, wh - s->car_heading,
+             cx + mx * mr / dc->asp, cy + my * mr, wh - ((float)M_PI * 0.5f - rot),   /* less local_64 (0 at Static) */
              rgba[0], rgba[1], rgba[2], rgba[3]);
 }
 static void hud_map_icon(Hud *h, const HudDC *dc, int o, float wx, float wy, float wh, int flag1,
@@ -1978,7 +2272,8 @@ static void hud_draw_map_icons(Hud *h, const HudDC *dc, const HudState *s,
         const FengObj *ob = &h->pk->obj[h->o_playerind];
         if (ob->res >= 0 && ob->res < h->pk->nres && h->rt[ob->res].tex)
             hud_blit(dc, h->rt[ob->res].tex, fabsf(ob->size[0]) / 240.0f, fabsf(ob->size[1]) / 240.0f,
-                     cx, cy, 0.0f, ob->rgba[0], ob->rgba[1], ob->rgba[2], ob->rgba[3]);
+                     cx, cy, s->car_heading - ((float)M_PI * 0.5f - rot),   /* heading less local_64 (0x4ca840) */
+                     ob->rgba[0], ob->rgba[1], ob->rgba[2], ob->rgba[3]);
     }
 }
 
@@ -2144,9 +2439,16 @@ static void hud_draw_map(Hud *h, const HudDC *dc, const HudState *s) {
                      m->rival ? 0.12f : 0.24f, 1.0f);
     }
     #undef MAP_PT
-    /* the player's icon never rotates: the map turns under it */
-    if (h->o_player >= 0)
-        fe_sprite_ndc(h, dc, h->o_player, cx, cy, h->pk->obj[h->o_player].rgba);
+    /* the player's icon (element type 4) turns like the others, by its
+       heading less local_64 (0x4ca840): 0 at Map Rotate (the map turns
+       under it), the car's heading at Map Static */
+    if (h->o_player >= 0) {
+        const FengObj *po = &h->pk->obj[h->o_player];
+        if (po->res >= 0 && po->res < h->pk->nres && h->rt[po->res].tex)
+            hud_blit(dc, h->rt[po->res].tex, fabsf(po->size[0]) / 240.0f, fabsf(po->size[1]) / 240.0f,
+                     cx, cy, s->car_heading - ((float)M_PI * 0.5f - rot),
+                     po->rgba[0], po->rgba[1], po->rgba[2], po->rgba[3]);
+    }
 }
 
 /* ------------------------------------------------------- the FEng screen */
@@ -2190,7 +2492,7 @@ static void str_load(const char *dataroot, unsigned char **plang, uint32_t **psh
                      const char ***pst, int *pn) {
     char path[1024];
     long len = 0;
-    snprintf(path, sizeof path, "%s/LANGUAGES/English.bin", dataroot);
+    n2_lang_path(path, sizeof path, dataroot);
     unsigned char *lang = *plang = hud_read_file(path, &len);
     if (!lang) return;
     for (long o = 0; o + 8 <= len; ) {
@@ -2245,7 +2547,8 @@ static void dw_text(struct HudDriftW *w, int o, const char *s) {
 static void dw_label(struct HudDriftW *w, int o, uint32_t hash) { dw_text(w, o, dw_str(w, hash)); }
 
 /* bPrintf "%$d" (0x43e950, flag '$' 0x2000): digits grouped by 3 with the
-   locale's ',' (0x7eb3f0: '.', ',', 3) */
+   locale's thousands character (0x7eb3f0: decimal, thousands, 3 -- English
+   '.', ',', see n2_lang_thou) */
 static void dw_num(char *out, int cap, int v) {
     char d[16]; int n = 0;
     unsigned u = v < 0 ? (unsigned)-(long)v : (unsigned)v;
@@ -2254,7 +2557,7 @@ static void dw_num(char *out, int cap, int v) {
     if (v < 0 && k < cap - 1) out[k++] = '-';
     for (int i = n - 1; i >= 0 && k < cap - 1; i--) {
         out[k++] = d[i];
-        if (i && i % 3 == 0 && k < cap - 1) out[k++] = ',';
+        if (i && i % 3 == 0 && k < cap - 1) out[k++] = n2_lang_thou();
     }
     out[k] = 0;
 }
@@ -3047,6 +3350,10 @@ static void gw_reset(Hud *h) {
     for (int k = 0; k < 7; k++) w->o_gw[k] = feng_find(h->pk, GW_OBJ[k]);
     for (int k = 0; k < 6; k++) w->o_ei[k] = feng_find(h->pk, EI_OBJ[k]);
     dw_show(w, w->o_gw[6], 0);
+    /* the getaway meter group (8ca76279, flags c0000000): bit 31 does not
+       hide it, the FEngHud ctor 0x4f8bf0's hide-all does (GC 801139f8 ->
+       FEngSetAllObjectsInPackageVisibility 801502d0) until 0x4dabd0 shows it */
+    dw_show(w, w->o_gw[0], 0);
     w->gw44 = 0; w->gw24 = 0; w->gw_was = 0;
     for (int k = 0; k < 4; k++) w->o_sc[k] = feng_find(h->pk, SC_OBJ[k]);
     dw_show(w, w->o_sc[0], 0);
@@ -3133,7 +3440,7 @@ void hud_showcase_reward(int kind, int base, int star) {
    "Bank Reward for Magazine" for kinds 1/3, 0x2ab10d61 "Bank Reward for DVD"
    for 2/4; other kinds keep the old text), the separator (" " when
    GetCurrentLanguage() == 1: PC 0x7909a0 / GC 80324004; else "": PC 0x783fe5
-   / GC 80322504; the port is English, so ""), base + star with '$' digit
+   / GC 80322504), base + star with '$' digit
    grouping -- then made visible with "ZoomIn" and the queue cleared. Once
    shown it is not hidden by the widget itself while the feature stays on:
    the ZoomIn script's own end state decides (FEng data). */
@@ -3147,7 +3454,7 @@ static void cr_update(Hud *h, const HudState *s) {
     if (!on) { dw_show(w, w->o_cr, 0); return; }
     if (0 < g_cr_delay) g_cr_delay--;
     if (!g_cr_queued || g_cr_delay != 0) return;
-    static const char sep[] = "";                        /* language != 1 */
+    const char *sep = n2_lang() == 1 ? " " : "";         /* French: " " */
     uint32_t label = (g_cr_kind == 3 || g_cr_kind == 1) ? 0xaba1e56fu
                    : (g_cr_kind == 4 || g_cr_kind == 2) ? 0x2ab10d61u : 0;
     if (label) {
@@ -3515,9 +3822,18 @@ static void gps_update(Hud *h, const HudState *s) {
    finishes (a drag run keeps it). Setup picks the rows by the race: drag
    (burnout / 0-60 / quarter mile, the speed), drift (best lap score / best
    drift / longest drift), the rest (best lap / current G's / max G's / Time).
-   The group is authored hidden and nothing names it in the code; the
-   element's registered objects show (GUESS: the rest of the group, e.g.
-   b2751131 outside a drag run, stays hidden). */
+   The group is authored c0000000 and nothing names it in the code; Toggle
+   (GC 80107e98) sets only the registered objects. CONFIRMED (G3 11-01) that
+   every unregistered child stays hidden, as dy_update does: the FEngHud ctor
+   (GC 801139f8, PC 0x4f8c2a..0x4f8c50) hides every object of the package
+   (FEngSetAllObjectsInPackageVisibility 0x52cfc0 (pkg, 0)) unless drag
+   (0x89e7d8 / 0x890108, g_tweakIsDragRace) or car show (0x89e7e5 / 0x836474,
+   g_tweakIsCarShow); in HUD_Drag the group's unregistered children are only
+   32eee5fc / 32eee5fd (Setup 80112c30 hides them) and the empty group
+   29f0a455. (Bit 31 of the group's flags gates RenderGroup 80147728 only
+   while the FEngine is not executing, SetExecution 80145958 -- the cFEng
+   ctor sets it executing for good, so bit 31 never hides: feng.c
+   feng_anim_init, stream F 11-01.) */
 #define DY_GROUP 0xd292009bu
 #define DY_MSG   0xd1b15e68u
 static void dy_mark(Hud *h) {
@@ -3556,12 +3872,12 @@ static void dy_printf(char *out, int cap, const char *fmt, const double *n, cons
         else if (*p == 'f') {
             double v = n[kn++];
             snprintf(b, sizeof b, "%.*f", prec < 0 ? 6 : prec, v);
-            if (grp && (v >= 1000.0 || v <= -1000.0)) {   /* the integer part grouped */
+            if (grp) {   /* the integer part grouped, the language's decimal character */
                 char g[64]; const char *dot = strchr(b, '.');
                 int neg = b[0] == '-', ni = (dot ? (int)(dot - b) : (int)strlen(b)) - neg, q = 0;
                 if (neg) g[q++] = '-';
-                for (int i = 0; i < ni; i++) { g[q++] = b[neg + i]; if ((ni - 1 - i) % 3 == 0 && i < ni - 1) g[q++] = ','; }
-                snprintf(g + q, sizeof g - q, "%s", dot ? dot : "");
+                for (int i = 0; i < ni; i++) { g[q++] = b[neg + i]; if ((ni - 1 - i) % 3 == 0 && i < ni - 1) g[q++] = n2_lang_thou(); }
+                if (dot) { g[q++] = n2_lang_dec(); snprintf(g + q, sizeof g - q, "%s", dot + 1); } else g[q] = 0;
                 snprintf(b, sizeof b, "%s", g);
             }
         } else {
@@ -3642,7 +3958,7 @@ static void dy_update(Hud *h, const HudState *s) {
                 dw_text(w, m, b);
                 feng_anim_set(&w->anim, m, zoom, 1);
             }
-            if (!w->dy_m3 && d->burnout > 0.0f) {             /* GUESS: Signpost::GetBits taken as set */
+            if (!w->dy_m3 && d->burnout > 0.0f) {             /* 0x4018f0 (0x89e7d8 || *0x890108, the drag flags) CONFIRMED set: DynoTuningStats::Update exits at 0x4c9d5d unless the same test passes */
                 w->dy_m3 = 1;
                 n[0] = kmh ? d->burnout : d->burnout * 3.3f;
                 ts[0] = kmh ? "m" : dw_str(w, 0xce8edab8u);
@@ -3793,6 +4109,19 @@ static void sp_update(Hud *h, const HudState *s) {
     int on = s->split_on && s->racing && !s->race_over;
     if (!on) { feng_anim_hide(&w->anim, w->o_sp, 1); w->sp28 = 0; return; }
     if (!s->split_new) {
+#ifdef OPENUG2_SIM_PRE_H
+        if (w->sp28 && getenv("OPENUG2_SIM_SPLITSHOT")) {   /* test aid: mid-zoom shots at 0.15/0.6/1.5 s */
+            static int stage, seq; static const float at[3] = { 0.15f, 0.6f, 1.5f };
+            float el = (float)(s->rt_now - w->sp2c) * 0.00025f;
+            if (el < 0.1f) stage = 0;
+            if (stage < 3 && el >= at[stage]) {
+                char nm[32]; void sim_shot_named(const char *);
+                snprintf(nm, sizeof nm, "splitz%d_%02d_%c", s->split_mode, seq, 'a' + stage);
+                sim_shot_named(nm);
+                if (++stage == 3) seq++;
+            }
+        }
+#endif
         if (3.0f < (float)(s->rt_now - w->sp2c) * 0.00025f) { feng_anim_hide(&w->anim, w->o_sp, 1); w->sp28 = 0; }
         return;
     }
@@ -3805,6 +4134,13 @@ static void sp_update(Hud *h, const HudState *s) {
         feng_anim_set(&w->anim, w->o_sp, feng_hash_upper(s->split_gap <= 0 ? "ZoominGreen" : "ZoominRed"), 1);
         feng_anim_hide(&w->anim, w->o_sp, 0);
         w->sp28 = 1;
+        printf("hud: split time %s (mode %d)\n", b, s->split_mode);
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_SIM_SPLITSHOT")) {   /* test aid: a shot of each split */
+            static int n; char nm[32]; void sim_shot_named(const char *);
+            snprintf(nm, sizeof nm, "split%d_%02d", s->split_mode, n++); sim_shot_named(nm);
+        }
+#endif
     }
 }
 /* the leaderboard (one human, 0x4da190): 4 rows -- the leader, the cars
@@ -3821,6 +4157,34 @@ static void lb_update(Hud *h, const HudState *s) {
         for (int q = 0; q < 4; q++) if (o4[q] >= 0) feng_anim_hide(&w->anim, o4[q], !on);
     }
     if (!on) return;
+    int names = w->lb1c0;                                /* the view: drawn before a flip shows */
+    if (!w->lb1c0) {
+        if (10.0f < (float)(s->rt_now - w->lb1bc) * 0.00025f) { w->lb1bc = s->rt_now; w->lb1c0 = 1; }   /* 0x784560 */
+    } else if (2.0f < (float)(s->rt_now - w->lb1bc) * 0.00025f) { w->lb1bc = s->rt_now; w->lb1c0 = 0; }
+    if (s->lb_drift) {
+        /* a drift race (0x4da190 with 0x89e7d9 / 0x890104): DrawDriftScores
+           0x4aac50 for 10 s, DrawDriftPlayerNames 0x4aadc0 for 2 s -- rows
+           1..min(list, 4) straight from the sorted score list, no window
+           around the player; LBBacking SetPlayerColor for a real car, else
+           Init (LBData's colour 0x4aa7a0 is online only); "%d :" the row,
+           LBData "%d" ftol(score) or the name "%s"; the 4 rows always shown
+           offline (0x5f00f0 == 0 -> count 4), then rows past the list hidden */
+        int n = s->lb_n < 4 ? s->lb_n : 4;
+        for (int q = 0; q < n; q++) {
+            char b[32];
+            if (w->o_lbb[q] >= 0)
+                feng_anim_set(&w->anim, w->o_lbb[q], feng_hash_upper(s->lb[q].hl ? "SetPlayerColor" : "Init"), 1);
+            if (names) dw_text(w, w->o_lbd[q], s->lb[q].name);
+            else { snprintf(b, sizeof b, "%d", dw_ftol(s->lb[q].score)); dw_text(w, w->o_lbd[q], b); }
+            snprintf(b, sizeof b, "%d :", q + 1);
+            if (w->o_lbt[q] >= 0) dw_text(w, w->o_lbt[q], b);
+        }
+        for (int q = n; q < 4; q++) {
+            if (w->o_lbd[q] >= 0) feng_anim_hide(&w->anim, w->o_lbd[q], 1);
+            if (w->o_lbt[q] >= 0) feng_anim_hide(&w->anim, w->o_lbt[q], 1);
+        }
+        return;
+    }
     int n = s->lb_n < 8 ? s->lb_n : 8, me = 0;
     for (int k = 0; k < n; k++) if (s->lb[k].me) me = k;
     int row[4] = { 0, 0, 0, 0 }, before[7], after[7], nb = 0, na = 0, slots = 4 - 1;
@@ -3833,10 +4197,6 @@ static void lb_update(Hud *h, const HudState *s) {
     for (int k = nb - 1; k >= 0; k--) row[r++] = before[k];
     if (me != 0) row[r++] = me;
     for (int k = 0; k < na; k++) row[r++] = after[k];
-    int names = w->lb1c0;                                /* the view: drawn before a flip shows */
-    if (!w->lb1c0) {
-        if (10.0f < (float)(s->rt_now - w->lb1bc) * 0.00025f) { w->lb1bc = s->rt_now; w->lb1c0 = 1; }   /* 0x784560 */
-    } else if (2.0f < (float)(s->rt_now - w->lb1bc) * 0.00025f) { w->lb1bc = s->rt_now; w->lb1c0 = 0; }
     for (int q = 0; q < 4 && q < n; q++) {
         int k = row[q];
         char b[32];
@@ -3971,15 +4331,24 @@ static void hud_draw_screen(Hud *h, const HudDC *dc, const HudState *s) {
                 fe_sprite(h, dc, i);
             break;
         case R_NOS_FILL: {
-            /* no tank model: a fitted system reads full; boosting brightens */
-            float fill = s->have_nitro_tank ? s->nitro_tank : 1.0f;
-            if (fill < 0.0f) fill = 0.0f;
-            if (fill > 1.0f) fill = 1.0f;
-            float c[4];
-            for (int q = 0; q < 4; q++) c[q] = o->rgba[q] + (1.0f - o->rgba[q]) * h->nos_glow;
+            /* NitrousGauge::Update 0x4c7b20 (GC 8010d324), single tach (0x89e7c0 == 1, not drag):
+               f <= 0 hides it; f <= 1 rotates NOS_Mask to f and colours it TweakRegulalNOSColour
+               0x96005a7d (+0x2c); above one bottle NOS_Mask goes to f - 1 and the colour is
+               TweakGBNOSColour 0x9600b4fa (+0x30). FEngSetColor replaces the authored colour
+               every frame (no boost glow: the glow scripts never start on PC, 0x4da710) */
+            float f = s->have_nitro_tank ? s->nitro_tank : 1.0f;
+            if (f > 2.0f) f = 2.0f;
+            if (!(f > 0.0f)) break;
+            float fill = f > 1.0f ? f - 1.0f : f;
+            unsigned argb = f > 1.0f ? 0x9600b4fau : 0x96005a7du;
+            float c[4] = { (argb >> 16 & 255) / 255.0f, (argb >> 8 & 255) / 255.0f,
+                           (argb & 255) / 255.0f, (argb >> 24) / 255.0f };
             if (fill >= 0.999f) fe_sprite_at(h, dc, i, o->ax, o->ay, o->aangle, c);
             else if (fill > 0.001f) fe_nos_sector(h, dc, i, fill, c);
             break; }
+        case R_NOS_LINE:   /* 0x4c7cb1: NOS_Line visible only above one bottle (0x4c7be2 hides it) */
+            if (s->have_nitro_tank && s->nitro_tank > 1.0f) fe_sprite(h, dc, i);
+            break;
         case R_MAP_SLOT:
             hud_draw_map(h, dc, s);
             break;

@@ -120,6 +120,13 @@ int  carcoll_pairs(int (*out)[3], int max);
    the GJK distance of the last test (+0x10) and whether the pair touched
    (+0x244). In the run's car numbering. */
 int  carcoll_car_pairs(int (*ab)[2], float *dist, int *touch, int max);
+/* CollisionBody +0x18 (car +0x3c -> +0x18): the body's live Collision
+   objects -- one per pair that took an impulse in the last 0.3 s of world
+   time (Collision::Update 0x592bd0). body = the CarCollCar's s (a car) or
+   obj (a prop). carcoll_world_time advances that clock once per world tick,
+   before the tick's runs. */
+void carcoll_world_time(float dt);
+int  carcoll_body_collisions(const void *body);
 
 #ifdef __cplusplus
 }

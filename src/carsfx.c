@@ -2,6 +2,8 @@
  * Addresses are SPEED2.EXE; RE notes in re-tools/out/AUDIO_AI.md. */
 #include "carsfx.h"
 #include "audio.h"
+#include "options.h"
+#include "speech.h"     /* the thunder stream */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,12 +102,13 @@ static float rng_float(float x)                         /* 0x43c1f0 */
 
 typedef struct { int mode, dsel, asel, curve[4], lo[4], hi[4]; } MixSub;
 typedef struct { int nsub; MixSub sub[8]; } Mix3D;
-/* a master channel: its output id, level, 3D record, and the object
-   slots it feeds (out-map, header [5]: entry slot (e >> 16) & 0xf, mB
-   offset (short)e; evaluator 0x477aa0) */
-typedef struct { unsigned out; int level, rec, nsl, slot[8], off[8]; } MixMaster;
+/* a master channel: its output id, level, 3D connects (its 0x8/0x9 inputs
+   in order, 0x480420), and the object slots it feeds (out-map, header [5]:
+   entry slot (e >> 16) & 0xf, 3D connect (e >> 20) & 0xf, mB offset
+   (short)e; evaluator 0x477aa0) */
+typedef struct { unsigned out; int level, rec, n3, r3[4], nsl, slot[8], off[8], sel[8]; } MixMaster;
 typedef struct { int n3d; Mix3D r3d[8]; int nmst; MixMaster mst[16]; } MixClass;
-static MixClass g_mix[4][6];    /* [mixmap][class 0..5]; AI = 2, traffic = 3, collisions = 5 */
+static MixClass g_mix[4][9];    /* [mixmap][class 0..8]; AI = 2, traffic = 3, collisions = 5, planes = 7 */
 static int g_mixmap;
 
 static unsigned rd32(const unsigned char *p) { return (unsigned)p[0] | p[1] << 8 | p[2] << 16 | (unsigned)p[3] << 24; }
@@ -118,7 +121,7 @@ static int mix_parse(const unsigned char *d, long len, MixClass *out)
         unsigned o = rd32(d + 0x10 + 4 * m);
         if (o + 0x20 > (unsigned)len) return 0;
         unsigned cls = rd32(d + o) & 0xffff;
-        if (cls > 5) continue;
+        if (cls > 8) continue;
         MixClass *mc = &out[cls];
         memset(mc, 0, sizeof *mc);
         unsigned t3 = rd32(d + o + 8), tm = rd32(d + o + 16), om = rd32(d + o + 20);
@@ -166,6 +169,7 @@ static int mix_parse(const unsigned char *d, long len, MixClass *out)
                     for (unsigned k = 0; k < ni; k++) {
                         unsigned in = rd32(d + q + 12 + 4 * k);
                         if ((in >> 28) == 9 && mm->rec < 0) mm->rec = (int)(in & 0xff);
+                        if ((in & 0xe0000000u) == 0x80000000u && mm->n3 < 4) mm->r3[mm->n3++] = (int)(in & 0xff);
                     }
                     /* the channel's out-map group, in channel order */
                     if (om != 0xffffffffu && o + om + 4 <= (unsigned)len) {
@@ -175,6 +179,7 @@ static int mix_parse(const unsigned char *d, long len, MixClass *out)
                             unsigned e = rd32(d + o + om + 4 + 4 * k);
                             if (mm->nsl < 8) {
                                 mm->slot[mm->nsl] = (int)(e >> 16 & 0xf);
+                                mm->sel[mm->nsl] = (int)(e >> 20 & 0xf);
                                 mm->off[mm->nsl++] = (short)(e & 0xffff);
                             }
                         }
@@ -190,11 +195,14 @@ static int mix_parse(const unsigned char *d, long len, MixClass *out)
 
 static void fx_load(const char *dataroot);
 static void co_reset(void);
+static void md_load(const unsigned char *d, long len, int m);
+static char g_aproot[512];                              /* the data root, for the race's AI patch banks */
 
 int carsfx_init(const char *dataroot)
 {
     static const char *const fn[4] = { "MAPOUTPUT", "MAPOUTPUTDFT", "MAPOUTPUTDRG", "MAPOUTPUTURL" };
     int n = 0;
+    snprintf(g_aproot, sizeof g_aproot, "%s", dataroot);
     memset(g_mix, 0, sizeof g_mix);
     for (int m = 0; m < 4; m++) {
         char path[512];
@@ -203,7 +211,7 @@ int carsfx_init(const char *dataroot)
         if (!f) continue;
         fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
         unsigned char *d = len > 0 ? (unsigned char *)malloc((size_t)len) : NULL;
-        if (d && fread(d, 1, (size_t)len, f) == (size_t)len && mix_parse(d, len, g_mix[m])) n++;
+        if (d && fread(d, 1, (size_t)len, f) == (size_t)len && mix_parse(d, len, g_mix[m])) { md_load(d, len, m); n++; }
         free(d); fclose(f);
     }
     fx_load(dataroot);
@@ -214,12 +222,22 @@ int carsfx_init(const char *dataroot)
 
 /* the 3D gain of record r for a source at distance d (by sel) and azimuth
    az (0x468580 -> 0x468380), mB */
+static const MixSub *mix_sub(const Mix3D *x, int mode)
+{
+    for (int s = 0; s < x->nsub; s++)
+        if (x->sub[s].mode == mode) {
+#ifdef OPENUG2_SIM_PRE_H
+            static int seen[8];
+            if (mode > 0 && mode < 8 && !seen[mode]) { seen[mode] = 1; printf("[mix3d] mode %d sub table in use (%d subs)\n", mode, x->nsub); }
+#endif
+            return &x->sub[s];
+        }
+    return &x->sub[0];
+}
 static int mix_3d(const Mix3D *x, int mode, const int d[2], const unsigned az[2])
 {
     if (x->nsub <= 0) return -10000;
-    const MixSub *u = &x->sub[0];
-    for (int s = 0; s < x->nsub; s++)
-        if (x->sub[s].mode == mode) { u = &x->sub[s]; break; }
+    const MixSub *u = mix_sub(x, mode);
     int dist = d[u->dsel ? 1 : 0];
     unsigned a = az[u->asel ? 1 : 0] & 0xffff;
     int q = (int)(a >> 14), f = (int)(a & 0x3fff), qb = (q + 1) & 3;
@@ -235,12 +253,366 @@ static int mix_3d(const Mix3D *x, int mode, const int d[2], const unsigned az[2]
     return carsfx_lin2mb((unsigned)((((0x7fff - 2 * f) * c0) >> 15) + ((2 * f * c1) >> 15)));
 }
 
+/* ---- the mixmaps' dynamic inputs (GC NFSMixMaster::ProcessMix) ----------
+   Every channel (header [3] sub channels, [4] masters) sums its fixed inputs
+   onto its base (+0x18: 0 for a sub, -level for a master) and clamps to
+   [+0x20, +0x1c] (sub: the record's down / up; master: -level - 10000 /
+   +level). Inputs: 0x8/0x9 = 3D record (added per out-map entry, mix_3d),
+   0x3CC000ss = sub channel ss of class CC, 0xaTCC3iii / 0xbTCC3iii =
+   NFSEvtMixCtl iii of class CC (header [6], 7 dwords: type in bits 24-27
+   0 AR / 1 ASR / 2 ATR, range, scale id, trigger id, A, S, R),
+   0x0NCC6iii = NFSMixCtl iii (header [1], 3 dwords: id = curve << 24 |
+   source, word, scale id). A scale id of 0 reads nUnityMixScale (GC
+   GetScaleOutputPtr: r13 - 0x75d0 = 0x8046d810 = 0x7fff, unity). */
+#define MD_NCH 24
+#define MD_NIN 16
+#define MD_NEVT 32
+#define MD_NDYN 12
+#define MD_COPY 16          /* object copies of a class: traffic 6, collision records (CO_REC) 16 */
+typedef struct { int sub, up, down, nin; unsigned in[MD_NIN]; } MdChan;
+typedef struct { unsigned id, word, scale; } MdDyn;
+typedef struct { unsigned type, scale, trig, a, s, r; int range; } MdEvt;
+typedef struct { int nch, nsub, ndyn, nevt; MdChan ch[MD_NCH]; MdDyn dyn[MD_NDYN]; MdEvt evt[MD_NEVT]; } MdClass;
+typedef struct { float t, trel; int on, lvl0, out, env; } MdEs;    /* NFSEvtMixCtl +0x24 / +0x28 / +4 / +8 / +0x18 / +0x1c */
+static MdClass g_md[4][9];                  /* [mixmap][class 0..8] */
+static MdEs g_mdes[9][MD_NEVT][MD_COPY];
+static int g_mdev[9][MD_NEVT], g_mdevsum[9][MD_NEVT], g_mddyn[9][MD_NDYN], g_mdsub[9][MD_NCH], g_mdfix[9][16];
+/* the objects' outputs the events read (set during a frame, read at the next) */
+static int g_md_bo[2];                      /* CARSFX_BottomOut +4 land (0x47ea30) / +8 bottom-out stitch (0x47ec60) */
+static int g_md_db;                         /* CARSFX_DriveBy +0x18 (output 5): a whoosh stitch started (GC 800a2264 /
+                                               800a2394 = 1 after Play; ProcessUpdate 800a23c8 clears it) */
+static int g_md_trw[MD_COPY], g_md_trh[MD_COPY];   /* SFXObj TrafficWoosh +0xc start pulse / TrafficHorn +8 playing */
+static int g_md_co[MD_COPY][4];             /* SFXObj_Collision +4 / +8 pulses, +0x18 / +0x1c strengths (kept) */
+static const CarSfxListener *g_md_L;
+volatile int g_eng_dyn_mb, g_mus_ext_mb, g_amb_ext_mb;    /* -> audio.c: master 0x40010000's inputs; map 0 sub 1's car inputs */
+
+static void md_parse(const unsigned char *d, long len, MdClass *out)
+{
+    unsigned nmaps = rd32(d + 4);
+    for (unsigned m = 0; m < nmaps && m < 9; m++) {
+        unsigned o = rd32(d + 0x10 + 4 * m);
+        if (o + 0x20 > (unsigned)len) return;
+        unsigned cls = rd32(d + o) & 0xffff;
+        if (cls > 8) continue;
+        MdClass *mc = &out[cls];
+        memset(mc, 0, sizeof *mc);
+        unsigned td = rd32(d + o + 4), te = rd32(d + o + 24);
+        if (td != 0xffffffffu && o + td + 0x10 <= (unsigned)len) {
+            unsigned p = o + td, c = rd32(d + p);
+            for (unsigned k = 0; k < c && k < MD_NDYN && p + 0x10 + 12 * k + 12 <= (unsigned)len; k++) {
+                const unsigned char *b = d + p + 0x10 + 12 * k;
+                mc->dyn[k].id = rd32(b); mc->dyn[k].word = rd32(b + 4); mc->dyn[k].scale = rd32(b + 8);
+                mc->ndyn = (int)k + 1;
+            }
+        }
+        if (te != 0xffffffffu && o + te + 0x10 <= (unsigned)len) {
+            unsigned p = o + te, c = rd32(d + p);
+            for (unsigned k = 0; k < c && k < MD_NEVT && p + 0x10 + 28 * k + 28 <= (unsigned)len; k++) {
+                const unsigned char *b = d + p + 0x10 + 28 * k;
+                MdEvt *e = &mc->evt[k];
+                unsigned rg = rd32(b + 4) & 0xffff;
+                e->type = rd32(b) >> 24 & 0xf;
+                e->range = rg < 0x2711 ? (int)rg : (int)(short)rg;
+                e->scale = rd32(b + 8); e->trig = rd32(b + 12);
+                e->a = rd32(b + 16); e->s = rd32(b + 20); e->r = rd32(b + 24);
+                mc->nevt = (int)k + 1;
+            }
+        }
+        for (int part = 0; part < 2; part++) {          /* [3] subs, then [4] masters */
+            unsigned t = rd32(d + o + 12 + 4 * part);
+            if (t == 0xffffffffu || o + t + 0x10 > (unsigned)len) continue;
+            unsigned p = o + t, cnt = rd32(d + p), q = p + 0x10;
+            for (unsigned r = 0; r < cnt; r++) {
+                if (q + 12 > (unsigned)len) return;
+                unsigned h = rd32(d + q), l = rd32(d + q + 4), ni = h >> 16 & 0xff;
+                int sub = (h & 0x10000000u) != 0;
+                unsigned ip = q + (sub ? 8 : 12);
+                if (ip + 4 * ni > (unsigned)len) return;
+                if (mc->nch < MD_NCH) {
+                    MdChan *ch = &mc->ch[mc->nch++];
+                    ch->sub = sub;
+                    if (sub) { ch->up = (int)(l >> 16 & 0x7fff); ch->down = (int)(l & 0xffff) - 0x10000; mc->nsub++; }
+                    else { ch->up = (short)(l >> 16); ch->down = -ch->up - 10000; }
+                    ch->nin = ni > MD_NIN ? MD_NIN : (int)ni;
+                    for (int k = 0; k < ch->nin; k++) ch->in[k] = rd32(d + ip + 4 * k);
+                }
+                q = ip + 4 * ni;
+            }
+        }
+    }
+}
+
+static void md_load(const unsigned char *d, long len, int m)
+{
+    memset(g_md[m], 0, sizeof g_md[m]);
+    md_parse(d, len, g_md[m]);
+}
+
+static int md_q15(float v) { int i = ftol(v * 32767.0f); return i < 0 ? 0 : i > 0x7fff ? 0x7fff : i; }
+/* MasterVol f14 (+0x3c, PC 0x471970) = g_IG_Music_Scale (0x7ed344): f1, the
+   in-game music slider's attenuation (1 - level x master x
+   curve0(0x7fff - master) / 32768), or 0x7fff in a drag (0x89e7d8) or drift
+   (0x89e7d9) race. Decoded 11-09 from GC SFXCTL_MasterVol::UpdateParams
+   (80096ca0): 0x7fff when TheRaceParameters +0x40 / +0x44 (drag / drift) or
+   g_tweakIsDragRace / g_tweakIsDriftRace (debug tweaks, always 0) or
+   g_pEAXS_PFController +0x98 == 0 -- the number of jukebox songs in mode 2 / 3
+   (in game / all), counted by EAXSound::InitEATRAX (8007bc70). */
+static int md_igscale(void)
+{
+    if (g_mixmap == 1 || g_mixmap == 2 || (g_md_L && g_md_L->drag)) return 0x7fff;
+    int ig = 0;
+    for (int i = 0; i < 27; i++) ig += g_opt.pl_mode[i] == 2 || g_opt.pl_mode[i] == 3;
+    if (!ig) return 0x7fff;
+    float m = g_opt.master;
+    float x = (float)carsfx_curve(0, (unsigned)(0x7fff - md_q15(m)), 0) * 3.05185e-5f;
+    return md_q15(1.0f - g_opt.ig_music * m * x);
+}
+/* CARSFX_Rain (type 0x10090) on view 1: the rain's intensity (Rain +0x1f0,
+   carsfx_set_rain), its FX_Weather instance (+0xd0) and the stopping flag
+   (+0xcc) -- UpdateMixerOutputs 0x461890 publishes playing && !stopping */
+static struct { float I, I_prev, stop_t, thunder_t, thunder_period; int playing, stopping, thunder_n; } g_rain;
+static int g_tun_type;   /* SFXCTL_Tunnel +0x78 while +0x70 (in a tunnel), else 0 */
+void carsfx_set_tunnel(int type) { g_tun_type = type; }
+static void weather_stop(void);
+/* an output an event or ctl reads (UpdateParams of the SFXCTL / SFXObj
+   objects: 0x6CC000f = SFXCTL field f of class CC, 0x4CCOOOf = object OOO
+   field f); copy = the object copy (traffic slot / collision record) */
+static int md_src(unsigned id, int copy)
+{
+    const CarSfxListener *L = g_md_L;
+    switch (id) {
+    case 0x6000000au: return md_q15(g_opt.master * g_opt.speech);   /* MasterVol slider levels: speech */
+    case 0x6000000bu: return md_q15(g_opt.master * g_opt.sfx);      /* sfx */
+    case 0x6000000eu: case 0x60010032u: return md_igscale();       /* f14, Shifting f2 */
+    case 0x40000010u: return (g_speech_state & 1) != 0;             /* SFXObj_Speech +4: speech in the front end */
+    case 0x40000011u: return (g_speech_state & 2) != 0;             /* +8: speech in game */
+    case 0x60010000u: case 0x60010001u: case 0x60010002u: case 0x60010003u: {   /* SFXCTL_Physics (0x470a60) */
+        static const float top[4] = { 30.0f, 60.0f, 100.0f, 140.0f };
+        return L && L->pwheels ? md_q15(fabsf(L->pspeed) * 2.237f / top[id & 3]) : 0;
+    }
+    case 0x60010005u:                                               /* airborne: no wheel down */
+        return L && L->pwheels && !(L->pcontact[0] | L->pcontact[1] | L->pcontact[2] | L->pcontact[3]);
+    case 0x60010006u:   /* EAXCar view +0xa8: {0, 1, 5} -> 32000, 4 -> 4000, else 0
+                           (smoothed +-0x3fff an update). +0xa8 = the POV type
+                           (0x45922c = Player::GetPovType 0x5eb400: bumper 2, hood 4,
+                           near 1, far 0, high 5; main.c): the outside views 32000,
+                           hood 4000, bumper 0 (confirmed G2 10-31) */
+        if (!L || !L->pwheels) return 0;
+        return L->pview == 0 || L->pview == 1 || L->pview == 5 ? 32000 : L->pview == 4 ? 4000 : 0;
+    case 0x60010007u:   /* f7 / f8, SFXCTL_Physics 0x470a60 (decoded G2 10-31): the player
+                           (+0x44 -> +0x30 -> +0x18) in camera zone 6 or 7 (+0x58) sets f7 (+0x20)
+                           when its mover (+0x238) is not a CubicCameraMover (+0xc != 1, i.e. the
+                           TrackCar jump cam runs), else f8 (+0x24) */
+        return L && L->pzone67 && !L->pcubic;
+    case 0x60010008u:
+        return L && L->pzone67 && L->pcubic;
+    case 0x60010023u: {                                             /* SFXCTL_Skid f3: GetSkidMag max << 5 */
+        float s = g_skid3[0];
+        if (g_skid3[1] > s) s = g_skid3[1];
+        if (g_skid3[2] > s) s = g_skid3[2];
+        return md_q15(s);
+    }
+    case 0x60010033u: return md_q15(g_opt.master * g_opt.sfx);      /* Shifting f3..f5: GetMasterVolume(4/5/6) */
+    case 0x60010034u: return md_q15(g_opt.master * g_opt.engine);
+    case 0x60010035u: return md_q15(g_opt.master * g_opt.tire);
+    case 0x40010030u: return g_nitro != 0;                          /* CARSFX_Nitrous +4 (0x472af0 / 0x45f2a0) */
+    case 0x40010041u: return g_sput_out != 0;                       /* CAR_Sputter +0xf8 (0x45f760) */
+    case 0x40010016u:   /* CARSFX_Shift::UpdateMixerOutputs (GC 80098404): output 6 = the
+                           controller's (+0xc8) shift state +0x80 == 1, an upshift's first phase
+                           (GUESS as player_swtn: that phase = n2sim's shifting window) */
+        return L && L->pwheels && L->pshifting && L->pshiftup;
+    case 0x40010092u: return g_rain.playing && !g_rain.stopping;   /* CARSFX_Rain +0xc (0x461890): the wet-road layer */
+    /* SFXCTL_Tunnel::UpdateMixerOutputs (GC 800963d0), the player's car in a
+       tunnel zone (+0x70): f0 type 5 (0x20), f1 types 6 / 7, f2 type 20, f3 any */
+    case 0x60010070u: return g_tun_type && !(g_tun_type == 6 || g_tun_type == 7 || g_tun_type == 20);
+    case 0x60010071u: return g_tun_type == 6 || g_tun_type == 7;
+    case 0x60010072u: return g_tun_type == 20;
+    case 0x60010073u: return g_tun_type != 0;
+    case 0x400100c5u: return g_md_db;
+    case 0x400100b0u: return g_md_bo[0];
+    case 0x400100b1u: return g_md_bo[1];
+    case 0x40030003u: return md_q15(g_opt.master * g_opt.sfx);      /* TrafficEngine +0x10 (0x462240) */
+    case 0x40030012u: return copy < MD_COPY ? g_md_trw[copy] : 0;
+    case 0x40030021u: return copy < MD_COPY ? g_md_trh[copy] : 0;
+    case 0x40050000u: case 0x40050001u: return copy < MD_COPY ? g_md_co[copy][id & 1] : 0;
+    case 0x40050005u: case 0x40050006u: return copy < MD_COPY ? g_md_co[copy][2 + ((id & 1) ^ 1)] : 0;
+    default: return 0;  /* not ported: NIS / movies, race mode 8, ambience, class-6 woosh, pause (g_game_mute) */
+    }
+}
+/* UpdateAREvent 800b65a0 / UpdateASREvent 800b6708 / UpdateATREvent 800b68b4 */
+static void md_env(MdEs *e, const MdEvt *v, int trig)
+{
+    float A = (float)(v->a & 0xfff) * 16.666670f, R = (float)(v->r & 0xfff) * 16.666670f, x;
+    unsigned w;
+    if (v->type == 2) {                                         /* ATR */
+        if (A <= e->t) {
+            if (trig) {
+                if (e->trel != 0.0f) { e->trel = 0.0f; e->on = 1; e->lvl0 = e->out; e->env = 0x7fff; e->t = 0.0f; return; }
+                e->env = 0; e->trel = 0.0f; e->t = A; e->on = 0; e->lvl0 = 0; return;
+            }
+            if (e->trel == 0.0f) e->trel = e->t;
+            float el = e->t - e->trel;
+            if (R < el) { e->lvl0 = 0; e->env = 0x7fff; e->trel = 0.0f; e->on = 0; e->t = 0.0f; return; }
+            x = 32767.0f - el * 32767.0f / R; w = v->r;
+        } else {
+            if (!trig) { e->env = 0; e->on = 1; e->lvl0 = e->out; e->t = A; return; }
+            x = e->t * 32767.0f / A; w = v->a;
+        }
+    } else {                                                    /* AR, ASR (sustain S) */
+        float S = v->type == 1 ? (float)(v->s & 0xfff) * 16.666670f : 0.0f;
+        if (A <= e->t) {
+            if (v->type == 1 && e->t - A <= S) { e->env = 0; return; }
+            float el = e->t - (A + S);
+            if (R <= el) { e->env = 0x7fff; e->t = 0.0f; return; }
+            x = 32767.0f - el * 32767.0f / R; w = v->r;
+            if (x < 0.0f) x = 0.0f; if (x > 32767.0f) x = 32767.0f;
+        } else { x = e->t * 32767.0f / A; w = v->a; }
+    }
+    int c = carsfx_curve((w >> 12) & 0xf, (unsigned)(int)x, 0);
+    e->env = v->range < 0 ? c : 0x7fff - c;
+}
+/* UpdateEvtMixCtl 800b6ab8: the event's mB */
+static int md_evt(MdEs *e, const MdEvt *v, int trig, int scale, float dt)
+{
+    if (e->t == 0.0f && !trig) { e->on = 0; e->trel = 0.0f; return e->out = 0; }
+    e->t += dt * 1000.0f;
+    if (v->type > 2) { e->out = 0; return 0; }
+    md_env(e, v, trig);
+    float k = (32767.0f - (float)e->env) * (1.0f / 32768.0f);
+    int o;
+    if (!e->on) o = (int)(k * (float)v->range);
+    else if (!trig) o = (int)(k * (float)e->lvl0);
+    else o = (int)(k * (float)(v->range - e->lvl0)) + e->lvl0;
+    e->out = o;
+    return (int)((float)scale / 32767.0f * (float)o);
+}
+/* NFSMixCtl (GetMixScaleRatio / UpdateMixCtl): the source through its curve
+   (id bits 24-28) to mB: word bit 15 clear = offset +(word & 0x7fff), range
+   -(word & 0x7fff); set = offset 0, range (short)word */
+static int md_dyn(const MdDyn *c)
+{
+    int w = (int)(c->word & 0xffff), off = 0, range;
+    if (!(w & 0x8000)) { off = w & 0x7fff; range = -off; } else range = (short)w;
+    int src = md_src((c->id & 0xe0fffff0u) | (c->id & 0xf), 0);
+    src = src < 0 ? 0 : src > 0x7fff ? 0x7fff : src;
+    int q = carsfx_curve(c->id >> 24 & 0x1f, (unsigned)src, 0);
+    int k28 = 0x7fff - carsfx_mb2lin(range);
+    int out = carsfx_lin2mb((unsigned)(0x7fff - (((0x7fff - q) * k28) >> 15))) + off;
+    if (c->scale) out = out * md_src(c->scale, 0) >> 15;
+    return out;
+}
+static int md_in(unsigned in, unsigned own, int *is3d)
+{
+    unsigned cls = in >> 16 & 0xff, idx = in & 0xfff;
+    *is3d = 0;
+    if ((in & 0xe0000000u) == 0x80000000u) { *is3d = 1; return 0; }
+    if (cls > 8) return 0;
+    if (in >> 28 == 3) return idx < MD_NCH ? g_mdsub[cls][idx] : 0;
+    if (in >> 28 >= 0xa && (in >> 12 & 0xf) == 3) return idx >= MD_NEVT ? 0 : cls == own ? g_mdev[cls][idx] : g_mdevsum[cls][idx];
+    if (in >> 28 == 0 && (in >> 12 & 0xf) == 6) return idx < MD_NDYN ? g_mddyn[cls][idx] : 0;
+    return 0;
+}
+/* once a frame, before the objects: events, ctls, then every class's
+   channels in order */
+static void md_update(const CarSfxListener *L, float dt)
+{
+    static const int ncopy[9] = { 1, 1, 1, CARSFX_TR_MAX, 1, MD_COPY, 1, 1, 1 };
+    MdClass *map = g_md[g_mixmap];
+    g_md_L = L;
+    for (int c = 0; c < 9; c++) {
+        const MdClass *mc = &map[c];
+        for (int i = 0; i < mc->nevt; i++) {
+            const MdEvt *v = &mc->evt[i];
+            int best = 0, sum = 0;
+            for (int k = 0; k < ncopy[c]; k++) {
+                /* class 0 event 0 (MasterVol f6, paused) is the port's
+                   g_game_mute in audio.c */
+                int trig = c == 0 && i == 0 ? 0 : md_src(v->trig, k) != 0;
+                int o = md_evt(&g_mdes[c][i][k], v, trig, v->scale ? md_src(v->scale, k) : 0x7fff, dt);
+                /* a channel of another class gets every copy's output as its
+                   own input, summed by ProcessMix and then clamped (GC
+                   ConnectMixChannel 800b4d94..800b4e48 loops over the
+                   class's states; ProcessMix 800b1b20). A same-class
+                   channel reads its own state; the port runs one channel
+                   set per class, so that keeps the copy with the largest
+                   level. */
+                sum += o;
+                if (abs(o) > abs(best)) best = o;
+            }
+            g_mdev[c][i] = best; g_mdevsum[c][i] = sum;
+        }
+        /* class 0 ctls 0..5 = the option sliders (MasterVol f0..f5): the
+           port applies those as bus gains (audio_set_levels) */
+        for (int i = 0; i < mc->ndyn; i++) g_mddyn[c][i] = c == 0 && i < 6 ? 0 : md_dyn(&mc->dyn[i]);
+    }
+    for (int c = 0; c < 9; c++) {
+        const MdClass *mc = &map[c];
+        int ns = 0, nm = 0;
+        for (int i = 0; i < mc->nch; i++) {
+            const MdChan *ch = &mc->ch[i];
+            int v = ch->sub ? 0 : -ch->up, is3d;
+            for (int k = 0; k < ch->nin; k++) v += md_in(ch->in[k], (unsigned)c, &is3d);
+            if (ch->sub) {
+                if (v > ch->up) v = ch->up; if (v < ch->down) v = ch->down;
+                if (ns < MD_NCH) g_mdsub[c][ns++] = v;
+            } else if (nm < 16) g_mdfix[c][nm++] = v + ch->up;   /* the inputs' sum; the clamp goes after 3D */
+        }
+    }
+    /* the player's engine: master 0x40010000 (class 1 master 0, no 3D in
+       the port's engine path), clamped */
+    {   const MixClass *m1 = &g_mix[g_mixmap][1];
+        int lv = m1->nmst ? m1->mst[0].level : 300, v = -lv + g_mdfix[1][0];
+        if (v > lv) v = lv; if (v < -lv - 10000) v = -lv - 10000;
+        g_eng_dyn_mb = v + lv;
+    }
+    /* map 0 sub 1 (the in-game music's duck, clamp -1320 in audio.c): its
+       inputs from the other classes (the class 0 ones are audio.c's) */
+    {   const MdClass *m0 = &map[0];
+        int v = 0, is3d;
+        for (int i = 0, ns = 0; i < m0->nch; i++) {
+            if (!m0->ch[i].sub) continue;
+            if (ns++ != 1) continue;
+            for (int k = 0; k < m0->ch[i].nin; k++)
+                if ((m0->ch[i].in[k] >> 16 & 0xff) != 0) v += md_in(m0->ch[i].in[k], 0, &is3d);
+        }
+        g_mus_ext_mb = v;
+        /* map 0 master 4 (SFXObj_Ambience, 0x40000020): its class-1
+           inputs (dyn 9, evts 0x17 / 0x18 in the shipped maps) -> audio.c's
+           bed level; the class-0 ones (speech ducks) are audio.c's */
+        v = 0;
+        for (int i = 0, nm = 0; i < m0->nch; i++) {
+            if (m0->ch[i].sub) continue;
+            if (nm++ != 4) continue;
+            for (int k = 0; k < m0->ch[i].nin; k++)
+                if ((m0->ch[i].in[k] >> 16 & 0xff) == 1) v += md_in(m0->ch[i].in[k], 0, &is3d);
+        }
+        g_amb_ext_mb = v;
+    }
+#ifdef OPENUG2_SIM_PRE_H
+    {   static float acc; static int on = -1;
+        if (on < 0) on = getenv("OPENUG2_MIXDYN_LOG") != NULL;
+        acc += dt;
+        if (on && acc >= 0.25f) {
+            acc = 0;
+            printf("[mixdyn] amb %d eng %d mus %d sub5 %d sub8 %d ev0 %d ev1 %d ev2 %d ev4 %d ev21 %d ev22 %d tr %d co %d/%d dyn5 %d spd %d\n",
+                   g_amb_ext_mb, g_eng_dyn_mb, g_mus_ext_mb, g_mdsub[1][5], g_mdsub[1][8], g_mdev[1][0], g_mdev[1][1], g_mdev[1][2],
+                   g_mdev[1][4], g_mdev[1][21], g_mdev[1][22], g_mdev[3][0], g_mdev[5][0], g_mdev[5][1],
+                   g_mddyn[1][5], md_src(0x60010000u, 0));
+        }
+    }
+#endif
+    /* the pulse outputs are cleared by their objects' next update */
+    g_md_bo[0] = g_md_bo[1] = 0; g_md_db = 0;
+    memset(g_md_trw, 0, sizeof g_md_trw);
+    for (int k = 0; k < MD_COPY; k++) g_md_co[k][0] = g_md_co[k][1] = 0;
+    g_md_L = NULL;
+}
+
 /* an object's mixmap volume in one slot (vt+0x38 0x45e390): its master
-   channel's level plus the 3D record it reads (the channels' other inputs
-   -- sub channels with 0xa0000000-type inputs and NFSMixCtl -- are not
-   decoded: 0 dB), floor -level - 10000 (0x479030), plus the slot's out-map
-   offset (0x477aa0: below -10000 -> 0, above 0 -> 0x7fff, else 0x467ff0).
-   A slot no channel feeds -> 0. */
+   channel's base -level plus its fixed inputs (md_update) and the 3D record
+   the slot reads, clamped to [-level - 10000, +level] (0x479030), plus the
+   slot's out-map offset (0x477aa0: below -10000 -> 0, above 0 -> 0x7fff,
+   else 0x467ff0). A slot no channel feeds -> 0. */
 static int mix_objvol(int cls, unsigned out, int slot, int mode, const int d[2], const unsigned az[2])
 {
     const MixClass *mc = &g_mix[g_mixmap][cls];
@@ -249,13 +621,35 @@ static int mix_objvol(int cls, unsigned out, int slot, int mode, const int d[2],
         if (m->out != out) continue;
         for (int k = 0; k < m->nsl; k++) {
             if (m->slot[k] != slot) continue;
-            int mb = -m->level;
-            if (m->rec >= 0 && m->rec < mc->n3d) mb += mix_3d(&mc->r3d[m->rec], mode, d, az);
+            int mb = -m->level + (i < 16 ? g_mdfix[cls][i] : 0), r = m->n3 > 0 && m->sel[k] < m->n3 ? m->r3[m->sel[k]] : -1;
+            if (r >= 0 && r < mc->n3d) mb += mix_3d(&mc->r3d[r], mode, d, az);   /* the slot's 3D connect */
+            if (mb > m->level) mb = m->level;
             if (mb < -m->level - 10000) mb = -m->level - 10000;
             mb += m->off[k];
             if (mb < -10000) return 0;
             if (mb > 0) return 0x7fff;
             return carsfx_mb2lin(mb) & 0x7fff;
+        }
+    }
+    return 0;
+}
+/* an object's azimuth word in one slot (vt+0x3c 0x45e3b0 = SFX_Base::
+   GetAzimOutput: the output's high u16). 0x477aa0 writes it from the slot's
+   3D connect (NFS3DMixCtl +0x14 = the azimuth its active sub selects,
+   0x468580); a channel without 3D connects writes *0x82bc7c = 4 (front);
+   a slot no channel feeds reads 0 */
+static unsigned mix_objaz(int cls, unsigned out, int slot, int mode, const unsigned az[2])
+{
+    const MixClass *mc = &g_mix[g_mixmap][cls];
+    for (int i = 0; i < mc->nmst; i++) {
+        const MixMaster *m = &mc->mst[i];
+        if (m->out != out) continue;
+        for (int k = 0; k < m->nsl; k++) {
+            if (m->slot[k] != slot) continue;
+            if (m->n3 <= 0) return 4;
+            int r = m->sel[k] < m->n3 ? m->r3[m->sel[k]] : -1;
+            if (r < 0 || r >= mc->n3d || mc->r3d[r].nsub <= 0) return 0;
+            return az[mix_sub(&mc->r3d[r], mode)->asel ? 1 : 0] & 0xffff;
         }
     }
     return 0;
@@ -406,13 +800,14 @@ static const struct {
 /* the downshift rpm per gear (0x7886ac) */
 static const float k_D[9] = { 6000, 6000, 5700, 6200, 6650, 7000, 7300, 7400, 7500 };
 /* the engine slots' recorded max / min rpm (0x7f0de0 +0x1c / +0x20) */
-static const float k_slot_rpm[41][2] = {
+static const float k_slot_rpm[43][2] = {
     {9229, 1350}, {8222, 1500}, {8007, 1250}, {8311, 1250}, {8836, 1000}, {8338, 1000}, {6888, 1000},
     {7099, 800}, {7145, 1000}, {8292, 1450}, {7239, 1100}, {8936, 1250}, {6509, 750}, {5672, 750},
     {5121, 750}, {6975, 1000}, {6313, 1000}, {6881, 1000}, {7037, 1526}, {8222, 1250}, {7158, 1500},
     {7085, 1500}, {8284, 1250}, {7158, 1500}, {7363, 1750}, {6599, 1200}, {6510, 1200}, {6596, 1250},
     {6773, 1000}, {5653, 1350}, {6548, 1250}, {6566, 1150}, {6840, 1250}, {6786, 1200}, {7301, 1250},
-    {7421, 1250}, {6508, 1250}, {6958, 1000}, {4782, 1000}, {7052, 1000}, {8326, 1250} };
+    {7421, 1250}, {6508, 1250}, {6958, 1000}, {4782, 1000}, {7052, 1000}, {8326, 1250},
+    {5200, 750}, {6509, 750} };   /* 41, 42: CAR_14's / CAR_12's files, their own records */
 
 typedef struct {
     int on, slot, bank, detune;
@@ -885,10 +1280,27 @@ static void fx_start(AudioFxVoice *v, int set, int clip, int loop, float delay, 
     v->trig++;
 }
 static void fx_stop(AudioFxVoice *v) { v->on = 0; v->gain = 0; v->pan = 0; }
-/* azimuth (0 front, 0x4000 right, 0x8000 back, 0x10000 = 360 deg) -> stereo
-   pan -1..1. GUESS: the mixer output's pan word (0x45e3b0, +2) is filled by
-   code not decoded; sin of the camera azimuth stands in for it */
-static float az_pan(unsigned az) { return sinf((float)(az & 0xffff) * (6.2831853f / 65536.0f)); }
+/* azimuth (0 front, 0x4000 right, 0x8000 back, 0x10000 = 360 deg; the word
+   mix_objaz gives) -> stereo pan -1..1 for audio.c's equal-power voices.
+   The EA sound library's speaker table: SNDI_precalcaztospkrvol 0x72559b /
+   SNDI_aztospkrvol 0x725878 with the stereo speakers at 90 and 270 deg
+   (SNDI_spkrconfig 0x7258e0): az >> 8 (256 steps, x 0.00549 deg), equal
+   power (SNDI_equalpower 0x72554c: sin / cos of the angle's share of the
+   speaker gap x pi/2) between the speakers around the front and around the
+   back, each gain rounded to 1/255. Speaker 0 (90 deg) is the right one
+   (GC SNDDRV_DSPMixerSetPan: gain 0 -> the AX right mix). The pan returned
+   gives audio.c's cos/sin pair the same angle (its x sqrt2 keeps the centre
+   at the Mono level) */
+static float az_pan(unsigned az)
+{
+    float th = (float)(az >> 8 & 0xff) * 256.0f * 0.0054931640625f, x;
+    if (th <= 90.0f) x = (th + 90.0f) / 180.0f;
+    else if (th >= 270.0f) x = (th - 270.0f) / 180.0f;
+    else x = (270.0f - th) / 180.0f;
+    x *= 1.5707964f;
+    int gr = (int)(sinf(x) * 255.0f + 0.5f), gl = (int)(cosf(x) * 255.0f + 0.5f);
+    return atan2f((float)gr, (float)gl) * (4.0f / 3.14159265f) - 1.0f;
+}
 /* the port's levels for effects the player also has (audio.c: squeal 0.45,
    rubber 0.35, nitrous 0.35 of the player's engine) over the effect
    mixer's 0.6; the mixmaps set the rest (the turbo too: the player's now
@@ -897,7 +1309,7 @@ static float fx_gain(int vol, float ref, float port) { return (float)vol / 32767
 
 /* a stitch on voices v[0..nv): every sample at its delay, volume and pitch
    (0x46cdd0 -> 0x45b280); returns the voices used */
-typedef struct { int n; int vol[13]; } StitchPlay;
+typedef struct { int n; int vol[13]; unsigned short pan[13]; } StitchPlay;
 static int stitch_start(AudioFxVoice *v, int nv, int lst, int idx, StitchPlay *sp)
 {
     sp->n = 0;
@@ -911,14 +1323,18 @@ static int stitch_start(AudioFxVoice *v, int nv, int lst, int idx, StitchPlay *s
         int pitch = m->pitch - (pr ? (int)rng_int((unsigned)pr) : 0);
         pitch = pitch < 0 ? 0 : pitch > 0x2000 ? 0x2000 : pitch;
         sp->vol[k] = ((tab * s->vol >> 15) * vol) >> 15;
+        sp->pan[k] = m->pan;
         fx_start(&v[k], m->ev ? AFX_WOOSH : AFX_COLL, m->smp, 0, (float)m->delay * 0.001f,
                  pitch ? (float)pitch / 4096.0f : 1.0f);
         sp->n = k + 1;
     }
     return sp->n;
 }
-/* a stitch's volumes (0x47bb30 -> 0x46cf70); 1 while a sample still plays */
-static int stitch_update(AudioFxVoice *v, const StitchPlay *sp, int objvol, float ref)
+/* a stitch's volumes and azimuths (0x47bb30 -> 0x46cf70: the event's
+   azimuth = the sample's pan word + the caller's azimuth (vt+0x3c of the
+   slot) mod 0x10000 -> the patch's player azimuth); 1 while a sample still
+   plays */
+static int stitch_update(AudioFxVoice *v, const StitchPlay *sp, int objvol, unsigned az, float ref)
 {
     int live = 0;
     for (int k = 0; k < sp->n; k++) {
@@ -926,6 +1342,7 @@ static int stitch_update(AudioFxVoice *v, const StitchPlay *sp, int objvol, floa
         if (v[k].done) { fx_stop(&v[k]); continue; }
         int g = sp->vol[k] * objvol >> 15;
         v[k].gain = fx_gain(g < 0 ? 0 : g > 0x7fff ? 0x7fff : g, ref, 0.6f);
+        v[k].pan = az_pan((sp->pan[k] + az) & 0xffff);
         live = 1;
     }
     return live;
@@ -943,14 +1360,35 @@ typedef struct {
     int t_on, t_rec, t_set, t_st, t_seq, t_bov, t_var, t_bvol, t_whine;
     float t_in, t_boost, t_frac, t_seqt;
     Ramp t_ramp;            /* +0xc4 */
-    /* CARSFX_Nitrous (0x47cbe0) */
-    int n_on;
+    /* CARSFX_Nitrous (0x47cbe0); n_bank = the 0x7ed1a0 index (0 Nitrous_00,
+       1 Nitrous_01, SetupLoadData 0x465830) */
+    int n_on, n_bank;
+    /* CARSFX_Skids: k_bank = engine class == 2 (SetupLoadData 0x465b90,
+       0x7ed1f8 [k_bank + 2 drift]) -> set AFX_PSKID + k_bank */
+    int k_bank;
     /* CARSFX_AIStereo (0x47f480) */
     int s_on, s_var, s_play;
     int init;
 } AiFx;
 static AiFx g_aifx[CARSFX_AI_MAX];
 static int g_aitb[CARSFX_AI_MAX], g_naitb;
+/* carsfx_ai_perf: [k][0] turbo level, [k][1] nitrous level */
+static int g_aiperf[CARSFX_AI_MAX][2];
+void carsfx_ai_perf(const int *turbo_level, const int *nos_level, int n)
+{
+    memset(g_aiperf, 0, sizeof g_aiperf);
+    for (int k = 0; k < n && k < CARSFX_AI_MAX; k++) {
+        g_aiperf[k][0] = turbo_level ? turbo_level[k] : 0;
+        g_aiperf[k][1] = nos_level ? nos_level[k] : 0;
+    }
+}
+/* carsfx_ai_engine_level: each AI car's EAXCar +0x94 (CarPreSetup 0x4593b0) */
+static int g_aielv[CARSFX_AI_MAX];
+void carsfx_ai_engine_level(const int *level, int n)
+{
+    memset(g_aielv, 0, sizeof g_aielv);
+    for (int k = 0; k < n && k < CARSFX_AI_MAX; k++) g_aielv[k] = level ? level[k] : 0;
+}
 static unsigned g_stereo_n;                          /* 0x82cb6c */
 static float g_fxtime;                               /* owner +0x34 */
 
@@ -1019,61 +1457,22 @@ static void turbo_update(AiFx *x, AudioFxVoice *vw, AudioFxVoice *vb, int set, f
     } else if (x->t_st == 2 && !x->t_bov) x->t_st = 0;
     int w = x->t_whine * mix_objvol(cls, out, 0, mode, d, az) >> 15;
     vw->gain = fx_gain(w < 0 ? 0 : w > 0x7fff ? 0x7fff : w, ref, 0.6f);
+    vw->pan = az_pan(mix_objaz(cls, out, 0, mode, az));             /* 0x45ece0: +0x10 = vt+0x3c(0) */
     if (x->t_bov) {
         int b = ftol((float)(x->t_bvol * mix_objvol(cls, out, x->t_var == 1 ? 1 : 2, mode, d, az) >> 15) * x->t_ramp.val);
         vb->gain = fx_gain(b < 0 ? 0 : b > 0x7fff ? 0x7fff : b, ref, 0.6f);
+        vb->pan = az_pan(mix_objaz(cls, out, x->t_var == 1 ? 1 : 2, mode, az));
     }
 }
 
+static void ai_patch_update(int k, AiSnd *a, AiFx *x, const CarSfxCar *c, const CarSfxListener *L, float dt, float ref);
+static void ai_patch_stop(int k);
+static void ai_patch_begin(void);
 static void ai_fx_update(int k, AiSnd *a, AiFx *x, const CarSfxCar *c, const CarSfxListener *L, float dt, float ref)
 {
     const int *d = a->p3.d; const unsigned *az = a->p3.az;
-    if (x->t_on)
-        turbo_update(x, FXA(k, FA_WHINE), FXA(k, FA_BOV), AFX_TURBO + x->t_set, a->load, a->out.bc100, a->sh,
-                     a->erpm, 2, 0x40020020u, &a->p3, L->mode, dt, ref);
-    /* nitrous (0x484f20 / 0x472af0 / 0x45f2a0, voice 0x45f4b0): FX_NITROUS
-       read as engage clip 1, burn loop clip 0, release clip 2 (the
-       player's reading) */
-    if (c->nos && !x->n_on) {
-        x->n_on = 1;
-        fx_start(FXA(k, FA_NOS1), AFX_NOS, 0, 0, 0, 1);
-        fx_start(FXA(k, FA_NOS), AFX_NOS, 1, 1, 0, 1);
-    } else if (!c->nos && x->n_on) {
-        x->n_on = 0;
-        fx_stop(FXA(k, FA_NOS));
-        fx_start(FXA(k, FA_NOS1), AFX_NOS, 2, 0, 0, 1);
-    }
-    {   int nv = mix_objvol(2, 0x40020030u, 0, L->mode, d, az);
-        if (FXA(k, FA_NOS1)->done) fx_stop(FXA(k, FA_NOS1));
-        FXA(k, FA_NOS)->gain = FXA(k, FA_NOS1)->gain = fx_gain(nv, ref, 0.35f);
-    }
-    /* skids (0x460a70 / 0x460c70), one voice for an AI car: the surface
-       the wheels agree on, 0x2d3b on surfaces 14, 15, 22, silent with the
-       left wheels (FL, RL) off the ground; channels = the controller's
-       sides averaged. FX_SKID read as squeal clip 3 - c per channel c plus
-       the rubber clip 4 (the player's reading). */
-    {   int s0 = c->surface[0], s1 = c->surface[1], s = s0;
-        if (s0 != s1) {
-            if (c->surface[2] == s0) { if (c->surface[3] != s0) s = s1; }
-            else if (c->surface[2] == s1) s = s1;
-        }
-        int g = (s < 14 || (s > 15 && s != 22)) ? 0x7fff : 0x2d3b;     /* DAT_007ed240 */
-        if (!c->contact[0] && !c->contact[3]) g = 0;
-        static const int slot[3] = { 3, 5, 4 };
-        float sum = 0;
-        for (int ch = 0; ch < 3; ch++) {
-            AudioFxVoice *v = FXA(k, FA_SQ0 + ch);
-            int lvl = ftol(c->skid[ch] * 1024.0f);
-            lvl = lvl < 0 ? 0 : lvl > 0x400 ? 0x400 : lvl;
-            int vol = mix_objvol(2, 0x40020050u, slot[ch], L->mode, d, az) * g >> 15;
-            if (!v->on) fx_start(v, AFX_SKID, 3 - ch, 1, 0, 1);
-            v->gain = fx_gain(vol, ref, 0.45f) * (float)lvl / 1024.0f;
-            sum += (float)lvl / 1024.0f;
-        }
-        AudioFxVoice *r = FXA(k, FA_RUB);
-        if (!r->on) fx_start(r, AFX_SKID, 4, 1, 0, 1);
-        r->gain = fx_gain(mix_objvol(2, 0x40020050u, 3, L->mode, d, az) * g >> 15, ref, 0.35f) * (sum > 1 ? 1 : sum);
-    }
+    /* turbo, nitrous and skids: their AEMS patches (ai_patch_update) */
+    ai_patch_update(k, a, x, c, L, dt, ref);
     /* stereo (0x4635b0 / 0x4636e0): ENV_STATIC variant 8/9 = ENV_COMMON
        clip 6/7 (the patch's variant table 0x90c: bank entry 7/8), looped,
        while the mixmap gives it any volume */
@@ -1082,7 +1481,10 @@ static void ai_fx_update(int k, AiSnd *a, AiFx *x, const CarSfxCar *c, const Car
         AudioFxVoice *v = FXA(k, FA_STEREO);
         if (!x->s_play && sv) { x->s_play = 1; fx_start(v, AFX_ENV, x->s_var - 2, 1, 0, 1); }
         else if (x->s_play && !sv) { x->s_play = 0; fx_stop(v); }
-        if (x->s_play) v->gain = fx_gain(sv, ref, 0.6f);
+        if (x->s_play) {
+            v->gain = fx_gain(sv, ref, 0.6f);
+            v->pan = az_pan(mix_objaz(2, 0x400200f0u, 0, L->mode, az));   /* 0x4636e0: +0x10 = vt+0x3c(0) */
+        }
     }
 }
 
@@ -1121,6 +1523,7 @@ static void tr_fx_detach(int i, TrFx *x)
 {
     for (int j = 0; j < 20; j++) fx_stop(FXT(i, j));
     memset(x, 0, sizeof *x);
+    if (i < MD_COPY) g_md_trh[i] = 0;
 }
 
 static void tr_fx_update(int i, TrFx *x, const Pos3D *p3, const CarSfxCar *c, const CarSfxListener *L, float dt, float ref)
@@ -1142,10 +1545,12 @@ static void tr_fx_update(int i, TrFx *x, const Pos3D *p3, const CarSfxCar *c, co
         int band = ftol(u127 * -0.0234375f);
         g_woosh_n = (unsigned)n + 1;
         x->w_on = stitch_start(FXT(i, FT_WOOSH), 4, 1, n - band * 6 + 9, &x->w_sp) > 0;
+        if (x->w_on && i < MD_COPY) g_md_trw[i] = 1;            /* TrafficWoosh +0xc: the stitch started */
         x->w_t = now;
     }
     if (x->w_on) {                                              /* 0x47e8d0 */
-        int live = stitch_update(FXT(i, FT_WOOSH), &x->w_sp, mix_objvol(3, 0x40030010u, 2, L->mode, d, az), ref);
+        int live = stitch_update(FXT(i, FT_WOOSH), &x->w_sp, mix_objvol(3, 0x40030010u, 2, L->mode, d, az),
+                                 mix_objaz(3, 0x40030010u, 2, L->mode, az), ref);
         if (rel <= 15.0f || !live) { stitch_stop(FXT(i, FT_WOOSH), &x->w_sp); x->w_on = 0; }
     }
     /* horn (0x47e6e0): the player within 20 m, ahead of the traffic car
@@ -1186,6 +1591,7 @@ static void tr_fx_update(int i, TrFx *x, const Pos3D *p3, const CarSfxCar *c, co
             x->h_on = 0; x->h_timed = 0; x->h_end = now;
         }
     }
+    if (i < MD_COPY) g_md_trh[i] = x->h_on;                     /* TrafficHorn +8: playing */
     if (x->h_on) {                                              /* 0x462550 */
         AudioFxVoice *v = FXT(i, FT_HORN);
         int hp = ftol(pos3d_pitch(p3, 0) * 4096.0f);
@@ -1193,6 +1599,7 @@ static void tr_fx_update(int i, TrFx *x, const Pos3D *p3, const CarSfxCar *c, co
         int hv = ftol((float)mix_objvol(3, 0x40030020u, 1, L->mode, d, az) * x->h_ramp.val);
         v->gain = fx_gain(hv < 0 ? 0 : hv > 0x7fff ? 0x7fff : hv, ref, 0.6f);
         v->pitch = (float)hp / 4096.0f;
+        v->pan = az_pan(mix_objaz(3, 0x40030020u, 1, L->mode, az));   /* vt+0x3c(1) */
     }
     /* stereo, as the AI's */
     if (x->s_on) {
@@ -1200,6 +1607,7 @@ static void tr_fx_update(int i, TrFx *x, const Pos3D *p3, const CarSfxCar *c, co
         AudioFxVoice *v = FXT(i, FT_STEREO);
         if (!x->s_play && sv) { x->s_play = 1; fx_start(v, AFX_ENV, x->s_var - 2, 1, 0, 1); }
         else if (x->s_play && !sv) { x->s_play = 0; fx_stop(v); }
+        if (x->s_play) v->pan = az_pan(mix_objaz(3, 0x40030030u, 0, L->mode, az));
         if (x->s_play) v->gain = fx_gain(sv, ref, 0.6f);
     }
     /* bottom-out (0x47ed80): an axle pair touching down (front FL+FR, rear
@@ -1233,13 +1641,15 @@ static void tr_fx_update(int i, TrFx *x, const Pos3D *p3, const CarSfxCar *c, co
         }
     }
     if (x->b_on) {                                              /* 0x47f100 */
-        x->b_on = stitch_update(FXT(i, FT_BO), &x->b_sp, mix_objvol(3, 0x40030040u, 0, L->mode, d, az), ref);
+        x->b_on = stitch_update(FXT(i, FT_BO), &x->b_sp, mix_objvol(3, 0x40030040u, 0, L->mode, d, az),
+                               mix_objaz(3, 0x40030040u, 0, L->mode, az), ref);
         if (!x->b_on) stitch_stop(FXT(i, FT_BO), &x->b_sp);
     }
 }
 
 /* the stitches and the effect banks (with the collision clips the
-   bottom-out stitches and the collision hits, 6..0x5d, play) */
+   bottom-out stitches, the collision hits 6..0x5d and the car part
+   sounds 0..5 play) */
 static void fx_load(const char *dataroot)
 {
     stitch_load(dataroot);
@@ -1248,7 +1658,7 @@ static void fx_load(const char *dataroot)
     for (int id = 0; id < g_nstitch[0]; id++) {
         int bo = 0;
         for (int m = 0; m < 3; m++) bo |= id >= k_bo_first[m] && id < k_bo_first[m] + 4;
-        if (!bo && (id < 6 || id >= 0x5e)) continue;
+        if (!bo && id >= 0x5e) continue;                 /* 0..5: PlayCarPartSnd's */
         const StitchDef *sd = &g_stitch[0][id];
         for (int k = 0; k < sd->nsmp; k++)
             if (!sd->smp[k].ev && !seen[sd->smp[k].smp]) { seen[sd->smp[k].smp] = 1; coll[nc++] = sd->smp[k].smp; }
@@ -1308,6 +1718,8 @@ typedef struct {
     StitchPlay sp;
     Pos3D p3;
     int ws;                     /* +0x14c: its slosh set, -1 = none */
+    int azl;                    /* object +0xbc: latch the azimuths (0x461e10 at attach) */
+    unsigned azh, azs;          /* +0xc8 the hit's (type slot), +0xdc the scrape's (slot 9) */
 } CoRec;
 static CoEff g_coe[CO_EFF];
 static CoRec g_cor[CO_REC];
@@ -1502,6 +1914,7 @@ static void co_hit_start(CoRec *r)                    /* 0x46a540 */
            (int)(r - g_cor), r->kind, r->type, r->str, r->dist, r->flags, id);
 #endif
     r->hit = r->hitdone = 1;
+    r->azl = 1;
     r->hb = -1;
     for (int h = 0; h < CO_HITS; h++) if (!g_co_hbused[h]) { r->hb = h; break; }
     if (r->hb < 0) return;
@@ -1546,7 +1959,7 @@ static void co_slosh_update(CoRec *r, int objvol, float ref)
         if (!v->on) continue;
         if (v->done) { fx_stop(v); return; }
         v->gain = fx_gain(vol, ref, 0.6f);
-        v->pan = az_pan(r->p3.az[0]);               /* member +0x10 = record +0xc8 */
+        v->pan = az_pan(r->azh);                    /* member +0x10 = record +0xc8 */
     }
 }
 static void co_begin_impact(CoRec *r)                 /* vt BeginImpact */
@@ -1722,7 +2135,7 @@ static void co_update(float dt, const CarSfxListener *L, float ref)
             if (r->sreq) {                                /* 0x46a460 */
                 r->sreq = 0;
                 if (e) {                                  /* at the record's +0x30 */
-                    r->scr = 1; r->fading = 0;
+                    r->scr = 1; r->fading = 0; r->azl = 1;
                     fx_start(FXS(i), AFX_SCRAPE, 0, 1, 0, 1);
                 } else co_end(r);
             }
@@ -1731,8 +2144,30 @@ static void co_update(float dt, const CarSfxListener *L, float ref)
             pos3d_update(&r->p3, r->p, L, dt);
             /* 0x461ce0: the hit's volume = the type's slot, the scrape's
                slot 9 (pitch 0x1000: 0x45e3d0 changes it only in a pause) */
+            if (r->azl) {                                 /* +0xbc: the azimuths once per attach */
+                r->azl = 0;
+                /* SFXObj_Collision outputs (PC 0x461b60): with the hit
+                   playing (+0x132), type 0/1 -> +4 = 1, +0x18 = s; type
+                   4/5 -> +8 = 1, +0x1c = s; s = ((str x near x 0xff >> 15)
+                   x sfx) >> 15, near = 1 - (distance to the closest
+                   player's car, 0..40 m) / 40. The strengths stay set.
+                   GUESS: the record slot stands for the pooled object;
+                   distance in 2D */
+                if (r->hit && i < MD_COPY) {
+                    float dx = r->p[0] - L->car[0], dy = r->p[1] - L->car[1], dd = sqrtf(dx * dx + dy * dy);
+                    dd = dd > 40.0f ? 40.0f : dd;
+                    int nr = ftol((1.0f - dd / 40.0f) * 32767.0f);
+                    int st = r->str < 0 ? 0 : r->str > 127 ? 127 : r->str;
+                    int s = (st * nr * 0xff >> 15) * md_q15(g_opt.master * g_opt.sfx) >> 15;
+                    if (r->type == 0 || r->type == 1) { g_md_co[i][0] = 1; g_md_co[i][2] = s; }
+                    else if (r->type == 4 || r->type == 5) { g_md_co[i][1] = 1; g_md_co[i][3] = s; }
+                }
+                r->azh = mix_objaz(5, 0x40050000u, r->type, L->mode, r->p3.az);
+                r->azs = mix_objaz(5, 0x40050000u, 9, L->mode, r->p3.az);
+            }
             if (r->hit && r->hb >= 0)
-                stitch_update(FXC(r->hb, 0), &r->sp, mix_objvol(5, 0x40050000u, r->type, L->mode, r->p3.d, r->p3.az), ref);
+                stitch_update(FXC(r->hb, 0), &r->sp, mix_objvol(5, 0x40050000u, r->type, L->mode, r->p3.d, r->p3.az),
+                              r->azh, ref);
             if (r->ws >= 0)                               /* the record's volume (+0xc0) */
                 co_slosh_update(r, mix_objvol(5, 0x40050000u, r->type, L->mode, r->p3.d, r->p3.az), ref);
             if (r->scr) {                                 /* 0x479970 */
@@ -1746,6 +2181,7 @@ static void co_update(float dt, const CarSfxListener *L, float ref)
                 AudioFxVoice *v = FXS(i);
                 v->gain = fx_gain(vol * k_scrape_vol[r->sstr] >> 15, ref, 0.6f);
                 v->pitch = (float)k_scrape_pitch[r->sstr] / 4096.0f;
+                v->pan = az_pan(r->azs);                  /* 0x459770 +0xc = record +0xdc */
             }
             if (r->ended) {                               /* 0x46a3a0 */
                 int live = 0;
@@ -1773,6 +2209,24 @@ static int engine_class(int row)                        /* 0x458f00 */
     default:
         return 0;
     }
+}
+/* CARSFX_Skids::SetupLoadData 0x465b90, every car (the player too): the
+   bank 0x7ed1f8 [(0x458f00(EAXCar +0x8c row) == 2) + 2 x drift], drift =
+   0x89e7d9 (a drift race) || 0x890104 (0 in the port), stored 0x82bc2c */
+static const char *const k_skid_bank[4] = { "SKID_PAV", "SKID_PAV2", "SKIDS_DRIFT", "SKIDS_DRIFT2" };
+static int g_prow = -1, g_in_begin;     /* the player's audio row (carsfx_player_car) */
+static const char *g_pskid;             /* the player's bank asked for */
+static void player_skid_stop(void);
+static void player_skid_sync(int hold)
+{
+    if (g_prow < 0) return;
+    const char *b = k_skid_bank[(engine_class(g_prow) == 2) + 2 * (g_drift != 0)];
+    if (b == g_pskid) return;
+    g_pskid = b;
+    if (hold) audio_hold(1);
+    player_skid_stop();                                 /* its voices play AFX_SKID; restarts on the new bank (player_skid) */
+    audio_set_skid_bank(b);
+    if (hold) audio_hold(0);
 }
 static const int k_cls0[] = { 0, 1, 2, 3, 4, 5, 10, 11, 18, 20, 21, 23, 24, 34, -1 };   /* 0x7ecaa8 */
 static const int k_cls1[] = { 1, 2, 6, 15, 16, 18, 20, 21, 24, 25, 28, -1 };            /* 0x7ecae4 */
@@ -1803,18 +2257,16 @@ static int slot_fresh(const int *pick, int cls)
     return s;
 }
 
-/* the row's engine slot at performance level 0 (0x7f2230 record) */
-static const unsigned char k_row_engine[33] = {
-    18, 6, 25, 29, 22, 22, 18, 31, 6, 39, 31, 25, 29, 14, 38, 15, 4, 26, 22, 23, 14, 39, 23, 23, 4, 10, 10, 4, 33, 9, 26, 28, 28 };
-
-/* 0x463f60: at most three engine banks for the whole field */
+/* 0x463f60: at most three engine banks for the whole field; a car's own
+   slot = its EAXCar +0x7c = the 0x7f2230 record at row x 4 + its engine
+   sound level +0x94 (CarPreSetup 0x4593b0; audio_row_engine_slot) */
 static int pick_banks(const int *rows, int n, int *carslot, int pick[3])
 {
     int cls[CARSFX_AI_MAX], own[CARSFX_AI_MAX], present[3] = { 0, 0, 0 }, cnt = 0;
     pick[0] = pick[1] = pick[2] = -1;
     for (int k = 0; k < n; k++) {
         int r = rows[k] < 0 || rows[k] > 32 ? 18 : rows[k];
-        cls[k] = engine_class(r); own[k] = k_row_engine[r]; carslot[k] = -1;
+        cls[k] = engine_class(r); own[k] = audio_row_engine_slot(r, g_aielv[k]); carslot[k] = -1;
         present[cls[k]] = 1;
     }
     for (int k = 0; k < n; k++) {                       /* each class keeps its first car's own bank */
@@ -1856,7 +2308,9 @@ done:
 
 int carsfx_race_begin(int mixmap, int streetx, int drift, const int *rows, int nai, int bank_slot[3])
 {
+    g_in_begin = 1;
     carsfx_race_end();
+    g_in_begin = 0;
     g_mixmap = mixmap >= 0 && mixmap < 4 ? mixmap : 0;
     g_streetx = streetx; g_drift = drift;
     g_nai = nai < 0 ? 0 : nai > CARSFX_AI_MAX ? CARSFX_AI_MAX : nai;
@@ -1874,17 +2328,24 @@ int carsfx_race_begin(int mixmap, int streetx, int drift, const int *rows, int n
         AiSnd *a = &g_ai[k];
         ai_reset(a);
         a->on = 1;
-        a->slot = carslot[k] >= 0 && carslot[k] < 41 ? carslot[k] : 0;
+        a->slot = carslot[k] >= 0 && carslot[k] < 43 ? carslot[k] : 0;
         a->bank = -1;
         for (int j = 0; j < nb; j++) if (bank_slot[j] == carslot[k]) a->bank = j;
         g_ndetune = (g_ndetune + 100) % 600;           /* 0x473ce0 */
         a->detune = g_ndetune - 300;
-        /* the effects: the turbo record of the car's row at upgrade level 0
-           (0x45eb30, 0x5995e0(4) is 0 for the AI), the stereo roll (every
-           6th AI car, 0x4765f0; 0x476580 rolls the variant again) */
+        /* the effects: the turbo record of the car's row at its turbo level
+           (0x45eb30: 0x5995e0(4) of EAXCar +0x74 = the DriverInfo that
+           CarPreSetup 0x4593b0 got, whose +0x300 = RideInfo +0x2f0 = the
+           RidePhysicsInfo levels MatchAICarPerformanceToPlayer 0x532010
+           fitted -- the same levels the shift flame 0x5f5f5c reads; G4
+           11-01, it read level 0), the nitrous bank by its nitrous level
+           (0x45f210 / 0x465830), the stereo roll (every 6th AI car,
+           0x4765f0; 0x476580 rolls the variant again) */
         AiFx *x = &g_aifx[k];
         memset(x, 0, sizeof *x);
-        x->t_rec = audio_row_turbo(rows[k]);
+        x->t_rec = audio_row_turbo(rows[k], g_aiperf[k][0]);
+        x->n_bank = g_aiperf[k][1] == 2 || g_aiperf[k][1] == 3;   /* 0x7ed1a0 index */
+        x->k_bank = engine_class(rows[k] < 0 || rows[k] > 32 ? 18 : rows[k]) == 2;   /* 0x465b90 */
         x->t_set = -1;
         for (int j = 0; j < g_naitb; j++) if (g_aitb[j] == x->t_rec) x->t_set = j;
         if (x->t_set < 0 && g_naitb < CARSFX_AI_MAX) { x->t_set = g_naitb; g_aitb[g_naitb++] = x->t_rec; }
@@ -1892,24 +2353,40 @@ int carsfx_race_begin(int mixmap, int streetx, int drift, const int *rows, int n
         g_stereo_n = (g_stereo_n + 1) % 6;
         x->s_on = g_stereo_n == 0;
         x->s_var = 8 + (int)rng_int(2);
-        printf("car sounds: opponent %d audio row %d -> engine CAR_%02d (bank %d)\n", k, rows[k], a->slot, a->bank);
+        printf("car sounds: opponent %d audio row %d, engine sound level %d (own slot %d) -> engine slot %d CAR_%02d (bank %d), "
+               "turbo level %d -> turbo bank %d, nitrous level %d -> Nitrous_0%d, skids %s\n",
+               k, rows[k], g_aielv[k], audio_row_engine_slot(rows[k], g_aielv[k]), a->slot, audio_slot_file(a->slot), a->bank,
+               g_aiperf[k][0], x->t_rec, g_aiperf[k][1], x->n_bank, k_skid_bank[x->k_bank + 2 * (g_drift != 0)]);
     }
     for (int i = 0; i < CARSFX_TR_MAX; i++) g_trs[i].car = -1;
+    ai_patch_begin();
+    player_skid_sync(1);                                /* the player's bank: the race's drift flag */
     return nb;
 }
 
 int carsfx_ai_bank(int k) { return k >= 0 && k < g_nai ? g_ai[k].bank : -1; }
 
+static void planes_reset(void);
+static void emitters_reset(void);
+static void part_snd_reset(void);
 void carsfx_race_end(void)
 {
+    part_snd_reset();
     g_nai = 0;
     memset(g_ai, 0, sizeof g_ai);
     for (int i = 0; i < CARSFX_TR_MAX; i++) g_trs[i].car = -1;
     for (int v = 0; v < AUDIO_CARVOICES; v++) g_carvoice[v].on = 0;
     for (int v = 0; v < AUDIO_FXVOICES; v++) g_fxvoice[v].on = 0;
     memset(g_aifx, 0, sizeof g_aifx);
+    for (int k = 0; k < CARSFX_AI_MAX; k++) ai_patch_stop(k);
+    player_skid_stop();
+    weather_stop();
+    planes_reset();
+    emitters_reset();
     memset(g_trfx, 0, sizeof g_trfx);
     co_reset();
+    g_drift = 0;                                        /* out of the race: not a drift race */
+    if (!g_in_begin) player_skid_sync(1);
 }
 
 /* the player's engine level in the same mix (map 1 engine -300 mB, its 3D
@@ -1989,17 +2466,35 @@ static struct {
     float logt;
 } g_rn;
 static Pos3D g_rn_p3;
+/* AUD_RoadTransitions (PlayTransition 0x4733aa / 0x47353d, GC
+   8009cdd8): with each transition, unless the side's last one still plays,
+   collision stitch 0x4e + (0..3 in turn, a counter per side: 0x82cb48 left,
+   0x82cb44 right) -- the bottom-out landing ones -- played at 0x7fff /
+   0x1000 (0x46cdd0, GC cStichWrapper::Play); ProcessUpdate 0x47cdb0 updates
+   it on channel 7 (left, +0xd4) / 6 (right, +0xd0) and frees it once it
+   ends. Voices 579 + 4 side (at most 3 samples) */
+#define FXRS(s) (&g_fxvoice[579 + 4 * (s)])
+static StitchPlay g_rn_st[2];
+static int g_rn_st_on[2];
+static unsigned g_rn_st_n[2];
 static void rn_stop(void)
 {
     for (int j = 0; j < 6; j++) fx_stop(FXR(j));
+    for (int s = 0; s < 2; s++) { stitch_stop(FXRS(s), &g_rn_st[s]); g_rn_st_on[s] = 0; }
     memset(&g_rn, 0, sizeof g_rn);
 }
 /* PlayTransition 0x4731c0: a one-shot of FX_ROADNOISE_TRANS variant `type`
    (clips 11..13) on side s (0 left: channel 3, 1 right: channel 2), volume
-   by type and speed, pitch by speed. The stitch AUD_RoadTransitions it also
-   starts is not ported (GAPS). */
+   by type and speed, pitch by speed, then the side's AUD_RoadTransitions
+   stitch (above). */
 static void rn_transition(int type, int s, float mph, int mode, float ref)
 {
+    if (!g_rn_st_on[s]) {
+        unsigned n = g_rn_st_n[s] % 4;
+        g_rn_st_n[s] = n + 1;
+        g_rn_st_on[s] = stitch_start(FXRS(s), 4, 0, 0x4e + (int)n, &g_rn_st[s]) > 0;
+        printf("[road] side %c stitch 0x%x (%d samples)\n", s ? 'R' : 'L', 0x4e + n, g_rn_st[s].n);
+    }
     int base = type == 0 || type == 1 ? 12000 : type == 2 || type == 3 ? 0x5fb4 : 0x7fff;
     int v = base * ftol(rn_slope(&k_rn_tvol, mph)) >> 15;
     v = mix_objvol(1, 0x40010060u, s ? 2 : 3, mode, g_rn_p3.d, g_rn_p3.az) * v >> 15;
@@ -2008,6 +2503,7 @@ static void rn_transition(int type, int s, float mph, int mode, float ref)
     if (clip > 13) { fx_stop(fv); return; }   /* the table holds 3 variants */
     fx_start(fv, AFX_ROAD, clip, 0, 0, (float)clampi(ftol(rn_slope(&k_rn_tpitch, mph)), 0, 0x1fff) / 4096.0f);
     fv->gain = fx_gain(clampi(v, 0, 0x7fff), ref, 0.6f);
+    fv->pan = az_pan((unsigned)clampi((int)mix_objaz(1, 0x40010060u, s ? 2 : 3, mode, g_rn_p3.az), 0, 0xffff));   /* member +0x10: vt+0x3c(channel), once */
     printf("[road] transition %d side %c clip %d vol %d mph %.0f\n", type, s ? 'R' : 'L', clip, v, mph);
 }
 static void player_road(float dt, const CarSfxListener *L, float ref)
@@ -2026,8 +2522,8 @@ static void player_road(float dt, const CarSfxListener *L, float ref)
        loops -- at level 10000 (-100 dB). Its input 0xb2013005 = class-1 mix
        event 5 (range +10000, A/R 0x91a3), triggered by 0x40010092 =
        CARSFX_Rain (0x10090) field 2, set by 0x461890 while the rain plays:
-       the base loops are the wet-road layer, silent while dry (the port has
-       no rain) */
+       the base loops are the wet-road layer, silent while dry (md_src
+       0x40010092, player_weather) */
     pos3d_update(&g_rn_p3, L->car, L, dt);
     /* SFXCTL_Wheel (0x8008f9d4): slip vectors summed per side over the
        wheels on the ground (+0x90 = FR+RR, +0x98 = FL+RL), friction use
@@ -2079,12 +2575,21 @@ static void player_road(float dt, const CarSfxListener *L, float ref)
         if (!down[sd]) v = 0;
         lv->gain = fx_gain(clampi(v, 0, 0x7fff), ref, 0.6f);
         lv->pitch = (float)clampi(g_rn.pitch[sd], 0, 0x1fff) / 4096.0f;
+        /* the mono players' azimuths: vt+0x3c of each side's channel (0x47cdb0) */
+        lv->pan = az_pan(mix_objaz(1, out, sd ? 0 : 1, L->mode, g_rn_p3.az));
+        bv->pan = az_pan(mix_objaz(1, out, sd ? 4 : 5, L->mode, g_rn_p3.az));
         /* the base loops both take the left volume (+0x100) x RoadNoiseVolumes[4] */
         int b = mix_objvol(1, out, sd ? 4 : 5, L->mode, g_rn_p3.d, g_rn_p3.az) * (g_rn.vol[0] * 24000 >> 15) >> 15;
         bv->gain = fx_gain(clampi(b, 0, 0x7fff), ref, 0.6f);
         bv->pitch = lv->pitch;
         AudioFxVoice *tv = FXR(sd ? FR_TRANS_R : FR_TRANS_L);
         if (tv->on && tv->done) fx_stop(tv);
+        if (g_rn_st_on[sd]) {   /* channel 7 left, 6 right */
+            int ch = sd ? 6 : 7;
+            g_rn_st_on[sd] = stitch_update(FXRS(sd), &g_rn_st[sd], mix_objvol(1, out, ch, L->mode, g_rn_p3.d, g_rn_p3.az),
+                                           mix_objaz(1, out, ch, L->mode, g_rn_p3.az), ref);
+            if (!g_rn_st_on[sd]) stitch_stop(FXRS(sd), &g_rn_st[sd]);
+        }
     }
 }
 
@@ -2118,6 +2623,7 @@ static void player_bottom(float dt, const CarSfxListener *L, float ref)
         unsigned n = g_bo_evt_n % 4;
         g_bo_evt_n = n + 1;
         g_pbo.e_on = stitch_start(FXB(FB_EVT), FB_END - FB_EVT, 0, 0x4e + (int)n, &g_pbo.e_sp) > 0;
+        g_md_bo[1] = 1;                                 /* +8: BottomOutPlay started */
         printf("[bottom] event 5 param %d -> stitch %d\n", L->pbottom >> 8, 0x4e + (int)n);
     }
     const int *w = L->pcontact;
@@ -2136,6 +2642,7 @@ static void player_bottom(float dt, const CarSfxListener *L, float ref)
         unsigned n = g_bo_n[mode] % 4;
         g_bo_n[mode] = n + 1;
         g_pbo.l_on = stitch_start(FXB(FB_LAND), FB_EVT - FB_LAND, 0, k_bo_first[mode] + (int)n, &g_pbo.l_sp) > 0;
+        g_md_bo[0] = 1;                                 /* +4: LandJumpPlay (0x47ea30) */
         printf("[bottom] land mode %d -> stitch %d\n", mode, k_bo_first[mode] + (int)n);
         if (L->pjumpcam) {                              /* view +0x58 == 6: stitch 0x2e.. on +0xb8, channel 2 */
             stitch_stop(FXZ(0), &g_pbo.z_sp);
@@ -2152,11 +2659,53 @@ static void player_bottom(float dt, const CarSfxListener *L, float ref)
         } else g_pbo.down[p] = 1;
     }
     int ov = mix_objvol(1, 0x400100b0u, 0, L->mode, g_pbo_p3.d, g_pbo_p3.az);   /* 0x47f100: channel 0 */
-    if (g_pbo.l_on && !(g_pbo.l_on = stitch_update(FXB(FB_LAND), &g_pbo.l_sp, ov, ref))) stitch_stop(FXB(FB_LAND), &g_pbo.l_sp);
-    if (g_pbo.e_on && !(g_pbo.e_on = stitch_update(FXB(FB_EVT), &g_pbo.e_sp, ov, ref))) stitch_stop(FXB(FB_EVT), &g_pbo.e_sp);
+    unsigned oa = mix_objaz(1, 0x400100b0u, 0, L->mode, g_pbo_p3.az);
+    if (g_pbo.l_on && !(g_pbo.l_on = stitch_update(FXB(FB_LAND), &g_pbo.l_sp, ov, oa, ref))) stitch_stop(FXB(FB_LAND), &g_pbo.l_sp);
+    if (g_pbo.e_on && !(g_pbo.e_on = stitch_update(FXB(FB_EVT), &g_pbo.e_sp, ov, oa, ref))) stitch_stop(FXB(FB_EVT), &g_pbo.e_sp);
     if (g_pbo.z_on && !(g_pbo.z_on = stitch_update(FXZ(0), &g_pbo.z_sp,
-                                                   mix_objvol(1, 0x400100b0u, 2, L->mode, g_pbo_p3.d, g_pbo_p3.az), ref)))
+                                                   mix_objvol(1, 0x400100b0u, 2, L->mode, g_pbo_p3.d, g_pbo_p3.az),
+                                                   mix_objaz(1, 0x400100b0u, 2, L->mode, g_pbo_p3.az), ref)))
         stitch_stop(FXZ(0), &g_pbo.z_sp);
+}
+
+/* ---- EAXCommon::PlayCarPartSnd 0x481500 (GC 8007e864): the in-game sound
+   of an opening / closing hood, trunk or door (0x61f820 with EAXSound +0x90
+   != 1, i.e. outside the front end). It builds a cStichWrapper (0x45b1f0)
+   from collision stitch list 0 entry `type` (0x43be60 on EAXSound +0xd0:
+   door close 0 / open 1, hood close 2 / open 3, trunk close 4 / open 5) into
+   the first free of 2 slots (+0x28, +0x2c; both busy -> nothing) and plays
+   it (0x46cdd0) with the params block zeroed (+8 volume 0, +0xc, +0x10).
+   EAXCommon::Update 0x4815b0 (GC 8007e8fc) runs its loop twice but on slot
+   +0x28 both times (retail bug, GC the same): slot 0 is freed once its
+   stitch ends (+0x1c == 0) and otherwise updated (0x47bb30) with volume =
+   the attached object's GetQ15Output(4) (vt+0x38, 0x45e390), azimuth 0.
+   The attached object is SFXObj_FEHUD (main type 6, InitSFX 800a3e58 ->
+   SetSFXBaseObject -> AttachSFXOBJ 8007e47c): mixmap class 6, out
+   0x40060000. Slot +0x2c is never updated nor freed: it keeps volume 0. In
+   all four shipped mixmaps that channel feeds slots 0 / 3 / 5 only, so
+   slot 4 reads 0 and the stitches are inaudible; the port runs the same
+   path (fx_load loads their clips, so a slot ends with its samples).
+   Voices 523.. (2 slots x 4 samples, the longest of stitches 0..5). ---- */
+#define FXCP(s, j) (&g_fxvoice[523 + (s) * 4 + (j)])
+static struct { int on; StitchPlay sp; } g_cps[2];
+void carsfx_part_snd(int type)
+{
+    int s = 0;
+    if (g_cps[0].on) { s = 1; if (g_cps[1].on) return; }
+    g_cps[s].on = stitch_start(FXCP(s, 0), 4, 0, type, &g_cps[s].sp) > 0;   /* fx_start: gain 0 */
+}
+static void part_snd_reset(void)
+{
+    for (int s = 0; s < 2; s++) { if (g_cps[s].on) stitch_stop(FXCP(s, 0), &g_cps[s].sp); g_cps[s].on = 0; }
+}
+static void part_snd_update(const CarSfxListener *L, float ref)
+{
+    static const int d0[2] = { 0, 0 }; static const unsigned a0[2] = { 0, 0 };
+    if (!g_cps[0].on) return;
+    int live = 0;
+    for (int k = 0; k < g_cps[0].sp.n; k++) live |= FXCP(0, k)->on && !FXCP(0, k)->done;
+    if (!live) { stitch_stop(FXCP(0, 0), &g_cps[0].sp); g_cps[0].on = 0; return; }   /* +0x1c == 0: delete */
+    stitch_update(FXCP(0, 0), &g_cps[0].sp, mix_objvol(6, 0x40060000u, 4, L->mode, d0, a0), 0, ref);
 }
 
 /* ---- CARSFX_SparkChatter (PC vt 0x78acb0): the CSIS class CAR_Sputter of
@@ -2175,21 +2724,33 @@ static void player_bottom(float dt, const CarSfxListener *L, float ref)
    the byte after it is set by each SetMemberData. The patch ticks every
    gVariableTimerPeriod = 20 ms (0x724c20: -1 -> 20). Its players are
    bank players (SNDAEMSI_playerplaybank) of the abk's own samples, options
-   pitchmult (0x1000 = 1), vol (0..0x7fff), azimuth (not used: mono fx
-   voices); its ControlClass output (CAR_SputOutput -> 0x47ccd0 -> +0xf8 ->
+   pitchmult (0x1000 = 1), vol (0..0x7fff), azimuth (the object's slot-0
+   azimuth word, member +0x10, -> az_pan); its ControlClass output (CAR_SputOutput -> 0x47ccd0 -> +0xf8 ->
    UpdateMixerOutputs 0x45f760) is a mixer input the port's mixmap does
    not decode (GAPS). ---- */
-#define FXS(j) (&g_fxvoice[334 + (j)])
-enum { AE_CALL, AE_LOAD, AE_STORE, AE_SETB };
+enum { AE_CALL, AE_LOAD, AE_STORE, AE_SETB, AE_ADD, AE_MUL, AE_MIN, AE_MAX };
 typedef struct { unsigned char k, op; short imm; int at; } AeIns;
-static struct {
+#define AE_MAXINS 640
+/* one patch instance; the interpreter runs the one g_aep points at (g_sp
+   below = *g_aep): CAR_Sputter (fx voices 334/335), a CAR_SWTN instance
+   (one player: 349 disengage / 350 engage; file is CAR_Sputter's, shared)
+   or an AI car's FX_TURBO / FX_NITROUS / FX_SKID instance (351 + 15 k ..).
+   Its players k play fx voice vbase + k from sound set `set`. */
+typedef struct {
     unsigned char *file; long flen;
     unsigned char *mem; int msize;
-    AeIns ins[160]; int nins;
-    int ok, dead, idx, vscale, row, nply, ply[2], child, out, toggle, flag;
+    const AeIns *ins; int nins;
+    int ok, dead, idx, vscale, row, nply, ply[8], child, out, toggle, flag, set;
     unsigned loops;
     float tick;
-} g_sp;
+    int vbase;
+} AeCtx;
+static AeIns g_sp_ins[AE_MAXINS], g_sw_ins[AE_MAXINS];
+static AeCtx g_sp_ctx = { .vbase = 334, .set = AFX_SWTN }, g_sw_ctx[4] = { { .vbase = 349, .set = AFX_SWTN }, { .vbase = 350, .set = AFX_SWTN },
+                                                                  { .vbase = 577, .set = AFX_SWTN }, { .vbase = 578, .set = AFX_SWTN } },
+             *g_aep = &g_sp_ctx;
+#define g_sp (*g_aep)
+#define SPV(j) (&g_fxvoice[g_sp.vbase + (j)])
 static Pos3D g_sp_p3;
 static unsigned g_sp_rnd[6];                              /* iSNDrandom state */
 
@@ -2221,14 +2782,18 @@ static unsigned ae_rand(void)                             /* iSNDrandom (GC 802d
     return r[0] = x + 1;
 }
 
-static int ae_player_no(int at) { return at == g_sp.ply[0] ? 0 : at == g_sp.ply[1] ? 1 : -1; }
+static int ae_player_no(int at)
+{
+    for (int p = 0; p < g_sp.nply && p < 8; p++) if (at == g_sp.ply[p]) return p;
+    return -1;
+}
 
 /* SNDAEMSI_updateplayer (0x720d57) with the bank player's play / update /
    stop (playerplaybank, playerupdatebank, playerstopbank) on an fx voice */
 static int ae_player(unsigned char *s, int at, float ref)
 {
     int p = ae_player_no(at);
-    AudioFxVoice *v = p >= 0 ? FXS(p) : NULL;
+    AudioFxVoice *v = p >= 0 ? SPV(p) : NULL;
     int st = ae_i(s + 0x18);
     st = st < 0 ? 0 : st > 2 ? 2 : st;
     signed char slot = (signed char)s[0x10];
@@ -2253,12 +2818,15 @@ static int ae_player(unsigned char *s, int at, float ref)
                     else if (op[0] == 3) az = x;
                     ae_w(op + 4, x);
                 }
-                if (v && e[0] == 0 && clip >= 0 && clip < 32) {
-                    fx_start(v, AFX_SWTN, clip, (int)(g_sp.loops >> clip & 1), 0.0f, (float)pm / 4096.0f);
+                if (v && e[0] == 0 && clip > 0 && clip < 32) {   /* bank sound (0 = the null entry) */
+                    fx_start(v, g_sp.set, clip, audio_fx_loop(g_sp.set, clip), 0.0f, (float)pm / 4096.0f);
                     v->gain = fx_gain(vol, ref, 0.6f);
                     v->pan = az_pan((unsigned)az);
                     ae_w(s + 8, 1);
-                    printf("[sputter] player %d sample %d pitch %d vol %d\n", p, clip, pm, vol);
+#ifdef OPENUG2_SIM_PRE_H
+                    if (g_sp.vbase < 351 || getenv("OPENUG2_AIPATCH_LOG"))   /* sim test aid */
+                        printf("[patch %d] player %d sound %d pitch %d vol %d\n", g_sp.vbase, p, clip, pm, vol);
+#endif
                 } else { ae_w(s + 8, -1); s[0x10] = 0xff; }
             }
         } else if (slot >= 0 && v) v->on = 0;            /* pause */
@@ -2292,7 +2860,7 @@ static int ae_op(int op, unsigned char *s, int at, float ref)
     case 4:                                                             /* destroy */
         if (ae_i(s + 0xc)) {
             g_sp.dead = 1;
-            for (int p = 0; p < 2; p++) fx_stop(FXS(p));
+            for (int p = 0; p < g_sp.nply; p++) fx_stop(SPV(p));
         }
         return 0;
     case 6: {                                                           /* counter */
@@ -2336,6 +2904,64 @@ static int ae_op(int op, unsigned char *s, int at, float ref)
         } else if (!s[0x10]) { s[0x11] = 1; s[0x10] = 1; return 1; }
         s[0x11] = 0;
         return 0;
+    }
+    case 11: {                                                          /* delaytrig (0x720376) */
+        if (ae_i(s + 8)) ae_wf(s, 0.0f);
+        float t = ae_f(s);
+        if (t < 0.0f) { s[4] = 0; return 0; }
+        if ((float)ae_i(s + 0xc) <= t) { ae_wf(s, -1.0f); s[4] = 1; return 1; }
+        ae_wf(s, t + 20.0f); s[4] = 0;
+        return 0;
+    }
+    case 12: {                                                          /* stategen (0x7203bd) */
+        const unsigned char *in = s + ae_h(s);
+        for (int k = 0; k < s[2]; k++)
+            if (ae_i(in + 4 * k)) { ae_w(s + 4, ae_i(s + 8 + 4 * k)); break; }
+        return ae_i(s + 4);
+    }
+    case 14: {                                                          /* envelope (0x720434) */
+        int in = ae_i(s + ae_h(s));
+        unsigned char prev = s[2], seg = s[3], nseg = s[0x10];
+        float val = ae_f(s + 0xc);
+#define AE_ENVSEG() do { float tm_ = ae_f(s + 0x18 + 8 * s[3]); ae_wf(s + 4, tm_); \
+                         ae_wf(s + 8, (ae_f(s + 0x1c + 8 * s[3]) - ae_f(s + 0xc)) / tm_ * 20.0f); } while (0)
+        if (in == 1 && prev == 0) { s[3] = 0; ae_wf(s + 0xc, ae_f(s + 0x14)); AE_ENVSEG(); }
+        else if (in == 3 && prev != 3 && (short)seg < (short)ae_h(s + 0x12)) { s[3] = s[0x12]; AE_ENVSEG(); }
+        else if ((in == 1 || in == 3) && seg < nseg) {
+            float tl = ae_f(s + 4) - 20.0f;
+            ae_wf(s + 4, tl);
+            if (tl <= 0.0f) {
+                ae_wf(s + 0xc, ae_f(s + 0x1c + 8 * seg));
+                s[3] = (unsigned char)(seg + 1);
+                if (s[3] < nseg) AE_ENVSEG(); else ae_wf(s + 0xc, 0.0f);
+            } else ae_wf(s + 0xc, val + ae_f(s + 8));
+        } else if (in != 2) ae_wf(s + 0xc, 0.0f);
+#undef AE_ENVSEG
+        s[2] = (unsigned char)in;
+        return ae_round(ae_f(s + 0xc));
+    }
+    case 17: { int k = ae_i(s + 4); return k > 0 && k <= s[0] ? ae_i(s + 4 + 4 * k) : 0; }   /* mux (0x720684) */
+    case 18: {                                                          /* demux (0x72069e) */
+        ae_w(s + 8 + 4 * (short)ae_h(s + 2), 0);
+        int k = ae_i(s + 4);
+        if (k > 0 && k <= s[0]) { ae_w(s + 8 + 4 * k, ae_i(s + 8)); ae_wh(s + 2, (unsigned short)k); }
+        return ae_i(s + 0xc);
+    }
+    case 25: { int b = ae_i(s + 4); return b ? ae_i(s) / b : 0; }      /* divide (0x7207bf) */
+    case 29: {                                                          /* ramp (0x720f32) */
+        int tg = ae_i(s + 0x18);
+        float cur = ae_f(s), ft = (float)tg;
+        if (ft == cur) return tg;
+        if (tg != ae_i(s + 8) || ae_i(s + 0x10) != ae_i(s + 0xc)) {
+            ae_w(s + 8, tg); ae_w(s + 0xc, ae_i(s + 0x10));
+            if (ae_i(s + 0x10) <= 0) { ae_wf(s, ft); return tg; }
+            ae_wf(s + 4, (ft - cur) / (float)ae_i(s + 0x10) * 20.0f * 0.000244140625f);
+        }
+        float st = ae_f(s + 4);
+        cur += (float)ae_i(s + 0x14) * st;
+        if (st < 0.0f ? cur < ft : cur > ft) cur = ft;
+        ae_wf(s, cur);
+        return ae_round(cur);
     }
     case 13:                                                            /* merge */
         for (int k = 0; k < s[0]; k++) if (ae_i(s + 4 + 4 * k)) return 1;
@@ -2425,13 +3051,31 @@ static int ae_op(int op, unsigned char *s, int at, float ref)
 }
 
 /* read the module's code into instructions (the subset it is made of) */
-static int ae_decode(const unsigned char *d, long len, int code)
+static int ae_decode(const unsigned char *d, long len, int code, AeIns *out, int max)
 {
     int esi = 0, pc = code, n = 0;
 #define AE_D32(o) ((int)(d[o] | d[(o) + 1] << 8 | d[(o) + 2] << 16 | (unsigned)d[(o) + 3] << 24))
-    while (pc + 8 < len && n < (int)(sizeof g_sp.ins / sizeof *g_sp.ins)) {
+    while (pc + 16 < len && n < max) {
         const unsigned char *c = d + pc;
-        AeIns *i = &g_sp.ins[n];
+        AeIns *i = &out[n];
+        /* imul eax,[esi+d] (0f af); the inline min / max: mov ecx,[esi+d];
+           cmp eax,ecx; jl / jg +2; mov eax,ecx */
+        if ((c[0] == 0x0f && c[1] == 0xaf) || (c[0] == 0x8b && (c[1] & 0x3f) == 0x0e)) {
+            const unsigned char *m = c + (c[0] == 0x0f);
+            int mod = m[1] >> 6, l, dsp;
+            if (mod == 3 || (c[0] == 0x0f && (m[1] & 0x3f) != 0x06)) break;
+            dsp = mod == 0 ? 0 : mod == 1 ? (signed char)m[2] : AE_D32(pc + (int)(m - c) + 2);
+            l = (int)(m - c) + 2 + (mod == 1 ? 1 : mod == 2 ? 4 : 0);
+            i->at = esi + dsp;
+            if (c[0] == 0x0f) i->k = AE_MUL;
+            else {
+                const unsigned char *t = c + l;
+                if (t[0] != 0x3b || t[1] != 0xc1 || (t[2] != 0x7c && t[2] != 0x7f) || t[3] != 0x02 || t[4] != 0x8b || t[5] != 0xc1) break;
+                i->k = t[2] == 0x7c ? AE_MIN : AE_MAX;
+                l += 6;
+            }
+            n++; pc += l; continue;
+        }
         if (c[0] == 0x56) { pc++; continue; }                                     /* push esi */
         if (c[0] == 0x5e) { pc++; continue; }                                     /* pop esi */
         if (c[0] == 0xc3) return n;                                               /* ret */
@@ -2442,12 +3086,12 @@ static int ae_decode(const unsigned char *d, long len, int code)
             if (c[1] == 0xc6) esi += v;
             pc += c[0] == 0x83 ? 3 : 6; continue;
         }
-        if (c[0] == 0x89 || c[0] == 0x8b || c[0] == 0xc6) {                       /* eax <-> [esi+d], byte [esi+d] */
+        if (c[0] == 0x89 || c[0] == 0x8b || c[0] == 0xc6 || c[0] == 0x03) {       /* eax <-> [esi+d], byte [esi+d], add eax,[esi+d] */
             int mod = c[1] >> 6, rm = c[1] & 7, reg = c[1] >> 3 & 7, dsp, l;
             if (rm != 6 || reg != 0 || mod == 3) break;
             dsp = mod == 0 ? 0 : mod == 1 ? (signed char)c[2] : AE_D32(pc + 2);
             l = 2 + (mod == 1 ? 1 : mod == 2 ? 4 : 0);
-            i->k = c[0] == 0x89 ? AE_STORE : c[0] == 0x8b ? AE_LOAD : AE_SETB;
+            i->k = c[0] == 0x89 ? AE_STORE : c[0] == 0x8b ? AE_LOAD : c[0] == 0x03 ? AE_ADD : AE_SETB;
             i->at = esi + dsp;
             if (c[0] == 0xc6) { i->imm = c[l]; l++; }
             n++; pc += l; continue;
@@ -2459,20 +3103,1246 @@ static int ae_decode(const unsigned char *d, long len, int code)
     return -1;
 }
 
+/* every decoded instruction stays inside the state and calls a ported operator */
+static int ae_ops_ok(const AeIns *ins, int nins, int size)
+{
+    for (int k = 0; k < nins; k++) {
+        const AeIns *i = &ins[k];
+        if (i->at < 0 || i->at >= size - 0x18) return 0;
+        /* ported: 0 1 4 6-8 10-18 21 22 25 27-31 35 38 */
+        static const unsigned long long k_ported = 0x3ull | 1ull << 4 | 0x1c0ull | 0x7fc00ull | 3ull << 21 | 1ull << 25 |
+                                                   0x1full << 27 | 1ull << 35 | 1ull << 38;
+        if (i->k == AE_CALL && (i->op > 63 || !(k_ported >> i->op & 1))) {
+            printf("[sputter] operator %d not ported\n", i->op);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* one 20 ms pass of the current instance's module code per tick */
+static void ae_tick(float dt, float ref)
+{
+    g_sp.tick += dt;
+    if (g_sp.tick > 0.2f) g_sp.tick = 0.2f;
+    for (; g_sp.tick >= 0.02f && !g_sp.dead; g_sp.tick -= 0.02f) {
+        unsigned char *b = g_sp.mem + 0x18;
+        int eax = 0;
+        for (int k = 0; k < g_sp.nins && !g_sp.dead; k++) {
+            const AeIns *i = &g_sp.ins[k];
+            switch (i->k) {
+            case AE_CALL:  eax = ae_op(i->op, b + i->at, i->at, ref); break;
+            case AE_LOAD:  eax = ae_i(b + i->at); break;
+            case AE_STORE: ae_w(b + i->at, eax); break;
+            case AE_SETB:  b[i->at] = (unsigned char)i->imm; break;
+            case AE_ADD:   eax += ae_i(b + i->at); break;
+            case AE_MUL:   eax = (int)((unsigned)eax * (unsigned)ae_i(b + i->at)); break;
+            case AE_MIN:   { int x = ae_i(b + i->at); if (!(eax < x)) eax = x; } break;
+            case AE_MAX:   { int x = ae_i(b + i->at); if (!(eax > x)) eax = x; } break;
+            }
+        }
+    }
+}
+
+/* ---- CAR_SWTN: the shift sweeteners (CARSFX_Shift, GC 800987a4 / PC
+   0x47c890: shift ctl +0x71 -> PlayDisengageSnd 0x4720d0, +0x72 ->
+   PlayEngageSnd 0x4722b0). Each play makes a CAR_SWTN instance of the car's
+   SWTN_CAR_<slot> abk (the file CAR_Sputter runs from), member data {type
+   0 disengage / 1 engage, engine slot, rpm, vol, az, 0, 0}; the module
+   picks the sample by type and destroys itself when it is done ---- */
+static int g_sw_ok, g_sw_tmpl, g_sw_size, g_sw_vscale, g_sw_prev;
+/* g_sw_ctx[type + 2 * alt]: Play (0x4722b0 / its disengage twin) drops the
+   handle to the type's old instance (refcount - 1) and makes a new one, so a
+   shift while the last one's sample still plays runs two of that type */
+static const int k_sw_vbase[4] = { 349, 350, 577, 578 };
+static unsigned char g_sw_alt[2];
+static float g_sw_rpm0;
+
+static void sw_free(void)
+{
+    for (int t = 0; t < 4; t++) {
+        g_aep = &g_sw_ctx[t];
+        if (g_sp.mem) fx_stop(SPV(0));
+        free(g_sp.mem);
+        memset(&g_sp, 0, sizeof g_sp);
+        g_sp.vbase = k_sw_vbase[t]; g_sp.set = AFX_SWTN;
+    }
+    g_sw_alt[0] = g_sw_alt[1] = 0;
+    g_aep = &g_sp_ctx;
+    g_sw_ok = 0;
+}
+
+static void sw_load(const unsigned char *d, long flen, unsigned loops, int slot)
+{
+    /* 0x7f3040 [slot] +4: the shift sweetener volume (the +8 column is CAR_Sputter's) */
+    static const unsigned short k_swtn_vol4[43] = {
+        15000, 18500, 14000, 12000, 13500, 16500, 16000, 14500, 16000, 22000, 12500, 18500, 20000, 18000, 18000,
+        16000, 18000, 18000, 16750, 13250, 14000, 15000, 16000, 14000, 15000, 16500, 16000, 18000, 15500, 18000,
+        19000, 13500, 15500, 13500, 13500, 22500, 16000, 18000, 13000, 15000, 14000, 18000, 18500 };
+    long cls = -1, t = ae_i(d + 0x38);
+    int n = t > 0 && t + 4 < flen ? ae_i(d + t) : 0;
+    for (int k = 0; k < n && t + 16 + 12 * k <= flen; k++) {
+        long nm = ae_i(d + t + 8 + 12 * k);
+        if (nm > 0 && nm + 4 + (long)sizeof "CAR_SWTN" <= flen && !strcmp((const char *)d + nm + 4, "CAR_SWTN")) cls = ae_i(d + t + 4 + 12 * k);
+    }
+    if (cls < 0 || cls + 0x60 > flen) return;
+    const unsigned char *md = d + cls + 0x20;
+    int code = ae_i(md + 4), tmpl = ae_i(md + 8), size = ae_i(md + 0xc);
+    if (code <= 0 || tmpl <= 0 || size <= 0x60 || tmpl + size > flen || md[0] != 1) return;
+    g_aep = &g_sw_ctx[0];
+    g_sp.ins = g_sw_ins;
+    g_sp.nins = ae_decode(d, flen, code, g_sw_ins, AE_MAXINS);
+    int ok = g_sp.nins > 0 && ae_ops_ok(g_sw_ins, g_sp.nins, size);
+    for (int i = 0; i < 4 && ok; i++) {
+        AeCtx *c = &g_sw_ctx[i];
+        if (i) { int vb = c->vbase; *c = g_sw_ctx[0]; c->vbase = vb; }
+        c->file = (unsigned char *)d; c->flen = flen;   /* CAR_Sputter's file: not freed here */
+        c->mem = (unsigned char *)malloc((size_t)size);
+        c->msize = size; c->loops = loops; c->idx = slot;
+        c->nply = 1; c->ply[0] = ae_i(md + 0x18) - 0x18;
+        c->dead = 1;                                    /* no instance yet */
+        if (!c->mem) ok = 0;
+    }
+    g_aep = &g_sp_ctx;
+    g_sw_tmpl = tmpl; g_sw_size = size;
+    g_sw_vscale = slot >= 0 && slot < 43 ? k_swtn_vol4[slot] : 0;
+    g_sw_ok = ok;
+    printf("[swtn] CAR_SWTN %d instructions, vol %d%s\n", g_sw_ctx[0].nins, g_sw_vscale, ok ? "" : " (not usable)");
+}
+
+/* PlayDisengageSnd / PlayEngageSnd: a new instance of the type */
+static void sw_start(int type, const CarSfxListener *L, float in, float ref)
+{
+    /* ShiftingAttackVolSlope (0x7f095c): 26000 at 4000 rpm .. 32767 at 7000, eval 0x4599e0 */
+    float f = (in - 4000.0f) / 3000.0f;
+    f = f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f;
+    int slope = (int)(26000.0f + 6767.0f * f);          /* _ftol */
+    int ov = mix_objvol(1, 0x40010010u, type ? 2 : 3, L->mode, g_sp_p3.d, g_sp_p3.az);   /* vt+0x38(3 / 2) */
+    int vol = (slope * g_sw_vscale >> 15) * ov >> 15;
+    int az = (int)mix_objaz(1, 0x40010010u, 0, L->mode, g_sp_p3.az);                   /* vt+0x3c(0) */
+    int rpm = (int)L->prpm;
+    if (!g_sw_ctx[type + 2 * g_sw_alt[type]].dead) g_sw_alt[type] ^= 1;   /* the old one plays on */
+    g_aep = &g_sw_ctx[type + 2 * g_sw_alt[type]];
+    fx_stop(SPV(0));
+    memcpy(g_sp.mem, g_sp.file + g_sw_tmpl, (size_t)g_sw_size);
+    unsigned char *m = g_sp.mem + 0x18 + 0x28;
+    ae_w(m, type);
+    ae_w(m + 4, g_sp.idx < 0 ? 0 : g_sp.idx > 60 ? 60 : g_sp.idx);
+    ae_w(m + 8, rpm < 0 ? 0 : rpm > 10000 ? 10000 : rpm);
+    ae_w(m + 0xc, vol < 0 ? 0 : vol > 0x8013 ? 0x8013 : vol);
+    ae_w(m + 0x10, az < 0 ? 0 : az > 0x10000 ? 0x10000 : az);
+    ae_w(m + 0x14, 0); ae_w(m + 0x18, 0);
+    g_sp.dead = 0; g_sp.tick = 0.02f;                   /* the first pass runs this frame */
+    ae_tick(0.0f, ref);
+    g_aep = &g_sp_ctx;
+#ifdef OPENUG2_SIM_PRE_H
+    printf("[swtn] %s rpm %d vol %d\n", type ? "engage" : "disengage", rpm, vol);
+#endif
+}
+
+static void player_swtn(float dt, const CarSfxListener *L, float ref)
+{
+    if (!g_sw_ok) return;
+    int sh = L->pwheels && L->pshifting && g_sp_ctx.ok;
+    /* gates: 0x7faaa8 set and 7000.0 (0x78abf8): the engine rpm for the
+       disengage, shift ctl +0xa8 for the engage (it also drives the engage's
+       volume slope). +0xa8 = [+0x6c] +0x12c read by BeginUpShift 0x46eccf /
+       BeginDownShift 0x46eeaf: [+0x6c] is the SFXCTL_Engine (GC GetEngRPM
+       800beb80 reads its +0x124), whose UpdateRPM (GC 80091bcc) keeps the last
+       update's rpm in +0x128 (PC +0x12c) -- the engine sound rpm one update
+       before the shift began */
+    float gate = 7000.0f;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SWTN_GATE")) gate = (float)atof(getenv("OPENUG2_SWTN_GATE"));   /* sim test aid */
+#endif
+    static float rpm_prev = -1.0f;   /* SFXCTL_Engine +0x12c: the previous update's rpm */
+    static int gear_prev = -1;
+    static float st1 = -1.0f;        /* SFXCTL_Shifting state 1's ramp (+0xc8) time left */
+    if (rpm_prev < 0.0f) rpm_prev = L->prpm;
+    if (L->preplay) {
+        /* the replay records the shift window only: its edges stand in */
+        if (sh && !g_sw_prev) {
+            g_sw_rpm0 = rpm_prev;
+            if (L->prpm >= gate) sw_start(0, L, L->prpm, ref);
+        } else if (!sh && g_sw_prev && L->pwheels && g_sw_rpm0 >= gate) sw_start(1, L, g_sw_rpm0, ref);
+        st1 = -1.0f;
+    } else {
+        /* SFXCTL_Shifting::UpdateParams (PC 0x483130, GC 80090700) runs
+           BeginUpShift when the gear goes up (CSTATE +0xc8 > +0xcc; n2sim
+           puts the gear in mid-shift, clutch out). BeginUpShift 0x46ec70
+           needs the rpm >= 3000 (0x7885c0) and then pulses +0x71 (the
+           disengage); state 1 ends when its +0xc8 ramp -- the player's
+           shift record +0x10 ms, at least 10 ms -- is done, pulsing +0x72
+           (the engage, UpdateGearShiftState 0x482d50). Downshifts pulse
+           neither. The record: 0x7f2860 + 0x60 x the 0x7f2230 entry's +4
+           at [CSTATE +0x8c row][+0xa4 engine level] (SetupCTL 0x45c330). */
+        static const unsigned char k_row_shrec[33][4] = {
+            {0,1,2,3}, {4,5,6,7}, {5,5,6,7}, {0,1,2,3}, {0,1,2,3}, {0,1,2,3}, {0,1,2,3}, {0,1,2,3}, {4,5,6,7},
+            {12,13,14,15}, {0,1,2,3}, {4,5,6,7}, {0,1,2,3}, {8,9,10,11}, {12,13,14,15}, {1,2,3,3}, {0,1,2,3},
+            {4,5,6,7}, {0,1,2,3}, {0,1,2,3}, {8,9,10,11}, {12,13,14,15}, {0,1,2,3}, {0,1,2,3}, {0,1,2,3},
+            {1,1,2,3}, {1,1,2,3}, {1,1,2,3}, {0,1,2,3}, {5,6,6,7}, {5,6,7,11}, {4,5,6,7}, {5,5,6,7} };
+        static const unsigned short k_shrec_up_ms[16] = {
+            600, 500, 250, 150, 500, 400, 300, 175, 600, 500, 300, 250, 700, 600, 400, 300 };
+        const int row = g_prow >= 0 && g_prow < 33 ? g_prow : 18;
+        const int lv = L->pengine_level < 0 ? 0 : L->pengine_level > 3 ? 3 : L->pengine_level;
+        const int up = L->pwheels && gear_prev >= 0 && L->pgear > gear_prev;
+        if (st1 >= 0.0f) {
+            st1 -= dt;
+            if (st1 <= 0.0f) {
+                st1 = -1.0f;
+                if (L->pwheels && g_sw_rpm0 >= gate) sw_start(1, L, g_sw_rpm0, ref);
+            }
+        }
+        if (up && L->prpm >= 3000.0f && g_sp_ctx.ok) {
+            g_sw_rpm0 = rpm_prev;
+            if (L->prpm >= gate) sw_start(0, L, L->prpm, ref);
+            float ms = (float)k_shrec_up_ms[k_row_shrec[row][lv]];
+            st1 = ms < 10.0f ? 0.01f : ms * 0.001f;
+        }
+    }
+    gear_prev = L->pgear;
+    g_sw_prev = sh;
+    rpm_prev = L->prpm;
+    for (int t = 0; t < 4; t++) {
+        g_aep = &g_sw_ctx[t];
+        if (!g_sp.dead) ae_tick(dt, ref);
+        g_aep = &g_sp_ctx;
+    }
+}
+
+/* ---- the AI racers' AEMS patches: FX_TURBO_xx (SOUND/TURBO bank of the
+   car's turbo record, CARSFX_Turbo 0x47ca70), FX_NITROUS (CARSFX_Nitrous
+   0x47cbe0) and FX_SKID (CARSFX_Skids 0x460680), run by the interpreter
+   above. One instance each per AI car k (the blow-off is a second FX_TURBO
+   instance), players on fx voices 351 + 15 k: whine 0-1, blow-off 2-3,
+   nitrous 4-7, skid 8-14 (FX_SKID has 7 players in the PAV banks, 5 in the
+   DRIFT ones). Member data (SetMemberData 0x735580) from state +0x28:
+     FX_TURBO   type (0 whine, 1..3 blow-off variant), vol, boost x 1024,
+                azimuth, throttle 0..0x400, rpm; update byte +0x40
+     FX_NITROUS type 0, vol, azimuth, release; update byte +0x38
+     FX_SKID    vol x3 (slots 3, 5, 4 by the surface gain), skid channels
+                x3 (0..0x400), azimuth (slot 3), drift flag, 0x1000 x3,
+                yaw deg, speed mph, 0, understeer, oversteer, rumble
+                terrain; update byte +0x6c ---- */
+static const char *const k_turbo_abk[15] = {
+    "TURBO_SML1_0", "TURBO_SML1_1", "TURBO_SML1_2", "TURBO_SML2_0", "TURBO_SML2_1", "TURBO_SML2_2",
+    "TURBO_MED_0", "TURBO_MED_1", "TURBO_MED_2", "TURBO_BIG_0", "TURBO_BIG_1", "TURBO_BIG_2",
+    "TURBO_TRUCK_0", "TURBO_TRUCK_1", "TURBO_TRUCK_2" };
+typedef struct {
+    unsigned char *file; long flen;
+    AeIns ins[AE_MAXINS];
+    int nins, tmpl, size, nply, ply[8], set, ok;
+    char path[512];
+} AeProg;
+static AeProg g_ap_turbo[CARSFX_AI_MAX], g_ap_nos[2], g_ap_skid[2];   /* g_ap_nos[b]: Nitrous_0b's FX_NITROUS; g_ap_skid[b]: 0x7ed1f8 [b + 2 drift]'s FX_SKID */
+enum { AI_TW, AI_TB, AI_NOS, AI_SKID };
+static AeCtx g_ai_inst[CARSFX_AI_MAX][4];
+/* FX_NITROUS's second instance per AI car (voices 545 + 4 k): Play 0x472af0
+   drops the car's handle to the old instance (0x735550 -> 0x735030: refcount
+   - 1) and creates a new one; the old one plays its release out and the
+   module ends it (ProcessUpdate 0x45f4b0 keeps it while the count > 1) */
+static AeCtx g_ai_nos2[CARSFX_AI_MAX];
+static unsigned char g_ai_nos_cur[CARSFX_AI_MAX];   /* 0: g_ai_inst[k][AI_NOS], 1: g_ai_nos2[k] */
+#define AI_NOS_PV2(k) (545 + 4 * (k))
+#define AI_PV(k) (351 + 15 * (k))
+#define AI_M(c) ((c)->mem + 0x18 + 0x28)
+
+static void ap_free(AeProg *p) { free(p->file); memset(p, 0, sizeof *p); }
+
+/* the module of the first class whose name starts with cls */
+static int ap_load(AeProg *p, const char *path, const char *cls, int set)
+{
+    if (p->ok && p->set == set && !strcmp(p->path, path)) return 1;   /* already loaded */
+    ap_free(p);
+    snprintf(p->path, sizeof p->path, "%s", path);
+    p->set = set;
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("[aipatch] %s: missing\n", path); return 0; }
+    fseek(f, 0, SEEK_END); p->flen = ftell(f); fseek(f, 0, SEEK_SET);
+    p->file = p->flen > 0x100 ? (unsigned char *)malloc((size_t)p->flen) : NULL;
+    int ok = p->file && fread(p->file, 1, (size_t)p->flen, f) == (size_t)p->flen;
+    fclose(f);
+    const unsigned char *d = p->file;
+    long c = -1, cl = (long)strlen(cls);
+    if (ok && !memcmp(d, "ABKC", 4)) {
+        long t = ae_i(d + 0x38);
+        int n = t > 0 && t + 4 < p->flen ? ae_i(d + t) : 0;
+        for (int k = 0; k < n && t + 16 + 12 * k <= p->flen && c < 0; k++) {
+            long nm = ae_i(d + t + 8 + 12 * k);
+            if (nm > 0 && nm + 4 + cl < p->flen && !strncmp((const char *)d + nm + 4, cls, (size_t)cl)) c = ae_i(d + t + 4 + 12 * k);
+        }
+    }
+    const unsigned char *md = c >= 0 && c + 0x40 <= p->flen ? d + c + 0x20 : NULL;
+    int code = md ? ae_i(md + 4) : 0, tmpl = md ? ae_i(md + 8) : 0, size = md ? ae_i(md + 0xc) : 0;
+    if (!md || code <= 0 || tmpl <= 0 || size <= 0x70 || tmpl + size > p->flen || md[0] < 1 || md[0] > 8) {
+        printf("[aipatch] %s: no %s\n", path, cls);
+        free(p->file); p->file = NULL;
+        return 0;
+    }
+    p->nply = md[0]; p->tmpl = tmpl; p->size = size;
+    for (int i = 0; i < p->nply; i++) p->ply[i] = ae_i(md + 0x18 + 4 * i) - 0x18;
+    p->nins = ae_decode(d, p->flen, code, p->ins, AE_MAXINS);
+    p->ok = p->nins > 0 && ae_ops_ok(p->ins, p->nins, size);
+    printf("[aipatch] %s %s: %d instructions, %d players, state %#x%s\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path,
+           cls, p->nins, p->nply, size, p->ok ? "" : " (not usable)");
+    return p->ok;
+}
+
+static int ai_alive(const AeCtx *c) { return c->ok && !c->dead; }
+static void ai_inst_kill(AeCtx *c)
+{
+    if (ai_alive(c)) for (int p = 0; p < c->nply; p++) fx_stop(&g_fxvoice[c->vbase + p]);
+    c->dead = 1;
+}
+/* CreateInstance: the template, then the member data the caller writes */
+static unsigned char *ai_inst_start(AeCtx *c, const AeProg *p, int vbase)
+{
+    ai_inst_kill(c);
+    if (!p->ok) return NULL;
+    if (c->msize < p->size) {
+        free(c->mem);
+        c->mem = (unsigned char *)malloc((size_t)p->size);
+        c->msize = c->mem ? p->size : 0;
+    }
+    if (!c->mem) return NULL;
+    memcpy(c->mem, p->file + p->tmpl, (size_t)p->size);
+    c->file = p->file; c->flen = p->flen; c->ins = p->ins; c->nins = p->nins;
+    c->set = p->set; c->nply = p->nply; memcpy(c->ply, p->ply, sizeof c->ply);
+    c->vbase = vbase; c->ok = 1; c->dead = 0; c->tick = 0.02f;   /* the first pass runs this frame */
+    for (int i = 0; i < c->nply; i++) fx_stop(&g_fxvoice[vbase + i]);
+    return AI_M(c);
+}
+static void ai_inst_run(AeCtx *c, float dt, float ref)
+{
+    if (!ai_alive(c)) return;
+    g_aep = c;
+    ae_tick(dt, ref);
+    g_aep = &g_sp_ctx;
+}
+static void am(unsigned char *m, int i, int v, int lo, int hi) { ae_w(m + 4 * i, v < lo ? lo : v > hi ? hi : v); }
+
+static void ai_patch_stop(int k)
+{
+    for (int j = 0; j < 4; j++) ai_inst_kill(&g_ai_inst[k][j]);
+    ai_inst_kill(&g_ai_nos2[k]); g_ai_nos_cur[k] = 0;
+}
+
+/* the race's programs and their banks (carsfx_race_begin; the turbo banks'
+   samples come with audio_load_ai_turbo_banks, sets AFX_TURBO + j) */
+static void ai_patch_begin(void)
+{
+    char path[640];
+    player_skid_stop();                                 /* it may share an AI bank's program (freed below) */
+    for (int j = 0; j < CARSFX_AI_MAX; j++) {
+        if (j >= g_naitb || g_aitb[j] < 0 || g_aitb[j] >= 15) { ap_free(&g_ap_turbo[j]); continue; }
+        snprintf(path, sizeof path, "%s/SOUND/TURBO/%s_MB.abk", g_aproot, k_turbo_abk[g_aitb[j]]);
+        ap_load(&g_ap_turbo[j], path, "FX_TURBO", AFX_TURBO + j);
+    }
+    /* SetupLoadData 0x465830 (CARSFX_Nitrous, vt 0x78ac58, class 0x10030 in
+       the factory table 0x7ed3b4): table 0x7ed1a0 [level 2 or 3], 0
+       Nitrous_00, 1 Nitrous_01, where the level = obj +0xac, written only by
+       SetupSFX 0x45f210 (driver types 1 and 2) = 0x5995e0(EAXCar vt+0x2c()
+       = +0x74 DriverInfo, +0x300, 2) = the car's NITROUS upgrade level (G3
+       decoded, G4 11-01 ported). So each car has its own bank: AI car k
+       plays set AFX_PNOS + n_bank; the player's comes from
+       audio_set_player_perf. A bank is loaded only while some AI car needs
+       it (the Vita's audio budget) */
+    for (int b = 0; b < 2; b++) {
+        int need = 0;
+        for (int k = 0; k < g_nai; k++) need |= g_aifx[k].n_bank == b;
+        snprintf(path, sizeof path, "%s/SOUND/NOS/Nitrous_0%d_MB.abk", g_aproot, b);
+        if (!need) {
+            if (g_ap_nos[b].ok || g_ap_nos[b].file) { ap_free(&g_ap_nos[b]); audio_load_patch_bank(AFX_PNOS + b, NULL); }
+            continue;
+        }
+        if (!(g_ap_nos[b].ok && !strcmp(g_ap_nos[b].path, path)) && ap_load(&g_ap_nos[b], path, "FX_NITROUS", AFX_PNOS + b))
+            printf("[aipatch] Nitrous_0%d bank: %d sounds (program file %ld bytes)\n", b,
+                   audio_load_patch_bank(AFX_PNOS + b, path), g_ap_nos[b].flen);
+    }
+    /* SetupLoadData 0x465b90 (CARSFX_Skids, per car: CARSFX +0x9c = its
+       EAXCar, row = EAXCar +0x8c): 0x7ed1f8 [(0x458f00(row) == 2) + 2 drift].
+       The drift flag is the race's, so a field needs at most two banks: set
+       AFX_PSKID + k_bank, each loaded only while some AI car needs it (the
+       player's own bank: player_skid_sync) */
+    for (int b = 0; b < 2; b++) {
+        int need = 0;
+        for (int k = 0; k < g_nai; k++) need |= g_aifx[k].k_bank == b;
+        const char *bank = k_skid_bank[b + 2 * (g_drift != 0)];
+        snprintf(path, sizeof path, "%s/SOUND/SKIDS/%s_MB.abk", g_aproot, bank);
+        if (!need) {
+            if (g_ap_skid[b].ok || g_ap_skid[b].file) { ap_free(&g_ap_skid[b]); audio_load_patch_bank(AFX_PSKID + b, NULL); }
+            continue;
+        }
+        if (!(g_ap_skid[b].ok && !strcmp(g_ap_skid[b].path, path)) && ap_load(&g_ap_skid[b], path, "FX_SKID", AFX_PSKID + b))
+            printf("[aipatch] %s bank: %d sounds (program file %ld bytes)\n", bank,
+                   audio_load_patch_bank(AFX_PSKID + b, path), g_ap_skid[b].flen);
+    }
+}
+
+/* CARSFX_Turbo on AI car k through FX_TURBO: the boost model of
+   turbo_update, the whine (PlaySpl, ProcessUpdate 0x45ece0) and the
+   blow-off (PlayBlowoff 0x45ee70 -> 0x45ef6a) as patch instances */
+static void ai_turbo_patch(int k, AiSnd *a, AiFx *x, const CarSfxListener *L, float dt, float ref)
+{
+    AeCtx *w = &g_ai_inst[k][AI_TW], *b = &g_ai_inst[k][AI_TB];
+    const AeProg *p = &g_ap_turbo[x->t_set];
+    const int *d = a->p3.d; const unsigned *az = a->p3.az;
+    float load = a->load, bc100 = a->out.bc100, rpm = a->erpm;
+    /* +0x38 throttle: the engine controller's +0xb0 (GUESS: its 0..100
+       throttle x 10.24; the module does not read it) */
+    int thr = ftol(bc100 * 10.24f);
+    x->t_in = load > 20.0f ? load * 0.01f : 0.0f;
+    if (x->t_bov) {                                        /* 0x4726e0 */
+        ramp_step(&x->t_ramp, dt);
+        if (bc100 > 20.0f && x->t_ramp.val == 1.0f && a->sh == 0) ramp_init(&x->t_ramp, 1, 0, 150, 0);
+        if (!ai_alive(b) || x->t_ramp.val == 0.0f) { x->t_bov = 0; ai_inst_kill(b); }
+    }
+    if (!ai_alive(w)) {
+        unsigned char *m = ai_inst_start(w, p, AI_PV(k));
+        if (m) {
+            am(m, 0, 0, 0, 5); am(m, 1, 0, 0, 0x7fff); am(m, 2, ftol(x->t_frac * 1024.0f), 0, 0x2000);
+            am(m, 3, (int)mix_objaz(2, 0x40020020u, 0, L->mode, az), 0, 0xffff);
+            am(m, 4, thr, 0, 0x400); am(m, 5, ftol(rpm), 0, 10000);
+            m[0x18] = 1;
+        }
+    } else turbo_boost(x, rpm, dt);
+    if (x->t_st == 0) { if (load > 20.0f) x->t_st = 1; }
+    else if (x->t_st == 1) {
+        if (load < 20.0f) {
+            x->t_st = 2;
+            if (!x->t_bov) {                               /* 0x45ee70 */
+                x->t_var = x->t_frac > 0.75f ? (int)rng_int(2) + 2 : 1;
+                x->t_bvol = ftol((float)k_turbo_rec[x->t_rec][x->t_var == 1 ? 1 : 2] * x->t_frac);
+                unsigned char *m = ai_inst_start(b, p, AI_PV(k) + 2);
+                if (m) {
+                    am(m, 0, x->t_var, 0, 5); am(m, 1, 0, 0, 0x7fff); am(m, 2, ftol(x->t_frac * 1024.0f), 0, 0x2000);
+                    am(m, 3, 0, 0, 0xffff); am(m, 4, thr, 0, 0x400); am(m, 5, ftol(rpm), 0, 10000);
+                    m[0x18] = 1;
+                }
+                x->t_bov = 1;
+                ramp_init(&x->t_ramp, 1, 1, 1, 0);
+            }
+            x->t_boost = 0;
+            turbo_boost(x, rpm, dt);
+        }
+    } else if (x->t_st == 2 && !x->t_bov) x->t_st = 0;
+    if (ai_alive(w)) {                                     /* 0x45ece0 */
+        unsigned char *m = AI_M(w);
+        am(m, 1, x->t_whine * mix_objvol(2, 0x40020020u, 0, L->mode, d, az) >> 15, 0, 0x7fff);
+        am(m, 2, ftol(x->t_frac * 1024.0f), 0, 0x2000);
+        am(m, 3, (int)mix_objaz(2, 0x40020020u, 0, L->mode, az), 0, 0xffff);
+        am(m, 4, thr, 0, 0x400); am(m, 5, ftol(rpm), 0, 10000);
+        m[0x18] = 1;
+    }
+    if (x->t_bov && ai_alive(b)) {                         /* its volume only; the azimuth result is dropped */
+        unsigned char *m = AI_M(b);
+        am(m, 1, ftol((float)(x->t_bvol * mix_objvol(2, 0x40020020u, x->t_var == 1 ? 1 : 2, L->mode, d, az) >> 15) * x->t_ramp.val),
+           0, 0x7fff);
+        m[0x18] = 1;
+    }
+    ai_inst_run(w, dt, ref);
+    ai_inst_run(b, dt, ref);
+}
+
+/* CARSFX_Nitrous on AI car k: Play (0x472af0 -> 0x472bab) on the burn's
+   start, Release (0x45f2a0: member 3 = 1) at its end, ProcessUpdate
+   0x45f4b0 every frame; the module ends the instance after the release.
+   Play also starts a 0 -> 1 400 ms interp on +0xcc (0x4850dc -> 0x459990,
+   release 1 -> 0 1000 ms) that nothing reads: ProcessUpdate's volume is
+   vt+0x38 and its azimuth vt+0x3c, so it is inert in retail too. A new
+   burn while the old instance still plays its release starts a second
+   instance; the old one runs on with its last member data until the
+   module ends it. */
+static void ai_nos_patch(int k, AiFx *x, const AiSnd *a, const CarSfxCar *c, const CarSfxListener *L, float dt, float ref)
+{
+    AeCtx *n = g_ai_nos_cur[k] ? &g_ai_nos2[k] : &g_ai_inst[k][AI_NOS];
+    AeCtx *o = g_ai_nos_cur[k] ? &g_ai_inst[k][AI_NOS] : &g_ai_nos2[k];   /* the previous burn's instance */
+    const int *d = a->p3.d; const unsigned *az = a->p3.az;
+    int vol = mix_objvol(2, 0x40020030u, 0, L->mode, d, az);
+    int azv = (int)mix_objaz(2, 0x40020030u, 0, L->mode, az), nos = c->nos;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_AI_FX_TEST")) {   /* sim test aid: P s burns (OPENUG2_AI_FX_TEST=P, default 4) */
+        float P = (float)atof(getenv("OPENUG2_AI_FX_TEST")); if (P <= 0.05f) P = 4.0f;
+        nos = fmodf(a->time, 2.0f * P) > P;
+    }
+#endif
+    if (nos && !x->n_on) {
+        x->n_on = 1;
+        if (ai_alive(n)) {   /* the last burn's release still plays: it keeps going, a new instance starts */
+            AeCtx *t = n; n = o; o = t;
+            g_ai_nos_cur[k] ^= 1;
+        }
+        unsigned char *m = ai_inst_start(n, &g_ap_nos[x->n_bank], g_ai_nos_cur[k] ? AI_NOS_PV2(k) : AI_PV(k) + 4);
+        if (m) { am(m, 0, 0, 0, 2); am(m, 1, vol, 0, 0x7fff); am(m, 2, azv, 0, 0xffff); am(m, 3, 0, 0, 1); m[0x10] = 1; }
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_NOSLOG"))   /* sim test aid: which bank each burn plays */
+            printf("[aipatch] opponent %d nitrous burn: Nitrous_0%d (set %d, instance %s, slot %d, last one %s)\n", k, x->n_bank,
+                   AFX_PNOS + x->n_bank, m ? "started" : "NOT started", g_ai_nos_cur[k], ai_alive(o) ? "still playing" : "done");
+#endif
+    } else if (!nos && x->n_on) {
+        x->n_on = 0;
+        if (ai_alive(n)) { am(AI_M(n), 3, 1, 0, 1); AI_M(n)[0x10] = 1; }
+    }
+    if (ai_alive(n)) {
+        unsigned char *m = AI_M(n);
+        am(m, 1, vol, 0, 0x7fff); am(m, 2, azv, 0, 0xffff);
+        m[0x10] = 1;
+        ai_inst_run(n, dt, ref);
+    }
+    ai_inst_run(o, dt, ref);   /* no member updates: the handle was dropped */
+}
+
+/* CARSFX_Skids on AI car k: one FX_SKID instance (InitSkids 0x4608d0, one
+   for an AI car), ProcessUpdate 0x460c70 every frame */
+static void ai_skid_patch(int k, const AiSnd *a, const CarSfxCar *c, const CarSfxListener *L, float dt, float ref)
+{
+    AeCtx *s = &g_ai_inst[k][AI_SKID];
+    const int *d = a->p3.d; const unsigned *az = a->p3.az;
+    unsigned char *m;
+    if (!ai_alive(s)) {
+        int b = g_aifx[k].k_bank;
+        m = ai_inst_start(s, &g_ap_skid[b], AI_PV(k) + 8);
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_SKIDLOG"))   /* sim test aid: which bank each car's FX_SKID instance plays */
+            printf("[aipatch] opponent %d FX_SKID instance: %s (set %d, %s)\n", k, k_skid_bank[b + 2 * (g_drift != 0)],
+                   AFX_PSKID + b, m ? "started" : "NOT started");
+#endif
+        if (!m) return;
+        memset(m, 0, 17 * 4);
+        am(m, 7, g_drift ? 1 : 0, 0, 1);                   /* 0x82bc2c */
+        am(m, 8, 0x1000, 0, 0x1000); am(m, 9, 0x1000, 0, 0x1000); am(m, 10, 0x1000, 0, 0x1000);
+    }
+    m = AI_M(s);
+    /* 0x460a70: the surface the wheels agree on, 0x2d3b on surfaces 14,
+       15, 22 (DAT_007ed240), 0 with the left wheels (FL, RL) off the ground */
+    int s0 = c->surface[0], s1 = c->surface[1], sf = s0;
+    if (s0 != s1) {
+        if (c->surface[2] == s0) { if (c->surface[3] != s0) sf = s1; }
+        else if (c->surface[2] == s1) sf = s1;
+    }
+    int g = (sf < 14 || (sf > 15 && sf != 22)) ? 0x7fff : 0x2d3b;
+    if (!c->contact[0] && !c->contact[3]) g = 0;
+    am(m, 0, mix_objvol(2, 0x40020050u, 3, L->mode, d, az) * g >> 15, 0, 0x7fff);
+    am(m, 1, mix_objvol(2, 0x40020050u, 5, L->mode, d, az) * g >> 15, 0, 0x7fff);
+    am(m, 2, mix_objvol(2, 0x40020050u, 4, L->mode, d, az) * g >> 15, 0, 0x7fff);
+    /* the skid controller's channels (AI: its sides averaged; GUESS: the
+       port's c->skid 0..1 x 1024) */
+    am(m, 3, ftol(c->skid[0] * 1024.0f), 0, 0x400);
+    am(m, 4, ftol(c->skid[1] * 1024.0f), 0, 0x400);
+    am(m, 5, ftol(c->skid[2] * 1024.0f), 0, 0x3ff);
+    am(m, 6, (int)mix_objaz(2, 0x40020050u, 3, L->mode, az), 0, 0xffff);
+    /* yaw (GUESS: the slip angle between heading and velocity), speed mph;
+       the modules read neither yaw nor under/oversteer (members 11, 14, 15) */
+    {   float cr = c->fwd[0] * c->vel[1] - c->fwd[1] * c->vel[0], dt2 = c->fwd[0] * c->vel[0] + c->fwd[1] * c->vel[1];
+        am(m, 11, c->speed > 0.5f ? ftol(fabsf(atan2f(cr, dt2)) * 57.2958f) : 0, 0, 180); }
+    am(m, 12, ftol(c->speed * 2.237f), 0, 1000);
+    am(m, 13, 0, 0, 0); am(m, 14, 0, 0, 0x400); am(m, 15, 0, 0, 0x400);
+    /* +0x44: the left wheel's terrain (+0xb0) 8 or 9 (GUESS: FL's surface) */
+    am(m, 16, c->surface[0] == 8 || c->surface[0] == 9, 0, 1);
+    m[0x44] = 1;
+    ai_inst_run(s, dt, ref);
+}
+
+/* CARSFX_Skids on the player's car (class 0x10050, factory 0x7ed430;
+   mixmap object 0x40010050 -- GAPS p2A): InitSkids 0x4608d0 gives a
+   driver type 1 car (the human player) TWO FX_SKID instances (+0xc4 = 2,
+   jump table 0x4608b8; types 2..4 one), one per side, run by the same
+   UpdateParams 0x460a70 / ProcessUpdate 0x460c70 as an AI car's:
+     instance 0 (+0xb0): vols slots 3/5/4 x gains +0xc8..+0xd0, azimuth
+       slot 3, the left side: terrain wheel ctl +0xb0, on the ground +0xe8,
+       channels SFXCTL_Skid +0x1a0/+0x1a4/+0x1a8
+     instance 1 (+0xb4): vols slots 0/2/1 x gains +0xd4..+0xdc, azimuth
+       slot 1, the right side: terrain +0xb4, on the ground +0xe9,
+       channels +0x194/+0x198/+0x19c
+   (one instance -- AI -- averages the two sides' channels and takes the
+   wheels' common surface). Gain 0x2d3b (0x7ed240) on surfaces 14, 15, 22,
+   else 0x7fff; 0 with the side off the ground. Member 11 = |CarState::
+   GetYaw 0x59fa10| x 57.29578 deg, 12 = car +0x430 x 2.237 mph, 14 / 15 =
+   Car::CalculateUndersteerFactor 0x5ed490 / Oversteer 0x5ed530 (the
+   modules read neither: written 0), 16 = the side's terrain 8 or 9.
+   The bank (0x465b90, player_skid_sync): its sounds 0..4 are already set
+   AFX_SKID (audio.c skid_load), so only its program is loaded here (the
+   file stays resident like an AI bank's: 205-255 KB, none when an AI car
+   of the race holds the same bank's program). Players on fx voices
+   531..544. Replaces A5's hand mix (audio.c, SKID_PAV's pairing for every
+   bank), kept as the fallback (test aid OPENUG2_PSKID_HAND) */
+static AeProg g_ap_pskid;
+static AeCtx g_pskid_inst[2];
+static Pos3D g_psk_p3;
+static void player_skid_stop(void)
+{
+    ai_inst_kill(&g_pskid_inst[0]);
+    ai_inst_kill(&g_pskid_inst[1]);
+    g_pskid_patch = 0;
+}
+static void player_skid(float dt, const CarSfxListener *L, float ref)
+{
+    static int hand = -1;
+    if (hand < 0) hand = getenv("OPENUG2_PSKID_HAND") != NULL;
+    if (hand || !L->coll || !L->pwheels || !g_pskid || g_prow < 0) { player_skid_stop(); return; }
+    if (!ai_alive(&g_pskid_inst[0]) || !ai_alive(&g_pskid_inst[1])) {
+        char path[640];
+        int b = engine_class(g_prow) == 2;
+        player_skid_stop();
+        snprintf(path, sizeof path, "%s/SOUND/SKIDS/%s_MB.abk", g_aproot, g_pskid);
+        const AeProg *p = g_ap_skid[b].ok && !strcmp(g_ap_skid[b].path, path) ? &g_ap_skid[b] : NULL;
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_PSKID_OWN")) p = NULL;   /* sim test aid: always the player's own program load */
+#endif
+        if (p) ap_free(&g_ap_pskid);
+        else {
+            if (!ap_load(&g_ap_pskid, path, "FX_SKID", AFX_SKID)) return;
+            p = &g_ap_pskid;
+        }
+        memset(&g_psk_p3, 0, sizeof g_psk_p3);
+        for (int i = 0; i < 2; i++) {
+            AeCtx *s = &g_pskid_inst[i];
+            unsigned char *m = ai_inst_start(s, p, 531 + 7 * i);
+            if (!m) { player_skid_stop(); return; }
+            s->set = AFX_SKID;                             /* the player's copy of the bank (audio.c skid_load) */
+            memset(m, 0, 17 * 4);
+            am(m, 7, g_drift ? 1 : 0, 0, 1);               /* 0x82bc2c */
+            am(m, 8, 0x1000, 0, 0x1000); am(m, 9, 0x1000, 0, 0x1000); am(m, 10, 0x1000, 0, 0x1000);
+        }
+        printf("[pskid] player FX_SKID instances (2): %s (%d players each%s)\n", g_pskid, g_pskid_inst[0].nply,
+               p == &g_ap_pskid ? "" : ", program shared");
+    }
+    g_pskid_patch = 1;
+    pos3d_update(&g_psk_p3, L->car, L, dt);
+    const int *d = g_psk_p3.d; const unsigned *az = g_psk_p3.az;
+    /* the sides' terrain (wheel ctl +0xb0 / +0xb4, GenerateTerrainTypes: player_road
+       keeps it) and on-the-ground flags (+0xe8 FL||RL / +0xe9 FR||RR) */
+    const int down[2] = { L->pcontact[0] || L->pcontact[3], L->pcontact[1] || L->pcontact[2] };
+    static const int k_slot[2][4] = { { 3, 5, 4, 3 }, { 0, 2, 1, 1 } };   /* vols x3, azimuth */
+    float yaw = 0.0f;
+    {   float cr = L->car_fwd[0] * L->car_vel[1] - L->car_fwd[1] * L->car_vel[0];
+        float dp = L->car_fwd[0] * L->car_vel[0] + L->car_fwd[1] * L->car_vel[1];
+        if (fabsf(L->pspeed) > 0.5f) yaw = fabsf(atan2f(cr, dp)) * 57.29578f; }
+    for (int i = 0; i < 2; i++) {
+        AeCtx *s = &g_pskid_inst[i];
+        unsigned char *m = AI_M(s);
+        const volatile float *ch = g_skid3s[i == 0 ? 1 : 0];   /* instance 0 = left = port side 1 */
+        int sf = g_rn.terr[i];
+        int g = (sf < 14 || (sf > 15 && sf != 22)) ? 0x7fff : 0x2d3b;
+        if (!down[i]) g = 0;
+        am(m, 0, mix_objvol(1, 0x40010050u, k_slot[i][0], L->mode, d, az) * g >> 15, 0, 0x7fff);
+        am(m, 1, mix_objvol(1, 0x40010050u, k_slot[i][1], L->mode, d, az) * g >> 15, 0, 0x7fff);
+        am(m, 2, mix_objvol(1, 0x40010050u, k_slot[i][2], L->mode, d, az) * g >> 15, 0, 0x7fff);
+        /* GUESS (as the AI's): the controller's 0..1 channels x 1024 */
+        am(m, 3, ftol(ch[0] * 1024.0f), 0, 0x400);
+        am(m, 4, ftol(ch[1] * 1024.0f), 0, 0x400);
+        am(m, 5, ftol(ch[2] * 1024.0f), 0, 0x3ff);
+        am(m, 6, (int)mix_objaz(1, 0x40010050u, k_slot[i][3], L->mode, az), 0, 0xffff);
+        am(m, 11, ftol(yaw), 0, 180);                      /* GUESS: GetYaw = the slip angle */
+        am(m, 12, ftol(fabsf(L->pspeed) * 2.237f), 0, 1000);
+        am(m, 13, 0, 0, 0); am(m, 14, 0, 0, 0x400); am(m, 15, 0, 0, 0x400);
+        am(m, 16, sf == 8 || sf == 9, 0, 1);
+        m[0x44] = 1;
+        ai_inst_run(s, dt, ref);
+    }
+#ifdef OPENUG2_SIM_PRE_H
+    static float logt;
+    if ((logt += dt) >= 1.0f && getenv("OPENUG2_SKIDLOG")) {   /* sim test aid: the player's instances */
+        int on[2] = { 0, 0 };
+        logt = 0.0f;
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < g_pskid_inst[i].nply; j++) on[i] += g_fxvoice[g_pskid_inst[i].vbase + j].on != 0;
+        printf("[pskid] L vol %d skid %.2f %.2f %.2f terr %d on %d | R vol %d skid %.2f %.2f %.2f terr %d on %d\n",
+               ae_i(AI_M(&g_pskid_inst[0])), g_skid3s[1][0], g_skid3s[1][1], g_skid3s[1][2], g_rn.terr[0], on[0],
+               ae_i(AI_M(&g_pskid_inst[1])), g_skid3s[0][0], g_skid3s[0][1], g_skid3s[0][2], g_rn.terr[1], on[1]);
+    }
+#endif
+}
+
+static void ai_patch_update(int k, AiSnd *a, AiFx *x, const CarSfxCar *c, const CarSfxListener *L, float dt, float ref)
+{
+    if (x->t_on && x->t_set >= 0 && g_ap_turbo[x->t_set].ok) ai_turbo_patch(k, a, x, L, dt, ref);
+    ai_nos_patch(k, x, a, c, L, dt, ref);
+    ai_skid_patch(k, a, c, L, dt, ref);
+}
+
+/* ---- the weather (SetupLoadData 0x4664c0 / 0x466420: IG_GLOBAL/FX_Rain_MB
+   class FX_Weather, IG_GLOBAL/WIND_00_MB class FX_WIND_Weather) ----
+   CARSFX_Rain (0x10090, map class 1 object 0x40010090): UpdateParams
+   0x474770 plays FX_Weather once Rain +0x1f0 is above 0.001 and stops it at
+   or below; ProcessUpdate 0x4618c0 writes the members every frame:
+     m0 type (1 in the car's views: EAXCar +0xa8 == 4 or 2 with +0xac set),
+     m1 0, m2 the mixmap volume of slot `type`, m3 7000, m4 0, m5 stop
+   (Stop: m5 = 1 and the instance ends 10 s later). The thunder: a timer
+   (+0xb8) runs; above intensity 0.25, outside game modes 2 / 3 / 7 and race
+   mode 8, once it passes the period (+0xbc) and the counter (+0xc4) is 0,
+   QueueWeatherStream (THUNDERSTRM, variant 1 below 0.5 else 2) and a new
+   period 25 + rand(20) s; past the period with the counter set it counts up
+   a frame, back to 0 above 32.
+   CARSFX_WindWeather (0x100a0, object 0x400100a0 -- the factory table
+   0x7ed3b4 entries are {class, name, ?, ctor}: 0x7ed420 = 0x100a0
+   "CARSFX_WindWeather", ctor 0x47d500 -> 0x473980; 0x10050 is
+   CARSFX_Skids, R2 11-01; it read the skids' slot 0): plays always (Play
+   0x4739c0); ProcessUpdate 0x473a10: m0 = the volume of slot 0 x the Slope
+   0x7f09f4 (1.0 at 0 mph -> 0.25 at 70 mph, input car +0x430 x 2.237), m1 0,
+   m2 4000, m3 0. Players: fx voices 471.. (rain) and 475.. (wind). */
+static AeProg g_ap_rain, g_ap_wind;
+static AeCtx g_rain_inst, g_wind_inst;
+static Pos3D g_rain_p3;
+static float g_wx_rng = 1.0f;
+void carsfx_set_rain(float I) { g_rain.I = I; }
+static int g_wx_rcstate = 4, g_wx_race_mode, g_wx_loading;
+void carsfx_set_race_flow(int rcstate, int race_mode, int loading)
+{
+    g_wx_rcstate = rcstate; g_wx_race_mode = race_mode; g_wx_loading = loading;
+}
+static void weather_stop(void)   /* every fx voice was stopped: the instances restart next update */
+{
+    ai_inst_kill(&g_rain_inst); ai_inst_kill(&g_wind_inst);
+    g_rain.playing = g_rain.stopping = 0;
+}
+static int weather_load(void)
+{
+    static int tried, ok;
+    if (tried) return ok;
+    tried = 1;
+    char path[640];
+    snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/FX_Rain_MB.abk", g_aproot);
+    if (ap_load(&g_ap_rain, path, "FX_Weather", AFX_PRAIN))
+        printf("[weather] FX_Rain bank: %d sounds\n", audio_load_patch_bank(AFX_PRAIN, path));
+    snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/WIND_00_MB.abk", g_aproot);
+    if (ap_load(&g_ap_wind, path, "FX_WIND_Weather", AFX_PWIND))
+        printf("[weather] WIND_00 bank: %d sounds\n", audio_load_patch_bank(AFX_PWIND, path));
+    ok = 1;
+    return ok;
+}
+static void player_weather(float dt, const CarSfxListener *L, float ref)
+{
+    if (!g_aproot[0] || !L->coll) {
+        if (ai_alive(&g_rain_inst)) ai_inst_kill(&g_rain_inst);
+        if (ai_alive(&g_wind_inst)) ai_inst_kill(&g_wind_inst);
+        g_rain.playing = g_rain.stopping = 0;
+        return;
+    }
+    weather_load();
+    pos3d_update(&g_rain_p3, L->car, L, dt);
+    const int *d = g_rain_p3.d; const unsigned *az = g_rain_p3.az;
+    /* CARSFX_Rain::UpdateParams */
+    g_rain.I_prev = g_rain.I;
+    if (g_rain.I <= 0.001f) {
+        if (g_rain.playing && !g_rain.stopping && ai_alive(&g_rain_inst)) {   /* Stop */
+            g_rain.stopping = 1; g_rain.stop_t = 10.0f;
+            am(AI_M(&g_rain_inst), 5, 1, 0, 1);
+            printf("[weather] rain sound stops\n");
+        }
+    } else if (!g_rain.playing) {   /* Play */
+        unsigned char *m = ai_inst_start(&g_rain_inst, &g_ap_rain, 471);
+        if (m) {
+            g_rain.playing = 1; g_rain.stopping = 0;
+            for (int i = 0; i < 6; i++) am(m, i, 0, 0, 0x7fff);
+            printf("[weather] rain sound plays (intensity %.3f)\n", g_rain.I);
+        }
+    }
+    g_rain.thunder_t += dt;
+    /* 0x47481c: skipped while TheCarLoader (0x8a3288) has loads pending
+       (+0x14 = 0x8a329c; the port loads no car while the world runs, so never)
+       or the world streamer is loading (TheTrackStreamer +0x168 = 0x88ec68) */
+    if (g_rain.I > 0.25f && !g_wx_loading && g_rain.thunder_t > g_rain.thunder_period) {
+        if (g_rain.thunder_n == 0) {
+            g_rain.thunder_t = 0.0f;
+            if (speech_stream_queued()) goto thunder_done;   /* IsStrmQueued 0x46c9a0 */
+            /* QueueWeatherStream 0x4852a0 (vtable +0x44): the THUNDERSTRM
+               stream = nisaudio SoundFX_Select(4, 1 below 0.5 else 2) on the
+               speech stream, only while no speech plays; not in CAMERA_FLYBY /
+               PRERACE / POSTRACE (2 / 3 / 7) nor race mode 8 */
+            if (g_wx_rcstate == 2 || g_wx_rcstate == 3 || g_wx_rcstate == 7 || g_wx_race_mode == 8) {
+#ifdef OPENUG2_SIM_PRE_H
+                if (getenv("OPENUG2_RAIN_LOG")) printf("[weather] thunder skipped (race state %d mode %d)\n", g_wx_rcstate, g_wx_race_mode);
+#endif
+            } else {
+                int v = g_rain.I < 0.5f ? 1 : 2, q = speech_weather_stream(v);
+#ifdef OPENUG2_SIM_PRE_H
+                if (getenv("OPENUG2_RAIN_LOG")) printf("[weather] thunder (THUNDERSTRM variant %d)%s\n", v, q ? " queued" : " (speech busy)");
+#else
+                (void)q;
+#endif
+            }
+            g_wx_rng = fmodf(g_wx_rng * 16807.0f, 2147483647.0f);
+            g_rain.thunder_period = 25.0f + (float)((int)g_wx_rng % 20);
+            g_rain.thunder_n++;
+        } else if (++g_rain.thunder_n > 32) g_rain.thunder_n = 0;
+    }
+thunder_done:
+    if (g_rain.stopping) {
+        g_rain.stop_t -= dt;
+        if (g_rain.stop_t < 0.0f) { ai_inst_kill(&g_rain_inst); g_rain.playing = g_rain.stopping = 0; }
+    }
+    if (g_rain.playing && ai_alive(&g_rain_inst)) {   /* ProcessUpdate */
+        unsigned char *m = AI_M(&g_rain_inst);
+        /* EAXCar +0xa8 = the POV type: 4 hood / 2 bumper (0x4618fd / 0x461910) = in the car */
+        int type = L->pview == 4 || L->pview == 2 ? 1 : 0;
+        am(m, 2, mix_objvol(1, 0x40010090u, type, L->mode, d, az), 0, 0x7fff);
+        am(m, 4, 0, 0, 0);
+        am(m, 0, type, 0, 3);
+        am(m, 1, 0, 0, 0);
+        am(m, 3, 7000, 0, 7000);
+        m[0x18] = 1;
+        ai_inst_run(&g_rain_inst, dt, ref);
+    } else if (g_rain.playing) g_rain.playing = g_rain.stopping = 0;
+    /* CARSFX_WindWeather */
+    if (!ai_alive(&g_wind_inst)) {
+        unsigned char *m = ai_inst_start(&g_wind_inst, &g_ap_wind, 475);
+        if (m) { for (int i = 0; i < 4; i++) am(m, i, 0, 0, 0x7fff); printf("[weather] wind plays\n"); }
+    }
+    if (ai_alive(&g_wind_inst)) {
+        float mph = fabsf(L->pspeed) * 2.237f;
+        float slope = mph <= 0.0f ? 1.0f : mph >= 70.0f ? 0.25f : 1.0f - 0.75f * mph / 70.0f;
+        unsigned char *m = AI_M(&g_wind_inst);
+        am(m, 0, ftol((float)mix_objvol(1, 0x400100a0u, 0, L->mode, d, az) * slope), 0, 0x7fff);
+        am(m, 2, 4000, 0, 4000);
+        am(m, 3, 0, 0, 0);
+        m[0x10] = 1;
+        ai_inst_run(&g_wind_inst, dt, ref);
+    }
+#ifdef OPENUG2_SIM_PRE_H
+    static float logt;
+    if ((logt += dt) >= 2.0f && getenv("OPENUG2_RAIN_LOG")) {
+        logt = 0.0f;
+        int type = L->pview == 4 || L->pview == 2 ? 1 : 0;
+        printf("[weather] rain I %.3f playing %d stopping %d src 40010092=%d rain vol %d wind vol %d mph %.0f\n",
+               g_rain.I, g_rain.playing, g_rain.stopping, md_src(0x40010092u, 0),
+               mix_objvol(1, 0x40010090u, type, L->mode, d, az), mix_objvol(1, 0x400100a0u, 0, L->mode, d, az),
+               fabsf(L->pspeed) * 2.237f);
+    }
+#endif
+}
+
+/* ---- the planes (CSTATEMGR_Planes 0x464410, SFXObj_Plane 0x462810 / 0x462ae0 /
+   0x462b70) -------------------------------------------------------------- */
+#define PL_MAX 6            /* the longest list (PlanesMain 0x7ed690) */
+#define PL_STATES 3         /* EnterWorld 0x476e00: three CSTATE_Plane */
+#define FXPL(j) (&g_fxvoice[479 + (j)])
+static CarSfxPlane g_pl_in[PL_MAX];
+static int g_pl_n;
+static float g_pl_car[3];
+static struct {
+    int on, entry;          /* +0x3c attached, +0x40 the list entry */
+    int play;               /* 1: +0xd8 the ENV_STATIC instance, 2: +0xdc the FX_MAIN_MEM one */
+    float prev[3], pos[3], speed;   /* +0xb0, +0xc0, +0xd0 */
+    Pos3D p3;               /* +0xd4: SFXCTL_3DEnviroObjPos */
+} g_pl[PL_STATES];
+/* the URL planes' FX_MAIN_MEM (IG_GLOBAL/FX_MAIN_MEM_MB.abk, 5 players):
+   members 0 0, 1 volume, 2 pitch, 3 azimuth, 4 the distance (-1000..1000) */
+static AeProg g_ap_pmain;
+static AeCtx g_pl_mi[PL_STATES];
+#define PLM_V(s) (482 + 5 * (s))
+static int g_pl_url;
+void carsfx_set_url(int url)
+{
+    g_pl_url = url;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_PLANE_URL")) g_pl_url = 1;   /* test aid: the URL plane patch in free roam */
+#endif
+}
+static int pl_main_ok(void)
+{
+    static int tried;
+    if (!tried && g_aproot[0]) {
+        tried = 1;
+        char path[640];
+        snprintf(path, sizeof path, "%s/SOUND/IG_GLOBAL/FX_MAIN_MEM_MB.abk", g_aproot);
+        if (ap_load(&g_ap_pmain, path, "FX_MAIN_MEM", AFX_PMAIN))
+            printf("[planes] FX_MAIN_MEM bank: %d sounds\n", audio_load_patch_bank(AFX_PMAIN, path));
+    }
+    return g_ap_pmain.ok;
+}
+void carsfx_set_planes(const CarSfxPlane *p, int n, const float car[3])
+{
+    g_pl_n = n < 0 ? 0 : n > PL_MAX ? PL_MAX : n;
+    if (g_pl_n) memcpy(g_pl_in, p, sizeof *p * (size_t)g_pl_n);
+    memcpy(g_pl_car, car, sizeof g_pl_car);
+}
+static void planes_reset(void)
+{
+    for (int s = 0; s < PL_STATES; s++) { fx_stop(FXPL(s)); ai_inst_kill(&g_pl_mi[s]); memset(&g_pl[s], 0, sizeof g_pl[s]); }
+}
+static float pl_dist(const float a[3], const float b[3])           /* bDistBetween 0x43ce10 */
+{
+    float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+    return sqrtf(x * x + y * y + z * z);
+}
+static void pl_attach(int s, int e)     /* vt+0x28: NewAttachment 0x462810 */
+{
+    g_pl[s].on = 1; g_pl[s].entry = e;
+    memcpy(g_pl[s].pos, g_pl_in[e].pos, sizeof g_pl[s].pos);
+    /* retail makes the instance here (ENV_STATIC variant 1, or FX_MAIN_MEM
+       in URL: 0x89e7e1 unless game state 4 with 0x83aab4 == 8); the speed
+       gate in ProcessUpdate releases it on the first update below 0.3 and
+       remakes it, so it is made there */
+    g_pl[s].play = 0;
+}
+static void pl_detach(int s)            /* vt+0x2c: Detach 0x462a40 */
+{
+    fx_stop(FXPL(s));
+    ai_inst_kill(&g_pl_mi[s]);
+    g_pl[s].on = 0; g_pl[s].play = 0;
+}
+static void player_planes(float dt, const CarSfxListener *L, float ref)
+{
+    if (!L->coll) { for (int s = 0; s < PL_STATES; s++) if (g_pl[s].on) pl_detach(s); return; }
+    /* CSTATEMGR_Planes::UpdateParams 0x464410 */
+    for (int e = 0; e < g_pl_n; e++) {
+        if (!g_pl_in[e].ok) continue;                               /* GetAnimPosition 0x439f40 */
+        int near = pl_dist(g_pl_in[e].pos, g_pl_car) < 2000.0f;      /* 0x78a514, the closest player car */
+        int s = 0;
+        while (s < PL_STATES && !(g_pl[s].on && g_pl[s].entry == e)) s++;
+        if (s < PL_STATES) {                                        /* attached: let go out of range / delaying */
+            if (!near || g_pl_in[e].delay) pl_detach(s);
+            continue;
+        }
+        if (!near || g_pl_in[e].delay) continue;
+        for (s = 0; s < PL_STATES && g_pl[s].on; s++) {}            /* vt+0x30: a free state */
+        if (s == PL_STATES) {                                       /* else the first one farther away */
+            float dn = pl_dist(g_pl_in[e].pos, g_pl_car);
+            for (s = 0; s < PL_STATES; s++)
+                if (pl_dist(g_pl_in[g_pl[s].entry].pos, g_pl_car) > dn) { pl_detach(s); break; }
+        }
+        if (s < PL_STATES) pl_attach(s, e);
+    }
+    static const unsigned char k_var[10] = { 1, 2, 0, 0, 3, 4, 5, 6, 7, 8 };   /* ENV_STATIC's variant table */
+    int clip = k_var[1] - 1;                                         /* variant 1 -> ENV_COMMON clip 1 */
+    for (int s = 0; s < PL_STATES; s++) {
+        if (!g_pl[s].on) continue;
+        /* SFXObj_Plane::UpdateParams 0x462ae0: the distance moved in one update */
+        const float *np = g_pl_in[g_pl[s].entry].pos;
+        float mv = pl_dist(np, g_pl[s].prev);
+        /* GUESS: retail updates the audio once a frame at 60 Hz; the
+           distance is scaled to 1/60 s */
+        g_pl[s].speed = dt > 0 ? mv * (1.0f / 60.0f) / dt : mv;
+        memcpy(g_pl[s].prev, np, sizeof g_pl[s].prev);
+        memcpy(g_pl[s].pos, np, sizeof g_pl[s].pos);
+        pos3d_update(&g_pl[s].p3, np, L, dt);   /* GUESS: the port's 2D Pos3D (the plane's height not in its distance) */
+        AudioFxVoice *v = FXPL(s);
+        /* ProcessUpdate 0x462b70: below 0.3 (0x78758c) the instance goes, else one is made */
+        if (g_pl[s].speed < 0.3f) {
+            if (g_pl[s].play) { fx_stop(v); ai_inst_kill(&g_pl_mi[s]); g_pl[s].play = 0; }
+            continue;
+        }
+        const int *d = g_pl[s].p3.d; const unsigned *az = g_pl[s].p3.az;
+        if (!g_pl[s].play) {
+            /* URL (0x89e7e1) and not 0x457ba0 (game state 4 with 0x83aab4 == 8;
+               CONFIRMED G3 11-01: ecx = 0x83a9d0, so +0x156a8 = game mode 0x850078 (4 =
+               split screen) and +0xe4 = quick-race type 0x83aab4 (8 = Outrun tourney);
+               split screen is not ported, so never true): FX_MAIN_MEM {0}, else ENV_STATIC {1} */
+            unsigned char *m = g_pl_url && pl_main_ok() ? ai_inst_start(&g_pl_mi[s], &g_ap_pmain, PLM_V(s)) : NULL;
+            if (m) { memset(m, 0, 5 * 4); g_pl[s].play = 2; }
+            else { g_pl[s].play = 1; fx_start(v, AFX_ENV, clip, audio_fx_loop(AFX_ENV, clip), 0, 1); }
+        }
+        if (g_pl[s].play == 2) {
+            /* 0x462d8c: f = the Pos3D's distance (vt+0x34 = its +8 int), at
+               most 1000, negative behind (azimuth 0x4000..0xc000), x 2.6 */
+            unsigned a1 = mix_objaz(7, 0x40070000u, 1, L->mode, az);
+            float f = (float)d[0];
+            if (f > 1000.0f) f = 1000.0f;
+            if (a1 > 0x4000 && a1 < 0xc000) f *= -1.0f;
+            int dist = ftol(f * 2.6f);
+            int pit = ftol(pos3d_pitch(&g_pl[s].p3, 5) * 4096.0f);
+            unsigned char *m = AI_M(&g_pl_mi[s]);
+            am(m, 0, 0, 0, 0);
+            am(m, 1, mix_objvol(7, 0x40070000u, 1, L->mode, d, az), 0, 0x7fff);
+            am(m, 2, pit, 0, 0x4000);
+            am(m, 3, (int)mix_objaz(7, 0x40070000u, 1, L->mode, az), 0, 0xffff);
+            am(m, 4, dist, -1000, 1000);
+            m[0x14] = 1;
+            ai_inst_run(&g_pl_mi[s], dt, ref);
+            if (!ai_alive(&g_pl_mi[s])) g_pl[s].play = 0;
+            continue;
+        }
+        /* GUESS: the mixmap class 7 output 0x40070000 taken as SFXObj_Plane's (id 0x70000) */
+        int vol = mix_objvol(7, 0x40070000u, 0, L->mode, d, az);    /* +8: vt+0x38(0), 0..0x7fff */
+        int pit = ftol(pos3d_pitch(&g_pl[s].p3, 5) * 4096.0f);      /* +0xc: GenDopplerFactor(5, 0) x 4096, 0..0x1fa0 */
+        if (pit < 0) pit = 0; if (pit > 0x1fa0) pit = 0x1fa0;
+        v->gain = fx_gain(vol, ref, 0.6f);
+        v->pitch = (float)pit / 4096.0f;
+        v->pan = az_pan(mix_objaz(7, 0x40070000u, 0, L->mode, az)); /* +0x10: vt+0x3c(0) */
+    }
+#ifdef OPENUG2_SIM_PRE_H
+    static float logt;
+    if ((logt += dt) >= 2.0f && getenv("OPENUG2_PLANE_LOG")) {
+        logt = 0.0f;
+        int nok = 0;
+        for (int e = 0; e < g_pl_n; e++) nok += g_pl_in[e].ok;
+        printf("[planes] %d of %d found", nok, g_pl_n);
+        for (int s = 0; s < PL_STATES; s++)
+            if (g_pl[s].on) printf("; state %d entry %d at %.0f m speed %.2f play %d vol %d", s, g_pl[s].entry,
+                                   pl_dist(g_pl[s].pos, g_pl_car), g_pl[s].speed, g_pl[s].play,
+                                   mix_objvol(7, 0x40070000u, 0, L->mode, g_pl[s].p3.d, g_pl[s].p3.az));
+        printf("\n");
+    }
+#endif
+}
+
+/* ---- the trains (CSTATEMGR_Trains 0x464600, SFXObj_Train 0x463020 /
+   0x462ae0-like UpdateParams / 0x4631e0) and the fountains
+   (CSTATEMGR_Enviro 0x4647e0, SFXObj_Fountain 0x463820 / 0x463920 /
+   0x463a60): world emitters on ENV_STATIC ---------------------------------- */
+#define TRN_MAX 24          /* uTrainIDs 0x7ed798..0x7ed8b8 */
+#define TRN_STATES 6        /* EnterWorld: six CSTATE_Train */
+#define FNT_STATES 4        /* EnterWorld: four CSTATE_Fountain (events 4000..4198) */
+#define FXTRN(j) (&g_fxvoice[497 + (j)])
+#define FXFNT(j) (&g_fxvoice[503 + (j)])
+static CarSfxPlane g_trn_in[TRN_MAX];
+static int g_trn_n, g_trn_st[TRN_MAX];      /* the entry's +8: 0 new, 1 found, 2 never found */
+static int g_env_ev;
+static struct { int on, entry; float pos[3]; Pos3D p3; } g_trn[TRN_STATES];
+static struct { int on, kind, pt; Pos3D p3; } g_fnt[FNT_STATES];
+/* 0x7f0d70 (kind 0, 7 points) and 0x7f0b80 (kind 1, 31 points): x y z, 16 bytes */
+static const float k_fnt0[7][3] = {
+    { -154, -615, 16 }, { -337, -702, 19 }, { -457, -1518, 13 }, { -133, -1388, 15 }, { -2662, 2237, 229 },
+    { -1641, 532, 8 }, { -883, 806, 40 } };
+static const float k_fnt1[31][3] = {
+    { -106.65f, -575.58f, 17.5f }, { -113.42f, -571.36f, 18.9f }, { -97.8f, -571.66f, 18.86f }, { 102.52f, 581.0f, 17.0f },
+    { -93.45f, -575.83f, 17.0f }, { -100.22f, -587.22f, 15.5f }, { -92.1f, -579.93f, 15.5f }, { 137, -642, 17 },
+    { -104, -653, 15 }, { -161, -624, 16 }, { -343, -561, 20 }, { -326, -55, 20 }, { -312, -564, 20 }, { -309, -534, 20 },
+    { -339, -530, 20 }, { -785, -285, 23 }, { -432, -112, 15 }, { -233, -283, 21 }, { -202, -280, 21 }, { -571, -154, 20 },
+    { -580, -163, 20 }, { -571, -143, 19 }, { -564, -126, 16 }, { -526, -27, 13 }, { 603, -177, 15 }, { -2134, 1687, 131 },
+    { -1500, 1143, 64 }, { -1214, 498, 19 }, { -813, 725, 36 }, { -841, 717, 36 }, { -123, 1499, 40 } };
+static const float *fnt_pt(int kind, int i) { return kind ? k_fnt1[i] : k_fnt0[i]; }
+void carsfx_set_trains(const CarSfxPlane *p, int n)
+{
+    if (n <= 0) { if (g_trn_n) memset(g_trn_st, 0, sizeof g_trn_st); g_trn_n = 0; return; }
+    g_trn_n = n > TRN_MAX ? TRN_MAX : n;
+    memcpy(g_trn_in, p, sizeof *p * (size_t)g_trn_n);
+}
+void carsfx_set_event(int ev) { g_env_ev = ev; }
+
+/* ---- CARSFX_DriveBy (0x474930; UpdateParams 0x474a20, ProcessUpdate
+   0x47e0d0) on SFXCTL_Tunnel's look-ahead triggers (UpdateDriveBySnds
+   0x471080): MB_Stitch_Whoosh stitches, entry slots 0/1 (+0xb4, mix slot
+   0), exit slots 2/3 (+0xe4, mix slot 4) ---------------------------------- */
+#define DB_NV 4
+#define FXDB(j) (&g_fxvoice[507 + DB_NV * (j)])
+static struct {
+    float t_in, t_out;          /* +0x94, +0xa4 */
+    int in_on, out_on;          /* +0x7c, +0x9c: this frame's triggers */
+    const void *z_in, *z_out;   /* +0x98, +0xa8 */
+    float pos[3];               /* +0x80 */
+    float s_in, s_out;          /* +0x90, +0xa0 */
+    int probe;                  /* +0x74 */
+} g_db;
+static int g_db_on[4], g_db_last = -1;      /* +0xb4/+0xb8, +0xe4/+0xe8; +0x114 */
+static unsigned g_db_az[4];
+static StitchPlay g_db_sp[4];
+static unsigned g_db_n5, g_db_n6, g_db_nx;  /* 0x82cb54, 0x82cb58, 0x82cb50 */
+static Pos3D g_db_p3;
+static float db_slope(float speed)          /* Slope 0x7f0b40: 0..1 over 18..45 (static init 0x77c5b0) */
+{
+    float t = (speed - 18.0f) / (45.0f - 18.0f);
+    t = t > 0 ? (t < 1 ? t : 1) : 0;
+    return t;
+}
+void carsfx_set_driveby(int probe_type, const void *zone, const float probe[3], float car_z, float speed, float dt)
+{
+    /* g_tun_type is still last frame's +0x78 (+0x70 = in a tunnel): retail
+       runs this before UpdateParams' own zone search */
+    int in_tun = g_tun_type != 0;
+    g_db.t_in -= dt; if (g_db.t_in < 0.0f) g_db.t_in = 0.0f;
+    g_db.t_out -= dt; if (g_db.t_out < 0.0f) g_db.t_out = 0.0f;
+    g_db.in_on = g_db.out_on = 0;
+    g_db.probe = probe_type == 5 || probe_type == 6 || probe_type == 7 ? probe_type : 2;
+    if (g_db.probe == 2) zone = NULL;
+    float s = db_slope(speed);
+    if (!in_tun) {
+        if (g_db.probe != 2 && ((g_db.t_in < 0.01f && g_db.z_in == zone) || g_db.z_in != zone) && 0.01f < s) {
+            g_db.t_in = 3.0f; g_db.in_on = 1; g_db.z_in = zone;     /* DAT_007886f0 */
+            g_db.pos[0] = probe[0]; g_db.pos[1] = probe[1]; g_db.pos[2] = car_z + 10.0f;
+            g_db.s_in = s;
+        }
+        return;
+    }
+    if (g_db.probe == 2 && g_tun_type == 5 && ((g_db.t_out < 0.01f && g_db.z_out == zone) || g_db.z_out != zone) && 0.01f < s) {
+        g_db.out_on = 1; g_db.t_out = 3.0f; g_db.z_out = zone;
+        g_db.pos[0] = probe[0]; g_db.pos[1] = probe[1]; g_db.pos[2] = car_z + 10.0f;
+        g_db.s_out = s;
+    }
+}
+static void db_stop(int k) { stitch_stop(FXDB(k), &g_db_sp[k]); g_db_on[k] = 0; if (g_db_last == k) g_db_last = -1; }
+static void player_driveby(float dt, const CarSfxListener *L, float ref)
+{
+    if (!L->coll) { for (int k = 0; k < 4; k++) if (g_db_on[k]) db_stop(k); g_db.in_on = g_db.out_on = 0; return; }
+    /* GUESS: the player car's position for the object's 3D (the tunnel's
+       +0x80 trigger point is not read by CARSFX_DriveBy) */
+    float pc[3] = { L->car[0], L->car[1], 0 };
+    pos3d_update(&g_db_p3, pc, L, dt);
+    const int *d = g_db_p3.d; const unsigned *az = g_db_p3.az;
+    if (g_db.in_on) {                       /* UpdateParams: an entry whoosh in a free slot */
+        int k = !g_db_on[0] ? 0 : !g_db_on[1] ? 1 : -1;
+        if (k >= 0) {
+            int n = ftol(g_db.s_in * -0.0234375f);              /* 0x78b070 */
+            unsigned *c = g_db.probe == 5 ? &g_db_n5 : &g_db_n6;
+            int r = (int)(*c % 3u), idx = r + (15 - n) * 3;
+            *c = (unsigned)r + 1;
+            g_db_az[k] = 0;
+            g_db_on[k] = stitch_start(FXDB(k), DB_NV, 1, idx, &g_db_sp[k]) > 0;
+            if (g_db_on[k]) g_db_last = k;
+            g_md_db = 1;
+#ifdef OPENUG2_SIM_PRE_H
+            if (getenv("OPENUG2_TUNNEL_LOG")) printf("[driveby] entry whoosh stitch %d (zone type %d, slope %.2f) slot %d vol %d\n",
+                                                    idx, g_db.probe, g_db.s_in, k, mix_objvol(1, 0x400100c0u, 0, L->mode, d, az));
+#endif
+        }
+    }
+    if (g_db.out_on) {                      /* an exit whoosh */
+        int k = !g_db_on[2] ? 2 : !g_db_on[3] ? 3 : -1;
+        if (k >= 0) {
+            int n = ftol(g_db.s_out * -0.015625f);              /* 0x78b06c */
+            int r = (int)(g_db_nx % 3u), idx = r + (18 - n) * 3;
+            g_db_nx = (unsigned)r + 1;
+            g_db_on[k] = stitch_start(FXDB(k), DB_NV, 1, idx, &g_db_sp[k]) > 0;
+            if (g_db_on[k]) g_db_last = k;
+            g_md_db = 1;
+#ifdef OPENUG2_SIM_PRE_H
+            if (getenv("OPENUG2_TUNNEL_LOG")) printf("[driveby] exit whoosh stitch %d (slope %.2f) slot %d vol %d\n",
+                                                    idx, g_db.s_out, k, mix_objvol(1, 0x400100c0u, 4, L->mode, d, az));
+#endif
+        }
+    }
+    g_db.in_on = g_db.out_on = 0;
+    for (int k = 0; k < 4; k++) {           /* ProcessUpdate */
+        if (!g_db_on[k]) continue;
+        int slot = k < 2 ? 0 : 4;
+        /* the entry's azimuth only while it is the last one started; the exit's always */
+        if (k >= 2 || g_db_last == k) g_db_az[k] = mix_objaz(1, 0x400100c0u, slot, L->mode, az);
+        int vol = mix_objvol(1, 0x400100c0u, slot, L->mode, d, az);
+        if (!stitch_update(FXDB(k), &g_db_sp[k], vol, g_db_az[k], ref)) db_stop(k);
+    }
+}
+
+static float em_dist(const float a[3], const float b[3]) { return pl_dist(a, b); }
+static void trn_detach(int s) { fx_stop(FXTRN(s)); g_trn[s].on = 0; }
+static void fnt_detach(int s) { fx_stop(FXFNT(s)); g_fnt[s].on = 0; }
+static void emitters_reset(void)
+{
+    for (int s = 0; s < TRN_STATES; s++) trn_detach(s);
+    for (int s = 0; s < FNT_STATES; s++) fnt_detach(s);
+    for (int k = 0; k < 4; k++) if (g_db_on[k]) db_stop(k);
+    memset(g_trn_st, 0, sizeof g_trn_st);
+    memset(&g_db, 0, sizeof g_db);
+}
+static void player_emitters(float dt, const CarSfxListener *L, float ref)
+{
+    if (!L->coll) {
+        for (int s = 0; s < TRN_STATES; s++) if (g_trn[s].on) trn_detach(s);
+        for (int s = 0; s < FNT_STATES; s++) if (g_fnt[s].on) fnt_detach(s);
+        return;
+    }
+    /* ENV_STATIC's variant table (0x90c): train 0 -> ENV_COMMON clip 0, fountain 4 -> clip 2 */
+    static const unsigned char k_var[10] = { 1, 2, 0, 0, 3, 4, 5, 6, 7, 8 };
+    /* CSTATEMGR_Trains::UpdateParams 0x464600 */
+    for (int e = 0; e < g_trn_n; e++) {
+        if (g_trn_st[e] == 2) continue;
+        if (!g_trn_in[e].ok) { g_trn_st[e] = 2; continue; }   /* GetAnimPosition false: never again */
+        g_trn_st[e] = 1;
+        int near = em_dist(g_trn_in[e].pos, g_pl_car) < 400.0f;   /* 0x78a54c */
+        int s = 0;
+        while (s < TRN_STATES && !(g_trn[s].on && g_trn[s].entry == e)) s++;
+        if (s < TRN_STATES) { if (!near || g_trn_in[e].delay) trn_detach(s); continue; }
+        if (!near || g_trn_in[e].delay) continue;
+        for (s = 0; s < TRN_STATES && g_trn[s].on; s++) {}
+        if (s == TRN_STATES) {
+            float dn = em_dist(g_trn_in[e].pos, g_pl_car);
+            for (s = 0; s < TRN_STATES; s++)
+                if (em_dist(g_trn_in[g_trn[s].entry].pos, g_pl_car) > dn) { trn_detach(s); break; }
+        }
+        if (s < TRN_STATES) {                                     /* NewAttachment 0x463020: ENV_STATIC {0} at once */
+            g_trn[s].on = 1; g_trn[s].entry = e;
+            memcpy(g_trn[s].pos, g_trn_in[e].pos, sizeof g_trn[s].pos);
+            int clip = k_var[0] - 1;
+            fx_start(FXTRN(s), AFX_ENV, clip, audio_fx_loop(AFX_ENV, clip), 0, 1);
+        }
+    }
+    for (int s = 0; s < TRN_STATES; s++) {
+        if (!g_trn[s].on) continue;
+        if (g_trn_in[g_trn[s].entry].ok) memcpy(g_trn[s].pos, g_trn_in[g_trn[s].entry].pos, sizeof g_trn[s].pos);
+        pos3d_update(&g_trn[s].p3, g_trn[s].pos, L, dt);
+        const int *d = g_trn[s].p3.d; const unsigned *az = g_trn[s].p3.az;
+        AudioFxVoice *v = FXTRN(s);                               /* ProcessUpdate 0x4631e0 */
+        v->gain = fx_gain(mix_objvol(8, 0x40080000u, 0, L->mode, d, az), ref, 0.6f);
+        v->pitch = 1.0f;                                          /* +0xc 0x1000 */
+        v->pan = az_pan(mix_objaz(8, 0x40080000u, 0, L->mode, az));
+    }
+    /* CSTATEMGR_Enviro::UpdateParams 0x4647e0: events 4000..4199 (the states
+       exist only for 4000..4198, EnterWorld 800ab6b0) */
+    if (g_env_ev - 4000 >= 0 && g_env_ev - 4000 < 199) {
+        for (int kind = 0; kind < 2; kind++) {
+            int np = kind ? 31 : 7;
+            for (int i = 0; i < np; i++) {
+                const float *pt = fnt_pt(kind, i);
+                int near = em_dist(pt, g_pl_car) < 150.0f;       /* 0x78a584 */
+                int s = 0;
+                while (s < FNT_STATES && !(g_fnt[s].on && g_fnt[s].kind == kind && g_fnt[s].pt == i)) s++;
+                if (s < FNT_STATES) { if (!near) fnt_detach(s); continue; }
+                if (!near) continue;
+                for (s = 0; s < FNT_STATES && g_fnt[s].on; s++) {}
+                if (s == FNT_STATES) {
+                    float dn = em_dist(pt, g_pl_car);
+                    for (s = 0; s < FNT_STATES; s++)
+                        if (em_dist(fnt_pt(g_fnt[s].kind, g_fnt[s].pt), g_pl_car) > dn) { fnt_detach(s); break; }
+                }
+                if (s < FNT_STATES) {                             /* NewAttachment 0x463920: ENV_STATIC {4} */
+                    g_fnt[s].on = 1; g_fnt[s].kind = kind; g_fnt[s].pt = i;   /* +0x44 = kind */
+                    int clip = k_var[4] - 1;
+                    fx_start(FXFNT(s), AFX_ENV, clip, audio_fx_loop(AFX_ENV, clip), 0, 1);
+                }
+            }
+        }
+    } else for (int s = 0; s < FNT_STATES; s++) if (g_fnt[s].on) fnt_detach(s);
+    for (int s = 0; s < FNT_STATES; s++) {
+        if (!g_fnt[s].on) continue;
+        pos3d_update(&g_fnt[s].p3, fnt_pt(g_fnt[s].kind, g_fnt[s].pt), L, dt);
+        const int *d = g_fnt[s].p3.d; const unsigned *az = g_fnt[s].p3.az;
+        AudioFxVoice *v = FXFNT(s);                               /* ProcessUpdate 0x463820 */
+        int k = g_fnt[s].kind;
+        v->gain = fx_gain(mix_objvol(4, 0x40040000u, k, L->mode, d, az), ref, 0.6f);
+        v->pitch = (float)(k ? 4000 : 0x1450) / 4096.0f;
+        v->pan = az_pan(mix_objaz(4, 0x40040000u, k, L->mode, az));
+    }
+#ifdef OPENUG2_SIM_PRE_H
+    static float logt;
+    if ((logt += dt) >= 2.0f && getenv("OPENUG2_PLANE_LOG")) {
+        logt = 0.0f;
+        int nok = 0;
+        for (int e = 0; e < g_trn_n; e++) nok += g_trn_st[e] == 1;
+        printf("[trains] %d of %d found", nok, g_trn_n);
+        for (int s = 0; s < TRN_STATES; s++)
+            if (g_trn[s].on) printf("; state %d entry %d at %.0f m vol %d", s, g_trn[s].entry, em_dist(g_trn[s].pos, g_pl_car),
+                                   mix_objvol(8, 0x40080000u, 0, L->mode, g_trn[s].p3.d, g_trn[s].p3.az));
+        printf("\n[fountains] event %d", g_env_ev);
+        for (int s = 0; s < FNT_STATES; s++)
+            if (g_fnt[s].on) printf("; state %d kind %d point %d at %.0f m vol %d", s, g_fnt[s].kind, g_fnt[s].pt,
+                                   em_dist(fnt_pt(g_fnt[s].kind, g_fnt[s].pt), g_pl_car),
+                                   mix_objvol(4, 0x40040000u, g_fnt[s].kind, L->mode, g_fnt[s].p3.d, g_fnt[s].p3.az));
+        printf("\n");
+    }
+#endif
+}
+
 int carsfx_player_car(const char *dataroot, int row)
 {
+    sw_free();                                          /* (shares CAR_Sputter's file) */
     free(g_sp.file); free(g_sp.mem);
     memset(&g_sp, 0, sizeof g_sp);
-    for (int p = 0; p < 2; p++) fx_stop(FXS(p));
+    g_sp.vbase = 334; g_sp.set = AFX_SWTN;
+    for (int p = 0; p < 2; p++) fx_stop(SPV(p));
     if (row < 0 || row >= 33) row = 18;
-    int slot = k_row_engine[row];                       /* CSTATE +0x7c (stock engine) */
-    /* 0x7f3040 {name, ?, volume}: slots 0..40 -> SWTN_CAR_<slot>; 0x7f0de0 +8 = slot */
-    static const unsigned short k_swtn_vol[41] = {
+    g_prow = row;
+    player_skid_sync(0);                                /* 0x465b90: the row's engine class (inside audio_hold) */
+    /* EAXCar +0x7c: the 0x7f2230 record at row x 4 + the engine sound level
+       +0x94 (CarPreSetup 0x4593b0) */
+    int slot = audio_row_engine_slot(row, audio_player_engine_level());
+    /* 0x7f3040 {name, ?, volume} by +0x7c (0x45f6e0; > 0x2b -> entry 0): slots 0..40 -> SWTN_CAR_<slot>,
+       41 / 42 -> SWTN_CAR_14 / SWTN_CAR_12 with their own volumes */
+    static const unsigned short k_swtn_vol[43] = {
         18500, 18000, 14500, 12500, 18500, 19500, 22500, 20000, 22000, 24500, 20000, 22000, 18000, 14000,
         14000, 18000, 20000, 24500, 14500, 13750, 13000, 18500, 16000, 15000, 16000, 20000, 20000, 20000,
-        24000, 24000, 22000, 16500, 20000, 16500, 17500, 17500, 19500, 22000, 18500, 18000, 17000 };
+        24000, 24000, 22000, 16500, 20000, 16500, 17500, 17500, 19500, 22000, 18500, 18000, 17000, 17000, 18000 };
     char path[512];
-    snprintf(path, sizeof path, "%s/SOUND/ENGINE/SWTN_CAR_%02d_MB.abk", dataroot, slot);
+    snprintf(path, sizeof path, "%s/SOUND/ENGINE/SWTN_CAR_%02d_MB.abk", dataroot, audio_slot_file(slot));
     int nclip = audio_load_swtn_bank(path, &g_sp.loops);
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
@@ -2499,22 +4369,14 @@ int carsfx_player_car(const char *dataroot, int row)
     g_sp.msize = size;
     g_sp.nply = md[0] < 2 ? md[0] : 2;
     for (int p = 0; p < g_sp.nply; p++) g_sp.ply[p] = ae_i(md + 0x18 + 4 * p) - 0x18;
-    g_sp.nins = ae_decode(d, g_sp.flen, code);
-    for (int k = 0; k < g_sp.nins; k++) {
-        const AeIns *i = &g_sp.ins[k];
-        if (i->at < 0 || i->at >= size - 0x18) g_sp.nins = -1;
-        if (i->k == AE_CALL && !(i->op <= 1 || i->op == 4 || i->op == 6 || i->op == 7 || i->op == 8 || i->op == 10 ||
-                                 i->op == 13 || i->op == 15 || i->op == 16 || i->op == 21 || i->op == 22 ||
-                                 (i->op >= 27 && i->op <= 28) || i->op == 30 || i->op == 31 || i->op == 35 || i->op == 38)) {
-            printf("[sputter] operator %d not ported\n", i->op);
-            g_sp.nins = -1;
-        }
-        if (g_sp.nins < 0) break;
-    }
-    g_sp.idx = slot; g_sp.vscale = k_swtn_vol[slot]; g_sp.row = row;
+    g_sp.ins = g_sp_ins;
+    g_sp.nins = ae_decode(d, g_sp.flen, code, g_sp_ins, AE_MAXINS);
+    if (g_sp.nins > 0 && !ae_ops_ok(g_sp_ins, g_sp.nins, size)) g_sp.nins = -1;
+    g_sp.idx = audio_slot_file(slot); g_sp.vscale = k_swtn_vol[slot]; g_sp.row = row;   /* idx: record +8 */
     g_sp.ok = g_sp.nins > 0;
     printf("[sputter] %s: CAR_Sputter %d instructions, %d players, %d samples (loops %x), vol %d\n",
            path, g_sp.nins, g_sp.nply, nclip, g_sp.loops, g_sp.vscale);
+    sw_load(g_sp.file, g_sp.flen, g_sp.loops, slot);
     return g_sp.ok;
 }
 
@@ -2538,13 +4400,14 @@ static void sp_member(const CarSfxListener *L, int vol, int az)
 static void player_sputter(float dt, const CarSfxListener *L, float ref)
 {
     if (!g_sp.ok || g_sp.dead || !L->pwheels) {
-        if (g_sp.ok) for (int p = 0; p < 2; p++) if (FXS(p)->on) fx_stop(FXS(p));
+        if (g_sp.ok) for (int p = 0; p < 2; p++) if (SPV(p)->on) fx_stop(SPV(p));
         g_sp.flag = 0;
+        g_sput_out = 0;
         return;
     }
     pos3d_update(&g_sp_p3, L->car, L, dt);
     int vol = mix_objvol(1, 0x40010040u, 0, L->mode, g_sp_p3.d, g_sp_p3.az) * g_sp.vscale >> 15;
-    int az = (int)(g_sp_p3.az[0] & 0xffff);
+    int az = (int)mix_objaz(1, 0x40010040u, 0, L->mode, g_sp_p3.az);   /* vt+0x3c 0x45e3b0 */
     if (L->pspark) g_sp.flag = 1;                       /* handler 0x469bc0: CSTATE +0xf0 */
     if (g_sp.flag && (L->pgear == 1 || L->pgear == 2)) {   /* CSTATE +0x50 = gear */  /* UpdateParams 0x45f780 */
         if (g_sp.toggle == 1) g_sp.toggle = 0;
@@ -2553,21 +4416,8 @@ static void player_sputter(float dt, const CarSfxListener *L, float ref)
         sp_member(L, vol, az);
     }
     sp_member(L, vol, az);                              /* ProcessUpdate 0x45f800 */
-    g_sp.tick += dt;
-    if (g_sp.tick > 0.2f) g_sp.tick = 0.2f;
-    for (; g_sp.tick >= 0.02f && !g_sp.dead; g_sp.tick -= 0.02f) {
-        unsigned char *b = g_sp.mem + 0x18;
-        int eax = 0;
-        for (int k = 0; k < g_sp.nins && !g_sp.dead; k++) {
-            const AeIns *i = &g_sp.ins[k];
-            switch (i->k) {
-            case AE_CALL:  eax = ae_op(i->op, b + i->at, i->at, ref); break;
-            case AE_LOAD:  eax = ae_i(b + i->at); break;
-            case AE_STORE: ae_w(b + i->at, eax); break;
-            case AE_SETB:  b[i->at] = (unsigned char)i->imm; break;
-            }
-        }
-    }
+    ae_tick(dt, ref);
+    g_sput_out = g_sp.out;                             /* -> +0xf8 (callback 0x472cd0) */
 }
 
 void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int nai,
@@ -2575,6 +4425,7 @@ void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int n
 {
     if (dt <= 0) return;
     g_fxtime += dt;
+    md_update(L, dt);                                   /* the mixmap's events, ctls and channel sums */
     float ref = player_ref();
     g_co_cam[0] = L->cam[0]; g_co_cam[1] = L->cam[1]; g_co_cam[2] = L->cam_z;
     if (!L->coll && g_co_live) co_reset();
@@ -2586,6 +4437,7 @@ void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int n
         if (k >= nai || !a->on || !ai[k].on || a->bank < 0) {
             v->on = 0;
             for (int j = 0; j < 10; j++) fx_stop(FXA(k, j));
+            ai_patch_stop(k);
             g_aifx[k].n_on = g_aifx[k].s_play = g_aifx[k].t_bov = 0;
             continue;
         }
@@ -2618,9 +4470,16 @@ void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int n
         v->gain = (float)(vol + 0x7fff) / 32767.0f / ref;
         v->pitch = 1.0f + (float)pof / 16000.0f;
         v->cutoff = (float)a->lpf;
+        /* +0x40 = vt+0x3c(0) = 0x45e3b0 GetAzimOutput (slot 0's 3D azimuth),
+           clamped 0..0x10000 (0x461270; the object's vtable starts at
+           0x78aee0, so 0x461490 at 0x78af3c is vt+0x5c, not the azimuth) */
+        v->pan = az_pan(mix_objaz(2, 0x40020000u, 0, L->mode, a->p3.az));
         v->on = 1;
         AiFx *x = &g_aifx[k];
         if (!x->init) { x->init = 1; x->t_on = c->turbo && x->t_set >= 0; }
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_AI_FX_TEST")) x->t_on = x->t_set >= 0;   /* sim test aid: every AI car turbo */
+#endif
         ai_fx_update(k, a, x, c, L, dt, ref);
     }
     /* traffic: a slot for a car within 70 m of the player's car (0x463e30) */
@@ -2658,6 +4517,7 @@ void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int n
         v->gain = (float)objvol / 32767.0f / ref;
         v->pitch = 1.0f + (float)pof / 16383.0f;
         v->cutoff = 24000.0f;
+        v->pan = az_pan(mix_objaz(3, 0x40030000u, 0, L->mode, t->p3.az));   /* +0x10 = vt+0x3c(0): FX_TRAFFIC's player azimuth */
         v->on = 1;
         tr_fx_update(i, &g_trfx[i], &t->p3, &tr[t->car], L, dt, ref);
     }
@@ -2665,5 +4525,12 @@ void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int n
     player_turbo(dt, L, ref);
     player_road(dt, L, ref);
     player_bottom(dt, L, ref);
+    part_snd_update(L, ref);                            /* EAXCommon::Update 0x4815b0 */
+    player_skid(dt, L, ref);                            /* CARSFX_Skids on the player's car */
     player_sputter(dt, L, ref);
+    player_swtn(dt, L, ref);
+    player_weather(dt, L, ref);   /* CARSFX_Rain, CARSFX_WindWeather */
+    player_planes(dt, L, ref);    /* CSTATEMGR_Planes, SFXObj_Plane */
+    player_emitters(dt, L, ref);  /* CSTATEMGR_Trains / SFXObj_Train, CSTATEMGR_Enviro / SFXObj_Fountain */
+    player_driveby(dt, L, ref);   /* CARSFX_DriveBy */
 }

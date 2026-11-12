@@ -215,6 +215,8 @@ void acid_set_cameras(const float (*pos)[3], int n)
     for (int i = 0; i < g_ncam; i++) memcpy(g_cam[i], pos[i], sizeof g_cam[i]);
 }
 void acid_set_enabled(int on) { g_enabled = on; }
+static int g_world_paused;
+void acid_world_pause(int on) { g_world_paused = on; }
 int acid_live_particles(void) { return g_nlive; }
 int acid_live_groups(void) { return g_nglive; }
 
@@ -365,7 +367,7 @@ void acid_tick(float dt)
     pools_init();
     int ticks = ftol(dt * 1024.0f);
     /* world emitters: states 0/1 sit at the head, the loop ends at the first other */
-    for (AcidEmitter *e = g_world, *nx; e; e = nx) {
+    for (AcidEmitter *e = g_world_paused ? NULL : g_world, *nx; e; e = nx) {
         nx = e->next;
         int st = e->state;
         if (st == 1) acid_emit(e, dt, NULL);
@@ -834,6 +836,13 @@ void acid_car_frame(AcidCar *c, const AcidCarFrame *f)
             if (k > 0) { acid_car_fire(c, CARFX_BOTTOM_OUT, k, t, f->pos, f->mat, f->vel); fx_log(c, CARFX_BOTTOM_OUT, k); }
         }
     }
+    /* the break effects ApplyDamage triggered (Car::TriggerEffect) */
+    for (int id = 0; id < CARFX_COUNT; id++)
+        if (c->dmg_fxq[id] > 0.0f) {
+            acid_car_fire(c, id, c->dmg_fxq[id], 0, f->pos, f->mat, f->vel);
+            c->fxlog[id] = 0; fx_log(c, id, c->dmg_fxq[id]);
+            c->dmg_fxq[id] = 0.0f;
+        }
     /* damage smoke (0x5f5e75): the engine past 0.9, the radiator past 0.65
        with the last breakable fully broken */
     if (c->dmg_on) {
@@ -849,6 +858,9 @@ void acid_car_frame(AcidCar *c, const AcidCarFrame *f)
         int id = (f->throttle > 0.001f && mph >= 5.0f) ? CARFX_NITRO : CARFX_NOS_BLOWOFF;
         acid_car_fire(c, id, 1.0f, 0, f->pos, f->mat, f->vel);
         fx_log(c, id, 1.0f);
+        /* 0x5f6088: burning while the race stage (*0x890118) is 0..3 -- on the
+           line -- fires NOS_BLOWOFF (13) once more, (1.0, 0, 0) */
+        if (f->nitrous == 2) acid_car_fire(c, CARFX_NOS_BLOWOFF, 1.0f, 0, f->pos, f->mat, f->vel);
     }
     /* revving in neutral (0x5f5f4f): with turbo parts of level 2 or more
        (+0.5 for the junkman turbo), the revs falling to half the band arm it and climbing back past
@@ -871,22 +883,28 @@ void (*acid_impulse_cb)(const void *sim, const float J[3], const float r[3]);
 /* the breakable items (0x8036ec, 0x24 B each: window flag, slot, name, index,
    marker hash, the level thresholds 0x610ea0 tests) */
 static const struct { uint32_t hash; float thr[4]; } k_break[15] = {
-    { 0xc4ec23c8u, { 0, 0.25f, 0.5f, 0.75f } },
-    { 0x0bea251bu, { 0, 0.25f, 0.5f, 0.75f } },  /* Side Mirror Left */
-    { 0xaa35c17fu, { 0, 0.25f, 0.5f, 0.75f } },  /* Side Mirror Right */
-    { 0xc805f7e0u, { 0, 0.25f, 0.5f, 0.75f } },  /* License Plate Rear */
-    { 0x9db90133u, { 0, 0.25f, 0.35f, 0.5f } },  /* License Plate Front */
-    { 0xd09091c6u, { 0, 0.25f, 0.35f, 0.5f } },  /* Headlight Left */
-    { 0x31a66786u, { 0, 0.25f, 0.45f, 0.65f } }, /* Headlight Right */
-    { 0xbf700a79u, { 0, 0.25f, 0.45f, 0.65f } }, /* Brakelight Left */
-    { 0x6ec7e79fu, { 0, 0.15f, 0.3f, 0.45f } },  /* Brakelight Right */
-    { 0x3f68f920u, { 0, 0.05f, 0.1f, 0.15f } },  /* windows */
-    { 0x3df28f69u, { 0, 0.05f, 0.1f, 0.15f } },
-    { 0xe898cfaau, { 0, 0.05f, 0.1f, 0.15f } },
-    { 0x64b0bb1cu, { 0, 0.05f, 0.1f, 0.15f } },
-    { 0x2f96d0fdu, { 0, 0.05f, 0.1f, 0.15f } },
-    { 0x68100815u, { 0, 0.7f, 0.85f, 0.95f } },
+    /* names: GC BreakableCarDamageInfoTable 0x80372120 (+0x20) */
+    { 0xc4ec23c8u, { 0, 0.25f, 0.5f, 0.75f } },  /* Side Mirror Left */
+    { 0x0bea251bu, { 0, 0.25f, 0.5f, 0.75f } },  /* Side Mirror Right */
+    { 0xaa35c17fu, { 0, 0.25f, 0.5f, 0.75f } },  /* License Plate Rear */
+    { 0xc805f7e0u, { 0, 0.25f, 0.5f, 0.75f } },  /* License Plate Front */
+    { 0x9db90133u, { 0, 0.25f, 0.35f, 0.5f } },  /* Headlight Left */
+    { 0xd09091c6u, { 0, 0.25f, 0.35f, 0.5f } },  /* Headlight Right */
+    { 0x31a66786u, { 0, 0.25f, 0.45f, 0.65f } }, /* Brakelight Left */
+    { 0xbf700a79u, { 0, 0.25f, 0.45f, 0.65f } }, /* Brakelight Right */
+    { 0x6ec7e79fu, { 0, 0.15f, 0.3f, 0.45f } },  /* Window Front (windows: +0x18 env flag) */
+    { 0x3f68f920u, { 0, 0.05f, 0.1f, 0.15f } },  /* Window Rear */
+    { 0x3df28f69u, { 0, 0.05f, 0.1f, 0.15f } },  /* Window Left Front */
+    { 0xe898cfaau, { 0, 0.05f, 0.1f, 0.15f } },  /* Window Left Rear */
+    { 0x64b0bb1cu, { 0, 0.05f, 0.1f, 0.15f } },  /* Window Right Front */
+    { 0x2f96d0fdu, { 0, 0.05f, 0.1f, 0.15f } },  /* Window Right Rear */
+    { 0x68100815u, { 0, 0.7f, 0.85f, 0.95f } },  /* Radiator */
 };
+/* +0x1c: the CarEffect ApplyDamage triggers (0x803714 +0x18 on PC) */
+static const unsigned char k_break_fx[15] = {
+    15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, CARFX_DAM_RADIATOR };
+/* BreakableCarDamageIntensities 0x803914 by level */
+static const float k_break_k[4] = { 0.0f, 0.1f, 0.4f, 1.0f };
 /* 0x60c1d0: the sector (0..31) of a car-space point, round the box's edge */
 static int dmg_sector(const float p[2], const float mn[2], const float mx[2])
 {
@@ -905,6 +923,40 @@ void acid_damage_repair(AcidCar *c)
 {
     if (!c) return;
     memset(c->dmg, 0, sizeof c->dmg); c->dmg_sum = 0; c->dmg_flags = 0;
+}
+static unsigned dmg_breakables(const AcidCar *c);
+/* CarDamage::ApplyDamage 0x633ef0 (GC 8024c850): only with visible damage
+   on. BodyDamage::ApplyDamage (0x633d50) only drives the vertex hook, an
+   empty function (GC CallDamageVertexFunctionForEveryVertex 801d7338 is 4
+   bytes) -> nothing; SetEnvironmentMapping is empty too (GC 8024bb1c);
+   PlayGlass is an empty function on both (PC 0x4031c0 ret 4, GC 8007d0e4
+   blr) -> no glass sound */
+static void dmg_apply(AcidCar *c)
+{
+    if (!c->dmg_vis) return;
+    unsigned fl = dmg_breakables(c);
+    c->dmg_flags = fl;
+    if (fl == c->dmg_applied) return;
+    for (int k = 0; k < 15; k++) {
+        unsigned lv = fl >> (2 * k) & 3u, was = c->dmg_applied >> (2 * k) & 3u;
+        if (lv == was) continue;
+        if (lv) c->dmg_fxq[k_break_fx[k]] = k_break_k[lv];   /* TriggerEffect(fx, k, 0, 0) */
+        c->dmg_applied = (c->dmg_applied & ~(3u << (2 * k))) | lv << (2 * k);
+    }
+    c->dmg_shown = fl;                                       /* UpdateCarReplacementTextures */
+    if (getenv("OPENUG2_FXLOG"))
+        printf("cardamage: car %p visible damage applied, levels %08x\n", (void *)c, fl);
+}
+void acid_damage_visible(AcidCar *c, int on)
+{
+    if (!c || c->dmg_vis == (on != 0)) return;
+    c->dmg_vis = on != 0;
+    if (on) dmg_apply(c);                                    /* RethinkDamage */
+}
+int acid_damage_window(const AcidCar *c, int w)
+{
+    if (!c || w < 0 || w > 5) return 0;
+    return (int)(c->dmg_shown >> (2 * (8 + w)) & 3u);
 }
 void acid_damage_setup(AcidCar *c, const float bbmin[2], const float bbmax[2],
                        const AcidMarker *mk, int nmk)
@@ -956,6 +1008,18 @@ static void dmg_sector_add(AcidCar *c, int s, float add, float hit)
     if (hit > 0.2f) c->dmg_flags = fl;
     else dmg_set(c, s, cur);
 }
+void acid_damage_full(AcidCar *c)
+{
+    if (!c || !c->dmg_on) return;
+    for (int s = 0; s < 32; s++) dmg_sector_add(c, s, 1.0f, 10000.0f);   /* 0x8033e5c8 / cc */
+    dmg_apply(c);
+}
+void acid_damage_zero(AcidCar *c)
+{
+    if (!c) return;
+    acid_damage_repair(c);
+    dmg_apply(c);
+}
 /* CarCollisionBody::AddDamage 0x593bf0 -> CarDamage::AddDamage 0x637c70 */
 void acid_damage_hit(AcidCar *c, const float local[3], float jmag)
 {
@@ -970,6 +1034,7 @@ void acid_damage_hit(AcidCar *c, const float local[3], float jmag)
         dmg_sector_add(c, (s + i) & 31, k, a);
         dmg_sector_add(c, (s - i) & 31, k, a);
     }
+    dmg_apply(c);                                                    /* GC 8024c680 */
     if (getenv("OPENUG2_FXLOG"))
         printf("cardamage: car %p hit %.3f sector %d -> damage %.3f flags %08x\n",
                (void *)c, a, s, acid_damage(c), c->dmg_flags);

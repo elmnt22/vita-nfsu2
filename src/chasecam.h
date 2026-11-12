@@ -132,6 +132,7 @@ void chasecam_update(ChaseCam *c, const CcCar *car, float dt,
 float chasecam_noise(float x);
 void  chasecam_lookat(const float eye[3], const float at[3], float V[4][4]);
 void  chasecam_shake_view(float V[4][4], const float nz[4], unsigned short fov_u16);
+void  retail_view_proj(float fov, int W, int H, float *fovy, float *aspect);
 void  chasecam_out(float V[4][4], unsigned short fov_u16, CcOut *out);
 /* RearViewMirrorCameraMover (PC ctor 0x44ba10 / Update 0x44ba80): the mirror's
    view from the car (hfov43 = FOV 20000, znear 0.75; far 192) */
@@ -139,6 +140,12 @@ void  chasecam_rvm(const CcCar *car, CcOut *out);
 /* ResetCameraShakers 0x5729e0: stop the acceleration jolts (car +0x80 ->
    MaybeCameraShake, applied to the drive camera and the mirror) */
 void  chasecam_shakers_reset(void);
+/* the jump cam's state for the shakers (MaybeCameraShake 0x572e50 in zone 7:
+   size x0.8, duration x1.2; ApplyCameraShake skipped below time scale 1) */
+void  chasecam_set_world(int zone, float time_scale);
+/* TopologyCoordinate::SegmentIntersectsPossiblyLong-style test: does a world
+   face cross p -> q (the camera's own LOS test, 0x5d39f0 over 0x5d37f0) */
+int   chasecam_seg_blocked(WColl *w, const float p[3], const float q[3]);
 /* ShowcaseCameraMover (0x446400): the photo view of the car from an SCCarSetup's
    nine floats; gup = the ground's normal under the car */
 void  chasecam_photo(ChaseCam *c, const CcCar *car, const float gup[3], const float p[9], WColl *w, CcOut *out);

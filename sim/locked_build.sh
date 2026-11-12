@@ -12,4 +12,4 @@ until mkdir "$LOCK" 2>/dev/null; do
     sleep 10
 done
 trap 'rmdir "$LOCK"' EXIT
-"$ROOT/sim/build_sim.sh" "$@"
+SIM_JOBS="${SIM_JOBS:-2}" "$ROOT/sim/build_sim.sh" "$@"   # 2 compiles max: RAM is shared with Driv3r

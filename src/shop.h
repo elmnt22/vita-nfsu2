@@ -10,7 +10,7 @@
  * GLOBALB career unlock table (0x34A1C).
  *
  * First use extracts what the screens need (three packages and their
- * textures, decoded) into ux0:data/OpenUG2/cache/shop_v1.bin, so FrontB and
+ * textures, decoded) into ux0:data/NFSU2/cache/shop_v1.bin, so FrontB and
  * GLOBALB are only unpacked once.
  *
  * The shop never touches the car itself: it hands main.c a complete
@@ -42,7 +42,8 @@ enum { SHOP_ACT_NONE, SHOP_ACT_PREVIEW, SHOP_ACT_RIM, SHOP_ACT_EXIT,
        SHOP_ACT_CAREER_RIDE,     /* the crib from the career menu: the career car on the platform */
        SHOP_ACT_CAREER_PARTS,    /* the crib's Change Parts: the Car Shop on the career car (shop_career_customize 1) */
        SHOP_ACT_CAREER_EVENT,    /* the crib World Map's Yes: StartCareerEventFromWorldMap(event) */
-       SHOP_ACT_TEST_TRACK };    /* the crib's Test Track: DoStartTuning -> BeginCarTuning(entry 0) */
+       SHOP_ACT_TEST_TRACK,      /* the crib's Test Track: DoStartTuning -> BeginCarTuning(entry 0) */
+       SHOP_ACT_DELETE_CAR };    /* F2.4: the Customize car select's Square + Yes: DeleteTunedCar(slot) */
 
 /* Quick race modes (settings 0x83aab4 +0: the type) */
 enum { QR_CIRCUIT = 0, QR_SPRINT = 1, QR_DRAG = 2, QR_DRIFT = 3, QR_URL = 4,
@@ -68,6 +69,9 @@ typedef struct {
     char rim_folder[16];      /* SHOP_ACT_RIM / EXIT: CARS/WHEELS/GEOMETRY_<folder>.BIN */
     int  rim_style;           /* ... and its STYLEnn, with the size (RIM_STYLE / RIM_INNER) */
     char car[32];             /* SHOP_ACT_QR_CAR / QR_GO: CARS/ folder */
+    int  slot;                /* F2.4, QR_CAR / CUSTOMIZE / QR_GO / DELETE_CAR from the Quick Race car select:
+                                 the car's tuned slot, -1 its stock car; -2 = not a garage pick (crib, lot) */
+    uint32_t career_handle;   /* QR_CAR from the crib car select: the career slot shown (SetRideInfo of its ride), else 0 */
     ShopQuickRace qr;         /* SHOP_ACT_QR_GO */
     int career_nis;           /* SHOP_ACT_CAREER: the first-time intro scene plays */
     const unsigned char *event;   /* SHOP_ACT_CAREER_EVENT: the career event record */
@@ -86,6 +90,7 @@ typedef struct {
     char make[24];            /* type record +0xc0: CARSELECT_MANUFACTURER_<make> */
     float accel, top_speed, handling;   /* 0x5b53a0 / 0x5b6a20 / 0x5b5490, 0.03..1 */
     int  mine;                /* a garage-saved configuration exists ("My Cars") */
+    int  slot;                /* F2.4: its tuned slot (TUNED_CAR_<slot>), -1 the stock car */
 } ShopCar;
 
 /* Loads (or builds) the cached screen data, the strings and the car part
@@ -136,6 +141,19 @@ int shop_preset_ride(const char *dataroot, uint32_t preset_hash, char car[32], N
  * loaded. 0 when the database or the car type is missing. */
 int shop_random_ride(Shop *s, const char *car, const int perf_lvl[10], uint32_t *rng, N2CarConfig *out,
                      char *rim, int rimsz, int *rim_style);
+/* The PC save import (pcsave.c). shop_car_type_name: the car type whose
+ * name hashes (bStringHash) to hash, 1 found. shop_slot_ride: a saved
+ * PresetCarSlot (0x418 bytes) as the garage keeps a car (FillRideWith
+ * 80134e24: every slot's part by hash, the perf parts, the junkman parts),
+ * 0 when not filled / unknown. shop_inv_owned: the parts a saved
+ * OwnedPartInventory (0x3c0 bytes as saved) owns, as name-hash keys
+ * (CareerCar.own); fitted (the car's slot, or NULL) is checked against them. */
+int shop_car_type_name(const char *dataroot, uint32_t hash, char car[32]);
+int shop_car_type_at(const char *dataroot, int i, char car[32]);   /* GLOBALB 0x34600 order (FEStockCar +0x14) */
+int shop_slot_ride(const char *dataroot, const unsigned char *slot, char car[32], N2CarConfig *cfg,
+                   char rim_folder[16], int *rim_style);
+int shop_inv_owned(const char *dataroot, const char *car, const unsigned char *inv, const unsigned char *fitted,
+                   uint32_t *own, int max, int *fit_n, int *fit_owned);
 /* the part database alone (no shop screens), loaded once */
 Shop *shop_part_db(const char *dataroot);
 /* SetUpgradePart 0x61bc80: the model of the slot's first part at that
@@ -205,6 +223,10 @@ Shop *shop_open_loading(const char *dataroot);
 void  shop_loading_text(Shop *s, const char *line1, const char *line2);
 /* the same with a third line under the second */
 void  shop_loading_text3(Shop *s, const char *line1, const char *line2, const char *line3);
+/* Which loading screen the next load shows (GC ShowLoadingScreen): the
+   career picks PC_Loading or the console Loading_Controller (a Vita
+   picture labelled from g_opt) by chance, every other mode the latter. */
+void  shop_loading_pick(Shop *s, int career);
 
 /* The Quick Race data: the GLOBALB 0x34201 track records (0x128 bytes each,
  * kept by the caller) and the selectable cars, `cur` the one in use. */
@@ -218,8 +240,12 @@ void  shop_set_car(Shop *s, const char *car, const N2CarConfig *fitted,
 /* The garage's platform, GarageMainScreen::ChangePlatform's PlatformNameMap
    (GC 8035b198) index: 1 SHOWROOM, 3 CARLOT01, 4 CRIB01, ... */
 int shop_platform(const Shop *s);
+/* the front end's ambience zone (GetAmbientZone 0x46b330, FE branch) for the
+   shop s is in; career = a career front end */
+int shop_fe_ambient_zone(const Shop *s, int career);
 /* the front end is on UI_Main (the main menu strip) */
 int shop_on_main_menu(const Shop *s);
+int shop_boot_pending(const Shop *s);   /* splash / boot load: no garage, no car yet */
 /* the hash of a rim part's "<MODEL>_STYLEnn" (attribute 0x10c98090), 0 = unknown */
 uint32_t shop_rim_base(const char *dataroot, const char *folder, int value);
 #ifdef OPENUG2_SIM_PRE_H

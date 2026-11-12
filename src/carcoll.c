@@ -951,6 +951,54 @@ static int wild_collision(CarCollCar *A, CarCollCar *B, const float *pt, const f
     return fired;
 }
 
+/* The Collision objects (0x5a9430), for each body's count (CollisionBody
+   +0x18 on PC, GC +0x16: BeginCollision 0x5a0590 inc, EndCollision 0x5929c0
+   dec). CollisionImpulse 0x5af0e0 makes one per pair (witness +0x244, made at
+   0x5af11c) and AddImpulse 0x5a9620 stamps it with WorldTimer (+0xc, at
+   0x5a9684); Collision::Update 0x592bd0 ends it once 0.3 s (0x7fbee0) have
+   passed since (DoTimestepCollisions, GC 80210b64), and a witness with a
+   Collision never expires (HasExpired GC 801ad444). One made without an
+   impulse is stamped 0 and ends in the same step, so only impulses count.
+   Keyed by the two bodies (a polygon by its id: each track polygon is its own
+   body in the original). */
+#define MAXCOLL 128
+typedef struct { const void *a, *b; int poly; float t; } BodyColl;
+static BodyColl g_coll[MAXCOLL];
+static int g_ncoll;
+static float g_coll_now;
+static const void *body_key(const CarCollCar *k) { return k->ops ? k->obj : (const void *)k->s; }
+static void coll_impulse(const CarCollCar *A, const CarCollCar *B, int poly)
+{
+    const void *a = body_key(A), *b = B ? body_key(B) : NULL;
+    int i;
+    for (i = 0; i < g_ncoll; i++)
+        if (g_coll[i].poly == poly && ((g_coll[i].a == a && g_coll[i].b == b) || (b && g_coll[i].a == b && g_coll[i].b == a)))
+            break;
+    if (i == g_ncoll) {
+        if (g_ncoll >= MAXCOLL) return;
+        g_coll[g_ncoll++] = (BodyColl){ a, b, poly, 0 };
+    }
+    g_coll[i].t = g_coll_now;
+}
+void carcoll_world_time(float dt)
+{
+    g_coll_now += dt;
+    int keep = 0;
+    for (int i = 0; i < g_ncoll; i++)
+        if (g_coll_now - g_coll[i].t < 0.3f) g_coll[keep++] = g_coll[i];
+    g_ncoll = keep;
+}
+int carcoll_body_collisions(const void *body)
+{
+    static int off = -1;
+    int n = 0;
+    if (off < 0) off = getenv("OPENUG2_NOBODYCOLL") != NULL;   /* test aid: the count stays 0 */
+    if (!body || off) return 0;
+    for (int i = 0; i < g_ncoll; i++)
+        if ((g_coll[i].a == body || g_coll[i].b == body) && g_coll_now - g_coll[i].t < 0.3f) n++;
+    return n;
+}
+
 /* 0x5b2610 + 0x5af0e0 for one contact; 1 when an impulse was applied (the
    bodies were closing) */
 static int resolve(World *W, const Contact *k, CarCollHit *hit, CarCollWake wake, void *user)
@@ -1077,6 +1125,7 @@ static int resolve(World *W, const Contact *k, CarCollHit *hit, CarCollWake wake
             hit->poly_nz = B ? 0 : poly->n[2];
             hit->wild = wild;
         }
+        coll_impulse(A, B, B ? -1 : poly->id);              /* Collision::AddImpulse 0x5a9620 */
         applied = 1;
     }
     advance_car(A, k->t);
@@ -1090,7 +1139,7 @@ void carcoll_begin(CarColl *c, const N2Sim *s, float dt)
     n2sim_body(s, &b);
     hull_bounds(c, b.com);
     memcpy(c->ppos, b.pos, 12); memcpy(c->pR, b.R, 64); memcpy(c->pv, b.v, 12);
-    c->span = dt;
+    c->span = dt * n2sim_time_scale();                                 /* the world step n2sim_step takes */
 }
 
 void carcoll_begin_body(CarColl *c, const N2Body *b, float dt)
@@ -1157,13 +1206,15 @@ static void broadphase(World *W, int ci)
         if (o == ci || W->cars[o].nocollide) continue;
         if (sleeper && W->cars[o].ops && W->cars[o].ops->asleep) continue;
         if ((K->noprops && W->cars[o].ops) || (K->ops && W->cars[o].noprops)) continue;
+        /* the box test first (port order only: both tests just skip, and the
+           pair-list scan below is the costly one with many cars) */
+        N2Body ob = body_of(&W->cars[o]);
+        float r = c->rad + W->cars[o].c->rad;
+        if (fabsf(ob.pos[0] - b.pos[0]) > r || fabsf(ob.pos[1] - b.pos[1]) > r) continue;
         int have = 0;
         for (int j = 0; j < W->npairs && !have; j++)
             have = W->pairs[j].b >= 0 && ((W->pairs[j].a == ci && W->pairs[j].b == o) || (W->pairs[j].a == o && W->pairs[j].b == ci));
         if (have) continue;
-        N2Body ob = body_of(&W->cars[o]);
-        float r = c->rad + W->cars[o].c->rad;
-        if (fabsf(ob.pos[0] - b.pos[0]) > r || fabsf(ob.pos[1] - b.pos[1]) > r) continue;
         if (W->npairs >= MAXPAIR) break;
         W->pairs[W->npairs++] = (CPair){ ci < o ? ci : o, ci < o ? o : ci, -1, 0 };
     }

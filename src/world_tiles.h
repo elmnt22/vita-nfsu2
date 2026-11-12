@@ -19,7 +19,7 @@
 #define WTILE_VERSION  5   /* 2: far full models keep their prelight; 3: 1 mm grid deltas + LZ4;
                                     4: road reflection flag per mesh;
                                     5: that flag read with the right bit (0x40) */
-#define WTILE_DIR      "ux0:data/OpenUG2/cache/tiles"
+#define WTILE_DIR      "ux0:data/NFSU2/cache/tiles"
 
 typedef struct {
     volatile int cells_done, cells_total, cells_failed;
@@ -34,7 +34,7 @@ int world_tiles_ready(const char *trackname);
 #include "nfsu2.h"
 #include "world_instance.h"
 /* 1 when the world should load from tiles (a tile set exists and
-   ux0:data/OpenUG2/notileload.txt does not). */
+   ux0:data/NFSU2/notileload.txt does not). */
 int world_tiles_enabled(const char *trackname);
 /* Fills scene (sky + world) and vista for a neighbourhood from the tiles,
    applying the event's scenery selection and the near/far LOD choice.

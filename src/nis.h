@@ -184,6 +184,27 @@ int nis_rev_step(NisRev *r, int nis_mode);
 int nis_camera(Nis *n, double now, const float car_com[3], const float car_rot[9],
                CcOut *out, float *near_clip, float *letterbox, float dof[2]);
 
+/* ---- the EAGL decoding for others (the world animations, worldanim.c) ----
+   The animation banks (0xe34010 top-level chunks) of a bundle; a channel is
+   one animation of them by name hash (0x434850 -> 0x6e2d40: a type 15
+   container of codec 11 / 20 / 21 parts; frames = its length, 0x6e2110),
+   evaluated into a pose (12 floats a bone: scale3, x-scale, quat xyzw,
+   translation, 1) of at most NIS_CHAN_POSE floats. The ROOT skeleton
+   (GLOBALB 0xe34009 "ROOT": ROOT + ROOT0, both at rest = identity) has two
+   bones; nis_root_bone1 is PoseSQTToGlobal's bone 1 (row vectors,
+   translation in [12..14]). */
+#define NIS_CHAN_POSE (12 * 64)
+typedef struct NisBanks NisBanks;
+typedef struct NisChan NisChan;
+NisBanks *nis_banks_load(const unsigned char *bundle, long len);
+int  nis_banks_count(const NisBanks *b);
+void nis_banks_free(NisBanks *b);
+NisChan *nis_chan_bind(const NisBanks *b, unsigned name_hash, float *frames);
+void nis_chan_eval(NisChan *c, float frame, float *pose, int npose);
+void nis_chan_free(NisChan *c);
+void nis_root_rest(float pose[24]);
+void nis_root_bone1(const float pose[24], float m[16]);
+
 #ifdef __cplusplus
 }
 #endif

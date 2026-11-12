@@ -24,6 +24,7 @@
 #include <psp2/power.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/io/dirent.h>
 #include <malloc.h>
 #include <unistd.h>
 #include <vitaGL.h>
@@ -72,7 +73,7 @@ static void boot_write_line(const char *line,int len) {
     unsigned long long begin=sceKernelGetProcessTimeWide();
     SceUID fd=g_boot_fd;
     if(fd<0) {
-        fd=sceIoOpen("ux0:data/OpenUG2/boot.txt",SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND,0777);
+        fd=sceIoOpen("ux0:data/NFSU2/boot.txt",SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND,0777);
         if(g_boot_lock_ready)g_boot_fd=fd;
     }
     if(fd>=0) {
@@ -151,16 +152,16 @@ __attribute__((constructor(101))) static void vita_boot_probe(void) {
         (unsigned)(_newlib_heap_size_user >> 20), (unsigned)(info.size_user >> 20),
         (unsigned)(info.size_cdram >> 20), (unsigned)(info.size_phycont >> 20));
     g_heap_base = (char *)sbrk(0);
-    sceIoMkdir("ux0:data/OpenUG2", 0777);
+    sceIoMkdir("ux0:data/NFSU2", 0777);
     /* the last run's logs survive one relaunch as *_prev.txt (a crash's log was lost to the relaunch) */
-    sceIoRemove("ux0:data/OpenUG2/log_prev.txt");    sceIoRename("ux0:data/OpenUG2/log.txt", "ux0:data/OpenUG2/log_prev.txt");
-    sceIoRemove("ux0:data/OpenUG2/boot_prev.txt");   sceIoRename("ux0:data/OpenUG2/boot.txt", "ux0:data/OpenUG2/boot_prev.txt");
-    sceIoRemove("ux0:data/OpenUG2/crumbs_prev.txt"); sceIoRename("ux0:data/OpenUG2/crumbs.txt", "ux0:data/OpenUG2/crumbs_prev.txt");
-    SceUID fd = sceIoOpen("ux0:data/OpenUG2/boot.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    sceIoRemove("ux0:data/NFSU2/log_prev.txt");    sceIoRename("ux0:data/NFSU2/log.txt", "ux0:data/NFSU2/log_prev.txt");
+    sceIoRemove("ux0:data/NFSU2/boot_prev.txt");   sceIoRename("ux0:data/NFSU2/boot.txt", "ux0:data/NFSU2/boot_prev.txt");
+    sceIoRemove("ux0:data/NFSU2/crumbs_prev.txt"); sceIoRename("ux0:data/NFSU2/crumbs.txt", "ux0:data/NFSU2/crumbs_prev.txt");
+    SceUID fd = sceIoOpen("ux0:data/NFSU2/boot.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd >= 0) { sceIoWrite(fd, line, (SceSize)len); sceIoClose(fd); }
     g_boot_lock_ready=sceKernelCreateLwMutex(&g_boot_lock,"openug-boot",0,0,NULL)>=0;
     if (g_boot_lock_ready)
-        g_boot_fd=sceIoOpen("ux0:data/OpenUG2/boot.txt",SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND,0777);
+        g_boot_fd=sceIoOpen("ux0:data/NFSU2/boot.txt",SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND,0777);
 }
 
 /* Startup milestones appended straight to boot.txt, independent of stdio, so
@@ -224,9 +225,9 @@ void vita_mark_stats(void) {
 
 #define VITA_W 960
 #define VITA_H 544
-#define VITA_DATA "ux0:data/OpenUG2"
+#define VITA_DATA "ux0:data/NFSU2"
 
-/* ---- logging: stdout/stderr -> ux0:data/OpenUG2/log.txt ------------------
+/* ---- logging: stdout/stderr -> ux0:data/NFSU2/log.txt ------------------
    freopen() on the Vita opens the file but newlib keeps writing fds 1/2 to
    tty0, and swapping the stdout FILE pointer does not stick either. So the
    final syscall is intercepted instead (linked with -Wl,--wrap=_write_r):
@@ -235,6 +236,7 @@ void vita_mark_stats(void) {
    file for every fragment adds memory-card work to the loading path. */
 #define LOG_PATH  VITA_DATA "/log.txt"
 static int g_log_ready;
+static int g_logs_off;   /* nolog.txt, see vlog() */
 static SceUID g_log_fd = -1;
 static SceKernelLwMutexWork g_log_lock;
 static int g_log_lock_ready;
@@ -366,6 +368,7 @@ void vita_async_file(FILE *f) {
 }
 
 static int log_write(const char *buf, int n) {
+    if (g_logs_off) return n;
     if (n > 0 && async_put(&g_ring_log, buf, (unsigned)n)) return n;
     return log_write_sync(buf, n);
 }
@@ -378,7 +381,12 @@ static int log_write(const char *buf, int n) {
    wrapped too. Other streams pass through to the real functions. */
 static int is_std(FILE *f) { return f == stdout || f == stderr; }
 
+/* nolog.txt (the Settings screen's Logs: off): nothing reaches log.txt
+   after its one "logging off" line. */
+int vita_logs_off(void) { return g_logs_off; }
+
 static int vlog(const char *fmt, va_list ap) {
+    if (g_logs_off) return 0;
     char small[1024];
     va_list ap2;
     va_copy(ap2, ap);
@@ -511,19 +519,28 @@ void vita_crumb(const char *fmt, ...) {
    registers and stack -- the main thread's PC is where it hangs. */
 volatile int vita_wd_armed, vita_wd_sec;
 volatile unsigned vita_wd_beat;
+/* The boot world load (main.c sets it from the smokeables to the end of the
+   world load, crumbs.txt names each step): a load stuck WD_LOAD_SECONDS
+   faults the same way, so a hung load leaves a core dump (10-31 HW: a venue
+   boot hung after the smokeables with no dump). A normal load is ~16 s. */
+volatile int vita_wd_load;
 #define WD_SECONDS 15
+#define WD_LOAD_SECONDS 120
 static int wd_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
     unsigned last = vita_wd_beat;
+    int last_load = vita_wd_load;
     Uint64 since = sceKernelGetProcessTimeWide();
     for (;;) {
         sceKernelDelayThread(500 * 1000);
         Uint64 now = sceKernelGetProcessTimeWide();
         unsigned b = vita_wd_beat;
-        if (b != last || !vita_wd_armed) { last = b; since = now; continue; }
-        if (now - since < (Uint64)WD_SECONDS * 1000000u) continue;
-        vita_crumb("WATCHDOG: main loop stuck %u s after perf mark %d (beat %u, armed in a race) -- "
-                   "faulting for a core dump", (unsigned)((now - since) / 1000000u), vita_wd_sec, b);
+        int load = vita_wd_load;
+        if (b != last || load != last_load || !(vita_wd_armed || load)) { last = b; last_load = load; since = now; continue; }
+        if (now - since < (Uint64)(load ? WD_LOAD_SECONDS : WD_SECONDS) * 1000000u) continue;
+        vita_crumb("WATCHDOG: main loop stuck %u s after perf mark %d (beat %u, %s) -- "
+                   "faulting for a core dump", (unsigned)((now - since) / 1000000u), vita_wd_sec, b,
+                   load ? "in the boot world load, step in the crumbs above" : "armed in a race");
         vita_log_flush();
         sceKernelDelayThread(1000 * 1000);          /* let the log writer drain */
         *(volatile int *)0 = 0x57d;                 /* the core dump */
@@ -554,6 +571,14 @@ void vita_early_init(void) {
     if (g_log_lock_ready)
         g_log_fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     g_log_ready = 1;
+    {   SceUID nf = sceIoOpen(VITA_DATA "/nolog.txt", SCE_O_RDONLY, 0);
+        if (nf >= 0) {
+            sceIoClose(nf);
+            static const char off[] = "logging off (nolog.txt, LiveArea Settings); boot.txt and crumbs.txt are still written\n";
+            log_write_sync(off, (int)sizeof off - 1);
+            g_logs_off = 1;
+            vita_mark("log.txt off (nolog.txt)");
+        } }
     /* tty fds are not "interactive" to newlib, so stdout would otherwise be
        fully buffered and lose its tail on a crash. */
     setvbuf(stdout, NULL, _IONBF, 0);   /* one write per printf call */
@@ -843,7 +868,7 @@ static struct SDL_Window g_window = { VITA_W, VITA_H };
 /* Display framebuffer size. 720x408 is a native PS Vita display mode: the
    display hardware upscales it to the panel for free, so the 3D renders
    straight into it with no offscreen pass and no full-screen upscale draw.
-   ux0:data/OpenUG2/display960.txt keeps the old 960x544 framebuffer (3D in
+   ux0:data/NFSU2/display960.txt keeps the old 960x544 framebuffer (3D in
    a 720x408 texture blitted up, HUD at 960x544). */
 static int g_disp_w = VITA_W, g_disp_h = VITA_H;
 
@@ -867,7 +892,7 @@ SDL_GLContext SDL_GL_CreateContext(SDL_Window *w) {
         /* Small legacy pool (the engine is shader-only); keep 16 MB of RAM free.
            vglInit* does not report success: GL_TRUE only means the display
            fell back to a smaller resolution than requested. */
-        {   SceUID fd = sceIoOpen("ux0:data/OpenUG2/display960.txt", SCE_O_RDONLY, 0);
+        {   SceUID fd = sceIoOpen("ux0:data/NFSU2/display960.txt", SCE_O_RDONLY, 0);
             if (fd >= 0) sceIoClose(fd);
             else { g_disp_w = 720; g_disp_h = 408; } }
         /* leave the big-block pool (less what is already taken) to the kernel */
@@ -875,7 +900,7 @@ SDL_GLContext SDL_GL_CreateContext(SDL_Window *w) {
            frame wait in the display queue behind the one on screen (the CPU
            blocks ~10 ms a frame in the queue), adding up to a frame of input
            lag; with two buffers the GPU has to finish inside each frame. */
-        {   SceUID fd = sceIoOpen("ux0:data/OpenUG2/lowlat.txt", SCE_O_RDONLY, 0);
+        {   SceUID fd = sceIoOpen("ux0:data/NFSU2/lowlat.txt", SCE_O_RDONLY, 0);
             if (fd >= 0) { sceIoClose(fd); vglUseTripleBuffering(GL_FALSE); }
             printf("display: %s" "%c", fd >= 0 ? "double buffered, low latency (lowlat.txt)"
                                                     : "triple buffered", 10); }
@@ -898,7 +923,7 @@ SDL_GLContext SDL_GL_CreateContext(SDL_Window *w) {
 void SDL_GL_DeleteContext(SDL_GLContext c) { (void)c; }
 void SDL_GL_GetDrawableSize(SDL_Window *w, int *dw, int *dh) { (void)w; *dw = g_disp_w; *dh = g_disp_h; }
 void SDL_GetWindowSize(SDL_Window *w, int *ww, int *wh) { (void)w; *ww = g_disp_w; *wh = g_disp_h; }
-/* Locked 30 (default; fps60.txt in ux0:data/OpenUG2 turns it off): the display
+/* Locked 30 (default; fps60.txt in ux0:data/NFSU2 turns it off): the display
    thread holds each frame until two vblanks have passed since the last one
    went out, so every frame stays on screen for exactly 2 refreshes. vitaGL
    runs this callback on its display-queue thread just before the flip; the
@@ -922,7 +947,7 @@ static void lock30_cb(void *fb) {
 }
 int SDL_GL_SetSwapInterval(int interval) {
     if (vita_lock30 < 0) {
-        SceUID fd = sceIoOpen("ux0:data/OpenUG2/fps60.txt", SCE_O_RDONLY, 0);
+        SceUID fd = sceIoOpen("ux0:data/NFSU2/fps60.txt", SCE_O_RDONLY, 0);
         vita_lock30 = fd < 0;
         if (fd >= 0) sceIoClose(fd);
         printf("frame rate: %s\n", vita_lock30 ? "locked 30 (fps60.txt unlocks)" : "unlocked (fps60.txt)");
@@ -1627,42 +1652,12 @@ void SDL_WaitThread(SDL_Thread *t, int *status) {
 /* ---- one-off progress screen (before the engine's renderer exists) --------
    Used by the world tile conversion, which runs before the world and its
    shaders load: rectangles and a 5x7 pixel font made of scissored clears. */
-static const struct { char c; unsigned char row[7]; } g_font5x7[] = {
-    {'0',{14,17,19,21,25,17,14}}, {'1',{4,12,4,4,4,4,14}}, {'2',{14,17,1,2,4,8,31}},
-    {'3',{30,1,1,14,1,1,30}}, {'4',{2,6,10,18,31,2,2}}, {'5',{31,16,30,1,1,17,14}},
-    {'6',{6,8,16,30,17,17,14}}, {'7',{31,1,2,4,8,8,8}}, {'8',{14,17,17,14,17,17,14}},
-    {'9',{14,17,17,15,1,2,12}}, {'A',{14,17,17,31,17,17,17}}, {'B',{30,17,17,30,17,17,30}},
-    {'C',{14,17,16,16,16,17,14}}, {'D',{30,17,17,17,17,17,30}}, {'E',{31,16,16,30,16,16,31}},
-    {'F',{31,16,16,30,16,16,16}}, {'G',{14,17,16,23,17,17,15}}, {'H',{17,17,17,31,17,17,17}},
-    {'I',{14,4,4,4,4,4,14}}, {'J',{7,2,2,2,2,18,12}}, {'K',{17,18,20,24,20,18,17}},
-    {'L',{16,16,16,16,16,16,31}}, {'M',{17,27,21,21,17,17,17}}, {'N',{17,17,25,21,19,17,17}},
-    {'O',{14,17,17,17,17,17,14}}, {'P',{30,17,17,30,16,16,16}}, {'Q',{14,17,17,17,21,18,13}},
-    {'R',{30,17,17,30,20,18,17}}, {'S',{15,16,16,14,1,1,30}}, {'T',{31,4,4,4,4,4,4}},
-    {'U',{17,17,17,17,17,17,14}}, {'V',{17,17,17,17,17,10,4}}, {'W',{17,17,17,21,21,21,10}},
-    {'X',{17,17,10,4,10,17,17}}, {'Y',{17,17,10,4,4,4,4}}, {'Z',{31,1,2,4,8,16,31}},
-    {'%',{24,25,2,4,8,19,3}}, {'/',{1,1,2,4,8,16,16}}, {':',{0,12,12,0,12,12,0}},
-    {'.',{0,0,0,0,0,12,12}}, {'-',{0,0,0,31,0,0,0}}, {'(',{2,4,8,8,8,4,2}},
-    {')',{8,4,2,2,2,4,8}}, {',',{0,0,0,0,12,4,8}} };
-
 static void ps_rect(int x, int y, int w, int h, float r, float g, float b) {
     glScissor(x, g_disp_h - y - h, w, h);   /* top-left coordinates */
     glClearColor(r, g, b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 }
-static int ps_text_width(const char *s, int px) { return (int)strlen(s) * 6 * px - px; }
-static void ps_text(const char *s, int x, int y, int px, float r, float g, float b) {
-    for (; *s; s++, x += 6 * px) {
-        char c = *s >= 'a' && *s <= 'z' ? (char)(*s - 32) : *s;
-        for (unsigned k = 0; k < sizeof g_font5x7 / sizeof *g_font5x7; k++) {
-            if (g_font5x7[k].c != c) continue;
-            for (int row = 0; row < 7; row++)
-                for (int col = 0; col < 5; col++)
-                    if (g_font5x7[k].row[row] & (16 >> col))
-                        ps_rect(x + col * px, y + row * px, px, px, r, g, b);
-            break;
-        }
-    }
-}
+#include "ps_font.inc"
 
 /* Background art (app0:assets/optimizing.raw, 720x408 RGB565, made from
    the user's own artwork; its title is part of the picture). */
@@ -1741,13 +1736,19 @@ void vita_fast_clocks(void) {
 
 /* The console user name: the profile name the original's results and standings
    show for the player (the port has no profile of its own). */
+static void apputil_init(void) {
+    static int done;
+    if (done) return;
+    SceAppUtilInitParam ip; SceAppUtilBootParam bp;
+    memset(&ip, 0, sizeof ip); memset(&bp, 0, sizeof bp);
+    sceAppUtilInit(&ip, &bp);
+    done = 1;
+}
 const char *vita_user_name(void) {
     static char name[SCE_SYSTEM_PARAM_USERNAME_MAXSIZE];
     static int done;
     if (!done) {
-        SceAppUtilInitParam ip; SceAppUtilBootParam bp;
-        memset(&ip, 0, sizeof ip); memset(&bp, 0, sizeof bp);
-        sceAppUtilInit(&ip, &bp);
+        apputil_init();
         if (sceAppUtilSystemParamGetString(SCE_SYSTEM_PARAM_ID_USERNAME, (SceChar8 *)name, sizeof name) < 0)
             name[0] = 0;
         done = 1;
@@ -1755,7 +1756,214 @@ const char *vita_user_name(void) {
     return name;
 }
 
-/* Restart the app (a venue change: the boot reads ux0:data/OpenUG2/venue.txt). */
+/* The system language (SCE_SYSTEM_PARAM_LANG_*): the game's language, as the
+   consoles take theirs from the OS (nfsu2.h n2_lang). */
+int vita_system_lang(void) {
+    apputil_init();
+    int v = -1;
+    if (sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_LANG, &v) < 0) v = -1;
+    return v;
+}
+
+/* Restart the app (a venue change: the boot reads ux0:data/NFSU2/venue.txt). */
+#define RELAUNCH_MARK VITA_DATA "/relaunch.tmp"
 void vita_relaunch(void) {
+    /* the new process is ours: the Settings screen does not open on it */
+    SceUID fd = sceIoOpen(RELAUNCH_MARK, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) sceIoClose(fd);
     sceAppMgrLoadExec("app0:eboot.bin", NULL, NULL);
+}
+
+/* ---- Settings screen (LiveArea button / L+R at boot, boot_settings.inc) ---- */
+#define BS_W g_disp_w
+#define BS_H g_disp_h
+static unsigned bs_pad(void) {
+    SceCtrlData pad; memset(&pad, 0, sizeof pad);
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    unsigned b = pad.buttons, o = 0;
+    if (b & SCE_CTRL_UP) o |= 1;          if (b & SCE_CTRL_DOWN) o |= 2;
+    if (b & SCE_CTRL_LEFT) o |= 4;        if (b & SCE_CTRL_RIGHT) o |= 8;
+    if (b & SCE_CTRL_CROSS) o |= 16;      if (b & SCE_CTRL_CIRCLE) o |= 32;
+    if (b & SCE_CTRL_START) o |= 64;
+    if (b & (SCE_CTRL_LTRIGGER | SCE_CTRL_L1)) o |= 128;
+    if (b & (SCE_CTRL_RTRIGGER | SCE_CTRL_R1)) o |= 256;
+    return o;
+}
+static void bs_present(void) { vglSwapBuffers(GL_FALSE); sceKernelDelayThread(33000); }
+static int bs_exists(const char *p) {
+    SceUID fd = sceIoOpen(p, SCE_O_RDONLY, 0);
+    if (fd < 0) return 0;
+    sceIoClose(fd); return 1;
+}
+static void bs_touch(const char *p) {
+    SceUID fd = sceIoOpen(p, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) sceIoClose(fd);
+}
+static void bs_remove(const char *p) { sceIoRemove(p); }
+static int bs_rmtree(const char *dir) {
+    int n = 0;
+    SceUID d = sceIoDopen(dir);
+    if (d < 0) return 0;
+    SceIoDirent e;
+    char path[512];
+    for (;;) {
+        memset(&e, 0, sizeof e);
+        if (sceIoDread(d, &e) <= 0) break;
+        if (!strcmp(e.d_name, ".") || !strcmp(e.d_name, "..")) continue;
+        snprintf(path, sizeof path, "%s/%s", dir, e.d_name);
+        if (SCE_S_ISDIR(e.d_stat.st_mode)) n += bs_rmtree(path);
+        else if (sceIoRemove(path) >= 0 && (++n & 63) == 0)
+            vita_progress_screen(NULL, "DELETING CACHES", NULL, 0.5f);
+    }
+    sceIoDclose(d);
+    sceIoRmdir(dir);
+    return n;
+}
+/* The Settings screen's text: the Vita's own system font (ScePvf, the
+   sans-serif Latin face the system menus use), one font handle per face. */
+#include <psp2/pvf.h>
+#include <psp2/sysmodule.h>
+typedef struct { int w, h, left, top; float adv; } BsGlyphRasterV;
+static ScePvfLibId g_pvf_lib; static ScePvfFontId g_pvf[2]; static int g_pvf_px[2], g_pvf_tried;
+static ScePvfPointer pvf_alloc(ScePvfPointer u, ScePvfU32 n) { (void)u; return malloc(n); }
+static ScePvfPointer pvf_realloc(ScePvfPointer u, ScePvfPointer p, ScePvfU32 n) { (void)u; return realloc(p, n); }
+static void pvf_free(ScePvfPointer u, ScePvfPointer p) { (void)u; free(p); }
+static ScePvfFontId pvf_open(int bold)
+{
+    ScePvfError err = 0;
+    ScePvfFontStyleInfo st; memset(&st, 0, sizeof st);
+    st.familyCode = SCE_PVF_FAMILY_SANSERIF;
+    st.style = bold ? SCE_PVF_STYLE_BOLD : SCE_PVF_STYLE_REGULAR;
+    st.languageCode = SCE_PVF_LANGUAGE_LATIN;
+    ScePvfFontIndex ix = scePvfFindOptimumFont(g_pvf_lib, &st, &err);
+    ScePvfFontId f = err >= 0 && ix >= 0 ? scePvfOpen(g_pvf_lib, ix, 1, &err) : NULL;
+    if (!f || err < 0) f = scePvfOpenDefaultLatinFontOnSharedMemory(g_pvf_lib, &err);
+    vita_mark("settings: system font %s %s (index %d, 0x%08x)", bold ? "bold" : "regular", f ? "open" : "missing",
+              (int)ix, (unsigned)err);
+    return f;
+}
+/* em size in pixels: measured from a capital H so the face lands at the
+   same visual size as any other font (cap height 0.7 em) */
+/* No system font: the boot screens' 5x7 pixel font, scaled to the cap
+   height (capitals only), so the screen always has readable text. */
+static int ps_glyph_raster(int face, int px, unsigned cp, unsigned char *buf, int stride, int cap, BsGlyphRasterV *g)
+{
+    int k = (int)((0.70f * (float)px) / 7.0f + 0.5f); if (k < 1) k = 1;
+    memset(g, 0, sizeof *g);
+    g->adv = (float)(6 * k + (face ? k / 2 : 0));
+    char c = cp >= 'a' && cp <= 'z' ? (char)(cp - 32) : (char)cp;
+    if (c == ' ') return 1;
+    for (unsigned i = 0; i < sizeof g_font5x7 / sizeof *g_font5x7; i++) {
+        if (g_font5x7[i].c != c) continue;
+        int w = 5 * k + (face ? 1 : 0), h = 7 * k;
+        if (w > stride || h > cap) return 0;
+        for (int row = 0; row < 7; row++)
+            for (int col = 0; col < 5; col++)
+                if (g_font5x7[i].row[row] & (16 >> col))
+                    for (int yy = 0; yy < k; yy++)
+                        for (int xx = 0; xx < k + (face ? 1 : 0); xx++)
+                            buf[(row * k + yy) * stride + col * k + xx] = 255;
+        g->w = w; g->h = h; g->left = 0; g->top = h;
+        return 1;
+    }
+    return 1;   /* unknown character: a blank advance */
+}
+static int pvf_size(int face, int px)
+{
+    ScePvfFontId f = g_pvf[face];
+    if (g_pvf_px[face] == px) return 1;
+    scePvfSetCharSize(f, 10.0f, 10.0f);
+    ScePvfCharInfo ci; memset(&ci, 0, sizeof ci);
+    if (scePvfGetCharInfo(f, 'H', &ci) < 0 || ci.bitmapTop <= 0) return 0;
+    float sz = 10.0f * (0.70f * (float)px) / (float)ci.bitmapTop;
+    scePvfSetCharSize(f, sz, sz);
+    g_pvf_px[face] = px;
+    return 1;
+}
+static int bs_font_raster_v(int face, int px, unsigned cp, unsigned char *buf, int stride, int cap, void *out)
+{
+    BsGlyphRasterV *g = (BsGlyphRasterV *)out;
+    if (!g_pvf_tried) {
+        g_pvf_tried = 1;
+        /* libpvf is a system module the app loads itself (the PGF id
+           covers it); without it every scePvf call fails and the screen
+           had no text */
+        int lm = sceSysmoduleLoadModule(SCE_SYSMODULE_PGF);
+        vita_mark("settings: font module load 0x%08x", (unsigned)lm);
+        ScePvfInitRec r; memset(&r, 0, sizeof r);
+        r.maxNumFonts = 4; r.allocFunc = pvf_alloc; r.reallocFunc = pvf_realloc; r.freeFunc = pvf_free;
+        ScePvfError err = 0;
+        g_pvf_lib = scePvfNewLib(&r, &err);
+        if (g_pvf_lib) {
+            scePvfSetResolution(g_pvf_lib, 72.0f, 72.0f);
+            g_pvf[0] = pvf_open(0); g_pvf[1] = pvf_open(1);
+            if (!g_pvf[1]) g_pvf[1] = g_pvf[0];
+        } else vita_mark("settings: scePvfNewLib failed 0x%08x", (unsigned)err);
+    }
+    face = face ? 1 : 0;
+    ScePvfFontId f = g_pvf[face];
+    if (!f) return ps_glyph_raster(face, px, cp, buf, stride, cap, g);
+    if (g_pvf[1] == g_pvf[0]) g_pvf_px[face ^ 1] = 0;   /* one handle for both faces: size each time */
+    static int warned;
+    if (!pvf_size(face, px)) {
+        if (!warned++) vita_mark("settings: system font size failed, pixel font used");
+        return ps_glyph_raster(face, px, cp, buf, stride, cap, g);
+    }
+    if (g_pvf[1] == g_pvf[0]) scePvfSetEmboldenRate(f, face ? 10.0f : 0.0f);   /* no bold face: embolden */
+    ScePvfCharInfo ci; memset(&ci, 0, sizeof ci);
+    if (scePvfGetCharInfo(f, (ScePvfCharCode)cp, &ci) < 0) return ps_glyph_raster(face, px, cp, buf, stride, cap, g);
+    g->adv = (float)ci.glyphMetrics.horizontalAdvance64 / 64.0f;
+    g->left = ci.bitmapLeft; g->top = ci.bitmapTop;
+    g->w = (int)ci.bitmapWidth; g->h = (int)ci.bitmapHeight;
+    if (g->w > stride) g->w = stride;
+    if (g->h > cap) g->h = cap;
+    if (g->w <= 0 || g->h <= 0) { g->w = g->h = 0; return 1; }   /* a space */
+    ScePvfUserImageBufferRec ib; memset(&ib, 0, sizeof ib);
+    ib.pixelFormat = SCE_PVF_USERIMAGE_DIRECT8;
+    ib.xPos64 = -ci.bitmapLeft * 64; ib.yPos64 = ci.bitmapTop * 64;   /* pen origin: the bitmap lands at (0,0) */
+    ib.rect.width = (ScePvfU16)stride; ib.rect.height = (ScePvfU16)cap;
+    ib.bytesPerLine = (ScePvfU16)stride;
+    ib.buffer = buf;
+    int ge = scePvfGetCharGlyphImage(f, (ScePvfCharCode)cp, &ib);
+    if (ge < 0) {
+        if (!warned++) vita_mark("settings: system font glyph failed 0x%08x, pixel font used", (unsigned)ge);
+        memset(buf, 0, (size_t)stride * cap);
+        return ps_glyph_raster(face, px, cp, buf, stride, cap, g);
+    }
+    return 1;
+}
+#define bs_font_raster(face, px, cp, buf, stride, cap, g) bs_font_raster_v(face, px, cp, buf, stride, cap, (void *)(g))
+/* a new press on the front touch screen, in screen pixels */
+static int bs_tap(int *x, int *y)
+{
+    static int init, down;
+    if (!init) { init = 1; sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START); }
+    SceTouchData td; memset(&td, 0, sizeof td);
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) < 0) return 0;
+    int was = down; down = td.reportNum > 0;
+    if (!down || was) return 0;
+    *x = td.report[0].x * BS_W / 1920; *y = td.report[0].y * BS_H / 1088;
+    return 1;
+}
+#include "boot_settings.inc"
+
+/* Called first thing in main(). Opens the Settings screen when the LiveArea
+   button (psla:-settings) launched the app or L+R are held, then restarts
+   the app; returns at once otherwise. */
+void vita_settings_boot(void) {
+    if (bs_exists(RELAUNCH_MARK)) { sceIoRemove(RELAUNCH_MARK); return; }   /* our own restart */
+    int want = (bs_pad() & (128 | 256)) == (128 | 256);
+    apputil_init();
+    SceAppUtilAppEventParam ev; memset(&ev, 0, sizeof ev);
+    if (sceAppUtilReceiveAppEvent(&ev) >= 0 && ev.type == 0x05) {   /* LiveArea liveitem */
+        char arg[2048] = "";
+        sceAppUtilAppEventParseLiveArea(&ev, arg);
+        vita_mark("LiveArea launch: \"%s\"", arg);
+        if (strstr(arg, "-settings")) want = 1;
+    }
+    if (!want) return;
+    sceIoMkdir(VITA_DATA, 0777);
+    SDL_GL_CreateContext(&g_window);
+    boot_settings_run();
+    vita_relaunch();
 }

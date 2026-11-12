@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <SDL.h>
 
 typedef struct { uint32_t hash; CarFxMat m; } CarFxEntry;
 static CarFxEntry *g_mats;
@@ -130,18 +131,31 @@ static void sh_light(float sh[10][4], float r, float g, float b, float dx, float
    it), rebuilt when the light list changes; the per-car pick then reads one
    cell's few lights instead of all ~2000. */
 static struct {
-    const void *lights; int n, stride; unsigned gen; int ok;
+    const void *lights; int n, stride; uint64_t gen; int ok;
     float x0, y0, inv; int w, h;
     int *start, *list;
 } g_lg;
 static unsigned g_lights_gen;
-void carfx_lights_changed(void) { g_lights_gen++; }
-static int light_grid(const void *lights, int n, int stride) {
-    if (g_lg.lights == lights && g_lg.n == n && g_lg.stride == stride && g_lg.gen == g_lights_gen)
+static unsigned g_next_light_revision;
+static unsigned g_light_grid_builds;
+static Uint64 g_light_grid_ticks;
+void carfx_lights_changed(void) { __sync_add_and_fetch(&g_lights_gen, 1); }
+uint32_t carfx_new_light_revision(void) {
+    unsigned revision = __sync_add_and_fetch(&g_next_light_revision, 1);
+    return revision ? revision : __sync_add_and_fetch(&g_next_light_revision, 1);
+}
+void carfx_light_grid_stats(unsigned *builds, uint64_t *ticks) {
+    *builds = g_light_grid_builds;
+    *ticks = g_light_grid_ticks;
+    g_light_grid_builds = 0;
+    g_light_grid_ticks = 0;
+}
+static int light_grid_build(const void *lights, int n, int stride, uint64_t generation) {
+    if (g_lg.lights == lights && g_lg.n == n && g_lg.stride == stride && g_lg.gen == generation)
         return g_lg.ok;
     free(g_lg.start); free(g_lg.list);
     memset(&g_lg, 0, sizeof g_lg);
-    g_lg.lights = lights; g_lg.n = n; g_lg.stride = stride; g_lg.gen = g_lights_gen;
+    g_lg.lights = lights; g_lg.n = n; g_lg.stride = stride; g_lg.gen = generation;
     const unsigned char *base = (const unsigned char *)lights;
     float mn[2] = { 1e30f, 1e30f }, mx[2] = { -1e30f, -1e30f };
     int any = 0;
@@ -198,6 +212,20 @@ static int light_grid(const void *lights, int n, int stride) {
     return 1;
 }
 
+static int light_grid(const void *lights, int n, int stride, uint32_t revision) {
+    /* Explicit revisions occupy the upper half of the key. Legacy callers
+       retain their global invalidation without invalidating resident lists. */
+    uint64_t generation = revision ? (uint64_t)revision << 32
+                                   : __atomic_load_n(&g_lights_gen, __ATOMIC_RELAXED);
+    if (g_lg.lights == lights && g_lg.n == n && g_lg.stride == stride && g_lg.gen == generation)
+        return g_lg.ok;
+    Uint64 begin = SDL_GetPerformanceCounter();
+    int ok = light_grid_build(lights, n, stride, generation);
+    g_light_grid_ticks += SDL_GetPerformanceCounter() - begin;
+    g_light_grid_builds++;
+    return ok;
+}
+
 /* Shaper light rigs: {flag, heading, pitch, r, g, b, intensity} x 3.
    0x7f3e10 is the in-game rig (the default of the lookup 0x48a2d0); the
    front end's come from the 0x0003B700 chunk (0x48a280, 0x74-byte records:
@@ -237,8 +265,8 @@ uint32_t carfx_rig_hash(const char *name) {
     return cfx_hash(u);
 }
 
-int carfx_sh(float sh[10][4], const float pos[3], const float camfwd[3],
-             const void *lights, int nlights, int stride) {
+int carfx_sh_revision(float sh[10][4], const float pos[3], const float camfwd[3],
+                     const void *lights, int nlights, int stride, uint32_t revision) {
     memset(sh, 0, sizeof(float) * 40);
     /* the shaper rig (carfx_use_rig): 0x48ed60 turns each light's
        {heading, pitch} by 0x48a310 into r = (cos p cos(h+180),
@@ -266,7 +294,7 @@ int carfx_sh(float sh[10][4], const float pos[3], const float camfwd[3],
     /* only the lights whose reach covers pos's grid cell, in index order,
        so the pick (ties included) is the full scan's */
     const int *cand = NULL; int ncand = nlights;
-    if (lights && isfinite(pos[0]) && isfinite(pos[1]) && light_grid(lights, nlights, stride)) {
+    if (lights && isfinite(pos[0]) && isfinite(pos[1]) && light_grid(lights, nlights, stride, revision)) {
         int cx = (int)floorf((pos[0] - g_lg.x0) * g_lg.inv), cy = (int)floorf((pos[1] - g_lg.y0) * g_lg.inv);
         if (cx < 0 || cy < 0 || cx >= g_lg.w || cy >= g_lg.h) ncand = 0;   /* no light reaches */
         else {
@@ -297,4 +325,9 @@ int carfx_sh(float sh[10][4], const float pos[3], const float camfwd[3],
                  L->pos[0] - pos[0], L->pos[1] - pos[1], L->pos[2] - pos[2]);
     }
     return nb;
+}
+
+int carfx_sh(float sh[10][4], const float pos[3], const float camfwd[3],
+             const void *lights, int nlights, int stride) {
+    return carfx_sh_revision(sh, pos, camfwd, lights, nlights, stride, 0);
 }

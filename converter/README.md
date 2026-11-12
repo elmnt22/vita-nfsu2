@@ -1,11 +1,11 @@
-# OpenUG2 World Data Converter (Windows)
+# UG2Converter (developer notes) (Windows)
 
 Does the Vita's one-time "OPTIMIZING WORLD DATA" boot step on a PC: about
 2 minutes for all six tracks instead of 15-20+ on the console.
 
 It runs the game's own conversion (`src/world_tiles.c`, `src/resource.c`,
 built 32-bit like the Vita, same as the simulator) on the player's NFSU2
-folder and writes what the Vita would write to `ux0:data/OpenUG2/cache`:
+folder and writes what the Vita would write to `ux0:data/NFSU2/cache`:
 
 - `cache/tiles/<TRACK>_v5.pak` + `.idx` -- the prebuilt world tiles
 - `cache/<TRACK>.BUN.compact` -- the compact bundle copies
@@ -31,7 +31,7 @@ World detail is set to low, as the Vita's default.
 2. Convert.
 3. Send to Vita: the Vita's FTP server on port 1337 (VitaShell: SELECT, or
    vitacompanion). Or copy the `cache` folder from "Open output folder" into
-   `ux0:data/OpenUG2/` by hand.
+   `ux0:data/NFSU2/` by hand.
 
 Command line: `UG2Converter.exe --cli GAME OUT` (convert, log in
 `OUT/convert_log.txt`), `UG2Converter.exe --send IP OUT`.

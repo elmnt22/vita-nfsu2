@@ -97,12 +97,14 @@ static void spl_arclen(Spl *s, int steps)                               /* 0x577
     spl_rebuild(s);
     s->dirty = 0;
 }
+static int g_ls_lastit;
 static float spl_project(Spl *s, const float p[3], float t, float tol)  /* 0x5774c0 (type 2) */
 {
     if (s->dirty) { spl_rebuild(s); s->dirty = 0; }
     if (s->n == 0) return 0;
     float step = 1.0f, ps = 0, pe = 0;
     for (int it = 998; it; it--) {
+        g_ls_lastit = 999 - it;
         float a[4], d[4];
         spl_eval(s, t, 0, a);
         spl_eval(s, t, 1, d);
@@ -157,8 +159,13 @@ struct RacePath {
     int nroute;                                  /* +0x2c */
     struct { int first, count; float len, p0, p1, scale; } route[16];   /* +0x30 */
     RpSec *list[128]; unsigned char dir[128]; int nlist;               /* +0x1b4 +0x3b4 +0x1b0 */
+    /* port only: the zones grouped by type (stable: file order kept within
+       a type) with their boxes read once, for FindZone's walks */
+    struct RpZoneIx { const unsigned char *z; int type; float bb[4]; } *zix;
+    int nzix;
 };
 
+static void zone_index(RacePath *p);
 static int sec_allowed(const RpSec *s, int ev)                          /* 0x5d4f60 */
 {
     int a = s->raw[0xac], d = s->raw[0xad];
@@ -185,14 +192,20 @@ static int in_box(const float *mn, const float *mx, const float *q, float r)   /
 }
 /* 0x5d57a0: the nearest node, over every section (routes 0) or the race
    routes' sections that have a spline (routes 1), within r (-1: any) */
+/* OPENUG2_LOCSTAT test aid: locate calls, nearest-node scans (any range /
+   128 m), node-loop work, projection iterations; logged every 2000 locates */
+static long g_ls_loc, g_ls_nn_any, g_ls_nn_r, g_ls_nn_nodes, g_ls_proj_it, g_ls_noloc;
+static int g_ls_on = -1;
 static int nearest_node(const RacePath *p, const float *q, int routes, float r)
 {
+    if (g_ls_on > 0) { if (r == -1.0f) g_ls_nn_any++; else g_ls_nn_r++; }
     float best = r == -1.0f ? 1e8f : r;
     int found = -1;
     if (!routes) {
         for (int i = 0; i < p->nsec; i++) {
             const RpSec *s = &p->sec[i];
             if (!in_box(s->bbmin, s->bbmax, q, best)) continue;
+            if (g_ls_on > 0) g_ls_nn_nodes += s->end - s->first;
             for (int k = s->first; k < s->end; k++) {
                 float dx = p->node[k].x - q[0], dy = p->node[k].y - q[1], d = sqrtf(dx * dx + dy * dy);
                 if (found < 0 || d < best) { best = d; found = k; }
@@ -204,6 +217,7 @@ static int nearest_node(const RacePath *p, const float *q, int routes, float r)
         for (int j = 0; j < p->route[r_].count; j++) {
             const RpSec *s = p->list[p->route[r_].first + j];
             if (!s->sp || !in_box(s->bbmin, s->bbmax, q, best)) continue;
+            if (g_ls_on > 0) g_ls_nn_nodes += s->end - s->first;
             for (int k = s->first; k < s->end; k++) {
                 float dx = p->node[k].x - q[0], dy = p->node[k].y - q[1], d = sqrtf(dx * dx + dy * dy);
                 if (found < 0 || d < best) { best = d; found = k; }
@@ -317,6 +331,7 @@ static void locate(const RacePath *p, RpLoc *l, const float *q, int hint)   /* 0
     }
     float P3[3] = { q[0], q[1], 0 }, a[4], dv[4];
     float t = spl_project(s->sp, P3, t0, 0.05f);
+    if (g_ls_on > 0) g_ls_proj_it += g_ls_lastit;
     spl_eval(s->sp, t, 0, a);
     float sx = a[0], sy = a[1];
     spl_eval(s->sp, t, 1, dv);
@@ -336,7 +351,18 @@ static void locate(const RacePath *p, RpLoc *l, const float *q, int hint)   /* 0
 void racepath_locate(const RacePath *p, RpLoc *l, const float pos[3])   /* 0x5da330 */
 {
     if (!p || !p->sec) return;
-    if (l->thresh <= fabsf(pos[0] - l->pos[0]) + fabsf(pos[1] - l->pos[1])) locate(p, l, pos, -1);
+    if (g_ls_on < 0) g_ls_on = getenv("OPENUG2_LOCSTAT") != NULL;
+    if (l->thresh <= fabsf(pos[0] - l->pos[0]) + fabsf(pos[1] - l->pos[1])) {
+        locate(p, l, pos, -1);
+        if (g_ls_on > 0) {
+            if (l->node < 0) g_ls_noloc++;
+            if (++g_ls_loc >= 2000) {
+                printf("locstat over %ld locates: nearest any %ld, nearest 128 m %ld, nodes scanned %.1f/locate, proj iters %.2f/locate, unlocated %ld (sections %d nodes %d)%c",
+                       g_ls_loc, g_ls_nn_any, g_ls_nn_r, (double)g_ls_nn_nodes / g_ls_loc, (double)g_ls_proj_it / g_ls_loc, g_ls_noloc, p->nsec, p->nnode, 10);
+                g_ls_loc = g_ls_nn_any = g_ls_nn_r = g_ls_nn_nodes = g_ls_proj_it = g_ls_noloc = 0;
+            }
+        }
+    }
 }
 static float locate_at(const RacePath *p, const float *q)               /* 0x5ded90 */
 {
@@ -690,6 +716,7 @@ static RacePath *load(const char *path, int event, int reversed, int zones_only)
         o = next;
         while (o >= end && depth > 0) { o = end; end = stack[--depth]; }
     }
+    zone_index(p);
     if (zones_only) {                       /* free roam: no route (0x5d9a60 ClearConnectionTree) */
         if (!p->zones) { racepath_free(p); return NULL; }
         return p;
@@ -739,7 +766,7 @@ void racepath_free(RacePath *p)
 {
     if (!p) return;
     if (p->sec) for (int i = 0; i < p->nsec; i++) spl_free(p->sec[i].sp);
-    free(p->sec); free(p->node); free(p->file); free(p);
+    free(p->sec); free(p->node); free(p->zix); free(p->file); free(p);
 }
 float racepath_lap(const RacePath *p) { return p ? p->lap : 0; }
 int racepath_circuit(const RacePath *p) { return p ? p->circuit : 0; }
@@ -757,9 +784,77 @@ static int poly_in(const float q[2], const unsigned char *pts, int n)
     }
     return in;
 }
+static int zix_cmp(const void *a, const void *b)
+{
+    const struct RpZoneIx *x = (const struct RpZoneIx *)a, *y = (const struct RpZoneIx *)b;
+    if (x->type != y->type) return x->type < y->type ? -1 : 1;
+    return x->z < y->z ? -1 : x->z > y->z;                 /* file order within a type */
+}
+static void zone_index(RacePath *p)
+{
+    if (!p->zones) return;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_NOZIX")) return;   /* simulator A/B: the plain walks */
+#endif
+    int n = 0;
+    for (const unsigned char *z = racepath_zone_next(p, NULL); z; z = racepath_zone_next(p, z)) n++;
+    p->zix = n ? (struct RpZoneIx *)malloc(sizeof *p->zix * (size_t)n) : NULL;
+    if (!p->zix) return;
+    for (const unsigned char *z = racepath_zone_next(p, NULL); z && p->nzix < n; z = racepath_zone_next(p, z)) {
+        struct RpZoneIx *e = &p->zix[p->nzix++];
+        e->z = z; e->type = (int)rd32(z);
+        e->bb[0] = rdf(z + 0x20); e->bb[1] = rdf(z + 0x24); e->bb[2] = rdf(z + 0x28); e->bb[3] = rdf(z + 0x2c);
+    }
+    qsort(p->zix, (size_t)p->nzix, sizeof *p->zix, zix_cmp);
+}
+/* the first index entry of `type` (n = past the end when none) */
+static int zix_first(const RacePath *p, int type)
+{
+    int lo = 0, hi = p->nzix;
+    while (lo < hi) { int m = (lo + hi) / 2; if (p->zix[m].type < type) lo = m + 1; else hi = m; }
+    return lo;
+}
+const unsigned char *racepath_zone_at(const RacePath *p, const float pos[2], int type, const unsigned char *after)
+{
+    if (!p || !p->zones) return NULL;
+    if (!p->zix) {                                         /* no index (out of memory): the plain walk */
+        for (const unsigned char *z = after ? racepath_zone_next(p, after) : racepath_zone_next(p, NULL); z; z = racepath_zone_next(p, z))
+            if ((int)rd32(z) == type && racepath_zone_holds(z, pos)) return z;
+        return NULL;
+    }
+    int i = zix_first(p, type);
+    if (after) while (i < p->nzix && p->zix[i].type == type && p->zix[i].z <= after) i++;
+    for (; i < p->nzix && p->zix[i].type == type; i++) {
+        const struct RpZoneIx *e = &p->zix[i];
+        if (e->bb[0] <= pos[0] && pos[0] <= e->bb[2] && e->bb[1] <= pos[1] && pos[1] <= e->bb[3] &&
+            poly_in(pos, e->z + 0x44, (int16_t)(e->z[0x40] | e->z[0x41] << 8))) return e->z;
+    }
+    return NULL;
+}
 const unsigned char *racepath_zone(const RacePath *p, const float pos[2], int type)
 {
     if (!p || !p->zones) return NULL;
+    if (p->zix) {
+        const unsigned char *r = racepath_zone_at(p, pos, type, NULL);
+#ifdef OPENUG2_SIM_PRE_H
+        static int chk = -1;
+        if (chk < 0) chk = getenv("OPENUG2_ZONECHECK") != NULL;
+        if (chk) {   /* simulator test aid: the index against the plain walk */
+            static long calls, diffs;
+            const unsigned char *w = NULL;
+            for (long o = 0; o + 0x44 <= p->nzones && !w; ) {
+                const unsigned char *z = p->zones + o;
+                int sz = (int16_t)(z[0x42] | z[0x43] << 8);
+                if (sz <= 0) break;
+                if ((int)rd32(z) == type && racepath_zone_holds(z, pos)) w = z;
+                o += sz;
+            }
+            if (w != r) diffs++;
+            if (++calls % 20000 == 0) printf("zonecheck: %ld lookups, %ld differences%c", calls, diffs, 10);
+        }
+#endif
+        return r;
+    }
     for (long o = 0; o + 0x44 <= p->nzones; ) {
         const unsigned char *z = p->zones + o;
         int sz = (int16_t)(z[0x42] | z[0x43] << 8);

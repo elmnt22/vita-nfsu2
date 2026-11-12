@@ -629,6 +629,17 @@ int aienc_arrow(AiWorld *w, float target[3])
     for (int a = 0; a < 3; a++) target[a] = ld->v->pos[a];
     return 1;
 }
+/* RenderFlares 0x61ae90's Outrun light trail: in mode 7 (0x89e7b0) the car
+   whose racing car (car +0x1c) is the leader (Race +0xbd0[0]) and that is no
+   player's car (car +0x18 = 0) */
+AiRacer *aienc_trail_car(AiWorld *w)
+{
+    if (!w || w->mode != 7 || w->rem.nrc < 1) return NULL;
+    int lead = w->rem.srt[0];
+    if (w->rem.rc[lead].human) return NULL;
+    AiSeen *ld = rc_seen(w, lead);
+    return ld ? ld->racer : NULL;
+}
 /* the player finished in the Outrun (entry +0x10 = 6 / 7, still mode 7
    until EndGetAway 3 s on): its reason and +0x198 for the race over
    widget (0x5fff50 single player: shown while racing, stage 4) */

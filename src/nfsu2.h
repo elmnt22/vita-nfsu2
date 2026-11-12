@@ -122,6 +122,9 @@ typedef struct {
     unsigned char scen_has;
     uint16_t scen_region, scen_index;
     unsigned char reflect;   /* world: drawn with the road reflection (N2_SUB_REFLECT) */
+    unsigned char car_win;   /* car glass: its window's texture slot (n2_car_window), 1..6, 0 none */
+    unsigned char fade_in;   /* world tiles: a building whose tile entered the object radius this
+                                build -- drawn fading in instead of popping (main.c) */
 } N2Mesh;
 #define N2_SUB_REFLECT 0x00000040u   /* +56 bytes 40 00 00 00 (little endian) */
 
@@ -292,6 +295,59 @@ static unsigned char *n2_read_file(const char *path, long *out_len) {
     return buf;
 }
 #endif
+
+/* ---- language: eLanguages, LanguageInfoTable (GC 8035bc20, 11 rows {id,
+   name, "LANGUAGES\<NAME>.BIN", texture info}). Consoles take the system
+   language: LoadCurrentLanguage 801210a0 = SetCurrentLanguage(GC_GetOSLanguage());
+   PC reads the installer's "Language" value. The port takes the Vita's system
+   language (OPENUG2_LANG=<id or name> overrides, for the simulator). Fixed per
+   boot, so every file keeps its own cached copy of the answer. */
+#ifdef __vita__
+int vita_system_lang(void);              /* SCE_SYSTEM_PARAM_ID_LANG, -1 unknown */
+#endif
+static const char *const k_n2_lang_name[11] = { "ENGLISH", "FRENCH", "GERMAN", "ITALIAN", "SPANISH",
+    "DUTCH", "SWEDISH", "DANISH", "KOREAN", "CHINESE", "JAPANESE" };
+static const char *const k_n2_lang_file[11] = { "English", "French", "German", "Italian", "Spanish",
+    "Dutch", "Swedish", "Danish", "Korean", "Chinese", "Japanese" };
+static int n2_lang(void) {
+    static int lang = -1;
+    if (lang >= 0) return lang;
+    int l = 0;
+    const char *e = getenv("OPENUG2_LANG");
+    if (e && *e) {
+        if (*e >= '0' && *e <= '9') l = atoi(e);
+        else for (int i = 0; i < 11; i++) {
+            const char *a = e, *b = k_n2_lang_name[i];
+            while (*a && *b && (*a & ~0x20) == *b) { a++; b++; }
+            if (!*a && !*b) l = i;
+        }
+    }
+#ifdef __vita__
+    else {
+        /* SCE_SYSTEM_PARAM_LANG_*: 0 ja, 1 en-US, 2 fr, 3 es, 4 de, 5 it, 6 nl, 7 pt-PT,
+           8 ru, 9 ko, 10 zh-T, 11 zh-S, 12 fi, 13 sv, 14 da, 15 no, 16 pl, 17 pt-BR,
+           18 en-GB, 19 tr; the ones the game has no text for stay English */
+        static const signed char k_sce[20] = { 10, 0, 1, 4, 2, 3, 5, 0, 0, 8, 9, 9, 0, 6, 7, 0, 0, 0, 0, 0 };
+        int s = vita_system_lang();
+        if (s >= 0 && s < 20) l = k_sce[s];
+    }
+#endif
+    /* Korean / Chinese / Japanese (8-10): their FNTF fonts and strings are past
+       Latin-1, which the port's text path stops at (feng_load_font c < 256) --
+       English until that is done (GAPS "Language select") */
+    if (l < 0 || l > 7) l = 0;
+    lang = l;
+    return lang;
+}
+/* "<dataroot>/LANGUAGES/<Language>.bin" (GetLanguageInfo(..)->file) */
+static void n2_lang_path(char *out, size_t cap, const char *dataroot) {
+    snprintf(out, cap, "%s/LANGUAGES/%s.bin", dataroot, k_n2_lang_file[n2_lang()]);
+}
+/* bPrintfSetLocaleInfo(decimal, thousands, 3) as SetCurrentLanguage 80120fa0
+   sets it: French ',' and ' ', German..Danish ',' and '.', the rest '.' and ','.
+   bPrintf (PC 0x43e950) uses both only under the '$' flag; plain %f keeps '.'. */
+static char n2_lang_dec(void) { int l = n2_lang(); return l >= 1 && l <= 7 ? ',' : '.'; }
+static char n2_lang_thou(void) { int l = n2_lang(); return l == 1 ? ' ' : l >= 2 && l <= 7 ? '.' : ','; }
 
 static uint32_t n2_u32(const unsigned char *p) {
     return asset_chunk_u32(p);
@@ -2078,6 +2134,25 @@ static uint32_t n2_mesh_texkey(const unsigned char *d, long beg, long end,
     return 0;
 }
 
+/* The window a car glass slot names: CarRenderInfo's replacement table
+ * (GC UpdateCarReplacementTextures 802353fc, slots +0x6fc + 16k) swaps
+ * WINDOW_FRONT / _REAR / _LEFT_FRONT / _LEFT_REAR / _RIGHT_FRONT /
+ * _RIGHT_REAR (k = 0..5, breakables 8..13) and, for the rear window,
+ * REAR_DEFROSTER (+0x75c) for the cracked sheet by that window's level.
+ * 1 + k, 0 for any other slot. */
+static int n2_car_window(uint32_t slot) {
+    switch (slot) {
+    case 0x7b220ddfu: return 1;            /* WINDOW_FRONT */
+    case 0x1b0763a0u: return 2;            /* WINDOW_REAR */
+    case 0xd195be56u: return 2;            /* REAR_DEFROSTER */
+    case 0xe7e4ef49u: return 3;            /* WINDOW_LEFT_FRONT */
+    case 0x4cdebfcau: return 4;            /* WINDOW_LEFT_REAR */
+    case 0x60f8b13cu: return 5;            /* WINDOW_RIGHT_FRONT */
+    case 0x0ab88f5du: return 6;            /* WINDOW_RIGHT_REAR */
+    }
+    return 0;
+}
+
 /* Every key in a mesh's 0x134012 slot list, BY SLOT INDEX (8-byte entries:
  * key + 0), including keys this car's TPK can't resolve — the index is what
  * a 0x134B02 record's mat_id refers to, so gaps must keep their position. */
@@ -2359,6 +2434,21 @@ static int n2_car_tail_lens(const N2Scene *car, int index) {
     return 1;
 }
 
+/* The centre (third) brake light's lens. It is NOT in the tail-light part:
+ * 24 cars author it as a BRAKELIGHT-material slice of KIT00_TRUNK (350Z, 240SX,
+ * SUPRA, RX8...), KIT00_SPOILER (3000GT, CIVIC, GTO, IMPREZAWRX) or KIT00_BODY
+ * (G35, IS300), at the a2a2fc7c flare marker of KIT00_BRAKELIGHT. Drawn as
+ * paint it stayed dark and only the flare dot lit. Rear half only: one front
+ * bumper (IMPREZAWRX KIT18) also carries the material. */
+static int n2_car_body_lamp(const N2Scene *car, int index) {
+    const N2Mesh *m = car->meshes + index;
+    if (m->cat == N2_CAR_BRAKELIGHT || m->car_material != N2_MAT_BRAKELIGHT ||
+        !m->verts || m->nverts <= 0) return 0;
+    float x = 0.0f;
+    for (int v = 0; v < m->nverts; v++) x += m->verts[5 * v];
+    return x < 0.0f;
+}
+
 static int n2_car_dark_trim(uint32_t mat) {
     return mat==N2_MAT_DULLPLASTIC || mat==N2_MAT_MOLDINGS ||
            mat==N2_MAT_RUBBER || mat==N2_MAT_WINDOWMASK;
@@ -2607,6 +2697,8 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                 if (scene->count > before) {
                     scene->meshes[before].trim = trim;
                     scene->meshes[before].car_material = submat[k];
+                    scene->meshes[before].car_win = sub[k].mat < (uint32_t)nslot
+                        ? (unsigned char)n2_car_window(slots[sub[k].mat]) : 0;
                     scene->meshes[before].car_source = ds;
                     scene->meshes[before].car_part=(unsigned char)(part_slot+1);
                     scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
@@ -2646,6 +2738,8 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                 if (scene->count > before) {
                     scene->meshes[before].trim = trim;
                     scene->meshes[before].car_material = trust_cls && nsub && !matdiffer ? submat[0] : 0;
+                    for (int q = 0; q < nslot && !scene->meshes[before].car_win; q++)   /* the object's first window slot */
+                        scene->meshes[before].car_win = (unsigned char)n2_car_window(slots[q]);
                     scene->meshes[before].car_source = ds;
                     scene->meshes[before].car_part=(unsigned char)(part_slot+1);
                     scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
@@ -4197,9 +4291,9 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                     pal = fsrc; ix = fsrc + 1024;
                 }
 #endif
-                for (long p = 0; p < (long)w*hh; p++) {   /* P8: index -> RGBA palette */
+                for (long p = 0; p < (long)w*hh; p++) {   /* P8: index -> BGRA palette */
                     const unsigned char *c = pal + (long)ix[p]*4;
-                    tex->rgb[p*3]=c[0]; tex->rgb[p*3+1]=c[1]; tex->rgb[p*3+2]=c[2];
+                    tex->rgb[p*3]=c[2]; tex->rgb[p*3+1]=c[1]; tex->rgb[p*3+2]=c[0];   /* palette is B,G,R,A (D3D) */
                     if (alf) alf[p] = c[3];
                 }
                 free(fsrc);

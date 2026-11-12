@@ -4,7 +4,7 @@
 #include <string.h>
 
 #ifdef __vita__
-#define OPT_FILE "ux0:data/OpenUG2/options.bin"
+#define OPT_FILE "ux0:data/NFSU2/options.bin"
 #else
 #define OPT_FILE "cache/options.bin"
 #endif

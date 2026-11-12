@@ -8,7 +8,7 @@ void garage_tt_request(int what, int dir) { (void)what; (void)dir; }   /* main.c
 
 int main(int argc, char **argv)
 {
-    const char *root = argc > 1 ? argv[1] : "E:/NFS Underground 2 Vita/simroot/ux0/data/OpenUG2";
+    const char *root = argc > 1 ? argv[1] : "E:/NFS Underground 2 Vita/simroot/ux0/data/NFSU2";
     static const char *const def[] = { "MIATA", "CIVIC", "350Z", "SKYLINE", "HUMMER", "RX8", "GTO", "ESCALADE" };
     int n = argc > 2 ? argc - 2 : (int)(sizeof def / sizeof def[0]);
     for (int i = 0; i < n; i++) {

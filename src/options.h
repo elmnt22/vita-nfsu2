@@ -8,7 +8,7 @@
  * master x level x 32767 (FUN_00469050 only stores the block and asks the
  * two sound objects to re-read it).
  *
- * Saved to ux0:data/OpenUG2/options.bin (cache dir relative on PC).
+ * Saved to ux0:data/NFSU2/options.bin (cache dir relative on PC).
  */
 #ifndef OPENUG2_OPTIONS_H
 #define OPENUG2_OPTIONS_H

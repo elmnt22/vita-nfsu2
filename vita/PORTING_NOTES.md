@@ -7,11 +7,11 @@ Status and working knowledge for the Vita port. Last updated 2026-10-05.
 - Toolchain: native-Windows VitaSDK at `E:\vitasdk` (vitaGL with its GLSL
   translator, vitashark, mathneon). No SDL2, zlib or make needed.
 - Build from `OpenUG2/`: `VITASDK=E:/vitasdk ./vita/build_vita.sh`
-  → `vita/build/OpenUG2.vpk` (title ID `OPUG20001`).
+  → `vita/build/NFSU2Vita.vpk` (title ID `NFSU20001`).
 - Packaging: `ATTRIBUTE2=12` (extended memory, ~356 MB user RAM), plain
   `vita-make-fself -c`. Signing with `-a 0x2800000000000001` killed the app
   before `main()` on hardware.
-- Console setup: game data in `ux0:data/OpenUG2/` (TRACKS, CARS, GLOBAL,
+- Console setup: game data in `ux0:data/NFSU2/` (TRACKS, CARS, GLOBAL,
   SOUND, ...); decrypted `libshacccg.suprx` in `ur0:data/` (ShaRKF00D).
 - Bubble icon: `vita/sce_sys/icon0.png` (128×128, 8-bit palette).
 
@@ -37,16 +37,16 @@ Status and working knowledge for the Vita port. Last updated 2026-10-05.
 
 ## Diagnostics (device and Vita3K)
 
-- `ux0:data/OpenUG2/boot.txt`: timestamped milestones with heap use and,
+- `ux0:data/NFSU2/boot.txt`: timestamped milestones with heap use and,
   after GL init, vitaGL free VRAM / RAM pool (`vita_mark`).
-- `ux0:data/OpenUG2/log.txt`: all engine `printf`/`fprintf`/`puts`/`fwrite`
+- `ux0:data/NFSU2/log.txt`: all engine `printf`/`fprintf`/`puts`/`fwrite`
   output, written immediately (linker `--wrap`).
 - `oom.txt`: failed allocations with size and caller.
 - `shader_fail_N.txt`: compiler messages and full source of a failed shader.
 - Crash dumps: `python E:/armtest/vita-parse-core/main.py <psp2dmp>
   vita/build/OpenUG2.elf` with `E:/vitasdk/bin` on PATH; the ELF must be
   the one that was installed.
-- Vita3K (`D:\Users\Desktop\Vita3K`, `-r OPUG20001`) is good for load and
+- Vita3K (`D:\Users\Desktop\Vita3K`, `-r NFSU20001`) is good for load and
   heap checks; it compiles the big world shader very slowly and returns
   garbage from `vglMemFree`.
 
@@ -55,7 +55,7 @@ Status and working knowledge for the Vita port. Last updated 2026-10-05.
 Playable free roam with seamless streaming, ~15 fps on hardware.
 
 - Seamless streaming: compact pinned track bundle (57 MB in RAM, texture
-  pixels read from the card, cached under ux0:data/OpenUG2/cache/); 350 m
+  pixels read from the card, cached under ux0:data/NFSU2/cache/); 350 m
   residents rebuilt every 80 m with a 3 s lookahead; the worker thread does
   the build, validation, collision, mesh packing and texture decoding; the
   render thread only uploads (budgets rise near the resident edge).
@@ -190,7 +190,7 @@ instead of being cancelled immediately.
 The latest hardware capture remains around 14.8-15.4 FPS at the later checkpoints.
 This build tests the game's authored simpler models rather than decimating roads.
 On Vita, low world detail is the default. Put the word `full` in
-`ux0:data/OpenUG2/world_detail.txt` and restart to compare original detail with
+`ux0:data/NFSU2/world_detail.txt` and restart to compare original detail with
 exactly the same executable; delete the file or use `low` to restore low detail.
 Desktop builds retain the original default. Set detail before loading and never
 change it while a streaming worker runs.
@@ -259,7 +259,7 @@ and whitespace checks. Added synthetic fixture coverage for hash collisions,
 zero/missing/max keys, first duplicate ownership and authored LOD fallback.
 Desktop fixtures cannot execute here because a native desktop compiler and SDL
 are unavailable. New hardware performance remains untested. Install the usual
-`vita/build/OpenUG2.vpk`; low world detail remains the default. Compare the fast
+`vita/build/NFSU2Vita.vpk`; low world detail remains the default. Compare the fast
 route with the same overclock settings and capture all four diagnostic files.
 
 ## Reuse placed bounds and omit collision prelighting (2026-10-05)
@@ -288,7 +288,7 @@ net savings and preparation speed need measurement on the Vita. Added fixture
 checks for translated/rotated bounds, colour ownership and cached/uncached wall
 collection equivalence. Production and fixture syntax checks and Vita build are
 local validation; desktop runtime fixtures remain unavailable on this machine.
-Use the usual `vita/build/OpenUG2.vpk` and send the same fast-route captures.
+Use the usual `vita/build/NFSU2Vita.vpk` and send the same fast-route captures.
 
 ## Single-level native world DXT experiment (2026-10-05)
 
@@ -319,7 +319,7 @@ Switch timing estimates directly to Vita. Without distant mips the test can
 shimmer/alias more; inspect fences/trees/decals and transparency carefully.
 
 Default: native single-level DXT where supported. For comparison/recovery put
-`decoded` in `ux0:data/OpenUG2/texture_mode.txt` and restart. Delete that file to
+`decoded` in `ux0:data/NFSU2/texture_mode.txt` and restart. Delete that file to
 restore native mode. This setting affects world DXT; car upload uses the safe
 single-level function independently. Low scenery and 400 m coverage remain.
 Startup logs `world textures: DXT single level` or `decoded RGB`. Worker logs
@@ -330,7 +330,7 @@ Local validation: Vita cross-build, production syntax and whitespace checks.
 A GL-free startup test checks rectangular mip offsets/lengths, short payloads,
 DXT1/3/5 formats, tiny/NPOT/oversized dimensions and previously halved RGB.
 These assertions will execute on next Vita boot; native upload stability and
-performance remain untested. The usual `vita/build/OpenUG2.vpk` is the experiment.
+performance remain untested. The usual `vita/build/NFSU2Vita.vpk` is the experiment.
 
 ## Fixed GPU tiles and shared resident buffers (2026-10-05)
 
@@ -381,7 +381,7 @@ GL-free DXT policy tests still run; native mode marker must also be present.
 
 Local validation: production cross-compiler syntax checks, Vita package build,
 and diff whitespace check. Device-only GL selftest and performance are not yet
-executed. Install the newly built usual `vita/build/OpenUG2.vpk`, keep overclock
+executed. Install the newly built usual `vita/build/NFSU2Vita.vpk`, keep overclock
 settings/route consistent, and capture all four diagnostic files.
 
 ### Startup crash correction (2026-10-05)
@@ -766,7 +766,7 @@ blocked in sceGxmDisplayQueueAddEntry.
   sdl_vita.c picks one before every draw from the cached uniform values and
   re-sends only uniforms that changed. Car ~6 ms, HUD ~1 ms; looks identical.
 - Linked programs are cached with glGetProgramBinary under
-  ux0:data/OpenUG2/cache/prog_<hash>.bin: shader setup at boot 8.4 s -> 75 ms.
+  ux0:data/NFSU2/cache/prog_<hash>.bin: shader setup at boot 8.4 s -> 75 ms.
 - vita_parallel_for(): two workers pinned to cores 1 and 2 (priority above
   the streaming worker), main thread pinned to core 0. Traffic cars step in
   parallel (each car only touches itself and read-only world data); AI step
@@ -825,7 +825,7 @@ source/vgl.c:
   sceGxmTransferCopy can still be in flight, then frees the old buffer under
   it. render.c declares it weak, so the stock library still links and falls
   back to one level. World DXT textures use it with LINEAR_MIPMAP_NEAREST,
-  chain stopped at 4x4; ux0:data/OpenUG2/nomips.txt turns it off.
+  chain stopped at 4x4; ux0:data/NFSU2/nomips.txt turns it off.
 
 `VGL=stock ./vita/build_vita.sh` links the installed library instead.
 boot.txt's "boot logging" line names which one is in the build.
@@ -840,8 +840,8 @@ FRONTEND/FrontB.lzc, drawn with their own textures and the front-end font
 from SPEED2.EXE; text from LANGUAGES/English.bin; part names, levels and
 model links from the GLOBALB car part database (0x80034602, layout per
 SpeedReflect's Nikki); prices from the GLOBALB career unlock table (0x34A1C).
-First use writes ux0:data/OpenUG2/cache/shop_v2.bin. Fitted parts and rims
-are saved per car in ux0:data/OpenUG2/garage.txt and restored on load.
+First use writes ux0:data/NFSU2/cache/shop_v2.bin. Fitted parts and rims
+are saved per car in ux0:data/NFSU2/garage.txt and restored on load.
 Working: Body Shop bumpers, skirts, spoilers, hoods, roof scoops, lights,
 exhaust tips, rims. Locked (shown as the game shows locked items): mirrors,
 carbon fibre, wide body, Performance, Graphics and Car Specialties.

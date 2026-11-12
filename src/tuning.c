@@ -1148,6 +1148,7 @@ int tun_dyno_frame(float dt, float rpm, int gear, float speed, float vtop, TunDy
             printf("tuning: dyno state %d target %d at %.2f s: rpm %.0f gear %d %.1f mph mean %.0f\n",
                    g_tt.dm_state, g_tt.dm_target, g_tt.dm_t, rpm, gear, mph, g_tt.dm_mean);
         ls = g_tt.dm_state; lt = g_tt.dm_target; }
+    if (o->on) o->on = g_tt.dm_state;   /* the state for n2sim_set_dyno (ResolveForces' state-2 test) */
     g_dm_prog = dm_progress(gear);
     return f;
 }

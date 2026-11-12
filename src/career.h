@@ -221,6 +221,7 @@ void career_speech_sponsor_done(void);                        /* HandleSponsorSe
 void career_speech_uniques(int visual);                       /* UniquesBrowser: ev 8 / 9 (0x5255d0 / 0x525610) */
 void career_speech_showcase_unlock(const unsigned char *sc);  /* HandleShowcaseUnlock 0x5253f0 */
 void career_speech_dvd_stars(int stars);                      /* HandleDVDStars: +0x19 */
+void career_speech_showcase_mode(void);                        /* HandleShowcaseMode 0x525850: once, +0xa6 */
 
 /* ---- the world layer (C3; CAREER.md "C3: the world layer") --------------
    The free roam's trigger zones are Paths chunk 0x3414a records (racepath_zone);

@@ -48,7 +48,7 @@ static VuVar vu_var[VU_VARIANTS];
 static int vu_nvar, vu_bound, vu_forced = -1;
 static int vu_reflect;   /* vita_set_reflect */
 static int vu_sky;       /* vita_set_sky */
-static int vu_nofast = -1;   /* ux0:data/OpenUG2/nofast.txt: no keys 23/24, for A/B */
+static int vu_nofast = -1;   /* ux0:data/NFSU2/nofast.txt: no keys 23/24, for A/B */
 static signed char vu_key_var[VU_KEYS];   /* key -> variant (0 = main program) */
 enum { VS_UVCHECK, VS_VISTA, VS_EMTEX, VS_UNLIT, VS_SPEC, VS_CLEARCOAT, VS_ENV, VS_FRESNEL,
        VS_ALPHATEST, VS_CARFX, VS_VCOLOR, VS_USETEX, VS_N };
@@ -58,7 +58,7 @@ static const char *const vu_sel_name[VS_N] = { "uUVCheck", "uVista", "uEmissiveT
 static int vu_sel[VS_N];
 static int vu_dofw = -1;                   /* uDofW's name index (depth of field) */
 static void vu_dof_sync(void);
-static unsigned vu_switches;               /* variant binds since the last report */
+static unsigned vu_switches;               /* cumulative variant binds */
 #define VU_HASH 128
 static struct { GLint loc; int idx; } vu_hash[VU_HASH];
 
@@ -165,7 +165,7 @@ void vu_select(void) {
     if (vu_forced >= 0) {
         int v = vu_forced;
         if (vu_nofast < 0) {
-            SceUID fd = sceIoOpen("ux0:data/OpenUG2/nofast.txt", SCE_O_RDONLY, 0);
+            SceUID fd = sceIoOpen("ux0:data/NFSU2/nofast.txt", SCE_O_RDONLY, 0);
             vu_nofast = fd >= 0;
             if (fd >= 0) sceIoClose(fd);
             printf("world shaders: %s%c", vu_nofast ? "sky/world fast paths off (nofast.txt)"
@@ -210,7 +210,13 @@ void vita_use_lite(int on) {
     if (on) vu_bind(1);
 }
 
-unsigned vita_variant_switches(void) { unsigned n = vu_switches; vu_switches = 0; return n; }
+unsigned vita_variant_switch_total(void) { return vu_switches; }
+unsigned vita_variant_switches(void) {
+    static unsigned previous;
+    unsigned n = vu_switches - previous;
+    previous = vu_switches;
+    return n;
+}
 
 /* Only element 0 of an array upload is recorded, under the base location:
    that is what glGetUniformfv returns for it in GL. Storing element e at

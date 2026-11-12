@@ -2,8 +2,8 @@
  * world code needs to run the one-time Vita conversion on a PC (the parts of
  * sim/sim_vita.c the converter uses, without the window, GL or pad).
  *
- * Folders: ux0:data/OpenUG2/cache/... goes to <output>/cache/..., the rest
- * of ux0:data/OpenUG2/... reads from the game folder (TRACKS, GLOBAL, ...),
+ * Folders: ux0:data/NFSU2/cache/... goes to <output>/cache/..., the rest
+ * of ux0:data/NFSU2/... reads from the game folder (TRACKS, GLOBAL, ...),
  * anything else on ux0: lands under <output>. The game sources are built
  * 32-bit (ILP32 like the Vita) with __vita__ on, so every file written here
  * is the one the console writes.
@@ -30,7 +30,7 @@ void conv_set_folders(const char *game, const char *out) {
     snprintf(g_game, sizeof g_game, "%s", game);
     snprintf(g_out, sizeof g_out, "%s", out);
 }
-#define DATA_PREFIX "ux0:data/OpenUG2/"
+#define DATA_PREFIX "ux0:data/NFSU2/"
 const char *sim_path(const char *p, char *buf, size_t cap) {
     if (strncmp(p, "ux0:", 4)) return p;
     if (!strncmp(p, DATA_PREFIX, sizeof DATA_PREFIX - 1)) {

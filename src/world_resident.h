@@ -128,6 +128,8 @@ int world_resident_finish_step(WorldResident *candidate, float x, float y, float
  * are borrowed. Take joins only after completion, then transfers the CPU owner
  * (including partial failed output). Cancel joins and disposes on the caller. */
 typedef struct WResidentJob WResidentJob;
+/* a streaming build is on the worker (reading tiles and textures) */
+int world_resident_loader_busy(void);
 int world_resident_job_start(WResidentJob **job, const WResidentBuildArgs *args,
                              float center_x, float center_y);
 /* 0 = not ready/no job (outputs untouched), 1 = prepared, -1 = load failed. */

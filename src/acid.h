@@ -84,6 +84,9 @@ typedef struct AcidEmitter {             /* 0xd0 bytes in the original */
 void acid_set_cameras(const float (*pos)[3], int n);
 /* g_ParticleSystemEnable (0x870cec); on by default */
 void acid_set_enabled(int on);
+/* port: hold the world emitters (no spawning, cycles frozen) while the
+   front end's showroom stands in room space at the car's world spot */
+void acid_world_pause(int on);
 /* 0x491e50: emit from e for dt seconds (dt < 0: driven, at least one particle) */
 void acid_emit(AcidEmitter *e, float dt, const AcidOwner *owner);
 /* 0x492e10: run the world emitters' on/off cycle and move every particle */
@@ -123,8 +126,9 @@ enum {
 };
 #define ACID_SLOTS 30
 
-/* A model marker (0x13401a: bStringHash name, 4x4, row 3 = position). */
-typedef struct { uint32_t hash; float pos[3]; } AcidMarker;
+/* A model marker (0x13401a: bStringHash name, 4x4, row 3 = position; row 2
+   = the light flare direction, CreateCarLightFlares 0x6204d0). */
+typedef struct { uint32_t hash; float pos[3]; float dir[3]; } AcidMarker;
 
 typedef struct AcidCar {
     AcidOwner own;                       /* car +0x70 velocity (drift) */
@@ -147,6 +151,13 @@ typedef struct AcidCar {
     unsigned dmg_flags;
     signed char dmg_item[15];
     float dmg_min[2], dmg_max[2];
+    /* visible damage (CarDamage +8, SetVisibleDamageEnabled 0x63a4b0, off
+       from the ctor): only while it is on does ApplyDamage 0x633ef0 run --
+       the applied levels (+0xe4), the break effects, the window textures
+       (UpdateCarReplacementTextures 0x615280 reads +0xe0 at that call) */
+    int   dmg_vis;
+    unsigned dmg_applied, dmg_shown;
+    float dmg_fxq[CARFX_COUNT];          /* Car::TriggerEffect 0x61fb00 from ApplyDamage, fired next frame */
 } AcidCar;
 
 /* 0x638190: wheels = the record's four wheel points (P+0x10+0x30i, car
@@ -190,7 +201,7 @@ typedef struct {
     float slipv[4][2];        /* car +0x3b4 */
     float wheel_mat[4][16];   /* car +0x130 wheel world matrices (spray) */
     int   centre_surface;     /* 0x5e72e0 at the car (drive-over), -1 unknown */
-    int   nitrous;            /* 0x59fa30: nitrous burning */
+    int   nitrous;            /* 0x59fa30: nitrous burning (2: and the race stage is 0..3, 0x5f6088) */
     float throttle;           /* |car +0x30 +0x20c| */
     float bottom;             /* car +0x370..+0x37c summed: bump-stop impulses this frame */
     int   gear;               /* car +0x434 (1 = neutral) */
@@ -210,6 +221,15 @@ void  acid_damage_setup(AcidCar *c, const float bbmin[2], const float bbmax[2],
 void  acid_damage_hit(AcidCar *c, const float local[3], float jmag);
 float acid_damage(const AcidCar *c);                 /* 0x610ad0: 0..1 */
 void  acid_damage_repair(AcidCar *c);                /* RepairAllDamage */
+/* SetVisibleDamageEnabled 0x63a4b0 (on: RethinkDamage), SetDamageToFull
+   0x637d30 (every sector +1.0 at hit 10000), SetDamageToZero 0x637d70
+   (repair, RethinkDamage) */
+void  acid_damage_visible(AcidCar *c, int on);
+void  acid_damage_full(AcidCar *c);
+void  acid_damage_zero(AcidCar *c);
+/* the shown level 0..3 of window w (0 front, 1 rear, 2 left front, 3 left
+   rear, 4 right front, 5 right rear: breakables 8..13) */
+int   acid_damage_window(const AcidCar *c, int w);
 extern int acid_damage_enabled;                      /* 0x89e7d2 */
 /* the collision code's hook: an impulse J (world) at r (world offset from
    the body's centre) on the car simulated by `sim`; main.c routes it */

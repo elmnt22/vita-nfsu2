@@ -16,6 +16,8 @@
 #include "speech.h"
 #include "career.h"     /* CSPK_* */
 #include "audio.h"
+#include "music.h"    /* music_set_io_hook: the clip reads run on its thread */
+#include <SDL.h>      /* SDL_Delay: lock()'s back-off */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +41,13 @@ static int16_t  s16be(const uint8_t *p) { return (int16_t)(p[0] << 8 | p[1]); }
 #define A4(n) (((n) + 3) & ~3u)
 
 static volatile int g_lock;            /* guards the clip FIFO + decoder (main <-> audio) */
-static void lock(void)   { while (__sync_lock_test_and_set(&g_lock, 1)) { } }
+/* The music thread (clip reads) shares cores 1-2 with the higher-priority
+   audio thread: a holder it preempts on the same core could leave it
+   spinning, so a long wait sleeps a moment to let the holder run. */
+static void lock(void) {
+    for (int n = 0; __sync_lock_test_and_set(&g_lock, 1); )
+        if (++n >= 2000) { n = 0; SDL_Delay(1); }
+}
 static void unlock(void) { __sync_lock_release(&g_lock); }
 
 /* ------------------------------------------------------------------ data */
@@ -86,6 +94,7 @@ static SBank g_bank[MAX_BANKS];
 static int g_nbank;
 static SBank *g_sorted[MAX_BANKS];
 static FILE *g_f;
+static char g_viv_path[600];   /* sdat.viv, for the clip reader's own handle */
 static int g_ok;
 
 static int name_eq(const char *a, const char *b) {
@@ -754,22 +763,29 @@ int speech_utk_read(SpeechUTK *u, int16_t *out, int n) {
 
 /* ------------------------------------------------------------------ clip FIFO (the stream) */
 #define NFIFO 4
-typedef struct { uint8_t *data; uint32_t size; volatile int finished; int bank, sub, sample; } Clip;
+/* pending: queued, its bytes (off, size) not read yet -- the music thread's
+   io hook reads them (speech_io_service), so a 300 KB clip read is not a
+   frame hitch (944 ms on HW 10-31); the audio thread waits on it */
+typedef struct { uint8_t *data; uint32_t size; volatile int finished; int bank, sub, sample, xa;
+                 volatile int pending; uint32_t off; } Clip;
 static Clip g_fifo[NFIFO];
 static volatile int g_head, g_tail;              /* head: main pushes; tail: audio plays (under g_lock) */
 static SpeechUTK g_dec;
 static int g_dec_started;
 static volatile int g_paused;
-/* SpeechModule queued object (m+0x44): QueStream .. PlayStream */
-static struct { int on, played; uint32_t t; } g_queued;
+/* SpeechModule queued object (m+0x44): QueStream .. PlayStream; ch = the
+   SPCH channel its events went to (0 UG2_Speech, 1 nisaudio) */
+static struct { int on, played, ch; uint32_t t; } g_queued;
+/* a nisaudio clip on the stream (EA-XA, below the NIS section) */
+static int xa_stream_read(const Clip *c, int start, int16_t *out, int n, int *done);
 
 static void fifo_reap(void) {           /* ClearCompletedRequests: free played clips (main) */
     uint8_t *d[NFIFO]; int n = 0, any = 0;
     for (int i = 0; i < NFIFO; i++) any |= g_fifo[i].finished;
     if (!any) return;
     lock();
-    for (int i = 0; i < NFIFO; i++)
-        if (g_fifo[i].finished) { d[n++] = g_fifo[i].data; g_fifo[i].data = NULL; g_fifo[i].finished = 0; }
+    for (int i = 0; i < NFIFO; i++)   /* a purged clip still being read: its reader drops the bytes */
+        if (g_fifo[i].finished && !g_fifo[i].pending) { d[n++] = g_fifo[i].data; g_fifo[i].data = NULL; g_fifo[i].finished = 0; }
     unlock();
     while (n > 0) free(d[--n]);
 }
@@ -798,6 +814,18 @@ int speech_pull(void *uu, int16_t *mono, int n) {
     lock();
     while (got < n && g_tail != g_head) {
         Clip *c = &g_fifo[g_tail];
+        if (c->pending) break;            /* still being read: silence until it is in */
+        if (!c->data) {                   /* the read failed: the next request */
+            c->finished = 1; g_tail = (g_tail + 1) % NFIFO; g_dec_started = 0;
+            continue;
+        }
+        if (c->xa) {
+            int done = 0;
+            got += xa_stream_read(c, !g_dec_started, mono + got, n - got, &done);
+            g_dec_started = 1;
+            if (done) { c->finished = 1; g_tail = (g_tail + 1) % NFIFO; g_dec_started = 0; }
+            continue;
+        }
         if (!g_dec_started) { speech_utk_start(&g_dec, c->data, c->size); g_dec_started = 1; }
         int r = speech_utk_read(&g_dec, mono + got, n - got);
         got += r;
@@ -846,6 +874,7 @@ int speech_init(const char *dataroot) {
     snprintf(path, sizeof path, "%s/SDATA/sdat.viv", dataroot);
     g_f = fopen(path, "rb");
     if (!g_f) { printf("speech: no %s\n", path); return 0; }
+    snprintf(g_viv_path, sizeof g_viv_path, "%s", path);
     uint8_t h[16];
     if (fread(h, 1, 16, g_f) != 16 || memcmp(h, "BIG", 3)) { fclose(g_f); g_f = NULL; return 0; }
     uint32_t n = be32(h + 8), hl = be32(h + 12);
@@ -889,9 +918,34 @@ static void parser_play(const char *fn, const uint32_t *args, int nargs) {
     if (!ev) return;
     add_event(ev, g_db[DB_SPEECH].datid, args, nargs);
     if (!g_queued.on) {                 /* SpeechModule::QueStream(3, SpeechStreamQueued) */
-        g_queued.on = 1; g_queued.played = 0; g_queued.t = NOW_MS();
+        g_queued.on = 1; g_queued.played = 0; g_queued.t = NOW_MS(); g_queued.ch = g_db[DB_SPEECH].datid;
     }
 }
+
+/* CARSFX_Rain::QueueWeatherStream 0x4852a0 -> NIS_AudioParser::QueStream
+   0x484510 (THUNDERSTRM branch 0x4846df): only while the speech module is
+   done, the Csis call SoundFX_Select(4, variant) (0x45a770, interface
+   0x7ed034) into the nisaudio channel, then SpeechModule::QueStream. */
+int speech_stream_queued(void) { return g_ok && g_queued.on; }
+/* NIS_AudioParser::QueStream 0x484510's stream branches: SoundFX_Select(a, b)
+   into the nisaudio channel, then SpeechModule::QueStream */
+static int fx_stream(uint32_t a, uint32_t b) {
+    if (!g_ok || !g_db[DB_NIS].ok || !speech_done() || g_queued.on) return 0;
+    SDb *db = &g_db[DB_NIS];
+    const SEvent *ev = NULL;
+    for (int i = 0; i < db->nev; i++) if (!strcmp(db->ev[i].name, "SoundFX_Select")) { ev = &db->ev[i]; break; }
+    if (!ev) return 0;
+    uint32_t p[2] = { a, b };
+    add_event(ev, db->datid, p, 2);
+    g_queued.on = 1; g_queued.played = 0; g_queued.t = NOW_MS(); g_queued.ch = db->datid;
+    return 1;
+}
+int speech_weather_stream(int variant) { return fx_stream(4, (uint32_t)variant); }
+/* EAXCollision::QueueCollisionStream 0x486130 (the crash, 0x5a0107):
+   QueStream(5, "CollisionStream") -> the 0x78c17c branch 0x484699:
+   SoundFX_Select(2, 8). GUESS: gated like the thunder (speech done, nothing
+   queued); retail stops a queued stream of type 1 / 4 / 8 for it (0x48457e) */
+int speech_collision_stream(void) { return fx_stream(2, 8); }
 
 void speech_cmd(int kind, uint32_t a, uint32_t b) {
     if (!g_ok) return;
@@ -917,6 +971,38 @@ void speech_cmd(int kind, uint32_t a, uint32_t b) {
     }
 }
 
+/* Perf (port): the pending clips' bytes, read on the music decoder thread
+   (music_set_io_hook) with its own handle on sdat.viv; the main thread only
+   queues them. A clip purged while it was read is dropped here. */
+static FILE *g_iof;   /* the reader thread's handle */
+static int g_io_queued;   /* a clip read was handed to the music thread */
+static void speech_io_service(void) {
+    for (;;) {
+        int slot = -1; uint32_t off = 0, size = 0;
+        lock();
+        for (int i = g_tail; i != g_head; i = (i + 1) % NFIFO)
+            if (g_fifo[i].pending) { slot = i; off = g_fifo[i].off; size = g_fifo[i].size; break; }
+        if (slot < 0)   /* purged (tail moved past it) but still marked pending */
+            for (int i = 0; i < NFIFO; i++)
+                if (g_fifo[i].pending && g_fifo[i].finished) { g_fifo[i].pending = 0; }
+        unlock();
+        if (slot < 0) return;
+        if (!g_iof && g_viv_path[0]) g_iof = fopen(g_viv_path, "rb");
+        uint8_t *d = g_iof ? (uint8_t *)malloc(size ? size : 1) : NULL;
+        if (d && (fseek(g_iof, (long)off, SEEK_SET) || fread(d, 1, size, g_iof) != size)) { free(d); d = NULL; }
+        lock();
+        Clip *c = &g_fifo[slot];
+        if (c->finished) { c->pending = 0; unlock(); free(d); continue; }   /* purged meanwhile */
+        c->data = d;          /* NULL: the read failed, speech_pull skips it */
+        __sync_synchronize();
+        c->pending = 0;
+        unlock();
+#ifdef OPENUG2_SIM_PRE_H
+        printf("speech: clip read on the music thread (%u bytes%s)\n", (unsigned)size, d ? "" : ", FAILED");
+#endif
+    }
+}
+
 /* the clip bytes for one sample request (SampleRequestCallback 80089b40) */
 static void sample_request(SBank *b, int s) {
     uint32_t off, size;
@@ -924,12 +1010,31 @@ static void sample_request(SBank *b, int s) {
     g_last_bank = b->id; g_last_sub_id = b->sub == 0xffff ? -1 : b->sub; g_last_sample = s;
     if (!size || size > (4u << 20) || !g_f) return;
     fifo_reap();
-    if (g_fifo[g_head].data || (g_head + 1) % NFIFO == g_tail) return;   /* stream full: dropped */
+    if (g_fifo[g_head].data || g_fifo[g_head].pending || g_fifo[g_head].finished ||
+        (g_head + 1) % NFIFO == g_tail) return;   /* stream full: dropped */
+    int async = 1;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_SPEECHDUMP")) async = 0;   /* the test aid decodes the bytes below */
+#endif
+    if (async && music_set_io_hook(speech_io_service)) {   /* perf: read on the music thread */
+        lock();
+        Clip *c = &g_fifo[g_head];
+        c->data = NULL; c->size = size; c->off = off; c->finished = 0;
+        c->bank = b->id; c->sub = b->sub; c->sample = s; c->xa = b->db == DB_NIS;
+        c->pending = 1;
+        g_head = (g_head + 1) % NFIFO;
+        unlock();
+        g_io_queued = 1;
+        printf("speech: clip bank %d sub %d sample %d (%u bytes, read queued)\n",
+               b->id, b->sub == 0xffff ? -1 : (int)b->sub, s, (unsigned)size);
+        return;
+    }
     uint8_t *d = read_at(off, size);
     if (!d) return;
     lock();
     g_fifo[g_head].data = d; g_fifo[g_head].size = size; g_fifo[g_head].finished = 0;
     g_fifo[g_head].bank = b->id; g_fifo[g_head].sub = b->sub; g_fifo[g_head].sample = s;
+    g_fifo[g_head].xa = b->db == DB_NIS;
     g_head = (g_head + 1) % NFIFO;
     unlock();
     printf("speech: clip bank %d sub %d sample %d (%u bytes)\n", b->id, b->sub == 0xffff ? -1 : (int)b->sub, s, (unsigned)size);
@@ -954,6 +1059,8 @@ static void sample_request(SBank *b, int s) {
 void speech_update(void) {              /* GameSpeech::Update 8008a6f0 */
     if (!g_ok) return;
     fifo_reap();
+    if (g_io_queued && !music_set_io_hook(speech_io_service))
+        speech_io_service();   /* the music thread is gone: read the queued clips here */
     /* SpeechModule::Update: a queued stream not started within 1.0 s is dropped */
     if (g_queued.on && NOW_MS() - g_queued.t > 1000) module_purge();
     /* speech volume 0 purges (GetMasterVolume(1) == 0) */
@@ -961,7 +1068,7 @@ void speech_update(void) {              /* GameSpeech::Update 8008a6f0 */
     if (g_paused) return;
     if (g_queued.on && !g_queued.played) {
         g_last_bank = g_last_sub_id = g_last_sample = -1;
-        int n = spch_play(g_db[DB_SPEECH].datid);
+        int n = spch_play(g_queued.ch);
         for (int i = 0; i < n; i++) sample_request(g_req[i].b, g_req[i].s);
         g_queued.played = 1;
     }
@@ -989,9 +1096,9 @@ static struct {
     int hist[2][2];
 } g_nis;
 
-static void nis_chan(const uint8_t *d, uint32_t dn, uint32_t pos, int n, int c, int16_t *out, int stride) {
+static void nis_chan(const uint8_t *d, uint32_t dn, uint32_t pos, int n, int c, int16_t *out, int stride, int (*hist)[2]) {
     static const int C1[4] = { 0, 240, 460, 392 }, C2[4] = { 0, 0, -208, -220 };
-    int c1 = g_nis.hist[c][0], c2 = g_nis.hist[c][1], got = 0;
+    int c1 = hist[c][0], c2 = hist[c][1], got = 0;
     while (got < n && pos < dn) {
         uint8_t hdr = d[pos];
         if (hdr == 0xEE) {
@@ -1015,7 +1122,7 @@ static void nis_chan(const uint8_t *d, uint32_t dn, uint32_t pos, int n, int c, 
         }
     }
     while (got < n) out[(got++) * stride] = 0;
-    g_nis.hist[c][0] = c1; g_nis.hist[c][1] = c2;
+    hist[c][0] = c1; hist[c][1] = c2;
 }
 
 int speech_nis_open(int bank, int sample, int *rate) {
@@ -1067,7 +1174,7 @@ int speech_nis_pull(int16_t *out, int nframes) {
                 }
                 for (int k = 0; k < ch; k++) {
                     uint32_t o = le32(body + 4 + 4 * k) + 4 * (uint32_t)(ch + 1);
-                    nis_chan(body, bn, o, ns, k, g_nis.pcm + k, ch);
+                    nis_chan(body, bn, o, ns, k, g_nis.pcm + k, ch, g_nis.hist);
                 }
                 g_nis.pcm_n = ns; g_nis.pcm_pos = 0; fed = 1;
                 break;
@@ -1084,4 +1191,69 @@ int speech_nis_pull(int16_t *out, int nframes) {
 void speech_nis_close(void) {
     free(g_nis.data); free(g_nis.pcm);
     memset(&g_nis, 0, sizeof g_nis);
+}
+
+/* A nisaudio clip on the speech stream: SoundFX_Select's thunder (bank 16398,
+   mono EA-XA R3 at 32 kHz) goes through the same SpeechModule stream as the
+   speech, so it is decoded here from the FIFO clip (channel 0) and resampled
+   linearly to the stream's 22050 Hz (audio_set_speech in speech_init).
+   Audio thread, under g_lock. */
+static struct {
+    uint32_t pos; int ch, rate;
+    int16_t *pcm; int pcm_n, pcm_pos, pcm_cap;
+    int hist[2][2];
+    double t; int16_t s0, s1;
+} g_xs;
+static int xs_next(const Clip *c, int16_t *s) {
+    while (g_xs.pcm_pos >= g_xs.pcm_n) {
+        if (g_xs.pos + 8 > c->size) return 0;
+        const uint8_t *k = c->data + g_xs.pos;
+        uint32_t sz = le32(k + 4);
+        if (sz < 8 || g_xs.pos + sz > c->size || !memcmp(k, "SCEl", 4)) { g_xs.pos = c->size; return 0; }
+        g_xs.pos += sz;
+        if (memcmp(k, "SCDl", 4) || sz < 8 + 4 + 4 * (uint32_t)g_xs.ch) continue;
+        const uint8_t *body = k + 8; uint32_t bn = sz - 8;
+        int ns = (int)le32(body);
+        if (ns <= 0 || ns > 1 << 20) continue;
+        if (ns > g_xs.pcm_cap) {
+            int16_t *np = realloc(g_xs.pcm, sizeof(int16_t) * (size_t)ns);
+            if (!np) { g_xs.pos = c->size; return 0; }
+            g_xs.pcm = np; g_xs.pcm_cap = ns;
+        }
+        nis_chan(body, bn, le32(body + 4) + 4 * (uint32_t)(g_xs.ch + 1), ns, 0, g_xs.pcm, 1, g_xs.hist);
+        g_xs.pcm_n = ns; g_xs.pcm_pos = 0;
+    }
+    *s = g_xs.pcm[g_xs.pcm_pos++];
+    return 1;
+}
+static int xa_stream_read(const Clip *c, int start, int16_t *out, int n, int *done) {
+    if (start) {
+        g_xs.pos = 0; g_xs.ch = 1; g_xs.rate = 32000;
+        g_xs.pcm_n = g_xs.pcm_pos = 0; memset(g_xs.hist, 0, sizeof g_xs.hist);
+        g_xs.t = 2.0; g_xs.s0 = g_xs.s1 = 0;
+        if (c->size >= 12 && !memcmp(c->data, "SCHl", 4)) {   /* 0x82 channels, 0x84 rate */
+            uint32_t sz = le32(c->data + 4), p = 12;
+            while (p + 2 <= sz && p + 2 <= c->size && c->data[p] != 0xff) {
+                uint8_t tg = c->data[p];
+                if (tg == 0xfc || tg == 0xfd || tg == 0xfe) { p++; continue; }
+                uint32_t ln = c->data[p + 1], v = 0;
+                for (uint32_t q = 0; q < ln && p + 2 + q < c->size; q++) v = v << 8 | c->data[p + 2 + q];
+                if (tg == 0x82) g_xs.ch = v == 2 ? 2 : 1;
+                if (tg == 0x84 && v > 0) g_xs.rate = (int)v;
+                p += 2 + ln;
+            }
+        }
+    }
+    double step = g_xs.rate / 22050.0;
+    int got = 0;
+    while (got < n) {
+        while (g_xs.t >= 1.0) {
+            g_xs.s0 = g_xs.s1;
+            if (!xs_next(c, &g_xs.s1)) { *done = 1; return got; }
+            g_xs.t -= 1.0;
+        }
+        out[got++] = (int16_t)(g_xs.s0 + (g_xs.s1 - g_xs.s0) * g_xs.t);
+        g_xs.t += step;
+    }
+    return got;
 }

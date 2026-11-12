@@ -128,6 +128,21 @@ void     airacer_placed(AiRacer *r);
    heading along the section, forward speed <= 8 m/s; 0 without a route
    point. The controller restarts; the caller places the car. */
 int      airacer_reset_pose(AiRacer *r, float pos[3], float *heading, float *speed);
+/* the controller's current route point (car +0x2c -> +0xc), as Player::
+   HandleReset 0x6009a0 reads it before choosing the route reset; 0 without */
+int      airacer_route_point(const AiRacer *r, float pos[3]);
+/* the player's route reset (HandleReset 0x6009a0 -> 0x5fbed0): race_dir =
+   the locator's direction (car +0x900) with a race route loaded, else NULL */
+/* wc / box (the car's box centre) / org (car +0x60, the record origin): the wall / intersection re-pick and the 150 m test from box
+   (0x600b58..0x600d17); wc NULL skips the re-pick (IsTooFarFromDragTrack). 0 = no route reset
+   (no point, or 150 m or more away): the caller uses the saved pose. *repicked = 1 when moved. */
+struct WColl;
+int      airacer_player_reset_pose(AiRacer *r, const float *race_dir, struct WColl *wc, const float box[3], const float org[3],
+                                   float pos[3], float *heading, float *speed, int *repicked);
+/* a drag race's reset: the lateral offset (+ right of the point's forward way) of the
+   traffic lane nearest the car at the controller's route point (HandleReset 0x600d0b);
+   out = the point moved by it (GetForwardPosition(0, offset), 0x5fbf0a) */
+float    airacer_drag_reset_offset(const AiRacer *r, const float carpos[2], float out[3]);
 /* the current action's type (0 Pass, 1 AvoidAvoidable, 4 Block, 6
    JustDrive, 9 GetUnstuck, 11 IJustGotHit, 13 AccidentRecovery) */
 int      airacer_action(const AiRacer *r);
@@ -140,6 +155,15 @@ int      airacer_horn(const AiRacer *r);   /* always 0: see 0x5f6190 in airacer.
 void     airacer_contact(AiRacer *r, int other, int other_is_car, float other_absv, const float pt[3], float j, int wall);
 /* the car touched a human player's car: full simulation for 5 s */
 void     airacer_touched_human(AiRacer *r);
+/* mover 4 (the far route mover, n2sim N2_MOVER_FAR): the frame found the
+   path drops away -- no far mover for `sec` (0x591540); the think asked for
+   a new path (0x5918a0, taken); the plan for it (respaced in place,
+   0x405120) with the driver's +0x230 / +0x234 and the car's acceleration
+   at its speed (0x4038d0 less its grade term; draft = car +0x4dc).
+   Returns the point count (up to 20). */
+void     airacer_far_hold(AiRacer *r, float sec);
+int      airacer_far_repath(AiRacer *r);
+int      airacer_far_plan(AiRacer *r, float draft, float (*p)[3], float *len, float *vtarget, float *x234, float *acc);
 /* the mover the car should run on now (N2_MOVER_PHYSICS / _MELLO) */
 int      airacer_mover(const AiRacer *r);
 /* the race manager finished the car (0x606cb0 -> 0x42b330): its goal
@@ -240,6 +264,8 @@ int      aienc_over(const AiWorld *w, int *reason, int *ftime);
 /* the getaway arrow (0x5f3ae0): 1 with the leader's position when the
    player is more than 60 m behind it in an Outrun */
 int      aienc_arrow(AiWorld *w, float target[3]);
+/* the Outrun's AI leader, whose light trail RenderFlares 0x61ae90 draws; NULL none */
+AiRacer *aienc_trail_car(AiWorld *w);
 
 /* ---- the race's reference times (0x5f6e70 / 0x5edd90) ------------------
    The race route located for the table: reset (0x5da2f0), locate a point
@@ -284,6 +310,20 @@ int    aigps_path(const AiGps *g, float *xyz, int max); /* debug: the solved rou
 /* optional: half the car-space box's width (0x5ec250; default 1 m), the
    off-path tolerance of UpdateGPSFuturePoints */
 void   aigps_set_halfwidth(AiGps *g, float half_wid);
+
+/* ---- the controller's FuturePoints for the camera -------------------------
+   The list a controller returns from vt+0x24 (ctrl +0x370), as
+   Player::IsJumpCamAvailable 0x5f1ee0, ChangeCameraMover 0x5f1fd0 case 0xf
+   and LineSegmentIsInBounds 0x41ce90 read it (jumpcam.c). */
+int   airacer_fp_count(const AiRacer *r);
+float airacer_fp_dist(const AiRacer *r, int i);                 /* point +0x54 */
+/* FuturePoints::GetClosestPoint(car, 1, lane vt+0x1c, 0, 0): -1 none */
+int   airacer_fp_closest(const AiRacer *r, const float pos[3]);
+/* FuturePoint::GetPosition(out, point +0x54, lateral, lane) for point i with
+   lateral: what 0 the route centre line (0x412470, the controller's lane),
+   1 the right road edge - inset (vt+0x10), 2 the left edge + inset (vt+0xc),
+   3 lane 0's limit +0x18, 4 lane 0's limit +0x2c (lane 0). 0 = no point. */
+int   airacer_fp_pos(const AiRacer *r, int i, int what, float inset, float out[3]);
 
 #ifdef __cplusplus
 }

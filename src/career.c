@@ -719,6 +719,13 @@ int career_zone_enterable(const CareerZone *z)                           /* 8012
 int career_zone_data(uint32_t zone, CareerZone *out)                     /* 801240bc */
 {
     memset(out, 0, sizeof *out);
+    if (g_career.wcs.wc) {
+        /* RecalcUnlockedZones publishes only the active challenge's goal. */
+        const CareerZone *goal = career_unlocked_zone(0);
+        if (!goal || goal->zone != zone) return 0;
+        *out = *goal;
+        return 1;
+    }
     for (int i = 0; i < career_nevents(); i++)                           /* GetFirstUnlockedEvent 80124040 */
         if (rd32(career_event(i) + 0x28) == zone && career_event_in_pile(career_event(i))) { out->event = career_event(i); break; }
     if (!out->event && !(out->shop = shop_by_zone(zone)) && !(out->showcase = showcase_by_zone(zone)) &&
@@ -797,12 +804,13 @@ int career_player_zones(const uint32_t *zones, int n)                    /* 8021
     CareerZone z = { 0 };
     uint32_t at = 0;
     for (int i = 0; i < n && !at; i++) if (career_zone_data(zones[i], &z)) at = zones[i];
-    if (at == g_cw.in_zone) return 0;
+    if (at == g_cw.in_zone && (!at || (!g_cw.cur.zone && !career_zone_enterable(&z)) ||
+        (z.event == g_cw.cur.event &&
+        z.shop == g_cw.cur.shop && z.showcase == g_cw.cur.showcase && z.wc == g_cw.cur.wc))) return 0;
     int r = 0;
     if (g_cw.in_zone) {                                                  /* ExitEventTriggerZone 80218ab4 */
-        CareerZone old;
-        if (career_zone_data(g_cw.in_zone, &old)) {
-            g_cw.left = old;                                             /* FEngHud::ExitTriggerZone's zone */
+        if (g_cw.cur.zone) {
+            g_cw.left = g_cw.cur;                                             /* FEngHud::ExitTriggerZone's zone */
             memset(&g_cw.cur, 0, sizeof g_cw.cur);                       /* NotifyExitTriggerZone 80123f74 */
             r |= CZONE_EXIT;                                             /* showcase / challenge exits: C9 / C5 */
         }
@@ -1315,6 +1323,11 @@ void career_speech_sponsor(void)
     else cs_say(CSPK_CAREER, 0x10, 0x20);
 }
 void career_speech_sponsor_done(void) { g_career.speech[0xb] = 0; }
+/* UniquesBrowser::NotificationMessage (GC 8016cc14) on 0xd05fc3a3: +0x5c == 0
+   (a visual part: InstallPart + BuyCarPart) -> HandleUniqueVisualChosen
+   8018a4ac = event 8; else InstallJunkmanPart -> HandleUniquePerformanceChosen
+   8018a4fc = event 9 (PC 0x5255d0 / 0x525610, called at 0x561866 / 0x561830).
+   CONFIRMED G5 11-01 (was a guess from the PC order) */
 void career_speech_uniques(int visual) { cs_add(CS_TICKS(1.0f), visual ? 8 : 9, 0); }
 /* HandleShowcaseUnlock 0x5253f0: a magazine (type 1/3) not in the list
    (+0x2c, count +0xa4) goes in it, event 14; a DVD (2/4) not in it, with
@@ -1338,6 +1351,15 @@ void career_speech_showcase_unlock(const unsigned char *sc)
     }
 }
 void career_speech_dvd_stars(int stars) { g_career.speech[0x19] = (unsigned char)stars; }
+/* HandleShowcaseMode 0x525850 / GC 8018a85c, from the photo screen's 0x35f8620b
+   (ShowcaseMagazineDialog::NotificationMessage 0x4cf170): Career(0x10000, 0x20)
+   once; the flag is the saved byte +0xa6 (GC +0xec), cleared by Default 0x531800 */
+void career_speech_showcase_mode(void)
+{
+    if (g_career.speech[0xa6]) return;
+    cs_say(CSPK_CAREER, 0x10000, 0x20);
+    g_career.speech[0xa6] = 1;
+}
 static void cs_event_begin(const unsigned char *ev)                      /* HandleCareerEventBegin 0x524240 */
 {
     if (rd32(ev + 8) != CAREER_DDAY_A) return;
@@ -2100,8 +2122,10 @@ int career_sms_help_zone(uint32_t zone)
     }
     return 0;
 }
-/* CanHelpTriggerZoneBeActivated: RecalcHelpTriggers' list (its reader is
-   not known; the minimap's, a guess) */
+/* CanHelpTriggerZoneBeActivated 8012ca54: RecalcHelpTriggers 80128f3c fills UnlockedZoneManager
+   +0x600 (<= 128 type-0x12 zones passing this test), rebuilt only from NotifyInSMSAutoTriggerZone
+   and RecalcUnlockedZones; its one reader is UpdateTriggerEffects 8022d584 (map mode 1 -> +0x600,
+   mode 2 -> banks +0x800; main.c trig_update), so this live test is equivalent */
 int career_help_zone_active(uint32_t zone)
 {
     for (int i = 0; i < career_nsms_data(); i++) {
@@ -2291,7 +2315,10 @@ static void choose_for_slot(CareerCar *c, uint32_t stock)
     if (!c || t < 0) return;
     c->stock = stock; c->type = t; c->cfg[0] = 0;
     inv_default(c);                                                     /* the parts inventory defaults */
-    memset(c->tune, 100, sizeof c->tune);   /* DefaultCustomTuningSpecs 80135004 (GUESS: a new car's tunings are stock) */
+    /* FillFromStockCar 80135388 calls DefaultCustomTuningSpecs 80135004: the
+       5 slots at +0x348 (0x29 bytes each) -> CustomPhysicsTunings::Reset(-1)
+       801ca218 = bMemSet 100 over 0x17 + 9 + 9 bytes (CONFIRMED G5 11-01) */
+    memset(c->tune, 100, sizeof c->tune);
     c->has = 1;
 }
 void career_choose_car(int slot, uint32_t stock)                        /* CommitChooseCar 801272b8 */

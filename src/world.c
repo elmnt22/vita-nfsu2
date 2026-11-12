@@ -74,7 +74,10 @@ void world_city_free(WorldCity *city) {
     memset(city, 0, sizeof *city);
 }
 
+void (*world_region_hook)(const unsigned char *data, long len, int r, int nreg);
+
 static void world_append_lights(World *w, const N2LightSrc *src, int count) {
+    w->neighborhood.lights_revision = carfx_new_light_revision();
     for (int i = 0; i < count; i++) {
         int duplicate = 0;
         for (int j = 0; j < w->neighborhood.nlights; j++)
@@ -89,7 +92,6 @@ static void world_append_lights(World *w, const N2LightSrc *src, int count) {
         }
         w->neighborhood.lights[w->neighborhood.nlights++] = src[i];
     }
-    carfx_lights_changed();
 }
 
 /* ---- load-time duplicate stripper (Phase 48) ----
@@ -311,6 +313,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         g->mesh0 = g->mesh1 = w->neighborhood.scene.count;
         if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); continue; }
         VMARK("  region %s in memory (%ld MB)", regs[r], g->len >> 20);
+        if (world_region_hook) world_region_hook(g->data, g->len, r, nreg);
 #ifdef __vita__
         /* The pinned bundle never changes, so its light list (a whole-bundle
            scan plus an O(n^2) de-duplication) is built once and copied. */
@@ -324,7 +327,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
                 memcpy(w->neighborhood.lights, lights_cache, (size_t)nlights_cache * sizeof *lights_cache);
                 w->neighborhood.nlights = w->neighborhood.lightcap = nlights_cache;
             }
-            carfx_lights_changed();
+            w->neighborhood.lights_revision = carfx_new_light_revision();
         } else
 #endif
         {
@@ -786,7 +789,7 @@ static void texclass_load(const char *region) {
         if ((*b >= 'A' && *b <= 'Z') || (*b >= 'a' && *b <= 'z') || (*b >= '0' && *b <= '9')) tag[n++] = *b;
     tag[n] = 0;
     char path[128];
-    snprintf(path, sizeof path, "ux0:data/OpenUG2/cache/texclass_%s.bin", tag);
+    snprintf(path, sizeof path, "ux0:data/NFSU2/cache/texclass_%s.bin", tag);
     if (g_texclass_loaded && !strcmp(path, g_texclass_path)) return;
     if (g_texclass_loaded) {   /* a track switch: the old bundle's list out, the new one's in */
         texclass_save();
@@ -2861,6 +2864,7 @@ static struct {
     float cur[8], last[2];
     int have_cur;
 } g_fog;
+static struct { float I, v[8], mix[8]; int n; } g_fog_rain;   /* the rain's share (rain.c) */
 
 static uint32_t fog_hash(const char *s) {
     uint32_t h = 0xFFFFFFFFu;
@@ -2935,7 +2939,9 @@ int world_fog_load(const char *troot, const char *track) {
 static const float *fog_entry(float x, float y) {
     float x0 = g_fog.box[0], y0 = g_fog.box[1], x1 = g_fog.box[2], y1 = g_fog.box[3];
     int idx = 0;
-    if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
+    /* no box test: 0x5f0930 / 0x5f0a30's "outside -> 0" exit never holds
+       (x < xmin && x > xmax ...), an outside point walks to the edge leaf (R1) */
+    {
         int n = 0;
         for (int guard = 0; guard < 64 && g_fog.tree[n * 4] != 0; guard++) {
             float mx = (x0 + x1) * 0.5f, my = (y0 + y1) * 0.5f;
@@ -2964,11 +2970,27 @@ int world_fog_eval(float x, float y, float *start, float *floor_f, float rgb[3])
     for (int i = 0; i < g_fog.values; i++)
         g_fog.cur[i] = g_fog.have_cur ? g_fog.cur[i] + (e[i] - g_fog.cur[i]) * t : e[i];
     g_fog.have_cur = 1; g_fog.last[0] = x; g_fog.last[1] = y;
-    *start = g_fog.cur[1] < 249.0f ? g_fog.cur[1] : 249.0f;
-    float fl = 1.0f - g_fog.cur[0];
+    /* FogQuery::CalculateFogInfo 0x614300: while it rains every value is
+       I x "Night Raining Fog" + (1 - I) x the normal one */
+    const float *m = g_fog.cur;
+    if (g_fog_rain.I > 0.0f) {
+        for (int i = 0; i < g_fog.values; i++)
+            g_fog_rain.mix[i] = i < g_fog_rain.n ? g_fog_rain.I * g_fog_rain.v[i] + (1.0f - g_fog_rain.I) * g_fog.cur[i]
+                                                 : g_fog.cur[i];
+        m = g_fog_rain.mix;
+    } else memcpy(g_fog_rain.mix, g_fog.cur, sizeof g_fog_rain.mix);
+    *start = m[1] < 249.0f ? m[1] : 249.0f;
+    float fl = 1.0f - m[0];
     *floor_f = fl < 0.6f ? fl : 0.6f;
-    rgb[0] = g_fog.cur[4] * (0.75f / 255.0f);
-    rgb[1] = g_fog.cur[3] * (0.75f / 255.0f);
-    rgb[2] = g_fog.cur[2] * (0.75f / 255.0f);
+    rgb[0] = m[4] * (0.75f / 255.0f);
+    rgb[1] = m[3] * (0.75f / 255.0f);
+    rgb[2] = m[2] * (0.75f / 255.0f);
     return 1;
 }
+void world_fog_set_rain(float I, const float *vals, int n)
+{
+    g_fog_rain.I = vals && n > 0 ? I : 0.0f;
+    g_fog_rain.n = n > 8 ? 8 : n;
+    for (int i = 0; i < g_fog_rain.n; i++) g_fog_rain.v[i] = vals[i];
+}
+const float *world_fog_values(void) { return g_fog.ok ? g_fog_rain.mix : NULL; }

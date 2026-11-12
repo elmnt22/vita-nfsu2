@@ -16,6 +16,11 @@ typedef struct {
 typedef struct { float pos[3], r_in, r_out; uint32_t rgba; } CarFxLight;
 /* the world's light list was rebuilt or grew in place (carfx_sh's light grid) */
 void carfx_lights_changed(void);
+/* Give each completed light-list update its own identity, including when
+   an allocator reuses the address of an earlier list. Safe on loader threads. */
+uint32_t carfx_new_light_revision(void);
+/* Renderer-only counters since the previous call. Elapsed time uses SDL ticks. */
+void carfx_light_grid_stats(unsigned *builds, uint64_t *ticks);
 
 /* GLOBALB.BUN light materials (0x00135200 records). Returns how many loaded. */
 int carfx_load_materials(const unsigned char *d, long len);
@@ -37,6 +42,9 @@ const CarFxMat *carfx_default(void);
  * start of each element). Returns the number of track lights used. */
 int carfx_sh(float sh[10][4], const float pos[3], const float camfwd[3],
              const void *lights, int nlights, int stride);
+/* A nonzero revision belongs to this list. Zero uses legacy invalidation. */
+int carfx_sh_revision(float sh[10][4], const float pos[3], const float camfwd[3],
+                     const void *lights, int nlights, int stride, uint32_t revision);
 
 /* Shaper light rigs (SetShaperLights): load the 0x0003B700 chunk payload,
  * then pick one by name hash (bStringHash of the uppercase name, see

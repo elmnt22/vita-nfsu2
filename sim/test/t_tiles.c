@@ -9,6 +9,12 @@
 #include "../../src/world_tiles.c"
 #undef main
 
+/* The tile harness links shop.o without the game's main.o. */
+void garage_tt_request(int what, int dir) {
+    (void)what;
+    (void)dir;
+}
+
 typedef struct { char name[32]; int nv, ni, role, vcol; uint64_t h; } Sig;
 
 static uint64_t fnv(const void *p, size_t n, uint64_t h) {
@@ -36,7 +42,8 @@ static int sig_cmp(const void *a, const void *b) {
 }
 
 /* the expected scene + what all its tiles cost decoded in full */
-static int expect(const char *track, float fx, float fy, float radius, Sig **out, size_t *full_bytes) {
+static int expect(const char *track, float fx, float fy, float radius, float object_radius,
+                  Sig **out, size_t *full_bytes) {
     int n = 0, cap = 4096;
     Sig *s = (Sig *)malloc((size_t)cap * sizeof *s);
     float reach = radius + 60.0f;
@@ -47,7 +54,7 @@ static int expect(const char *track, float fx, float fy, float radius, Sig **out
         WtLoaded t;
         if (!wt_read_decode_t(track, e->x, e->y, &t, 1, 0)) { printf("expect: tile %d %d unreadable\n", e->x, e->y); exit(2); }
         *full_bytes += t.bytes;
-        int tile_objects = wt_objects_at(e, fx, fy, radius);
+        int tile_objects = wt_objects_at(e, fx, fy, object_radius);
         float tcx = ((float)e->x + 0.5f) * WTILE_SIZE - fx, tcy = ((float)e->y + 0.5f) * WTILE_SIZE - fy;
         int near = tcx * tcx + tcy * tcy < WT_LOD_NEAR_M * WT_LOD_NEAR_M;
         for (int i = 0; i < t.n; i++) {
@@ -72,7 +79,7 @@ static int expect(const char *track, float fx, float fy, float radius, Sig **out
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
-    const char *track = "STREAML4RA", *troot = "ux0:data/OpenUG2/TRACKS";
+    const char *track = "STREAML4RA", *troot = "ux0:data/NFSU2/TRACKS";
     float radius = 400.0f;
     /* out through downtown and back, 80 m steps (a build every ~80 m) */
     static const float way[][2] = { { 800, -400 }, { -800, 200 }, { 400, -300 }, { 400, 900 } };
@@ -87,7 +94,12 @@ int main(int argc, char **argv) {
             float fx = px + dx * (float)i / (float)ns, fy = py + dy * (float)i / (float)ns;
             float ax = px + dx * (float)(i + 1) / (float)ns, ay = py + dy * (float)(i + 1) / (float)ns;
             N2Scene sc = { 0 }, vi = { 0 };
-            int got = world_tiles_assemble(&sc, &vi, troot, track, fx, fy, radius, 0, NULL);
+            /* Exercise the reduced-scenery build with an overlapping resident,
+               then restore full detail on the following step. */
+            float object_radius = steps == 5 ? 240.0f : radius;
+            int got = object_radius < radius
+                ? wt_assemble_once(&sc, &vi, troot, track, fx, fy, radius, object_radius, 0, NULL)
+                : world_tiles_assemble(&sc, &vi, troot, track, fx, fy, radius, 0, NULL);
             if (got <= 0) { printf("step %d: assemble failed\n", steps); return 1; }
             /* the scene's sky is the global tile's: compare world meshes only */
             Sig *have = (Sig *)malloc((size_t)sc.count * sizeof *have);
@@ -98,7 +110,7 @@ int main(int argc, char **argv) {
             }
             qsort(have, (size_t)nh, sizeof *have, sig_cmp);
             Sig *want; size_t full;
-            int nw = expect(track, fx, fy, radius, &want, &full);
+            int nw = expect(track, fx, fy, radius, object_radius, &want, &full);
             int same = nh == nw;
             for (int m = 0; same && m < nh; m++) same = !sig_cmp(&have[m], &want[m]);
             size_t kept = 0;

@@ -78,6 +78,15 @@ int  smk_slosh_claim(int serial);
 void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float view_dist,
               const float (*planes)[4]);
 
+/* Replay (step 8b, replay.c): the spawner count, the virgin bit per spawner
+   ((nsp+7)/8 bytes), the live props (spawner index + Smokeable::Move model
+   matrix); while set, smk_draw draws the given state instead of the live one. */
+int  smk_rp_nsp(void);
+void smk_rp_virgins(unsigned char *bits);
+int  smk_rp_live(int max, uint16_t *sp, float (*Mn)[16]);
+void smk_rp_set(const unsigned char *bits, int n, const uint16_t *sp, const float (*Mn)[16]);
+void smk_rp_off(void);
+
 /* Per-run counters for the log line. */
 void smk_report(void);
 

@@ -81,6 +81,7 @@ typedef struct {
     uint32_t adskeys[32]; int nadskeys; /* shipped regional pack: one texture */
     N2Tex grass; int have_grass;
     N2LightSrc *lights; int nlights, lightcap;
+    uint32_t lights_revision;       /* identity of this list's completed contents */
     float (*mbb)[4];
     WGroundGrid grid;
     WInstStats inst_stats;
@@ -206,6 +207,9 @@ int world_barrier_push(const World *w, float *pos, float r);
  * into w->scene. Builds per-mesh bounds and the ground grid. Returns the
  * mesh count (0 = nothing readable). */
 int world_load(World *w, const char *troot, const char *trackname);
+/* Called with each region bundle's bytes while a world loads (region index r,
+ * of nreg); main.c takes the world light flares from it. NULL = none. */
+extern void (*world_region_hook)(const unsigned char *data, long len, int r, int nreg);
 int world_load_ex(World *w, const char *troot, const char *trackname,
                   const WLoadOptions *options);
 
@@ -391,5 +395,10 @@ int world_scripted_defs(const World *w, const char *troot,
 /* Regional fog from the track bundle's "Normal Fog" table (see world.c). */
 int world_fog_load(const char *troot, const char *track);
 int world_fog_eval(float x, float y, float *start, float *floor_f, float rgb[3]);
+/* the rain's fog (rain_fog_values) and intensity, mixed into the next
+   world_fog_eval (CalculateFogInfo 0x614300); I 0 = none */
+void world_fog_set_rain(float I, const float *vals, int n);
+/* the last evaluated (rain-mixed) raw fog values, NULL without a table */
+const float *world_fog_values(void);
 
 #endif

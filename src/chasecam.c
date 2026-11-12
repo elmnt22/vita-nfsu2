@@ -177,7 +177,9 @@ static void shk_tick(float dt)                        /* 0x5728c0 (the 0x8650c4 
    250) / 350, size 0.08 + 0.08 f (0x79dcdc / 0x79dce0), started only when
    above the running shake's graph value; duration 0.3 + 0.4 f (0x79dce4 /
    0x79dce8), rate 17 (0x79dc68); in jump cam zone 7: size x0.8, duration
-   x1.2 (not reached: no jump cams). */
+   x1.2 (chasecam_set_world). */
+static int g_cc_zone; static float g_cc_tscale = 1.0f;
+void chasecam_set_world(int zone, float time_scale) { g_cc_zone = zone; g_cc_tscale = time_scale; }
 static void shk_maybe(int k, const float acc[3])
 {
     float a[3] = { 0.7f * acc[0], 0.5f * acc[1], 2.0f * acc[2] };
@@ -186,9 +188,11 @@ static void shk_maybe(int k, const float acc[3])
     if (m > 600.0f) m = 600.0f;
     float f = (m - 250.0f) / (600.0f - 250.0f);
     float size = 0.08f + (0.16f - 0.08f) * f;
+    if (g_cc_zone == 7) size *= 0.8f;
     Shaker *s = &g_shk[k];
     if (!(size > (s->on ? shk_graph(s->t) : 0.0f))) return;
     float dur = 0.3f + (0.7f - 0.3f) * f;
+    if (g_cc_zone == 7) dur *= 1.2f;
     float n = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);   /* 0x43cf90 */
     for (int i = 0; i < 3; i++) s->v[i] = -(a[i] / n * size);
     s->on = 1; s->t = 0.0f; s->dur = dur; s->rate = 17.0f;
@@ -201,6 +205,7 @@ static void shk_maybe(int k, const float acc[3])
 static void shk_apply(int k, float V[4][4])
 {
     float w[3], s[3];
+    if (g_cc_tscale < 1.0f) return;
     shk_value(&g_shk[k], w);
     if (w[0] == 0.0f && w[1] == 0.0f && w[2] == 0.0f) return;
     for (int j = 0; j < 3; j++) s[j] = w[0] * V[0][j] + w[1] * V[1][j] + w[2] * V[2][j];
@@ -445,6 +450,14 @@ static int seg_blocked(WColl *w, WCollCtx *ctx, const float p[3], const float q[
         if (inside && t < 1.0f) return 1;                 /* nearer than the segment's end */
     }
     return 0;
+}
+
+int chasecam_seg_blocked(WColl *w, const float p[3], const float q[3])
+{
+    static WCollCtx ctx; static int init;
+    if (!w) return 0;
+    if (!init) { wcoll_ctx_init(&ctx); init = 1; }
+    return seg_blocked(w, &ctx, p, q);
 }
 
 /* the shared camera's state after a frame (camera +0x40 eye, +0x60 target =
@@ -864,6 +877,17 @@ void chasecam_rvm(const CcCar *car, CcOut *out)
     out->znear = 0.75f;
     out->hide_car = 1;   /* ctor 0x44ba10: camera +0x280 = the car, +0x284 = 0 */
 }
+/* eViewPlatInfo::CalculateViewMatricies 0x5c7ec0 (GC CreateViewMatricies 801d8c68), player views
+   1/2: the half-angles are scaled linearly -- x = 1.1 x fov/2, y = (H/W) x (1.1/0.8696) x fov/2 --
+   with H/W of the view's own target (the Vita screen here; retail on a 16:9 screen does the same).
+   Out: the GL vertical fov and the aspect for mat_persp (x scale = cot(y)/aspect = cot(x)). */
+void retail_view_proj(float fov, int W, int H, float *fovy, float *aspect)
+{
+    float hx = 0.55f * fov, hy = (float)H / (float)W * (1.1f / 0.8696f) * 0.5f * fov;
+    *fovy = 2.0f * hy;
+    *aspect = tanf(hx) / tanf(hy);
+}
+
 void chasecam_out(float V[4][4], unsigned short fov_u16, CcOut *out)
 {
     ea_eye(V, out->eye);

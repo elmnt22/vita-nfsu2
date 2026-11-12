@@ -24,6 +24,10 @@
 #include <time.h>
 #include <limits.h>
 #include <SDL.h>
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
+#include <psp2/kernel/threadmgr.h>
+#define PF_VITA_THREAD 1
+#endif
 
 #include "nfsu2.h"
 #include "car_mod.h"
@@ -34,6 +38,7 @@
 #include "wcoll.h"
 #include "carcoll.h"
 #include "smokeable.h"
+#include "worldanim.h"
 #include "career.h"
 #include "speech.h"
 #include "mplay.h"
@@ -45,15 +50,18 @@
 #include "nisdraw.h"
 #include "acid.h"
 #include "aciddraw.h"
+#include "rain.h"
 #include "racepath.h"
 #include "style.h"
 #include "chasecam.h"
+#include "jumpcam.h"
 static int n2_find_record(const unsigned char *g, long len, const char *name, unsigned char *out);
 #include "ai.h"
 #include "audio.h"
 #include "music.h"
 #include "options.h"
 #include "profile.h"
+#include "garage_line.h"
 #include "carsfx.h"
 #include "resource.h"
 #include "world.h"
@@ -73,13 +81,29 @@ static int tiles_pack_thread(void *a) {
 /* Boot: the game's own loading screen (PC_Loading) from before the world
    loads until the front end takes over, drawn by the front-end module. */
 static Shop *g_boot_fe;
+/* Boot: the full front end (every menu package), opened behind the loading
+   screen while the world loads on its worker, then handed to the menus. */
+static Shop *g_boot_full;
+static int g_boot_full_tried;
+static void boot_open_full(const char *dataroot) {
+    if (g_boot_full_tried) return;
+    g_boot_full_tried = 1;
+    Uint32 t0 = SDL_GetTicks();
+    g_boot_full = shop_open(dataroot, "", NULL, NULL, NULL, 0);
+#ifdef __vita__
+    vita_mark("front end: menus opened behind the loading screen (%u ms)", (unsigned)(SDL_GetTicks() - t0));
+#else
+    printf("front end: menus opened behind the loading screen (%u ms)\n", (unsigned)(SDL_GetTicks() - t0));
+#endif
+}
 /* After the boot: the loading screen alone (shop_open_loading), opened on
    first need and kept -- every track switch and race start shows it. */
 static Shop *g_ls_fe;
+static int g_career_mode;   /* (defined with the career state below) */
 static Shop *loading_screen(const char *dataroot) {
     static int tried;
     if (!g_ls_fe && !tried) { tried = 1; g_ls_fe = shop_open_loading(dataroot); }
-    if (g_ls_fe) shop_loading_text(g_ls_fe, NULL, NULL);
+    if (g_ls_fe) { shop_loading_text(g_ls_fe, NULL, NULL); shop_loading_pick(g_ls_fe, g_career_mode); }
     return g_ls_fe;
 }
 static void fe_frame(Shop *fe) {
@@ -108,6 +132,17 @@ static void ls_pump(void) {
     if (!g_restart_ls || !g_ls_fe || now - last < 50) return;
     last = now;
     fe_frame(g_ls_fe);
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_LS_SHOT=1 shoots ls_<n> on each load's third loading frame */
+        static Uint32 prev; static int n, f;
+        if (now - prev > 1000) f = 0;
+        prev = now;
+        if (getenv("OPENUG2_LS_SHOT") && ++f == 3) {
+            void sim_shot_named(const char *); char nm[24];
+            snprintf(nm, sizeof nm, "ls_%d", n++); sim_shot_named(nm);
+        }
+    }
+#endif
 }
 /* the boot world load, off the main thread so the loading screen animates */
 static struct { World *w; const char *root, *track; const WLoadOptions *opt; int world2, nm; volatile int done; } g_wl;
@@ -133,6 +168,7 @@ static Shop *g_shop;
    garage scene. g_fe_in: it has taken over the parked car. */
 static Shop *g_fe;
 static int g_fe_in, g_shop_from_fe;
+static int g_tt_cust_back;   /* the FE Test Track (entry 2) quit: the Car Shop once the showroom stands */
 /* the career's Car Shop: 1 the crib's Change Parts, 2 a city shop (ShopDataDesc
    types 1..6); the city shop waiting for the car to stop; Change Parts
    waiting for the crib's car; the crib's from-the-menu flag across it */
@@ -158,8 +194,13 @@ static const unsigned char *g_tt_shop, *g_tt_ret_shop, *g_cshop_cur;
    on the dyno; the scene's car / spotlight animation is not played. Leaving the
    dyno event, CAnimChooser::ChooseAnim (0x436a91) picks DynoExit for 0x1262, whose
    revs are pattern 2 = RevDynoLeave (GC 803a4a84 = k_revpat at[0], 0x27 entries):
-   g_tt_exit holds the Test Run / Quit until they have played (GUESS: Quit plays
-   it too; the screens close and the camera holds -- the NIS animation not played) */
+   g_tt_exit holds the Test Run until they have played. Only Test Run: retail
+   TestTrack::React (GC 8030fb74) SimulateRaceFinish -> RCStatePostRaceCallback
+   (8021d36c) on the dyno race (SetupDynoRun 8011c894: race type 803fca54 = 8)
+   BeginLoading(5) -> RCStateLoadingCallback (8021c21c) EndNIS_StartStreaming /
+   SafeLoad / SafeUpdate = the DynoExit NIS (ChooseAnim type 1). Quit = DoQuitTuning
+   (8017e65c) RequestUnPause(6) -> RCStatePauseCallback (8021cc28) state None +
+   message 0xb -> RCStateNoneCallback UnloadTrack: no end NIS, no revs. */
 static NisRev g_tt_revs; static int g_tt_rev, g_tt_exit, g_tt_exit_go;
 static struct { int fresh; float pos[3], rot[9], dist; uint16_t pitch, yaw; } g_dycam = { 1 };   /* DynoCarCameraMover */
 static float g_tt_spot[3], g_tt_spot_h;
@@ -317,112 +358,178 @@ static int garage_parse_line(const char *line, const char *car, N2CarConfig *cfg
     }
     return 1;
 }
-static int garage_load_car(const char *car, N2CarConfig *cfg, char *rim, int *rim_style) {
-    FILE *f = fopen(GARAGE_SAVE, "r");
-    if (!f) return 0;
-    char line[2048];
-    int found = 0;
-    while (fgets(line, sizeof line, f))
-        if (garage_parse_line(line, car, cfg, rim, rim_style)) found = 1;
-    fclose(f);
-    return found;
+/* F2.4: the garage by slot, as retail's FEPlayerCarDB: 20 tuned FECarConfigs
+   (+0x544, 0x434 each, "TUNED_CAR_%d"); BeginCarCustomize 8015dda0 on a stock
+   car -> AddNewTunedCar 80134314 = FillFromStockCar into FindEmptyTunedCarSlot
+   8013427c's first free slot, no type check (two of one model are fine); on a
+   tuned car it edits that slot; MaybeCommitChangesToCarStable 8016dd2c drops a
+   new car whose ride is still the stock one (DeleteTunedCar, the stock car
+   selected). garage.txt: "#<slot> <car line>" per tuned car, "CURRENT <car>"
+   (stock) or "CURRENT <car>#<slot>" the current car. Old files' bare
+   "<car> ..." lines become slots in file order (rewritten on the next write);
+   an old "CURRENT <car>" means that car's line when it has one. */
+#define GARAGE_NSLOT 20
+static int g_gslot = -1;        /* the current car's tuned slot, -1 = the stock car */
+static int g_garage_gen;        /* bumped by every garage write (the tunings cache) */
+typedef struct { char *line[GARAGE_NSLOT]; char cur[64]; int legacy; } GarageFile;
+static void garage_free(GarageFile *g) { for (int i = 0; i < GARAGE_NSLOT; i++) { free(g->line[i]); g->line[i] = NULL; } }
+static int garage_line_is(const char *line, const char *car) {
+    char name[64];
+    return line && sscanf(line, "%63s", name) == 1 && !strcmp(name, car);
 }
-/* a car's garage.txt line (no newline); the career slots keep the same line */
-static void garage_format_line(char *b, size_t cap, const char *car, const N2CarConfig *cfg, const char *rim, int rim_style) {
-    size_t n = 0;
-#define GF(...) do { if (n < cap) { int k_ = snprintf(b + n, cap - n, __VA_ARGS__); if (k_ > 0) n += (size_t)k_; } } while (0)
-    if (cap) b[0] = 0;
-    GF("%s %d", car, cfg->body_kit);
-    for (int i = 0; i < N2_PART_COUNT; i++) GF(" %d", cfg->parts[i]);
-    if (rim && rim[0]) GF(" RIM %s %d", rim, rim_style);
-    GF(" PAINT");
-    for (int i = 0; i < N2_PAINT_COUNT; i++) GF(" %x", cfg->paint[i]);
-    GF(" PERF ");
-    for (int i = 0; i < N2_PERF_PARTS; i += 4)
-        GF("%x", (cfg->perf[i] ? 1 : 0) | (cfg->perf[i + 1] ? 2 : 0) | (cfg->perf[i + 2] ? 4 : 0) | (cfg->perf[i + 3] ? 8 : 0));
-    GF(" VINYL");
-    for (int i = 0; i < 4; i++) GF(" %x", cfg->vinyl[i]);
-    for (int i = 0; i < 16; i++) GF(" %x", cfg->vinyl_col[i / 4][i % 4]);
-    GF(" DECAL");
-    for (int i = 0; i < 7; i++) GF(" %x", cfg->decal_layout[i]);
-    for (int i = 0; i < 56; i++) GF(" %x", cfg->decal[i / 8][i % 8]);
-    GF(" TINT %x", cfg->tint);
-    GF(" BULB %x", cfg->bulb);
-    GF(" CARBON %x", cfg->carbon);
-    GF(" NEON");
-    for (int i = 0; i < 8; i++) GF(" %x", cfg->neon[i / 2][i % 2]);
-    GF(" HUD %x %x %x %x", cfg->hud, cfg->hud_col[0], cfg->hud_col[1], cfg->hud_col[2]);
-    GF(" SPEC %x %x %x", cfg->purge, cfg->hydraulics, cfg->doors);
-    GF(" ICE");
-    for (int i = 0; i < 12; i++) GF(" %x", cfg->audio_comp[i]);
-    {   unsigned jm = 0;
-        for (int i = 0; i < 10; i++) jm |= cfg->junk[i] ? 1u << i : 0u;
-        GF(" JUNK %x", jm); }
-#undef GF
-    if (n >= cap && cap) printf("garage: %s's line truncated at %u bytes\n", car, (unsigned)cap);
+/* "RX8#3" -> "RX8", 3; "RX8" -> "RX8", -1 */
+static int garage_id_split(const char *id, char *car, size_t cap) {
+    const char *h = strchr(id, '#');
+    int slot = h ? atoi(h + 1) : -1;
+    snprintf(car, cap, "%.*s", h ? (int)(h - id) : (int)strlen(id), id);
+    return slot >= 0 && slot < GARAGE_NSLOT ? slot : -1;
 }
-static void garage_save_car(const char *car, const N2CarConfig *cfg, const char *rim, int rim_style) {
-    char *keep = NULL; size_t keeplen = 0;
+static void garage_id(char *out, size_t cap, const char *car, int slot) {
+    if (slot >= 0) snprintf(out, cap, "%s#%d", car, slot); else snprintf(out, cap, "%s", car);
+}
+static void garage_read(GarageFile *g) {
+    memset(g, 0, sizeof *g);
     FILE *f = fopen(GARAGE_SAVE, "r");
-    if (f) {   /* every other car's line stays */
-        char line[2048], name[64];
-        while (fgets(line, sizeof line, f)) {
-            if (sscanf(line, "%63s", name) == 1 && !strcmp(name, car)) continue;
-            size_t l = strlen(line);
-            char *g = (char *)realloc(keep, keeplen + l + 1);
-            if (!g) break;
-            keep = g; memcpy(keep + keeplen, line, l + 1); keeplen += l;
+    if (!f) return;
+    static char line[4096];
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char tag[16], name[64];
+        if (sscanf(line, "%15s %63s", tag, name) == 2 && !strcmp(tag, "CURRENT")) { snprintf(g->cur, sizeof g->cur, "%s", name); continue; }
+        const char *body = line; int slot = -1;
+        if (line[0] == '#') {
+            int k = 0;
+            if (sscanf(line, "#%d %n", &slot, &k) < 1 || k == 0 || slot < 0 || slot >= GARAGE_NSLOT) continue;
+            body = line + k;
         }
-        fclose(f);
+        if (sscanf(body, "%63s", name) != 1) continue;
+        if (slot < 0 || g->line[slot]) {   /* an old file's line (or a doubled slot): the first free slot */
+            slot = -1;
+            for (int i = 0; i < GARAGE_NSLOT && slot < 0; i++) if (!g->line[i]) slot = i;
+            if (slot < 0) { printf("garage: no free slot for %s's line, dropped\n", name); continue; }
+            g->legacy = 1;
+        }
+        g->line[slot] = strdup(body);
     }
-    f = fopen(GARAGE_SAVE, "w");
-    if (!f) { free(keep); return; }
-    if (keep) fputs(keep, f);
+    fclose(f);
+    if (g->legacy && g->cur[0] && !strchr(g->cur, '#'))   /* an old CURRENT: its car's line, when it has one */
+        for (int i = 0; i < GARAGE_NSLOT; i++)
+            if (garage_line_is(g->line[i], g->cur)) {
+                char c[64]; snprintf(c, sizeof c, "%s", g->cur);
+                garage_id(g->cur, sizeof g->cur, c, i);
+                break;
+            }
+}
+static void garage_write(GarageFile *g) {
+    FILE *f = fopen(GARAGE_SAVE, "w");
+    g_garage_gen++;
+    if (!f) { printf("garage: %s not written\n", GARAGE_SAVE); return; }
+    for (int i = 0; i < GARAGE_NSLOT; i++) if (g->line[i]) fprintf(f, "#%d %s\n", i, g->line[i]);
+    if (g->cur[0]) fprintf(f, "CURRENT %s\n", g->cur);
+    fclose(f);
+    if (g->legacy) printf("garage: old per-type lines moved to tuned slots\n");
+    g->legacy = 0;
+}
+/* the tuned slot's build (0 = no such slot / not that car) */
+static int garage_load_slot(int slot, const char *car, N2CarConfig *cfg, char *rim, int *rim_style) {
+    if (slot < 0 || slot >= GARAGE_NSLOT) return 0;
+    GarageFile g; garage_read(&g);
+    int ok = g.line[slot] && garage_parse_line(g.line[slot], car, cfg, rim, rim_style);
+    garage_free(&g);
+    return ok;
+}
+/* the current car's build: its tuned slot's, none for a stock car */
+static int garage_load_car(const char *car, N2CarConfig *cfg, char *rim, int *rim_style) {
+    return garage_load_slot(g_gslot, car, cfg, rim, rim_style);
+}
+/* the car's line into its slot (the current car's, else AddNewTunedCar's first free
+   one -- g_gslot then names it); tail = the line's " TUNE ..." to keep, NULL keeps the
+   slot's own. Returns the slot, -1 when all 20 are taken. */
+static int garage_put_line(const char *car, const char *body, const char *tail) {
+    GarageFile g; garage_read(&g);
+    int slot = g_gslot >= 0 && garage_line_is(g.line[g_gslot], car) ? g_gslot : -1;
+    for (int i = 0; i < GARAGE_NSLOT && slot < 0; i++) if (!g.line[i]) slot = i;
+    if (slot < 0) { garage_free(&g); printf("garage: all %d tuned slots taken, %s not saved\n", GARAGE_NSLOT, car); return -1; }
+    static char keep[512];
+    keep[0] = 0;
+    if (!tail && g.line[slot]) {
+        const char *t = strstr(g.line[slot], " TUNE ");
+        if (t) snprintf(keep, sizeof keep, "%s", t);
+        tail = keep;
+    }
+    size_t n = strlen(body) + (tail ? strlen(tail) : 0) + 1;
+    char *l = (char *)malloc(n);
+    if (!l) { garage_free(&g); return -1; }
+    snprintf(l, n, "%s%s", body, tail ? tail : "");
+    free(g.line[slot]); g.line[slot] = l;
+    g_gslot = slot;
+    garage_id(g.cur, sizeof g.cur, car, slot);   /* a customized car is the current car */
+    garage_write(&g);
+    garage_free(&g);
+    return slot;
+}
+/* garage_format_line: garage_line.c (shared with the converter's save import) */
+static void garage_save_car(const char *car, const N2CarConfig *cfg, const char *rim, int rim_style) {
     static char line[2048];
     garage_format_line(line, sizeof line, car, cfg, rim, rim_style);
-    fprintf(f, "%s\n", line);
-    fclose(f);
-    free(keep);
-    printf("garage: saved %s\n", car);
+    int slot = garage_put_line(car, line, NULL);
+    if (slot >= 0) printf("garage: saved %s in tuned slot %d (TUNED_CAR_%d)\n", car, slot, slot);
+}
+/* DeleteTunedCar 80133d20 (UIQRCarSelect::DeleteCurrentCar 800e081c) */
+static void garage_delete_slot(int slot) {
+    if (slot < 0 || slot >= GARAGE_NSLOT) return;
+    GarageFile g; garage_read(&g);
+    if (g.line[slot]) {
+        char car[64] = ""; sscanf(g.line[slot], "%63s", car);
+        free(g.line[slot]); g.line[slot] = NULL;
+        char cc[64]; int cs = garage_id_split(g.cur, cc, sizeof cc);
+        if (cs == slot) snprintf(g.cur, sizeof g.cur, "%s", cc);   /* the current car: its stock one */
+        garage_write(&g);
+        printf("garage: tuned slot %d (%s) deleted\n", slot, car);
+    }
+    garage_free(&g);
+    if (g_gslot == slot) g_gslot = -1;
 }
 /* FEDatabase +0xe8 (0x83aab8): player 0's current car, the one the Quick
    Race / Customize car select left, saved with the profile. A new profile's
-   is the stock car of type *0x7faa48 = 21, the RX8 (0x515800). Kept as a
-   "CURRENT <car>" line in the garage file (no car has that name). */
+   is the stock car of type *0x7faa48 = 21, the RX8 (0x515800). Kept as the
+   "CURRENT" line of the garage file; *slot = its tuned slot (-1 stock). */
 #define GARAGE_DEFAULT_CAR "RX8"
-static void garage_current_car(char *out, size_t cap) {
-    snprintf(out, cap, "%s", GARAGE_DEFAULT_CAR);
-    FILE *f = fopen(GARAGE_SAVE, "r");
-    if (!f) return;
-    char line[2048], tag[16], name[64];
-    while (fgets(line, sizeof line, f))
-        if (sscanf(line, "%15s %63s", tag, name) == 2 && !strcmp(tag, "CURRENT")) snprintf(out, cap, "%s", name);
-    fclose(f);
+static void garage_current_car(char *out, size_t cap, int *slot) {
+    GarageFile g; garage_read(&g);
+    int s = g.cur[0] ? garage_id_split(g.cur, out, cap) : -1;
+    if (!g.cur[0]) snprintf(out, cap, "%s", GARAGE_DEFAULT_CAR);
+    if (s >= 0 && !garage_line_is(g.line[s], out)) s = -1;   /* a slot since emptied: the stock car */
+    if (g.legacy) garage_write(&g);
+    garage_free(&g);
+    if (slot) *slot = s;
 }
 static void garage_set_current_car(const char *car) {
-    char cur[64];
-    garage_current_car(cur, sizeof cur);
-    FILE *f = fopen(GARAGE_SAVE, "r");
-    if (f && !strcmp(cur, car)) { fclose(f); return; }
-    char *keep = NULL; size_t keeplen = 0;
-    if (f) {   /* every car's line stays */
-        char line[2048], name[64];
-        while (fgets(line, sizeof line, f)) {
-            if (sscanf(line, "%63s", name) == 1 && !strcmp(name, "CURRENT")) continue;
-            size_t l = strlen(line);
-            char *g = (char *)realloc(keep, keeplen + l + 1);
-            if (!g) break;
-            keep = g; memcpy(keep + keeplen, line, l + 1); keeplen += l;
-        }
-        fclose(f);
-    }
-    f = fopen(GARAGE_SAVE, "w");
-    if (!f) { free(keep); return; }
-    if (keep) fputs(keep, f);
-    fprintf(f, "CURRENT %s\n", car);
-    fclose(f);
-    free(keep);
-    printf("garage: current car %s\n", car);
+    GarageFile g; garage_read(&g);
+    if (g_gslot >= 0 && !garage_line_is(g.line[g_gslot], car)) g_gslot = -1;   /* another model came in: its stock car */
+    char id[64]; garage_id(id, sizeof id, car, g_gslot);
+    if (!strcmp(g.cur, id) && !g.legacy) { garage_free(&g); return; }
+    snprintf(g.cur, sizeof g.cur, "%s", id);
+    garage_write(&g);
+    garage_free(&g);
+    printf("garage: current car %s\n", id);
+}
+/* the Car Shop's car as it opened (MaybeCommitChangesToCarStable's
+   AreRideInfosDifferent against it: a stock car left as it was gets no slot) */
+static N2CarConfig g_cust_cfg0; static char g_cust_rim0[16]; static int g_cust_rs0;
+static char g_cust_last_line[2048];   /* the last Car Shop exit's line (a new slot's base for its tunings) */
+static void cust_open_mark(const N2CarConfig *cfg, const char *rim, int rs) {
+    g_cust_cfg0 = *cfg; snprintf(g_cust_rim0, sizeof g_cust_rim0, "%s", rim ? rim : ""); g_cust_rs0 = rs;
+}
+/* the Customize car select's tuned entries (FEPlayerCarDB's tuned list):
+   n = how many, folders + slots out */
+static int garage_list(char car[][32], int slot[], int cap) {
+    GarageFile g; garage_read(&g);
+    int n = 0;
+    for (int i = 0; i < GARAGE_NSLOT && n < cap; i++)
+        if (g.line[i] && sscanf(g.line[i], "%31s", car[n]) == 1) slot[n++] = i;
+    garage_free(&g);
+    return n;
 }
 /* Showroom: while the Car Shop is open the car stands in the game's own
    front-end room (FRONTEND/PLATFORMS/Showroom.BIN: one 0x80134000 solid list
@@ -433,6 +540,7 @@ static void garage_set_current_car(const char *car) {
 static int g_showroom;                 /* drawing the room this frame */
 #ifdef __vita__
 static int g_refl_ready;               /* this frame's road reflection is rendered */
+static int g_room_refl_ready;          /* this frame's garage floor reflection (view 4) is rendered */
 static int g_fog_linear;               /* fog_density is the regional linear fog's 1/(250-start) */
 static long g_refl_batches;            /* reflective batches drawn, for the 60-frame log */
 extern int vita_gfx_mode;
@@ -544,7 +652,8 @@ static float room_view_tick(int view, int suv, float heading) {
 }
 static int g_room_envmap;                /* the garage's fixed reflection cube is loaded */
 static int room_envmap_load(const char *root, const char *name);
-static char g_room_env[16];               /* its FRONTEND\ENVMAPS name */
+static char g_room_env[16];               /* its FRONTEND\ENVMAPS name, "#<platform>" a platform file's */
+static int room_envmap_load_from(const char *root, const char *name, unsigned char *dd, long dlen);
 static float g_room_roll;                /* the magazine camera's roll, degrees (0x444de0) */
 /* ---- The garage turntable: GarageMainScreen HandleTick (PC 0x4d82d0, GC
    800fc340), HandleRender (PC 0x4a7330), UpdateRenderingCarParameters
@@ -582,7 +691,8 @@ static struct {
     int lock_slot[2], lock_shown[2], lock_i;   /* +0x58/+0x5c, +0x60/+0x64; +0x68 */
     int req_lock, req_empty;    /* +0x161, +0x162 */
     int from_lock, from_empty;  /* +0x164, +0x163 */
-    int car_req, car_scroll;    /* SetRideInfo waiting for its car; with a scroll direction */
+    int car_req, car_scroll;    /* SetRideInfo waiting for its car; with GarageCarLoader +0x2ce0 (spin it in) */
+    int back;                   /* TT_BACK's ride rebuild still to come (its car switch) */
     int pend, pend_dir; float pend_t;   /* the car select's request in its scroll delay (-1 none) */
     float spin;                 /* +0x274: the showroom heading (rad) */
     int discs;                  /* the room has DISC01..03 */
@@ -605,6 +715,33 @@ static int tt_solid_matrix(const unsigned char *d, long len, uint32_t hash, floa
         return m[15] > 0.5f && m[15] < 1.5f;
     }
     return 0;
+}
+/* a solid's effect (the eEffect table 0x7ff850 index), as the solid loader
+   picks it (0x5cc31a -> 0x5c58a0): its platform info (chunk 0x134900, body
+   16-aligned) +0xc flags against the table 0x800464, first match: 0x1 ->
+   4 worldbone, 0x40 -> 2 worldreflect, 0x80 -> 5 car.fx, none -> 0 world.
+   -1: no such solid. */
+#define TT_FX_WORLD 0
+#define TT_FX_REFLECT 2
+#define TT_FX_CAR 5
+static int tt_solid_fx(const unsigned char *d, long len, uint32_t hash) {
+    N2Leaf ob[96]; int n = 0;
+    n2_find_leaves(d, 0, len, 0x80134010u, ob, &n, 96);
+    for (int i = 0; i < n; i++) {
+        long b = ob[i].off, e = ob[i].off + (long)ob[i].size;
+        N2Leaf h[2], pi[2]; int nh = 0, np = 0;
+        n2_find_leaves(d, b, e, 0x00134011u, h, &nh, 2);
+        if (!nh) continue;
+        const unsigned char *p = d + h[0].off; int s = (int)h[0].size, pad = n2_skip_filler(p, s);
+        if (pad + 0x14 > s || n2_u32(p + pad + 0x10) != hash) continue;
+        n2_find_leaves(d, b, e, 0x00134900u, pi, &np, 2);
+        if (!np) return TT_FX_WORLD;
+        long q = (pi[0].off + 15) & ~15L;
+        if (q + 0x10 > pi[0].off + (long)pi[0].size) return TT_FX_WORLD;
+        uint32_t f = n2_u32(d + q + 0xc);
+        return f & 0x1u ? 4 : f & 0x40u ? TT_FX_REFLECT : f & 0x80u ? TT_FX_CAR : TT_FX_WORLD;
+    }
+    return -1;
 }
 /* back into the solid's own space: the scene walker placed it by that matrix
    (p -> p.x * row 0 + p.y * row 1 + p.z * row 2 + row 3); eModel::Render
@@ -635,6 +772,10 @@ static int tt_role(const N2Mesh *m) {
     return 0;
 }
 static unsigned char *g_room_role;   /* tt_role per room mesh */
+/* per room mesh: its solid's effect (tt_solid_fx), | TT_FX_BACKDROP for the
+   BACKDROP solid (drawn mirrored in HandleRender's second pass) */
+#define TT_FX_BACKDROP 0x80
+static unsigned char *g_room_fx;
 static char g_tt_root[512];          /* the data root, for the LOCK model */
 static void tt_rz(float rad, float x, float y, float z, float M[16]) {   /* eRotateZ (0x5bae60) after a translation */
     float c = cosf(rad), s = sinf(rad);
@@ -661,7 +802,11 @@ static void tt_car_offset(float o[2]) {
     o[0] = c * p[0] - s * p[1] - g_room_anchor[0];
     o[1] = s * p[0] + c * p[1] - g_room_anchor[1];
 }
-static int tt_car_hidden(void) { return g_tt.state && !g_tt.car_shown; }
+/* the boot flow (splash, MC_Background's load) up to the loaded profile's car
+   being in: UIMain 0x4df140 builds the first garage ride from that profile,
+   so the car the front end came up with never shows */
+static int g_fe_boot_wait = 1;
+static int tt_car_hidden(void) { return g_fe_boot_wait || (g_tt.state && !g_tt.car_shown); }
 /* PlatformNameMap (GC 8035b198), as the files are named on the disc */
 static const char *const k_platform[] = { "Showroom", "Showroom", "AudioShop01", "CarLot01", "Crib01",
                                           "MegaloShop01", "PaintShop01", "PartsShop01", "PerfShop01" };
@@ -712,6 +857,10 @@ static int room_load(const char *root, int plat) {
             free(tx.rgb); free(tx.alpha); free(tx.dxt);
         }
         mtex[i] = t; modes[i] = md;
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_ROOM_DUMP")) printf("room mesh %d: %s / %s tex %08x gl %u mode %d bb (%.1f %.1f %.1f)-(%.1f %.1f %.1f)\n",
+               i, m->sname, m->aname, k, t, md, b[0], b[1], b[2], b[3], b[4], b[5]);
+#endif
     }
     if (disc < 0) {   /* no turntable found: centre of the floor */
         g_room_anchor[0] = 0.5f * (lo[0] + hi[0]); g_room_anchor[1] = 0.5f * (lo[1] + hi[1]);
@@ -732,6 +881,19 @@ static int room_load(const char *root, int plat) {
         }
         snprintf(g_tt_root, sizeof g_tt_root, "%s", root);
     }
+    {   /* each solid's effect: DISC01..03 and BACKDROP_FLOOR are worldreflect,
+           BACKDROP / PLATFORMBASE world (every platform BIN, 11-01 dump) */
+        free(g_room_fx);
+        g_room_fx = (unsigned char *)calloc((size_t)(sc.count ? sc.count : 1), 1);
+        uint32_t lasth = 0; int lastfx = 0;
+        for (int i = 0; g_room_fx && i < sc.count; i++) {
+            const N2Mesh *m = &sc.meshes[i];
+            uint32_t h = skin_hash(m->sname);
+            if (h != lasth || i == 0) { lastfx = tt_solid_fx(d, len, h); lasth = h; }
+            g_room_fx[i] = (unsigned char)(lastfx < 0 ? TT_FX_WORLD : lastfx);
+            if (!strcmp(m->sname, "BACKDROP") || !strcmp(m->aname, "BACKDROP")) g_room_fx[i] |= TT_FX_BACKDROP;
+        }
+    }
     g_room_gm = sc.count ? upload_scene(&sc) : NULL;
     g_room_n = g_room_gm ? sc.count : 0;
     g_room_mt = mtex; g_room_md = modes; mtex = NULL; modes = NULL;
@@ -740,8 +902,16 @@ static int room_load(const char *root, int plat) {
            lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], disc >= 0 ? sc.meshes[disc].sname : "none",
            g_room_anchor[0], g_room_anchor[1], g_room_anchor[2]);
     free(mbb); free(mtex); free(modes);
-    n2_free_scene(&sc); free(tp.blk); free(d);
-    if (g_room_n > 0 && !g_room_envmap) g_room_envmap = room_envmap_load(root, "Showroom");
+    n2_free_scene(&sc); free(tp.blk);
+    if (g_room_n > 0) {   /* ChangePlatform's cube from this file's XPOS..ZNEG (0x4a7316 -> 0x5b9910) */
+        char env[16];
+        snprintf(env, sizeof env, "#%s", k_platform[plat]);
+        if (!g_room_envmap || strcmp(env, g_room_env)) {
+            if (g_room_envmap) { render_env_static(NULL, 0, 0); g_room_envmap = 0; }
+            g_room_envmap = room_envmap_load_from(root, env, d, len);
+        }
+    }
+    free(d);
     return g_room_n > 0;
 }
 /* The turntable's LOCK model (the GarageMainScreen ctor PC 0x4eafbb:
@@ -753,7 +923,11 @@ static int room_load(const char *root, int plat) {
 static struct {
     int tried, n;
     GpuMesh *gm; GLuint tex; unsigned char md; uint32_t key; uint32_t *mkey;
+    uint32_t mmat[16]; unsigned char vcol[16];   /* per mesh: its light material (0x134013 by matid), prelit */
 } g_tt_lock;
+/* the main room pass's room-to-world matrix and camera direction: the LOCK's
+   car.fx lighting (set around that pass only; the env faces draw it plain) */
+static float g_room_T[16], g_room_look[3]; static int g_room_lock_fx;
 /* JDLZ (n2_jdlz) bytes [a, a + n) of the unpacked stream; its matches reach
    back at most 2064 bytes */
 static int tt_jdlz_slice(const unsigned char *s, long slen, long a, long n, unsigned char *out) {
@@ -838,15 +1012,19 @@ static int tt_lock_load(void) {
                     n2_find_leaves(d, ob, oe, 0x00134B01u, vtx, &nv, 2);
                     n2_find_leaves(d, ob, oe, 0x00134B03u, idx, &ni, 2);
                     uint32_t slot[16]; int nslot = n2_mesh_texslots(d, ob, oe, slot, 16);
+                    uint32_t mats[16]; int nmats = n2_mesh_matslots(d, ob, oe, mats, 16);
                     N2Sub sub[16]; int nsub = n2_mesh_submeshes(d, ob, oe, sub, 16);
                     if (nv >= 1 && ni >= 1) {
                         if (nsub <= 0) { nsub = 1; sub[0].start = 0; sub[0].count = (uint32_t)-1; sub[0].mat = 0; }
                         for (int k = 0; k < nsub; k++) {
                             uint32_t key = sub[k].mat < (uint32_t)nslot ? slot[sub[k].mat] : (nslot ? slot[0] : 0);
+                            int c0 = sc.count;
                             n2_add_pair(d, vtx[0], idx[0], N2_CAR_MISC, &sc, 36, 28, 24, 0, key, NULL,
                                         sub[k].count == (uint32_t)-1 ? 0 : (long)sub[k].start,
                                         sub[k].count == (uint32_t)-1 ? -1 : (long)sub[k].count,
                                         (unsigned char)N2_DRAW_OPAQUE);
+                            for (int c = c0; c < sc.count && c < 16; c++)   /* the slice's light material */
+                                g_tt_lock.mmat[c] = sub[k].matid < (uint32_t)nmats ? mats[sub[k].matid] : 0;
                         }
                     }
                     break;
@@ -867,6 +1045,7 @@ static int tt_lock_load(void) {
     for (int i = 0; g_tt_lock.mkey && i < n; i++) {
         uint32_t k = sc.meshes[i].texkey;
         g_tt_lock.mkey[i] = k;
+        if (i < 16) g_tt_lock.vcol[i] = (unsigned char)(sc.meshes[i].vcol != 0);
         if (!k || g_tt_lock.key) continue;
         /* its record (as n2_tpk_decode): +0x18 hash, +0x24 offset, +0x38 w/h, +0x3e format,
            +0x45.. order/usage/blend/wz */
@@ -922,6 +1101,24 @@ static void tt_draw_locks(const RProg *rp, GLint uUseTex, GLint uColor, const fl
         mat_mul(MR, L, X);
         glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, X);
         glUniform1f(rp->uAlphaTest, g_tt_lock.md == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
+        /* FrontB flags 0x4080 -> car.fx (0x5c58a0): HandleRender's one light context
+           (elSetupLightContext 0x48f600: the platform rig) and the garage cube, per-slice
+           light materials (0x134013: 0x2e65e067 / DEFAULT / 0x12049251) */
+        int fx = 0;
+        if (g_room_lock_fx) {
+            vita_use_lite(0);
+            render_carfx_begin(rp);
+            fx = render_carfx_active();
+            if (fx) {
+                float sh[10][4], Wm[16];
+                mat_mul(g_room_T, L, Wm);
+                carfx_sh(sh, Wm + 12, g_room_look, NULL, 0, (int)sizeof(N2LightSrc));
+                render_carfx_sh(sh);
+                render_model(rp, Wm);
+                glUniform1f(rp->uSpec, 0.0f); glUniform1f(rp->uEnv, 0.0f); glUniform1f(rp->uClearcoat, 0.0f);
+                glUniform3f(rp->uEmissive, 0, 0, 0);
+            } else vita_use_lite(1);
+        }
         if (blend) {
             glEnable(GL_BLEND); glDepthMask(GL_FALSE);
             glUniform1f(rp->uTextureAlpha, 1.0f);
@@ -931,7 +1128,17 @@ static void tt_draw_locks(const RProg *rp, GLint uUseTex, GLint uColor, const fl
             if (g_tt_lock.tex && g_tt_lock.mkey[q] == g_tt_lock.key) {
                 glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, g_tt_lock.tex);
             } else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.5f, 0.5f, 0.52f); }
+            if (fx) {
+                glUniform1f(rp->uVColor, q < 16 && g_tt_lock.vcol[q] ? 2.0f : 0.0f);
+                render_carfx_part(q < 16 ? g_tt_lock.mmat[q] : 0, N2_CAR_MISC);
+            }
             draw_gpumesh(&g_tt_lock.gm[q]);
+        }
+        if (fx) {
+            render_carfx_end();
+            render_model(rp, NULL);
+            glUniform1f(rp->uVColor, g_dbg.vcolor);
+            vita_use_lite(1);
         }
         if (blend) {
             glDisable(GL_BLEND); glDepthMask(GL_TRUE);
@@ -946,13 +1153,22 @@ static void tt_draw_locks(const RProg *rp, GLint uUseTex, GLint uColor, const fl
 void garage_tt_request(int what, int dir) {
     if (!g_tt.state) tt_reset();
     if (what == TT_BACK) {
-        /* back to the crib: BuildCurrentRideForPlayer -> SetRideInfo, which spins
-           the car in when a lock or an empty slot is in front (state 1, +0x164 /
-           +0x163); with the car in front no spin (guess: +0x2ce0 not decoded) */
+        /* back to the crib: BuildCurrentRideForPlayer -> SetRideInfo 0x4d8c70
+           (state 3 -> 1) -> GarageCarLoader::LoadRideInfo 0x4d8030: +0x2ce0 =
+           1 when nothing is loaded yet (+0x2ccc == 0; the loader ctor 0x4c1730
+           also starts it at 1), else (loaded car type +0x10 != the ride's type).
+           HandleTick 0x4d85f8 state 1, the car loaded (+0x2cd4): +0x2ce0 ->
+           spin it in (0.5 s, sound 4 / 5); else a lock / empty slot in front
+           (+0x164 / +0x163) -> spin; else state 3, no spin. So the same model
+           in front: no spin; a lock / empty in front: spin; another model in
+           front: spin (the car switch below sets car_scroll when g_tt.back;
+           G4 11-01, was a GUESS) */
         g_tt.pend = -1;
+        g_tt.back = 1;
         if (!g_tt.car_shown) { g_tt.car_req = 1; g_tt.car_scroll = 0; if (g_tt.state == 3) g_tt.state = 1; }
         return;
     }
+    g_tt.back = 0;
     g_tt.pend = what; g_tt.pend_dir = dir; g_tt.pend_t = TT_DELAY;   /* a newer scroll restarts the delay */
 }
 int shop_car_pending(const Shop *s);
@@ -1042,17 +1258,35 @@ static int env_chunk(const unsigned char *d, long beg, long end, uint32_t id, lo
     }
     return 0;
 }
-static int room_envmap_load(const char *root, const char *name) {
+/* name "#<platform>": the platform file's own faces. GarageMainScreen::
+   ChangePlatform 0x4a7180 loads FRONTEND\PLATFORMS\<name>.BIN (0x7906c0,
+   names 0x7f60e8) and then copies the XPOS..ZNEG textures into the cube
+   (0x4a7316 -> 0x5b9910); every platform file has its own six in its
+   second TPK (R1 11-01: Crib01 / CarLot01 differ from Showroom's, whose
+   equal ENVMAPS\Showroom.bin only UIMagazineReward loads, 0x523e88).
+   d / len: the file already read (NULL: read it here). */
+static int room_envmap_load_from(const char *root, const char *name, unsigned char *dd, long dlen) {
     char path[1024];
     snprintf(g_room_env, sizeof g_room_env, "%s", name);   /* tried: not retried every frame */
-    snprintf(path, sizeof path, "%s/FRONTEND/ENVMAPS/%s.bin", root, name);
-    long len = 0;
-    unsigned char *d = n2_read_file(path, &len);
+    if (name[0] == '#') snprintf(path, sizeof path, "%s/FRONTEND/PLATFORMS/%s.BIN", root, name + 1);
+    else snprintf(path, sizeof path, "%s/FRONTEND/ENVMAPS/%s.bin", root, name);
+    long len = dlen;
+    unsigned char *d = dd ? dd : n2_read_file(path, &len);
     if (!d) { printf("showroom: %s missing\n", path); return 0; }
     static const char *const nm[6] = { "XPOS", "XNEG", "YPOS", "YNEG", "ZPOS", "ZNEG" };
     const unsigned char *face[6] = { 0 }; int fw = 0;
-    long rb, rs, pb, ps;
-    if (env_chunk(d, 0, len, 0x33310004u, &rb, &rs) && env_chunk(d, 0, len, 0x33320002u, &pb, &ps) && rs % 6 == 0) {
+    long rb, rs, pb, ps, tb = 0, te = len;
+    for (long o = 0; o + 8 <= len; ) {                  /* the TPK (0xb3300000) that holds XPOS */
+        uint32_t cid = n2_u32(d + o), sz = n2_u32(d + o + 4);
+        if (o + 8 + (long)sz > len) break;
+        if (cid == 0xb3300000u) {
+            int has = 0;
+            for (long q = o + 8; !has && q + 5 <= o + 8 + (long)sz; q++) has = !memcmp(d + q, "XPOS", 5);
+            if (has) { tb = o + 8; te = o + 8 + (long)sz; break; }
+        }
+        o += 8 + (long)sz;
+    }
+    if (env_chunk(d, tb, te, 0x33310004u, &rb, &rs) && env_chunk(d, tb, te, 0x33320002u, &pb, &ps) && rs % 6 == 0) {
         long base = (pb + 0x7f) & ~0x7fL, rl = rs / 6;
         for (int k = 0; k < 6 && rl >= 0x48; k++) {
             const unsigned char *r = d + rb + k * rl;
@@ -1066,10 +1300,10 @@ static int room_envmap_load(const char *root, const char *name) {
     }
     int ok = fw > 0;
     for (int f = 0; f < 6; f++) if (!face[f]) ok = 0;
-    if (!ok) { printf("showroom: %s: no cube faces\n", path); free(d); return 0; }
+    if (!ok) { printf("showroom: %s: no cube faces\n", path); if (!dd) free(d); return 0; }
     enum { N = 128 };
     unsigned char *at = (unsigned char *)malloc(3 * N * 2 * N * 4);
-    if (!at) { free(d); return 0; }
+    if (!at) { if (!dd) free(d); return 0; }
     const float k = 64.0f / 62.0f;                      /* cubeuv's 1-texel inset */
     for (int row = 0; row < 2; row++) for (int col = 0; col < 3; col++)
     for (int py = 0; py < N; py++) for (int px = 0; px < N; px++) {
@@ -1103,10 +1337,11 @@ static int room_envmap_load(const char *root, const char *name) {
         o[2] = (unsigned char)(c[2] + 0.5f); o[3] = 255;
     }
     render_env_static(at, 3 * N, 2 * N);
-    free(at); free(d);
+    free(at); if (!dd) free(d);
     printf("showroom: environment cube %s (%d px faces -> %d px atlas faces)\n", path, fw, (int)N);
     return 1;
 }
+static int room_envmap_load(const char *root, const char *name) { return room_envmap_load_from(root, name, NULL, 0); }
 static void room_free(void) {
     if (g_room_envmap) { render_env_static(NULL, 0, 0); g_room_envmap = 0; }
     g_room_env[0] = 0;
@@ -1186,7 +1421,7 @@ static void room_shaper_tick(const Shop *fe) {
         rig = carfx_rig_hash(k_platform[g_room_plat]);
         roll = 0.0f; env[0] = 0;
     }
-    if (!env[0]) snprintf(env, sizeof env, "Showroom");
+    if (!env[0]) snprintf(env, sizeof env, "#%s", k_platform[g_room_plat]);   /* the platform's own cube (R1) */
     room_rigs_load();
     carfx_use_rig(rig);
     g_room_roll = roll;
@@ -1341,7 +1576,10 @@ static void marker_draw(const RProg *rp, int which, const float V[16], const flo
 /* The room's meshes, opaque/cutout then blended, under MR, the room's MVP
    (the main view and the car's environment faces share it); the turntable's
    discs, PLATFORMBASE and locks by their own matrices on top. */
-static void room_draw_meshes(const RProg *rp, GLint uUseTex, GLint uColor, const float MR[16]) {
+/* refl: the floor reflection (view 4) is in render_refl_texture: the
+   worldreflect solids (discs, BACKDROP_FLOOR) add it (worldreflect.fx);
+   without it they are world.fx (0x5c5930's remap 0x7ff0d8, reflection off) */
+static void room_draw_meshes(const RProg *rp, GLint uUseTex, GLint uColor, const float MR[16], int refl) {
     for (int pass = 0; pass < 2; pass++) {
         for (int q = 0; q < g_room_n; q++) {
             int md = g_room_md[q];
@@ -1368,7 +1606,10 @@ static void room_draw_meshes(const RProg *rp, GLint uUseTex, GLint uColor, const
                 mat_mul(MR, Mq, X);
                 glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, X);
             }
+            int rq = refl && g_room_fx && (g_room_fx[q] & 0x7f) == TT_FX_REFLECT;
+            if (rq) vita_set_reflect(1);
             draw_gpumesh(&g_room_gm[q]);
+            if (rq) vita_set_reflect(0);
             if (role) glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MR);
             if (blend) {
                 glDisable(GL_BLEND); glDepthMask(GL_TRUE);
@@ -1397,6 +1638,8 @@ static void garage_restore_car(const char *car) {
 #include "ground_motion.h"
 #include "debug.h"
 #include "tuning.h"
+#include "replay.h"
+#include "reverb.h"
 #ifdef __vita__
 #define VMARK(...) vita_mark(__VA_ARGS__)
 #else
@@ -1671,29 +1914,100 @@ static void spin_tex_load(const unsigned char *wt, long wtlen, uint32_t key) {
     g_spin_mode = n2_tex_mode(&g_spin_src);
     printf("  spinner texture %08x %dx%d, mask %s\n", (unsigned)key, g_spin_src.w, g_spin_src.h, g_spin_mask.rgb ? "yes" : "no");
 }
+/* the masked paint composite (0x612ee0) of src into a new GL texture */
+static GLuint paint_composite(const N2Tex *src, const N2Tex *mask, const unsigned char *paint) {
+    N2Tex t = *src; t.dxt = NULL; t.dxtlen = 0; t.dxtfmt = 0;
+    long np = (long)t.w * t.h;
+    unsigned char *px = (unsigned char *)malloc((size_t)np * 3);
+    if (!px) return 0;
+    for (long i = 0; i < np; i++)
+        for (int c = 0; c < 3; c++) {
+            float sv = src->rgb[i * 3 + c];
+            float m = paint && mask && mask->rgb ? mask->rgb[i * 3 + 2] / 255.0f : 0.0f;   /* the mask's b0 */
+            float pv = paint ? (float)(int)(paint[c] / 255.0f * sv) : sv;                 /* 0x611a30 */
+            px[i * 3 + c] = (unsigned char)((1.0f - m) * sv + m * pv);
+        }
+    t.rgb = px;
+    GLuint id = upload_tpk_texture_to_gpu(&t);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    free(px);
+    return id;
+}
 static GLuint spin_tex(const unsigned char *paint) {
     if (!g_spin_src.rgb) return 0;
     uint32_t sig = paint ? 0x1000000u | paint[0] | paint[1] << 8 | (uint32_t)paint[2] << 16 : 0;
     if (g_spin_tex && sig == g_spin_sig) return g_spin_tex;
     g_spin_sig = sig;
     if (g_spin_tex) glDeleteTextures(1, &g_spin_tex);
-    N2Tex t = g_spin_src; t.dxt = NULL; t.dxtlen = 0; t.dxtfmt = 0;
-    long np = (long)t.w * t.h;
-    unsigned char *px = (unsigned char *)malloc((size_t)np * 3);
-    if (!px) return g_spin_tex = 0;
-    for (long i = 0; i < np; i++)
-        for (int c = 0; c < 3; c++) {
-            float sv = g_spin_src.rgb[i * 3 + c];
-            float m = paint && g_spin_mask.rgb ? g_spin_mask.rgb[i * 3 + 2] / 255.0f : 0.0f;   /* the mask's b0 */
-            float pv = paint ? (float)(int)(paint[c] / 255.0f * sv) : sv;                     /* 0x611a30 */
-            px[i * 3 + c] = (unsigned char)((1.0f - m) * sv + m * pv);
+    return g_spin_tex = paint_composite(&g_spin_src, &g_spin_mask, paint);
+}
+/* Rim paint (slot 0x49) is the same kind of composite: 0x6343a0 builds
+   DUMMY_WHEEL (texture role 6) from the rim's <rim>_WHEEL and its
+   <rim>_WHEEL_INNER_MASK, modulated by the paint where the mask is set
+   (0x612ee0); no mask of the same size: no rim paint (0x61de90 returns 0).
+   The player's (kept with its sources: the Paint Shop repaints it);
+   opponents and the outgoing turntable car get theirs from rim_lib_paint. */
+static N2Tex g_rimp_src, g_rimp_mask; static GLuint g_rimp_tex; static uint32_t g_rimp_sig;
+static void rimp_free(void) {
+    free(g_rimp_src.rgb); free(g_rimp_src.alpha); free(g_rimp_src.dxt); memset(&g_rimp_src, 0, sizeof g_rimp_src);
+    free(g_rimp_mask.rgb); free(g_rimp_mask.alpha); free(g_rimp_mask.dxt); memset(&g_rimp_mask, 0, sizeof g_rimp_mask);
+    if (g_rimp_tex) glDeleteTextures(1, &g_rimp_tex);
+    g_rimp_tex = 0; g_rimp_sig = 0;
+}
+static void rimp_load(const unsigned char *wt, long wtlen, uint32_t key) {
+    rimp_free();
+    if (!key || !wt) return;
+    if (!n2_load_car_tex_by_key(wt, wtlen, n2_bstr("_INNER_MASK", key), &g_rimp_mask) || !g_rimp_mask.rgb ||
+        !n2_load_car_tex_by_key(wt, wtlen, key, &g_rimp_src) || !g_rimp_src.rgb ||
+        g_rimp_mask.w != g_rimp_src.w || g_rimp_mask.h != g_rimp_src.h) {
+        printf("  rim paint mask %08x: %s\n", (unsigned)n2_bstr("_INNER_MASK", key),
+               g_rimp_mask.rgb ? "size differs" : "none");
+        rimp_free();
+        return;
+    }
+    printf("  rim paint mask %08x %dx%d\n", (unsigned)n2_bstr("_INNER_MASK", key), g_rimp_mask.w, g_rimp_mask.h);
+}
+static GLuint rimp_tex(const unsigned char *paint) {
+    if (!g_rimp_src.rgb || !paint) return 0;
+    uint32_t sig = 0x1000000u | paint[0] | paint[1] << 8 | (uint32_t)paint[2] << 16;
+    if (g_rimp_tex && sig == g_rimp_sig) return g_rimp_tex;
+    g_rimp_sig = sig;
+    if (g_rimp_tex) glDeleteTextures(1, &g_rimp_tex);
+    return g_rimp_tex = paint_composite(&g_rimp_src, &g_rimp_mask, paint);
+}
+/* The same two composites for a car other than the player's (an opponent's
+   RideInfo, the outgoing turntable car), built once from its config: its
+   DUMMY_WHEEL (0x6343a0: <rim>_WHEEL + _INNER_MASK, rim paint 0x49; 0 when
+   unpainted or no mask of the same size) and its DUMMY_SPINNER (0x61e040:
+   SPINNER_TEXTURE + _MASK, spinner paint 0x4a; NULL paint = untinted). The
+   rim texture is the library's first slice's (as load_rim_style). */
+static void rim_lib_paint(const N2Scene *rl, const unsigned char *wt, long wtlen,
+                          const unsigned char *rim_paint, const unsigned char *spin_paint,
+                          GLuint *rimtex, GLuint *spintex, int *spinmode) {
+    *rimtex = 0; *spintex = 0; *spinmode = N2_DRAW_OPAQUE;
+    if (!rl || rl->count <= 0 || !wt) return;
+    uint32_t tk = rl->meshes[0].texkey, sk = 0;
+    for (int i = 0; i < rl->count; i++) if (rl->meshes[i].car_anim == N2_WHEEL_SPIN) sk = rl->meshes[i].texkey;
+    N2Tex src, mask;
+    if (rim_paint && tk) {
+        memset(&src, 0, sizeof src); memset(&mask, 0, sizeof mask);
+        if (n2_load_car_tex_by_key(wt, wtlen, tk, &src) && src.rgb &&
+            n2_load_car_tex_by_key(wt, wtlen, n2_bstr("_INNER_MASK", tk), &mask) && mask.rgb &&
+            mask.w == src.w && mask.h == src.h)
+            *rimtex = paint_composite(&src, &mask, rim_paint);
+        free(src.rgb); free(src.alpha); free(src.dxt); free(mask.rgb); free(mask.alpha); free(mask.dxt);
+    }
+    if (sk) {
+        memset(&src, 0, sizeof src); memset(&mask, 0, sizeof mask);
+        if (n2_load_car_tex_by_key(wt, wtlen, sk, &src) && src.rgb) {
+            int mok = n2_load_car_tex_by_key(wt, wtlen, n2_bstr("_MASK", sk), &mask) && mask.rgb &&
+                      mask.w == src.w && mask.h == src.h;
+            *spinmode = n2_tex_mode(&src);
+            *spintex = paint_composite(&src, mok ? &mask : NULL, spin_paint);
         }
-    t.rgb = px;
-    g_spin_tex = upload_tpk_texture_to_gpu(&t);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    free(px);
-    return g_spin_tex;
+        free(src.rgb); free(src.alpha); free(src.dxt); free(mask.rgb); free(mask.alpha); free(mask.dxt);
+    }
 }
 /* set while an opponent's rims load: the spinner texture is the player's */
 static int g_rim_keep_spin;
@@ -1727,6 +2041,62 @@ static uint32_t rim_mesh_base(const unsigned char *wldata, long wllen, const N2M
     for (const char *c = nm; c < p + 8; c++) h = h * 33u + (unsigned char)*c;
     return h;
 }
+/* The wheel library parsed for one STYLEnn (n2_load_car of the whole rim
+   file, ~250 ms on the Vita per car switch): the last one kept, handed out
+   as copies (the fitting below edits its copy). Car meshes own plain
+   verts / idx (no shared geometry, no vertex colour). */
+static struct { const unsigned char *lib; long len; int style, nkeys; uint32_t keysum; N2Scene sc; } g_rimlib;
+static int rim_scene_copy(N2Scene *dst, const N2Scene *src) {
+    memset(dst, 0, sizeof *dst);
+    if (src->count <= 0) return 0;
+    dst->meshes = (N2Mesh *)calloc((size_t)src->count, sizeof *dst->meshes);
+    if (!dst->meshes) return -1;
+    dst->cap = src->count;
+    for (int i = 0; i < src->count; i++) {
+        const N2Mesh *a = &src->meshes[i];
+        N2Mesh *b = &dst->meshes[dst->count];
+        if (a->shared_geometry || a->vcol) { n2_free_scene(dst); return -1; }
+        *b = *a;
+        size_t nv = (size_t)a->nverts * (a->authored_normals ? 8 : 5) * sizeof(float);
+        b->verts = nv ? (float *)malloc(nv) : NULL;
+        b->idx = a->nidx ? (uint16_t *)malloc((size_t)a->nidx * sizeof(uint16_t)) : NULL;
+        if ((nv && !b->verts) || (a->nidx && !b->idx)) {
+            free(b->verts); free(b->idx); b->verts = NULL; b->idx = NULL;
+            n2_free_scene(dst); return -1;
+        }
+        if (nv) memcpy(b->verts, a->verts, nv);
+        if (a->nidx) memcpy(b->idx, a->idx, (size_t)a->nidx * sizeof(uint16_t));
+        dst->count++;
+    }
+    return dst->count;
+}
+static int rim_lib_load(const unsigned char *wldata, long wllen, N2Scene *lib,
+                        const uint32_t *wkeys, int nwkeys, const N2CarConfig *wcfg, int st) {
+    uint32_t sum = 2166136261u;
+    for (int i = 0; i < nwkeys; i++) sum = (sum ^ wkeys[i]) * 16777619u;
+    if (g_rimlib.sc.count > 0 && g_rimlib.lib == wldata && g_rimlib.len == wllen &&
+        g_rimlib.style == st && g_rimlib.nkeys == nwkeys && g_rimlib.keysum == sum) {
+        int n = rim_scene_copy(lib, &g_rimlib.sc);
+        if (n > 0) return n;
+    }
+    int n = n2_load_car(wldata, wllen, lib, wkeys, nwkeys, wcfg);
+    if (n > 0) {
+        n2_free_scene(&g_rimlib.sc);
+        if (rim_scene_copy(&g_rimlib.sc, lib) > 0) {
+            g_rimlib.lib = wldata; g_rimlib.len = wllen; g_rimlib.style = st;
+            g_rimlib.nkeys = nwkeys; g_rimlib.keysum = sum;
+            long bytes = 0;
+            for (int i = 0; i < g_rimlib.sc.count; i++)
+                bytes += (long)g_rimlib.sc.meshes[i].nverts * (g_rimlib.sc.meshes[i].authored_normals ? 32 : 20) +
+                         (long)g_rimlib.sc.meshes[i].nidx * 2 + (long)sizeof(N2Mesh);
+            printf("  rim library: STYLE%02d kept (%d meshes, %ld KB)\n", st, g_rimlib.sc.count, bytes >> 10);
+        }
+    }
+    return n;
+}
+/* the wheel library itself was freed or replaced */
+static void rim_lib_forget(void) { n2_free_scene(&g_rimlib.sc); memset(&g_rimlib, 0, sizeof g_rimlib); }
+
 static int load_rim_style(const unsigned char *wldata, long wllen,
                           const uint32_t *wkeys, int nwkeys, int style,
                           N2Scene *active, GpuMesh **active_gm, int *ngm,
@@ -1746,20 +2116,40 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
        (NFSU_STYLE03 is SPARCO_STYLE01), so the part's style first, then the
        others until one holds that model */
     uint32_t base = g_rim_base; g_rim_base = 0;
-    int n = 0;
-    for (int tok = 0; tok < 40 && n <= 0; tok++) {
-        int st = tok ? tok : style;
-        if (tok && (!base || tok == style)) continue;
-        if (tok) { n2_free_scene(&candidate); memset(&candidate, 0, sizeof candidate); }
+    int n = 0, parses = 0;
+    Uint32 rim_t0 = SDL_GetTicks();
+    /* which STYLEnn held this model last time (same library): try it first --
+       the search below finds the same one, parsing the library once per try */
+    static struct { const unsigned char *lib; long len; uint32_t base; int style, found; } memo[8];
+    int memo_tok = -1;
+    for (int k = 0; k < 8; k++)
+        if (base && memo[k].lib == wldata && memo[k].len == wllen && memo[k].base == base &&
+            memo[k].style == style) { memo_tok = memo[k].found; break; }
+    for (int tok = memo_tok >= 0 ? -1 : 0; tok < 40 && n <= 0; tok++) {
+        int st = tok < 0 ? memo_tok : tok ? tok : style;
+        if (tok > 0 && (!base || tok == style || tok == memo_tok)) continue;
+        if (tok == 0 && memo_tok == style) continue;
+        if (parses) { n2_free_scene(&candidate); memset(&candidate, 0, sizeof candidate); }
         N2CarConfig wcfg = {.hood_style=st,.wheel_style_id=st};   /* STYLEnn selects the rim */
-        n = n2_load_car(wldata, wllen, lib, wkeys, nwkeys, &wcfg);
+        n = rim_lib_load(wldata, wllen, lib, wkeys, nwkeys, &wcfg, st);
+        parses++;
         if (n > 0 && base) {
             int has = 0;
             for (int i = 0; i < lib->count && !has; i++) has = rim_mesh_base(wldata, wllen, &lib->meshes[i]) == base;
             if (!has) n = 0;
         }
-        if (n > 0) style = st;
+        if (n > 0) {
+            if (base && st != memo_tok) {
+                static int next;
+                int k = next++ & 7;
+                memo[k].lib = wldata; memo[k].len = wllen; memo[k].base = base;
+                memo[k].style = style; memo[k].found = st;
+            }
+            style = st;
+        }
     }
+    printf("  rim library: %d parse%s, %u ms%s\n", parses, parses == 1 ? "" : "s",
+           SDL_GetTicks() - rim_t0, memo_tok >= 0 ? " (style remembered)" : "");
     if (n <= 0) goto failed;
     /* the size: every style ships as <FOLDER>_STYLEnn_<inner>_<outer>_{A,B,C};
        the game fits the part of the car's OUTER_RADIUS (0x539b70) and the
@@ -1881,6 +2271,7 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
         uint32_t sk = 0;
         for (int i = 0; i < n; i++) if (active->meshes[i].car_anim == N2_WHEEL_SPIN) sk = active->meshes[i].texkey;
         spin_tex_load(wtdata, wtlen, sk);
+        rimp_load(wtdata, wtlen, tk);
     }
     /* channel telemetry: B min/max spanning 0..255 confirms the decode is NOT
        truncating blue -- the low average is an authentic gold/bronze rim. */
@@ -1958,7 +2349,7 @@ typedef struct {
     char brake[48];   /* the front brake model (car_sync_upgrades) */
     AcidMarker mk[64]; int nmk;   /* 0x13401a model markers (car effects, acid.c) */
     /* AI draw: same-state body meshes merged (built on first AI draw) */
-    GpuMesh *mgpu; short *mlead; int nmgpu, mtried;
+    GpuMesh *mgpu; short *mlead; int nmgpu, mtried, cabin_mesh;
 } CarSwitchCandidate;
 
 /* Every model marker (chunk 0x13401a: bStringHash name, 4x4, row 3 the
@@ -1968,7 +2359,7 @@ static int car_markers(const unsigned char *d, long len, const N2Scene *s, AcidM
 {
     int n = 0;
     if (!d) return 0;
-    for (int i = 0; i < s->count && n < max; i++) {
+    for (int i = 0; i < s->count && n < max - 1; i++) {
         long off = s->meshes[i].car_source;
         if (off < 8 || off > len) continue;
         int seen = 0;
@@ -1982,12 +2373,32 @@ static int car_markers(const unsigned char *d, long len, const N2Scene *s, AcidM
             const unsigned char *p = d + leaf[l].off; long bytes = leaf[l].size;
             int pad = n2_skip_filler(p, (int)bytes); p += pad; bytes -= pad;
             if (bytes % 80) continue;
-            for (long at = 0; at < bytes && n < max; at += 80) {
+            for (long at = 0; at < bytes && n < max - 1; at += 80) {
                 out[n].hash = n2_u32(p + at);
                 memcpy(out[n].pos, p + at + 16 + 48, sizeof out[n].pos);
+                memcpy(out[n].dir, p + at + 16 + 32, sizeof out[n].dir);
                 n++;
             }
         }
+    }
+    /* CarRenderInfo +0x30..+0x38 (ctor 0x638190 at 0x638990): the
+       translation of slot 5's model (BODY, slot table 0x802de8), eSolid
+       +0x70 via 0x488eb0; CreateCarLightFlares 0x6204d0 takes it off every
+       flare. Carried as a hash-0 entry, which no marker consumer matches. */
+    for (int i = 0; i < s->count && n < max; i++) {
+        long off = s->meshes[i].car_source;
+        if (off < 8 || off > len) continue;
+        uint32_t size = n2_u32(d + off - 4);
+        if ((long)size > len - off) continue;
+        char nm[64]; n2_car_mesh_name(d, off, off + size, nm);
+        if (!strstr(nm, "_BODY_")) continue;
+        float m[16];
+        if (!n2_obj_matrix(d, off, off + size, m)) break;
+        out[n].hash = 0;
+        memcpy(out[n].pos, m + 12, sizeof out[n].pos);
+        memset(out[n].dir, 0, sizeof out[n].dir);
+        n++;
+        break;
     }
     return n;
 }
@@ -2018,8 +2429,10 @@ static void car_global_drop(void) {
    PCM on load). g_car_sounds_pending: the front end's car select switched
    cars silently; main loads them once the menus close. */
 static int g_car_sounds_pending;
+static void player_engine_sound_levels(void);
 static void car_load_sounds(const char *dataroot, const char *carname) {
     g_car_sounds_pending = 0;
+    player_engine_sound_levels();   /* the engine slot / shift bank by the car's levels (0x4593b0, 0x45c376) */
     audio_hold(1);
     int ns = audio_load_ginsu_sweeps(dataroot, carname);
     if (!ns) {
@@ -2058,24 +2471,38 @@ static void car_switch_release(CarSwitchCandidate *candidate) {
    state 2) turns it away and its +0xb64 goes 0 when the spin ends. The port
    switches the player car in place, so the old car's meshes, textures and
    rims are moved here at the switch (the new car is already loaded then:
-   no new peak) and freed when the spin ends. Drawn by tt_old_draw. */
-static struct {
+   no new peak) and freed when the spin ends. Drawn by tt_car_draw, which
+   the garage floor's reflection (0x630de0(view 4, 1), not yet ported) is to
+   use for the cars too (the player car through a TtCar view of it). */
+typedef struct {
     int held, on, slot;          /* held: taken at the switch; on: drawn (+0xb64) at slot (+0xb78) */
     N2Scene scene; GpuMesh *gpu; int nmesh, own_mesh, stock_wheel;
     uint32_t keys[128]; GLuint tex[128]; char alpha[128], mode[128], own_tex[128]; int ntex;
     N2Scene rim; GpuMesh *rgm; int nrim; GLuint rtex; int rmode;   /* its library rims (none: its own wheel) */
+    GLuint rptex, sptex; int spmode;      /* its DUMMY_WHEEL / DUMMY_SPINNER (rim_lib_paint) */
     float wheelT[4][16], brakeT[4][16];   /* its last wheel placements (car-local) */
     float ride, wride, up[3];             /* body / wheel ride, the body up */
     float paint[3]; uint32_t pmat;        /* its base paint and light material */
     N2CarConfig cfg;
-} g_tt_old;
+    GLuint skin; uint32_t skinkey[SKIN_KEYS];   /* its vinyl skin (car_skin_update) and the keys wearing it */
+    float bb[6];                          /* its body box (the ground shadow) */
+    float nseg[24][6]; int nnseg;         /* its neon tubes (car-local FRONT/SIDE/REAR_NEON markers) */
+    GLuint neon_ut;                       /* its <CAR>_NEON underglow texture */
+} TtCar;
+/* the player car's neon tubes, cached per car (g_car_gen) */
+static struct { int gen, n; float p[24][6]; } g_neon_seg = { -1, 0 };
+static TtCar g_tt_old;
 static void tt_old_free(void) {
     if (!g_tt_old.held) return;
+    if (g_tt_old.skin) glDeleteTextures(1, &g_tt_old.skin);
     if (g_tt_old.own_mesh) { free_scene_gpu(g_tt_old.gpu, g_tt_old.nmesh); n2_free_scene(&g_tt_old.scene); }
     for (int i = 0; i < g_tt_old.ntex; i++)
         if (g_tt_old.own_tex[i] && g_tt_old.tex[i]) glDeleteTextures(1, &g_tt_old.tex[i]);
     free_scene_gpu(g_tt_old.rgm, g_tt_old.nrim); n2_free_scene(&g_tt_old.rim);
     if (g_tt_old.rtex) glDeleteTextures(1, &g_tt_old.rtex);
+    if (g_tt_old.rptex) glDeleteTextures(1, &g_tt_old.rptex);
+    if (g_tt_old.sptex) glDeleteTextures(1, &g_tt_old.sptex);
+    if (g_tt_old.neon_ut) glDeleteTextures(1, &g_tt_old.neon_ut);
     memset(&g_tt_old, 0, sizeof g_tt_old);
 }
 static void tt_old_show(int slot) { g_tt_old.on = 1; g_tt_old.slot = slot; }
@@ -2100,7 +2527,7 @@ static void car_texture_map_clear(GLuint *textures, int count,
 static void mod_catalog_cached(const char *dataroot, const char *car, const unsigned char *cdata,
                                long clen, const N2Scene *scene, N2PartMenu menus[N2_PART_COUNT]) {
     char fp[1024];
-    snprintf(fp, sizeof fp, "ux0:data/OpenUG2/cache/mods_%s.bin", car ? car : "");
+    snprintf(fp, sizeof fp, "ux0:data/NFSU2/cache/mods_%s.bin", car ? car : "");
     FILE *f = car && car[0] ? fopen(fp, "rb") : NULL;
     if (f) {
         char m[8]; long key = 0; int ok = fread(m, 8, 1, f) == 1 && !memcmp(m, MOD_CACHE_MAGIC, 8) &&
@@ -2116,7 +2543,7 @@ static void mod_catalog_cached(const char *dataroot, const char *car, const unsi
     }
     n2_mod_catalog(dataroot, cdata, clen, scene, menus);
     if (!car || !car[0]) return;
-    mkdir("ux0:data/OpenUG2/cache", 0777);
+    mkdir("ux0:data/NFSU2/cache", 0777);
     char tmp[1040]; snprintf(tmp, sizeof tmp, "%s.tmp", fp);
     if (!(f = fopen(tmp, "wb"))) return;
     int ok = fwrite(MOD_CACHE_MAGIC, 8, 1, f) == 1 && fwrite(&clen, sizeof clen, 1, f) == 1;
@@ -2380,26 +2807,51 @@ enum { PF_FRAME_TOP, PF_PLAYER_SIM, PF_AI_FOLLOW, PF_AI_STEP, PF_AI_CONTACT,
        PF_AI_SPAWN, PF_CAMERA, PF_WORLD_DRAW, PF_CAR_SHADOW, PF_PLAYER_DRAW,
        PF_AI_DRAW, PF_MID_DRAW, PF_AI_LAMPS,
        /* the post_draw span split up: car sounds, car effects (particles),
-          district lights + world glows, telemetry/banners/debug, the screen
+          district lights + world glows (+ the sound/world setters), the rain's
+          draws (streaks + screen drops), telemetry/banners/debug, the screen
           effects (render_scene_end), FE + HUD; post_draw = the rest */
-       PF_PD_SOUND, PF_PD_PARTICLES, PF_PD_GLOWS, PF_PD_MISC, PF_PD_SCREENFX, PF_PD_HUD,
+       PF_PD_SOUND, PF_PD_PARTICLES, PF_PD_GLOWS, PF_PD_RAIN, PF_PD_MISC, PF_PD_SCREENFX, PF_PD_HUD,
        PF_POST_DRAW, PF_SCENE_END, PF_SWAP, PF_N };
 static const char *const pf_name[PF_N] = { "top","player_sim","ai_follow","ai_step",
     "ai_contact","ai_spawn","camera","world_draw","car_shadow","player_draw",
     "ai_draw","mid_draw","ai_lamps",
-    "pd_sound","pd_particles","pd_glows","pd_misc","pd_screenfx","pd_hud",
+    "pd_sound","pd_particles","pd_glows","pd_rain","pd_misc","pd_screenfx","pd_hud",
     "post_draw","scene_end","swap" };
 #define PF_GPU_N 3      /* scene before AI cars | AI car meshes | rest to swap */
 #define PF_GPU_LAG 4
 static FILE *pf_csv; static Uint64 pf_last; static double pf_ms[PF_N];
+static int g_pair_player_brakes;
+enum { PF_WORLD_PARTS = 11 };
+/* Subspans of the existing CPU columns, stored in raw ticks until CSV output. */
+static struct {
+    Uint64 stream, player_physics, race_control, race_physics;
+    Uint64 player_body, player_late, rival_body, player_brakes;
+    Uint64 player_mesh_state, player_mesh_submit, player_body_thread_us;
+    unsigned player_brake_meshes;
+    unsigned player_body_thread_sample, player_body_preempts, player_body_interrupts, player_body_releases;
+    unsigned player_draws, rival_draws, rival_binds, rival_switches;
+    Uint64 world_us[PF_WORLD_PARTS];
+    unsigned road_reflection_updated, car_env_updated;
+    int race_event;
+} pf_detail;
+static Uint64 pf_stamp(void) { return pf_csv ? SDL_GetPerformanceCounter() : 0; }
+static Uint64 pf_elapsed(Uint64 start) { return start ? SDL_GetPerformanceCounter() - start : 0; }
+#ifdef PF_VITA_THREAD
+static int pf_thread_info(SceKernelThreadInfo *info) {
+    memset(info, 0, sizeof *info);
+    info->size = sizeof *info;
+    return sceKernelGetThreadInfo(sceKernelGetThreadId(), info) >= 0;
+}
+#endif
 static int pf_gpu_ok; static GLuint pf_q[PF_GPU_LAG][PF_GPU_N]; static int pf_gpu_open=-1;
 static void (*pf_GenQueries)(GLsizei,GLuint*);
 static void (*pf_BeginQuery)(GLenum,GLuint), (*pf_EndQuery)(GLenum);
 static void (*pf_GetQueryObjectuiv)(GLuint,GLenum,GLuint*);
 static void (*pf_GetQueryObjectui64v)(GLuint,GLenum,unsigned long long*);
 #ifdef __vita__
-extern volatile int vita_wd_armed, vita_wd_sec;
+extern volatile int vita_wd_armed, vita_wd_sec, vita_wd_load;
 extern volatile unsigned vita_wd_beat;
+unsigned vita_variant_switch_total(void);
 #endif
 static void pf_mark(int s) {
 #ifdef __vita__
@@ -2414,8 +2866,18 @@ static void pf_mark(int s) {
 #ifdef __vita__
 unsigned long long sceKernelGetProcessTimeWide(void);
 unsigned vita_heap_top_mb(void);
-static unsigned long long wt_last; static double wt_ms[10]; static int wt_frames;
-#define WT_MARK(i) do { unsigned long long wt_now_ = sceKernelGetProcessTimeWide(); if ((i) >= 0) wt_ms[(i)] += (double)(wt_now_ - wt_last) / 1000.0; wt_last = wt_now_; } while (0)
+static unsigned long long wt_last;
+static double wt_ms[PF_WORLD_PARTS];
+static int wt_frames;
+static void WT_MARK(int part) {
+    unsigned long long now = sceKernelGetProcessTimeWide();
+    if (part >= 0) {
+        unsigned long long elapsed = now - wt_last;
+        wt_ms[part] += (double)elapsed / 1000.0;
+        if (pf_csv) pf_detail.world_us[part] += elapsed;
+    }
+    wt_last = now;
+}
 #else
 #define WT_MARK(i) ((void)0)
 #endif
@@ -2457,7 +2919,17 @@ static void pf_open(const char *path) {
     { extern void vita_gx_start(void); extern const char *vita_gx_header(void);
       vita_gx_start(); fputs(vita_gx_header(),pf_csv); }
 #endif
-    fputs(",nis,x,y,z",pf_csv);
+    fputs(",nis,x,y,z,race_event,cpu_stream_update,cpu_player_physics,cpu_race_control,"
+          "cpu_race_physics,cpu_player_body,cpu_player_late,cpu_rival_body,"
+          "player_draws,rival_body_draws,rival_body_texture_binds,rival_body_variant_switches,"
+          "cpu_world_fog,cpu_world_carvis_lights,cpu_world_sky,cpu_world_vista,"
+          "cpu_world_opaque_cull,cpu_world_cut_blend,cpu_world_rest,cpu_world_camera,"
+          "cpu_world_reflection,cpu_world_env,cpu_world_mirror,"
+          "road_reflection_updated,car_env_updated,"
+          "cpu_player_brakes,player_brake_meshes,player_brake_pair_setup,"
+          "cpu_player_mesh_state,cpu_player_mesh_submit,player_body_thread_sample,"
+          "player_body_thread_ms,player_body_preempts,player_body_interrupts,player_body_releases,"
+          "car_light_grid_builds,cpu_car_light_grid", pf_csv);
     fputc('\n',pf_csv);
     pf_last=SDL_GetPerformanceCounter();
 }
@@ -2492,6 +2964,26 @@ static void pf_row(long frame,const int counts[12]) {
     { extern void vita_gx_row(FILE *); vita_gx_row(pf_csv); }
 #endif
     fprintf(pf_csv,",%d,%.1f,%.1f,%.1f",g_pf_nis,g_pf_pos[0],g_pf_pos[1],g_pf_pos[2]);
+    double ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
+    fprintf(pf_csv, ",%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%u,%u,%u",
+            pf_detail.race_event, pf_detail.stream * ms, pf_detail.player_physics * ms,
+            pf_detail.race_control * ms, pf_detail.race_physics * ms, pf_detail.player_body * ms,
+            pf_detail.player_late * ms, pf_detail.rival_body * ms, pf_detail.player_draws,
+            pf_detail.rival_draws, pf_detail.rival_binds, pf_detail.rival_switches);
+    for (int i = 0; i < PF_WORLD_PARTS; i++)
+        fprintf(pf_csv, ",%.4f", (double)pf_detail.world_us[i] / 1000.0);
+    fprintf(pf_csv, ",%u,%u", pf_detail.road_reflection_updated, pf_detail.car_env_updated);
+    fprintf(pf_csv, ",%.4f,%u,%d", pf_detail.player_brakes * ms,
+            pf_detail.player_brake_meshes, g_pair_player_brakes);
+    fprintf(pf_csv, ",%.4f,%.4f,%u,%.4f,%u,%u,%u",
+            pf_detail.player_mesh_state * ms, pf_detail.player_mesh_submit * ms,
+            pf_detail.player_body_thread_sample, (double)pf_detail.player_body_thread_us / 1000.0,
+            pf_detail.player_body_preempts, pf_detail.player_body_interrupts, pf_detail.player_body_releases);
+    unsigned light_grid_builds;
+    uint64_t light_grid_ticks;
+    carfx_light_grid_stats(&light_grid_builds, &light_grid_ticks);
+    fprintf(pf_csv, ",%u,%.4f", light_grid_builds, light_grid_ticks * ms);
+    memset(&pf_detail, 0, sizeof pf_detail);
     fputc('\n',pf_csv);
 }
 
@@ -3006,13 +3498,15 @@ static float m94_prex, m94_prey, m94_prez;   /* car pose before this frame's pus
  * no mouse or keyboard and gameplay input is untouched. */
 static int g_devui = 0;
 static int g_reset_req;          /* the Reset binding pressed (keypad 1 event), taken by the next tick */
+static float g_reset_blink;      /* car +0x974 / +0x978: seconds of the 2 s reset blink left (0x5fbd60 / 0x5ebf70) */
+static int g_pose_ring_clear;    /* a new Player (ctor 0x5f1670 sets +0xbc = 0): the saved poses start over */
 /* M130: the player's authoritative vertical pose. carpos[0..1] stay owned by
    the XY arcade model; carpos[2], the chassis tilt and every wheel's own height
    now come from here. There is exactly one body-pose filter, not two. */
 static PhysRideState  g_ride;
 static PhysRideSupport g_sup;
 /* The retail NFSU2 car simulation (n2sim.c, ported from SPEED2.EXE). It owns
-   the player car whenever its GLOBALB record is known; ux0:data/OpenUG2/
+   the player car whenever its GLOBALB record is known; ux0:data/NFSU2/
    arcade.txt (arcade.txt on PC) brings back the older arcade model. */
 static N2Sim *g_n2;
 /* the retail collision world (wcoll.c): the player car's collider */
@@ -3040,6 +3534,76 @@ static void snd_coll_car(CarSfxCollCar *o, int id, const N2Sim *s, int human)
     for (int w = 0; w < 4; w++) o->wheels += st.wheel_contact[w] != 0;
     o->human = human;
 }
+/* The collision sounds' calls, kept by the replay while it records and
+   made again as its playback passes them (retail re-simulates the
+   collisions, so their sounds play in the replay) */
+enum { RPS_HIT, RPS_PROP, RPS_PAIRS };
+static int g_sfx_hitsrc[4];             /* a hit kept this run: its pairs call is kept too */
+typedef struct {
+    int kind, src, a, b, poly, prop, cat, has_ca, has_cb, n;
+    float point[3], imp[3], slide;
+    CarSfxCollCar ca, cb;
+} RpSndCall;
+static void sfx_coll_hit(int src, int a, int b, int poly, const float point[3], const float impulse[3],
+                         float slide, const CarSfxCollCar *ca, const CarSfxCollCar *cb)
+{
+    carsfx_coll_hit(src, a, b, poly, point, impulse, slide, ca, cb);
+    if (!rp_recording()) return;
+    RpSndCall e; memset(&e, 0, sizeof e);
+    e.kind = RPS_HIT; e.src = src; e.a = a; e.b = b; e.poly = poly; e.slide = slide;
+    memcpy(e.point, point, sizeof e.point); memcpy(e.imp, impulse, sizeof e.imp);
+    if (ca) { e.has_ca = 1; e.ca = *ca; }
+    if (cb) { e.has_cb = 1; e.cb = *cb; }
+    rp_sound(&e, (int)sizeof e);
+    if (src >= 0 && src < 4) g_sfx_hitsrc[src] = 1;
+}
+static void sfx_coll_prop(int src, int a, int b, int poly, const float point[3], const float impulse[3],
+                          const CarSfxCollCar *car, int prop, int cat)
+{
+    carsfx_coll_prop(src, a, b, poly, point, impulse, car, prop, cat);
+    if (!rp_recording()) return;
+    RpSndCall e; memset(&e, 0, sizeof e);
+    e.kind = RPS_PROP; e.src = src; e.a = a; e.b = b; e.poly = poly; e.prop = prop; e.cat = cat;
+    memcpy(e.point, point, sizeof e.point); memcpy(e.imp, impulse, sizeof e.imp);
+    if (car) { e.has_ca = 1; e.ca = *car; }
+    rp_sound(&e, (int)sizeof e);
+    if (src >= 0 && src < 4) g_sfx_hitsrc[src] = 1;
+}
+/* the pairs: kept when a source's set changes or a hit of the run made an
+   effect (the set ends the effects whose pair is gone; an unchanged set
+   ends none) */
+static void sfx_coll_pairs(int src, const int (*pairs)[3], int n)
+{
+    enum { FIT = (RP_SND_LEN / 4 - 3) / 3 };
+    static int last[4][FIT * 3], lastn[4];
+    carsfx_coll_pairs(src, pairs, n);
+    if (!rp_recording() || src < 0 || src > 3) return;
+    int m = n > 0 ? n : 0;
+    if (m > FIT) m = FIT;
+    int buf[RP_SND_LEN / 4];
+    buf[0] = RPS_PAIRS; buf[1] = src; buf[2] = m;
+    for (int i = 0; i < m; i++) { buf[3 + 3 * i] = pairs[i][0]; buf[4 + 3 * i] = pairs[i][1]; buf[5 + 3 * i] = pairs[i][2]; }
+    int same = m == lastn[src] && !memcmp(last[src], buf + 3, (size_t)m * 12);
+    if (same && !g_sfx_hitsrc[src]) return;
+    g_sfx_hitsrc[src] = 0;
+    lastn[src] = m; memcpy(last[src], buf + 3, (size_t)m * 12);
+    rp_sound(buf, (3 + 3 * m) * 4);
+}
+static void sfx_coll_play(const void *ev, int len)
+{
+    int kind; memcpy(&kind, ev, 4);
+    if (kind == RPS_PAIRS) {
+        int buf[RP_SND_LEN / 4]; memcpy(buf, ev, (size_t)len);
+        carsfx_coll_pairs(buf[1], (const int (*)[3])(buf + 3), buf[2]);
+        return;
+    }
+    RpSndCall e; if (len != (int)sizeof e) return;
+    memcpy(&e, ev, sizeof e);
+    if (kind == RPS_HIT)
+        carsfx_coll_hit(e.src, e.a, e.b, e.poly, e.point, e.imp, e.slide, e.has_ca ? &e.ca : NULL, e.has_cb ? &e.cb : NULL);
+    else if (kind == RPS_PROP)
+        carsfx_coll_prop(e.src, e.a, e.b, e.poly, e.point, e.imp, e.has_ca ? &e.ca : NULL, e.prop, e.cat);
+}
 /* the smokeable props' contacts of a collision run as their own sound
    source (stSmokableCollision 0x47a960): ids[] = the sound ids of the run's
    cars, a prop's id 1000 + its serial; then the pairs of src it still has */
@@ -3055,7 +3619,7 @@ static void smk_coll_sounds(int src, const CarCollCar *cs, int nc, const CarColl
         if (car >= 0) snd_coll_car(&cc, ids[car], cs[car].s, cs[car].human);
         int ia = pa ? 1000 + pa : ids[a], ib = b < 0 ? -1 : pb ? 1000 + pb : ids[b];
         if (ib >= 0 && ib < ia) { int t = ia; ia = ib; ib = t; }
-        carsfx_coll_prop(src, ia, ib, b < 0 ? h[i].poly : -1, h[i].point, h[i].impulse,
+        sfx_coll_prop(src, ia, ib, b < 0 ? h[i].poly : -1, h[i].point, h[i].impulse,
                          car >= 0 ? &cc : NULL, pa ? pa : pb, pa ? cat : catb);
     }
     static int pr[512][3];
@@ -3069,7 +3633,7 @@ static void smk_coll_sounds(int src, const CarCollCar *cs, int nc, const CarColl
         if (ib >= 0 && ib < ia) { int t = ia; ia = ib; ib = t; }
         pr[k][0] = ia; pr[k][1] = ib; pr[k][2] = pr[i][2]; k++;
     }
-    carsfx_coll_pairs(src, (const int (*)[3])pr, k);
+    sfx_coll_pairs(src, (const int (*)[3])pr, k);
 }
 static unsigned char g_n2rec[N2_REC_SIZE];
 static int g_n2rec_ok, g_n2rec_gen, g_n2_gen = -1, g_n2_enabled = -1;
@@ -3081,6 +3645,27 @@ static int g_n2_race_mode;
    (PerfConfig +0x330) the working record is built from (0x5ac4f0) */
 static unsigned char g_n2rec_raw[N2_REC_SIZE];
 static PerfParts g_n2_pp;
+/* the player's turbo / nitrous levels for its sound banks (0x5995e0(4) / (2)), its engine sound
+   level (CarPreSetup 0x4593b0: EAXCar +0x94) and transmission level (+0xa4 = 0x5995e0(1)) */
+static int g_n2_aud_lv[4];
+/* EAXCar +0x94: 3 / 2 / 1 with perf part 0x18 / 0x13 / 0xf fitted (0x599610), else 0 */
+static int engine_sound_level(const PerfParts *pp)
+{
+    return perf_part_fitted(pp, 0x18) ? 3 : perf_part_fitted(pp, 0x13) ? 2 : perf_part_fitted(pp, 0xf) ? 1 : 0;
+}
+/* the levels the player's engine / shift sounds load with: a car switch's
+   garage build (g_shop_req) is applied after its sounds load, so its parts
+   count already */
+static void player_engine_sound_levels(void)
+{
+    int e = g_n2_aud_lv[2], t = g_n2_aud_lv[3];
+    if (g_shop_req_pending && perf_ready()) {
+        PerfParts pp; perf_clear(&pp);
+        memcpy(pp.fit, g_shop_req.perf, sizeof pp.fit);
+        e = engine_sound_level(&pp); t = perf_cat_level(&pp, 1);
+    }
+    audio_set_player_engine_level(e, t);
+}
 static int g_n2_perf_nos;   /* the fitted nitrous package level (category 2) */
 /* the player's wall contacts this tick (polygon pairs, |impulse|), for the
    style manager's collision pairs (0x5a9620 -> 0x56fb20) */
@@ -3096,6 +3681,9 @@ static int g_n2_dsteer_on; static unsigned short g_n2_dsteer;
    half -- the port's own key mapping, sdl_vita.c) */
 static int g_drag_btn[2];
 static int g_n2_ticked, g_n2_live, g_n2_prev_gear;
+#ifdef OPENUG2_SIM_PRE_H
+static int g_n2_live_was = 1;   /* N2TRACE */
+#endif
 /* after the player crosses the line the car is driven by an AI racer
    controller (0x605c70(0) drops the driving inputs, 0x5eba30(3)): its
    controls, set each tick by rt_tick, in place of the pad */
@@ -3171,8 +3759,15 @@ static N2State g_n2s;
    frame of a run): angle += -wheel spin rate (car +0x328) * dt. Render
    (80191690): eRotateY(angle) then the car matrix at the roller's spot;
    RenderCars (80241174) draws them while the car has a DynoManager (the
-   dyno event). GUESS: the wheel offsets taken from the car origin and the
-   ground from the wheel's contact point. */
+   dyno event). Spot (GC 80191ae8..80191bcc, PC 0x56d1d0..0x56d31f):
+   local (wheel k x - P x +-0.26, 0 (0x8032d898), wheel k z - P z - 0.175)
+   off CarPhysicsInfo (Car +0x20 = RidePhysicsInfo +0x24; P[0] the centre
+   of gravity, wheel k at +0x10 + 0x30k), eMulVector by the body matrix
+   (+0x88) + the car position (+0x58, the centre of gravity), then z =
+   GetElevation(car topology +0x5b4, spot) - 0.175 (or the car z - 0.175
+   with no topology). */
+static const N2Scene *g_dyroll_scene;   /* the scene n2_ground probes (n2_player_tick) */
+static int n2_ground(void *user, float x, float y, float zref, float *z, float n[3], int *surf);
 static struct {
     int tried, n, set;
     GpuMesh *gm; GLuint tex[8]; unsigned char md[8], skip[8];
@@ -3252,14 +3847,22 @@ static int dyroll_load(void) {
 }
 /* Initialize: the four spots off the car as it stands */
 static void dyroll_place(void) {
-    const float *fw = g_n2s.rot;
-    for (int k = 0; k < 4; k++) {
-        float d[3] = { g_n2s.wheel_pos[k][0] - g_n2s.pos[0], g_n2s.wheel_pos[k][1] - g_n2s.pos[1], g_n2s.wheel_pos[k][2] - g_n2s.pos[2] };
-        float x = d[0] * fw[0] + d[1] * fw[1] + d[2] * fw[2] + (k & 1 ? -0.26f : 0.26f);
-        for (int a = 0; a < 2; a++) g_dyroll.pos[k][a] = g_n2s.pos[a] + fw[a] * x;
-        g_dyroll.pos[k][2] = g_n2s.wheel_cpt[k][2] - 0.175f;
+    if (!g_n2 || !g_n2rec_ok) return;
+    N2Body b; n2sim_body(g_n2, &b);
+    const unsigned char *P = g_n2rec + 0x110;
+    float x0 = 0.26f;                                         /* 0x8032d894, sign flipped per wheel */
+    for (int k = 0; k < 4; k++, x0 = -x0) {
+        float wx, wz;
+        memcpy(&wx, P + 0x10 + 0x30 * k, 4); memcpy(&wz, P + 0x18 + 0x30 * k, 4);
+        float l[3] = { wx - b.com[0] + x0, 0.0f, wz - b.com[2] - 0.175f };
+        float *o = g_dyroll.pos[k];
+        for (int a = 0; a < 3; a++) o[a] = l[0] * b.R[a] + l[1] * b.R[4 + a] + l[2] * b.R[8 + a] + b.pos[a];
+        float gz, n[3]; int surf;
+        if (g_dyroll_scene && n2_ground((void *)g_dyroll_scene, o[0], o[1], b.pos[2], &gz, n, &surf))
+            o[2] = gz - 0.175f;                               /* GetElevation + -0.175 (0x8032d89c) */
+        else o[2] = b.pos[2] - 0.175f;
     }
-    memcpy(g_dyroll.rot, g_n2s.rot, sizeof g_dyroll.rot);
+    for (int r = 0; r < 3; r++) for (int a = 0; a < 3; a++) g_dyroll.rot[r * 3 + a] = b.R[r * 4 + a];
     g_dyroll.set = 1;
 }
 static void dyroll_draw(const RProg *rp, const float MVP[16]) {
@@ -3287,6 +3890,22 @@ static void dyroll_draw(const RProg *rp, const float MVP[16]) {
 /* 0x5a9620's sparks / impact effects for one resolved contact (acid.c): a
    car's collidable is surface 28 (CAR, 0x5aeed0); va, vb: the velocities of
    both sides (vb NULL for a polygon) */
+/* acid_contact, kept by the replay while it records (played again at its tick) */
+static void acid_contact_rec(int surf, const float pt[3], const float imp[3], float slide,
+                             const float va[3], const float vb[3])
+{
+    acid_contact(surf, pt, imp, slide, va, vb);
+    if (!rp_recording()) return;
+    RpContact c; memset(&c, 0, sizeof c);
+    c.surface = surf; c.slide = slide; c.has_vb = vb != NULL;
+    memcpy(c.pt, pt, sizeof c.pt); memcpy(c.imp, imp, sizeof c.imp); memcpy(c.va, va, sizeof c.va);
+    if (vb) memcpy(c.vb, vb, sizeof c.vb);
+    rp_contact(&c);
+}
+static void rp_contact_play(const RpContact *c)
+{
+    acid_contact(c->surface, c->pt, c->imp, c->slide, c->va, c->has_vb ? c->vb : NULL);
+}
 static void acid_hit_fx(const CarCollHit *h, const N2Sim *a, const N2Sim *b)
 {
     if (!acid_ndefs() || !a) return;
@@ -3294,7 +3913,7 @@ static void acid_hit_fx(const CarCollHit *h, const N2Sim *a, const N2Sim *b)
     n2sim_body(a, &ba);
     if (b) n2sim_body(b, &bb);
     int surf = acid_contact_surface(28, b ? 28 : h->surface);
-    acid_contact(surf, h->point, h->impulse, h->slide, ba.v, b ? bb.v : NULL);
+    acid_contact_rec(surf, h->point, h->impulse, h->slide, ba.v, b ? bb.v : NULL);
 }
 /* the same contact effect for the hits of a collision run that involve a
    smokeable prop (every pair has one, 0x5af11c): a prop's surface is its
@@ -3312,7 +3931,7 @@ static void smk_hit_fx(const CarCollCar *cs, int nc, const CarCollHit *h, int nh
         if (!pa) { if (!cs[a].s) continue; n2sim_body(cs[a].s, &k); memcpy(va, k.v, sizeof va); sa = 28; }
         if (b >= 0 && !pb) { if (!cs[b].s) continue; n2sim_body(cs[b].s, &k); memcpy(vb, k.v, sizeof vb); sb = 28; }
         if (b < 0) sb = h[i].surface;
-        acid_contact(acid_contact_surface(sa, sb), h[i].point, h[i].impulse, h[i].slide, va, b >= 0 ? vb : NULL);
+        acid_contact_rec(acid_contact_surface(sa, sb), h[i].point, h[i].impulse, h[i].slide, va, b >= 0 ? vb : NULL);
     }
 }
 /* the retail player camera (chasecam.c); reloaded when the car record changes */
@@ -3320,20 +3939,30 @@ static ChaseCam g_ccam;
 static int g_cc_ready, g_cc_snap, g_cc_setting = 3;
 /* camera +0x280 (CcOut.hide_car): the player car is not drawn this frame */
 static int g_cc_hide_car;
+/* player +0x238 -> +0xc == 1: the CubicCameraMover (CameraMoverTypes 1, ctor 0x451660 -> 0x44ab90)
+   drives the view -- not NIS / ICE, the jump cam's TrackCar, the photo view, the dyno (Rain::Update
+   0x61e8a1, SFXCTL_Physics f7 / f8 0x470a60); set by the camera pass each frame */
+static int g_cc_cubic;
 /* the rear-view mirror (HUD feature 0x1000 -> Player::SetRearViewMirrorCameraMover):
    wanted this frame, its view, its target drawn */
 static int g_rvm_on, g_rvm_ready;
+#ifdef OPENUG2_SIM_PRE_H
+static int g_jc_test_crash;             /* test aid OPENUG2_JC_TEST (jump cams) */
+#endif
 static CcOut g_rvm_cc;
 static float g_nis_znear;   /* the scene camera's near clip this frame (0: none) */
 static float g_nis_lb, g_nis_dof[2];   /* its letterbox and depth of field (0: none) */
 static float g_n2_skid3[3];         /* retail skid sound channels, 0..1 */
 /* one car's SFXCTL_Skid state (n2_skid_channels) */
-typedef struct { float ha[2][5], hc[2][5], tb[2], c1[2], c2b[2], pv[3]; int hi; } N2SkidCtl;
+typedef struct { float ha[2][5], hc[2][5], tb[2], c1[2], c2b[2], pv[3]; int hi;
+                 float side[2][3]; /* +0x194.. (side 0, right) / +0x1a0.. (side 1, left): each side's channels */ } N2SkidCtl;
+static float g_n2_skid3s[2][3];     /* the player's per side (CARSFX_Skids' two instances, 0x460a70) */
 static void n2_skid_ctl(N2SkidCtl *k, const N2State *o, float brake, float handbrake, float out[3]);
 static void n2_skid_channels(float brake, float handbrake, float out[3])
 {
     static N2SkidCtl k;
     n2_skid_ctl(&k, &g_n2s, brake, handbrake, out);
+    memcpy(g_n2_skid3s, k.side, sizeof g_n2_skid3s);
 }
 /* the 0x34600 record of one car (N2_REC_SIZE, stock physics + upgrade targets): 0x40 bytes before its CARS\NAME\GEOMETRY.BIN */
 static int n2_find_record(const unsigned char *g, long len, const char *name, unsigned char *out)
@@ -3448,6 +4077,8 @@ static int g_car_gen;                  /* bumped whenever the player car's scene
 static PartAnims *g_partanim; static char g_partanim_car[32];
 static int g_sc_parts;   /* Show Off (0x4b5ad0): 1 hood (+0xe9), 2 trunk (+0xeb), 4 both doors (+0xea) */
 static int g_sc_parts_hold;   /* the showcase photo screen is up */
+static float g_pa_clock;      /* the part animations' clock, s (WorldTimer 0x86518c) */
+static int part_world_paused(void);   /* the in-game pause menu is up (after g_pause) */
 static void part_anim_tick(Shop *vs, const char *dataroot, const char *car, const N2CarConfig *cfg,
                            const N2Scene *scene, GpuMesh *gm, int n) {
     static int gen = -1, prev_mask, posed_n, tried; static unsigned char *posed;
@@ -3468,21 +4099,38 @@ static void part_anim_tick(Shop *vs, const char *dataroot, const char *car, cons
         free(posed); posed = (unsigned char *)calloc((size_t)(n > 0 ? n : 1), 1);
         posed_n = n; gen = g_car_gen;
     }
+    /* the clock: WorldTimer 0x86518c (+= world dt x 4000 at 0x57a170). In the
+       front end (0x8654a4 != 6) MainLoop 0x5811c0 sets the world dt 0x865154
+       = the real frame step 0x865198; in game it is the RaceCoordinator / sim
+       step (0x601a60): scaled with the sim's time scale and 0 while the game
+       is paused. One clock for both, so a part moving across the switch
+       stays continuous. */
+    {
+        static unsigned last; static int have;
+        unsigned t = SDL_GetTicks();
+        float dt = have ? (float)(t - last) * 0.001f : 0.0f;
+        last = t; have = 1;
+        if (!vs) dt = part_world_paused() ? 0.0f : (dt > 0.1f ? 0.1f : dt) * n2sim_time_scale();   /* <= 3 sim ticks */
+        g_pa_clock += dt;
+    }
     if (!g_partanim || !gm || !posed) return;
-    float now = (float)SDL_GetTicks() * 0.001f;
+    float now = g_pa_clock;
     if (mask != prev_mask && !vs) shop_car_part_anim_styles(dataroot, car, cfg, &hs, &hf, &ds);
     if (mask != prev_mask) {   /* 0x61f820, with its front-end sounds (0x50d180 -> SoundMgr 0x458520):
                                   hood 0x51 open / 0x4d close, trunk 0x53 / 0x52, the left door
                                   0x4c / 0x4f when it swings up (ANIMSTYLE 1), else 0x50 / 0x4e */
         /* UIMagazineReward poses through FEDoCarPartAnimNow (0x4c1860): speed 20 */
         float mc_[9], spd = vs && shop_mag_view(vs, mc_) ? 20.0f : 1.0f;
+        /* EAXSound +0x90 != 1 (in game: the world's Show Off, vs NULL):
+           EAXCommon::PlayCarPartSnd 0x481500 instead, stitch hood close 2 /
+           open 3, trunk 4 / 5, door 0 / 1 (any door style) */
         if ((mask ^ prev_mask) & 1) {
             partanim_request_speed(g_partanim, PA_HOOD, mask & 1, hs, hf, spd, now);
-            audio_fe_play(mask & 1 ? 0x51 : 0x4d);
+            if (vs) audio_fe_play(mask & 1 ? 0x51 : 0x4d); else carsfx_part_snd(mask & 1 ? 3 : 2);
         }
         if ((mask ^ prev_mask) & 2) {
             partanim_request_speed(g_partanim, PA_TRUNK, (mask & 2) != 0, 0, 0, spd, now);
-            audio_fe_play(mask & 2 ? 0x53 : 0x52);
+            if (vs) audio_fe_play(mask & 2 ? 0x53 : 0x52); else carsfx_part_snd(mask & 2 ? 5 : 4);
         }
         /* 4 = both doors (Show Off's one toggle), 8 / 16 = the left / right
            door alone (the magazine's flag bits 1 / 2); only the left door
@@ -3490,7 +4138,7 @@ static void part_anim_tick(Shop *vs, const char *dataroot, const char *car, cons
         int lw = (mask & 12) != 0, lp = (prev_mask & 12) != 0, rw = (mask & 20) != 0, rp = (prev_mask & 20) != 0;
         if (lw != lp) {
             int up = ds == 1 || ds >= 3;   /* scissor, or its wide-body styles */
-            audio_fe_play(lw ? (up ? 0x4c : 0x50) : (up ? 0x4f : 0x4e));
+            if (vs) audio_fe_play(lw ? (up ? 0x4c : 0x50) : (up ? 0x4f : 0x4e)); else carsfx_part_snd(lw ? 1 : 0);
             partanim_request_speed(g_partanim, PA_LEFT_DOOR, lw, ds, 0, spd, now);
         }
         if (rw != rp) partanim_request_speed(g_partanim, PA_RIGHT_DOOR, rw, ds, 0, spd, now);
@@ -3532,21 +4180,28 @@ static GLuint neon_blur_tex(const char *dataroot) {
     free(own);
     return id;
 }
+static uint32_t g_neon_ut_key; static GLuint g_neon_ut_id;
+/* the outgoing turntable car takes the underglow texture loaded for it (the
+   cache then loads the new car's without deleting it) */
+static GLuint neon_under_take(const char *car) {
+    if (g_neon_ut_key != n2_bstr("_NEON", n2_bstr(car, 0xffffffffu))) return 0;
+    GLuint id = g_neon_ut_id; g_neon_ut_id = 0; g_neon_ut_key = 0;
+    return id;
+}
 static GLuint neon_under_tex(const char *car, const unsigned char *ctdata, long ctlen) {
-    static uint32_t key; static GLuint id;
     uint32_t k = n2_bstr("_NEON", n2_bstr(car, 0xffffffffu));
-    if (k == key) return id;
-    if (id) glDeleteTextures(1, &id);
-    key = k; id = 0;
+    if (k == g_neon_ut_key) return g_neon_ut_id;
+    if (g_neon_ut_id) glDeleteTextures(1, &g_neon_ut_id);
+    g_neon_ut_key = k; g_neon_ut_id = 0;
     N2Tex t; memset(&t, 0, sizeof t);
     if (ctdata && n2_load_car_tex_by_key(ctdata, ctlen, k, &t) && t.rgb) {
-        id = upload_tex(&t);
+        g_neon_ut_id = upload_tex(&t);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         printf("neon: %s_NEON %dx%d\n", car, t.w, t.h);
     } else printf("neon: %s_NEON not found\n", car);
     free(t.rgb); free(t.alpha); free(t.dxt);
-    return id;
+    return g_neon_ut_id;
 }
 /* the tube's three pieces (0x60d7f0): the start cap (u 0 .. 0.5), the
    stretched middle (u 0.5) and the end cap (u 0.5 .. 1); v runs across */
@@ -3767,6 +4422,7 @@ static void n2_take_record(const unsigned char *rec, int ok, const char *name)
     g_rim_outer = ok ? (signed char)rec[0xdc] : 0;
     shop_set_car_rec(ok ? rec : NULL);
     perf_clear(&g_n2_pp); g_n2_perf_nos = 0;   /* a new car comes stock; the garage refits it */
+    memset(g_n2_aud_lv, 0, sizeof g_n2_aud_lv);   /* its turbo / nitrous / engine / transmission sound levels */
     /* the game drives the record rebuilt by the parts system (0x5ac4f0),
        never the raw one: with no parts that adds the stock turbo boost
        (P+0x224) to the torque curve; nitrous stays n2sim_set_nitrous's */
@@ -3807,6 +4463,13 @@ static void n2_set_perf(const unsigned char fit[N2_PERF_PARTS], const unsigned c
     perf_clear(&g_n2_pp);
     memcpy(g_n2_pp.fit, fit, sizeof g_n2_pp.fit);
     memcpy(g_n2_pp.junk, junk, sizeof g_n2_pp.junk);
+    /* the turbo bank (0x45eb30: row x 4 + 0x5995e0(4)) and the nitrous bank
+       (0x45f210 / 0x465830: 0x5995e0(2) 2 or 3 -> Nitrous_01) follow the
+       fitted levels (applied per frame, audio_set_player_perf) */
+    g_n2_aud_lv[0] = perf_cat_level(&g_n2_pp, 4);
+    g_n2_aud_lv[1] = perf_cat_level(&g_n2_pp, 2);
+    g_n2_aud_lv[2] = engine_sound_level(&g_n2_pp);   /* CarPreSetup 0x4593b0: the engine slot */
+    g_n2_aud_lv[3] = perf_cat_level(&g_n2_pp, 1);    /* and the shift bank (0x45c376) */
     if (!g_n2rec_ok || !perf_ready()) return;
     perf_build(g_n2rec_raw, &g_n2_pp, g_n2rec);
     tune_apply(g_n2rec, g_n2rec_raw, &g_n2_pp, g_tune_cur);   /* RebuildPhysicsInfo 0x5b4dc0 -> 0x5b4780 */
@@ -3837,6 +4500,70 @@ static void n2_retune(const uint8_t *tune)
     g_n2rec_gen++;
     g_cc_ready = 0;
 }
+/* A front-end garage car's tunings. Retail keeps every car's five tuning
+   settings in its FEPlayerCarDB record: CarTuneManager::TakeControl (GC 8017c710)
+   reads them with PresetCarSlot::GetCustomTuning (801350c4) from the FECarConfig's
+   PresetCarSlot (+0x18) at +0x348 + setting x 0x29, CommitCustomTuningsToFEDatabase
+   (8017cbb8) writes all five back with SetCustomTuning (80135048), and every race's
+   SetupPlayerCarsAndStuff (80119c88) -> BuildCurrentRideForPlayer -> FECarConfig::
+   BuildRide (80135564) -> PresetCarSlot::FillRideWith (80134d4c) rides on the race
+   type's setting -- the same for a quick race car as for a career car. The port's
+   front-end cars live in garage.txt: the five settings ride at the end of the
+   car's line as " TUNE" + five groups of 0x29 bytes in hex (lines without it, old
+   saves and the PC converter's, are stock; the line parser stops before it). */
+static uint8_t g_fe_tune[TUNE_NSET][TUNE_BYTES];
+static char g_fe_tune_car[64];
+static int g_fe_tune_has = -1;   /* -1 not read for g_fe_tune_car */
+static int garage_tune_parse(const char *line, uint8_t tune[TUNE_NSET][TUNE_BYTES]) {
+    const char *t = strstr(line, " TUNE ");
+    if (!t) return 0;
+    t += 6;
+    for (int s = 0; s < TUNE_NSET; s++) {
+        while (*t == ' ') t++;
+        for (int k = 0; k < TUNE_BYTES; k++) {
+            unsigned v;
+            if (sscanf(t, "%2x", &v) != 1) return 0;
+            tune[s][k] = (uint8_t)(v > 200 ? 100 : v);
+            t += 2;
+        }
+    }
+    return 1;
+}
+/* the current car's settings (NULL when its tuned slot's line has none, or a stock car) */
+static int g_fe_tune_slot = -1, g_fe_tune_gen = -1;
+static const uint8_t (*garage_tune_get(const char *car))[TUNE_BYTES] {
+    if (g_fe_tune_has < 0 || strcmp(car, g_fe_tune_car) || g_fe_tune_slot != g_gslot || g_fe_tune_gen != g_garage_gen) {
+        snprintf(g_fe_tune_car, sizeof g_fe_tune_car, "%s", car);
+        g_fe_tune_slot = g_gslot; g_fe_tune_gen = g_garage_gen;
+        g_fe_tune_has = 0;
+        GarageFile g; garage_read(&g);
+        if (g_gslot >= 0 && garage_line_is(g.line[g_gslot], car)) g_fe_tune_has = garage_tune_parse(g.line[g_gslot], g_fe_tune);
+        garage_free(&g);
+    }
+    return g_fe_tune_has ? (const uint8_t (*)[TUNE_BYTES])g_fe_tune : NULL;
+}
+/* the car's line again with these settings at its end; a stock car (none of its
+   own yet) gets a tuned slot first (AddNewTunedCar), its line from base */
+static void garage_tune_put(const char *car, const uint8_t tune[TUNE_NSET][TUNE_BYTES], const char *base) {
+    static char tail[8 + TUNE_NSET * (2 * TUNE_BYTES + 1)];
+    int n = snprintf(tail, sizeof tail, " TUNE");
+    for (int s = 0; s < TUNE_NSET; s++) {
+        tail[n++] = ' ';
+        for (int k = 0; k < TUNE_BYTES; k++) n += snprintf(tail + n, sizeof tail - n, "%02x", tune[s][k]);
+    }
+    static char body[4096];
+    body[0] = 0;
+    GarageFile g; garage_read(&g);
+    if (g_gslot >= 0 && garage_line_is(g.line[g_gslot], car)) {
+        snprintf(body, sizeof body, "%s", g.line[g_gslot]);
+        char *t = strstr(body, " TUNE ");
+        if (t) *t = 0;
+    } else if (base) snprintf(body, sizeof body, "%s", base);
+    garage_free(&g);
+    int slot = body[0] ? garage_put_line(car, body, tail) : -1;
+    g_fe_tune_has = -1;
+    printf("garage: %s's tunings %s (slot %d)\n", car, slot >= 0 ? "kept on its line (FEPlayerCarDB +0x348)" : "not kept", slot);
+}
 /* <car>_CV, the convex collision hull the original builds the car's
    collidable from (0x5a1750) */
 static void n2_take_hull(const char *dataroot, const char *car, int wide)
@@ -3866,7 +4593,7 @@ static int n2_active(void)
 {
     if (g_n2_enabled < 0) {
 #ifdef __vita__
-        FILE *f = fopen("ux0:data/OpenUG2/arcade.txt", "rb");
+        FILE *f = fopen("ux0:data/NFSU2/arcade.txt", "rb");
 #else
         FILE *f = fopen("arcade.txt", "rb");
 #endif
@@ -3887,6 +4614,7 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
                             float *speed, float gas, float brake, float steer, int handbrake,
                             int manual, int shift, int hold, int nitrous)
 {
+    g_dyroll_scene = scene;
     if (!g_n2 || g_n2_gen != g_n2rec_gen) {
         n2sim_destroy(g_n2);
         g_n2 = n2sim_create(g_n2rec, n2_ground, (void *)scene);
@@ -3905,6 +4633,10 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
     if (!g_n2_live || dx*dx + dy*dy > 25.0f || fabsf(dz) > 3.0f || fabsf(dh) > 0.3f ||
         (g_showroom && fabsf(dh) > 1e-6f)) {
         n2sim_reset(g_n2, carpos, *heading);
+#ifdef OPENUG2_SIM_PRE_H
+        g_n2_live_was = 0;
+        printf("n2trace reset at (%.3f %.3f %.3f) h %.3f\n", carpos[0], carpos[1], carpos[2], *heading);
+#endif
         g_n2_live = 1;
         g_n2_prev_gear = 1;
         float v3[3] = { vel[0] * 60.0f, vel[1] * 60.0f, 0 };
@@ -3954,6 +4686,7 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
             n2sim_set_velocity(g_n2, z);
             n2sim_set_dyno(g_n2, 1);
         }
+        if (dc.on && n2sim_dyno(g_n2)) n2sim_set_dyno(g_n2, dc.on);   /* DynoManager state (1..4) */
         N2Controls dcl; memset(&dcl, 0, sizeof dcl);
         dcl.throttle = dc.throttle; dcl.brake = dc.brake; dcl.gear_req = dc.gear_req;
         n2sim_controls(g_n2, &dcl);
@@ -3971,13 +4704,23 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
         n2sim_input(g_n2, &in);
     }
     g_n2_coll = g_cc && g_wcoll && wcoll_pack_count(g_wcoll) > 0;
-    /* on the dyno the car is held over its spot (ResolveDynoForces) and runs on
-       the rollers; GUESS: no world collision pass for it then (its hull touched
-       the dyno platform at rest and the push-out threw it in the air) */
-    const int n2_cc = g_n2_coll && !n2sim_dyno(g_n2);
+    /* the world collision pass runs on the dyno too, as in retail (11-09: the old port-only skip
+       removed -- the platform push-out it hid was the paused-frame render-ground bug fixed 10-29;
+       sim dyno run identical with and without it: 102.9 kW, 0-60 7.85 s, no lift) */
+    const int n2_cc = g_n2_coll;
+    /* the Collisions' WorldTimer (Collision::Update 0x592bd0), then the
+       player's car +0x3c -> +0x18 for its step (ResetDampenMode, hydraulics) */
+    carcoll_world_time(1.0f / 60.0f * n2sim_time_scale());
+    n2sim_set_body_collisions(g_n2, carcoll_body_collisions(g_n2));
+    {   /* test aid: OPENUG2_COLLTEST logs the player's live Collision count and dampen mode changes */
+        static int on = -1, pc, pd;
+        if (on < 0) on = getenv("OPENUG2_COLLTEST") != NULL;
+        int c = carcoll_body_collisions(g_n2), d = n2sim_dampen(g_n2);
+        if (on && (c != pc || d != pd)) { printf("colltest: collisions %d dampen %d\n", c, d); pc = c; pd = d; }
+    }
     if (n2_cc) {
         carcoll_begin(g_cc, g_n2, 1.0f / 60.0f);
-        smk_begin(1.0f / 60.0f, g_wcoll);       /* Smokeable::Move for the live props */
+        smk_begin(1.0f / 60.0f * n2sim_time_scale(), g_wcoll);       /* Smokeable::Move for the live props */
     }
 #ifdef OPENUG2_SIM_PRE_H
     {   /* test aid (simulator): OPENUG2_FXTEST_HOP=s throws the player car up (7 m/s) every s seconds -> bottom-out */
@@ -3987,6 +4730,17 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
             float v3[3] = { g_n2s.vel[0], g_n2s.vel[1], 7.0f };
             ht = 0; n2sim_set_velocity(g_n2, v3);
             printf("fxtest: hop %d\n", ++hn);
+        }
+    }
+    {   /* test aid (simulator): OPENUG2_JC_TEST="s vz crash" throws the player car up at vz m/s every s
+           seconds; crash 1 also puts it into crash mode and asks for the crash jump cam (rt_tick) */
+        static float s = -1, vz, t; static int crash;
+        if (s < 0) { s = 0; if (getenv("OPENUG2_JC_TEST")) sscanf(getenv("OPENUG2_JC_TEST"), "%f %f %d", &s, &vz, &crash); }
+        if (s > 0 && (t += 1.0f / 60.0f) > s) {
+            float v3[3] = { g_n2s.vel[0], g_n2s.vel[1], vz };
+            t = 0; n2sim_set_velocity(g_n2, v3);
+            if (crash) { n2sim_set_dampen(g_n2, 1); g_jc_test_crash = 1; }
+            printf("jctest: up %.1f m/s%s\n", vz, crash ? ", crash mode" : "");
         }
     }
 #endif
@@ -4021,7 +4775,7 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
             acid_hit_fx(&hit[i], g_n2, NULL);
             CarSfxCollCar me;                   /* the collision sound (0x5a9620 -> 0x4814e0) */
             snd_coll_car(&me, 0, g_n2, 1);
-            carsfx_coll_hit(0, 0, -1, hit[i].poly, hit[i].point, hit[i].impulse, hit[i].slide, &me, NULL);
+            sfx_coll_hit(0, 0, -1, hit[i].poly, hit[i].point, hit[i].impulse, hit[i].slide, &me, NULL);
         }
     }
     {   /* the pairs the run still has: car 0 is the player (sound id 0);
@@ -4030,7 +4784,7 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
         int np = n2_cc ? carcoll_pairs(pr, 512) : 0, k = 0;
         for (int i = 0; i < np; i++)
             if (pr[i][0] == 0 && pr[i][1] < 0) { pr[k][0] = pr[i][0]; pr[k][1] = pr[i][1]; pr[k][2] = pr[i][2]; k++; }
-        carsfx_coll_pairs(0, (const int (*)[3])pr, k);
+        sfx_coll_pairs(0, (const int (*)[3])pr, k);
     }
     if (n2_cc) {                                /* CheckTimers, SmokeableThink */
         N2Body pb; n2sim_body(g_n2, &pb);
@@ -4040,6 +4794,21 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
     memcpy(carpos, g_n2s.pos, sizeof g_n2s.pos);
     vel[0] = g_n2s.vel[0] / 60.0f; vel[1] = g_n2s.vel[1] / 60.0f;
     *heading = g_n2s.heading;
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_N2TRACE logs the first 90 ticks after each reset */
+        static int on = -1, nt = 999;
+        if (on < 0) on = getenv("OPENUG2_N2TRACE") != NULL;
+        if (on && !g_n2_live_was) nt = 0;
+        if (on && nt < 90) {
+            printf("n2trace %d: z %.3f vz %+.3f comp %.3f %.3f %.3f %.3f cont %d%d%d%d bot %.2f nhit %d coll %d nis %d mover %d\n",
+                   nt, g_n2s.pos[2], g_n2s.vel[2], g_n2s.wheel_comp[0], g_n2s.wheel_comp[1], g_n2s.wheel_comp[2],
+                   g_n2s.wheel_comp[3], g_n2s.wheel_contact[0], g_n2s.wheel_contact[1], g_n2s.wheel_contact[2],
+                   g_n2s.wheel_contact[3], g_n2s.bottom, g_n2_nwhit, n2_cc, g_n2_nis, g_n2s.mover);
+            nt++;
+        }
+        g_n2_live_was = 1;
+    }
+#endif
     *speed = g_n2s.speed / 60.0f;
     memcpy(g_n2_out, carpos, sizeof g_n2_out);
     g_n2_outv[0] = vel[0]; g_n2_outv[1] = vel[1]; g_n2_outh = *heading;
@@ -4121,6 +4890,7 @@ static void n2_skid_ctl(N2SkidCtl *k, const N2State *o, float brake, float handb
         if (d < -40.0f / 1024.0f) d = -40.0f / 1024.0f;
         c2b[sd] += d;
         float ch2 = c + c2b[sd];
+        k->side[sd][0] = a > 1 ? 1 : a; k->side[sd][1] = ch1 > 1 ? 1 : ch1; k->side[sd][2] = ch2 > 1 ? 1 : ch2;
         out[0] += 0.5f * (a > 1 ? 1 : a);
         out[1] += 0.5f * (ch1 > 1 ? 1 : ch1);
         out[2] += 0.5f * (ch2 > 1 ? 1 : ch2);
@@ -4276,6 +5046,8 @@ static struct {
     struct {
         GLuint skin; uint32_t skey[SKIN_KEYS]; int paint_on; float paint[3]; uint32_t paint_mat;
         N2Scene rl; GpuMesh *rgm; int nr; GLuint rtex; int rmode;
+        GLuint rptex, sptex; int spmode;               /* its DUMMY_WHEEL / DUMMY_SPINNER (rim_lib_paint) */
+        float spin_ang, spin_vel, spin_prev; uint32_t spin_t;   /* its spinners (0x5ecac0) */
     } olook[AIRACE_MAX];
     CarColl *vcc[AIRACE_MAX];           /* each model's hull, from its GEOMETRY.BIN while loaded */
     float grid[8][3], gridh[8]; int ngrid, pslot, oslot[AIRACE_MAX];
@@ -4300,6 +5072,9 @@ static struct {
     DriftScorer ds[AIRACE_MAX + 1]; DriftLaps dl[AIRACE_MAX + 1];
     StylePairs pairs[AIRACE_MAX + 1]; int prevmax[AIRACE_MAX + 1];
     int nvirt; char vname[3][16]; float vscore[3];
+    /* DriftManager's score list (0x864630) as an order: racer k (0..n) or
+       100 + v (a set-score downhill opponent); 0 nodes = not built yet */
+    unsigned char dlb[1 + AIRACE_MAX + 3]; int dlb_n;
     unsigned title; float title_t;      /* the player's last drift title */
     /* the drift HUD (HUD_Drift.fng) and what its widgets read, latched over
        the sim ticks of one drawn frame: moment 0 shown / banked, a new title,
@@ -4315,6 +5090,7 @@ static struct {
        that took the car over (0x5eba30(3)); RCSTATE_POSTRACE entered
        (0x60aaa0, 3 s after the line), the opponents then gone (0x5f6e20) */
     int ticks, pfin_tick; AiRacer *pdrv; int postrace, field_gone, put_down, post_done;
+    int post_pre;                       /* the post-race screens asked ahead (post_prefetch) */
     /* a drag race (0x89e7d8): the player's DragController (type 2,
        0x4299c0), the sim it tuned (n2sim_set_drag), seconds to GO before
        the start (0x5ef2e0), the status a car's race ended with (0x6076d0:
@@ -4354,6 +5130,7 @@ static struct {
        (+0x1e0) the AI audio's trackers read */
     NisRev arev[AIRACE_MAX]; unsigned short asteer[AIRACE_MAX];
     N2SkidCtl askid[AIRACE_MAX]; float askid3[AIRACE_MAX][3], abrake[AIRACE_MAX], ahbrake[AIRACE_MAX];
+    float abrake_t[AIRACE_MAX];         /* car +0x948: g_rt.t of the racer's last brake > 0.05 (0 = never) */
     int nis_hyd, nis_msg, nis_aiaud, nis_fx;
     float pdist;                        /* the player's car +0x410: metres driven while the race is on (0x604740) */
     /* every racer's RacingCarStats (race entry +0x1a0, 0x5f7410): top
@@ -4385,6 +5162,64 @@ static struct {
         HudStyle hud;
     } sty;
 } g_rt;
+/* the player's car and race for the jump cams (jumpcam.c) */
+static const AiRacer *jc_fp(void) { return g_rt.human ? g_rt.human : g_rt.pdrag ? g_rt.pdrag : g_rt.pdrv; }
+static void jc_fill(JcCar *c, JcEnv *e)
+{
+    memset(c, 0, sizeof *c); memset(e, 0, sizeof *e);
+    memcpy(c->pos, g_n2s.pos, sizeof c->pos);
+    memcpy(c->rot, g_n2s.rot, sizeof c->rot);
+    memcpy(c->vel, g_n2s.vel, sizeof c->vel);
+    c->speed = sqrtf(g_n2s.vel[0] * g_n2s.vel[0] + g_n2s.vel[1] * g_n2s.vel[1] + g_n2s.vel[2] * g_n2s.vel[2]);
+    c->wheels_down = g_n2s.wheels_down;
+    c->dampen = n2sim_dampen(g_n2);
+    memcpy(c->wheel_pos, g_n2s.wheel_pos, sizeof c->wheel_pos);
+    for (int k = 0; k < 4; k++) c->wheel_r[k] = n2sim_param(g_n2, 0x20 + 0x30 * k);
+    c->aero = n2sim_param(g_n2, 0x264) + n2sim_param(g_n2, 0x268);
+    c->mass = n2sim_param(g_n2, 0x110);
+    /* GUESS: the model box centre (model +0x110) taken as the centre of
+       mass offset (the port keeps no render box in car space here) */
+    N2Body b; n2sim_body(g_n2, &b);
+    memcpy(c->box_centre, b.com, sizeof c->box_centre);
+    /* car +0x60 = the record origin, body pos - R com (as sim_base / rs_box):
+       g_n2s.pos is the state origin, a sim base lower (fixed 11-08) */
+    for (int i = 0; i < 3; i++)
+        c->pos[i] = b.pos[i] - (b.com[0] * b.R[i] + b.com[1] * b.R[4 + i] + b.com[2] * b.R[8 + i]);
+    c->race_frac = g_rt.loc[0].frac;
+    e->option = g_opt.jump_cam != 0;
+    /* GUESS: *0x890118 == 4 read as in the world (a race or free roam),
+       the player not over the line (the race-over / post-race cameras are
+       their own), no scene camera */
+    e->racing = g_rt.active && !g_rt.pfinished && !g_rt.postrace && !g_n2_nis;
+    e->drift = g_rt.drift;
+    e->wrong_way = g_rt.pwrong;
+    e->rp = g_rt.active && g_rt.rp && racepath_lap(g_rt.rp) > 0.0f ? g_rt.rp : NULL;   /* 0x88f2be */
+}
+/* HandleReset 0x600b65: the box centre = car +0x50 + 0x441000(matrix +0x90,
+   model +0x110). GUESS (as the jump cam's LOS start): model +0x110 taken as
+   the centre-of-mass offset; without the retail handling, the car position */
+/* org = car +0x60, the record origin (body pos - R com, as sim_base; the
+   n2sim_state origin sits the sim base below it); box = org + R x com =
+   the body position under the GUESS */
+static void rs_box(float box[3], float org[3], const float carpos[3])
+{
+    if (!(n2_active() && g_n2)) { memcpy(box, carpos, 3 * sizeof *box); memcpy(org, carpos, 3 * sizeof *org); return; }
+    N2Body b; n2sim_body(g_n2, &b);
+    for (int i = 0; i < 3; i++) {
+        box[i] = b.pos[i];
+        org[i] = b.pos[i] - (b.com[0] * b.R[i] + b.com[1] * b.R[4 + i] + b.com[2] * b.R[8 + i]);
+    }
+}
+/* IsTooFarFromDragTrack 0x5eaec0: a drag race (0x89e7d8 || 0x890108) on
+   event 4400..4404 or 4709 (0x89e7a0) with the locator's car more than 30 m
+   (0x7a5570) from its route projection (car +0x8e0/+0x8e4 - +0x8e8/+0x8ec) */
+static int rs_too_far_from_drag_track(void)
+{
+    if (!(g_rt.active && g_rt.drag)) return 0;
+    if (!((g_rt.ev >= 0x1130 && g_rt.ev <= 0x1134) || g_rt.ev == 0x1265)) return 0;
+    float dx = g_rt.loc[0].pos[0] - g_rt.loc[0].spt[0], dy = g_rt.loc[0].pos[1] - g_rt.loc[0].spt[1];
+    return sqrtf(dx * dx + dy * dy) > 30.0f;
+}
 static void rt_style_begin(void);
 /* RideInfo::BuildRandomRide 0x6374b0 for every racer without a preset
    look, from its fitted performance levels (PerfConfig +0x2e0, by path) */
@@ -4399,6 +5234,15 @@ static void rt_random_rides(const char *dataroot, AiRng *rng) {
             g_rt.ocfg_on[k] = 1;
             snprintf(g_rt.orim[k], sizeof g_rt.orim[k], "%s", rim); g_rt.orim_style[k] = rs;
         }
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid: OPENUG2_SIM_OPPRIM="RIM style rimpaint spinpaint" on every random ride */
+            const char *e = getenv("OPENUG2_SIM_OPPRIM"); char er[16]; int es; unsigned ep, eq;
+            if (e && g_rt.ocfg_on[k] && sscanf(e, "%15s %d %x %x", er, &es, &ep, &eq) == 4) {
+                snprintf(g_rt.orim[k], sizeof g_rt.orim[k], "%s", er); g_rt.orim_style[k] = es;
+                g_rt.ocfg[k].paint[4] = ep; g_rt.ocfg[k].paint[5] = eq;
+            }
+        }
+#endif
         rng->s = r;
     }
 }
@@ -4410,6 +5254,8 @@ static void rt_opp_look_free(int k)
 {
     if (g_rt.olook[k].skin) glDeleteTextures(1, &g_rt.olook[k].skin);
     if (g_rt.olook[k].rtex) glDeleteTextures(1, &g_rt.olook[k].rtex);
+    if (g_rt.olook[k].rptex) glDeleteTextures(1, &g_rt.olook[k].rptex);
+    if (g_rt.olook[k].sptex) glDeleteTextures(1, &g_rt.olook[k].sptex);
     free_scene_gpu(g_rt.olook[k].rgm, g_rt.olook[k].nr);
     n2_free_scene(&g_rt.olook[k].rl);
     memset(&g_rt.olook[k], 0, sizeof g_rt.olook[k]);
@@ -4513,6 +5359,15 @@ static void rt_opp_look(int k, const char *dataroot, const CarSwitchCandidate *v
     free(wd);
     printf("opponent %d look: rims %s style %d inner %d %s\n", k, rim, RIM_STYLE(rs), RIM_INNER(rs),
            ok ? "fitted" : "not loaded (model's own wheel)");
+    if (ok) {   /* its DUMMY_WHEEL / DUMMY_SPINNER from its rim / spinner paint (0x49 / 0x4a) */
+        const StockPaint *rp = paint_part(cfg->paint[4]), *sp = paint_part(cfg->paint[5]);
+        rim_lib_paint(&g_rt.olook[k].rl, g_wt_data, g_wt_len, rp ? rp->rgb : NULL, sp ? sp->rgb : NULL,
+                      &g_rt.olook[k].rptex, &g_rt.olook[k].sptex, &g_rt.olook[k].spmode);
+        if (rp || g_rt.olook[k].sptex)
+            printf("opponent %d look: rim paint %08x %s, spinner %s (paint %08x)\n", k, (unsigned)cfg->paint[4],
+                   g_rt.olook[k].rptex ? "composited" : "-", g_rt.olook[k].sptex ? "composited" : "-",
+                   (unsigned)cfg->paint[5]);
+    }
 }
 /* screen effect slot 0 of the player's view (0x832de0 +0x60: SCREEN_FLASH,
    preset 0x8769dc, callback 0x5d7a60): active +0xc, mode +4, counter +8,
@@ -4524,7 +5379,13 @@ static struct { int active, mode, n; float k; } g_flash;
    the simulation it was made for; a new simulation gets a new object. */
 static int g_acid_ok;
 static WCollCtx g_acid_wc; static int g_acid_wc_on;
-typedef struct { AcidCar *c; const N2Sim *s; int gen; unsigned purge; } AcidSlot;
+static int g_acid_prerace;   /* the race's stage is 0..3 (*0x890118 < 4): the countdown */
+typedef struct {
+    AcidCar *c; const N2Sim *s; int gen; unsigned purge;
+    /* the light trail's ring (0x61ad80): CarRenderInfo +0x2180 the newest
+       entry, +0x2150 positions, +0x2090 matrices; tr_n 0 = not yet filled */
+    int tr_idx, tr_n; float tr_pos[3][3], tr_mat[3][16];
+} AcidSlot;
 /* the player car's Nitrous Purge part (car config +0x818, 0 none) and the
    data root its database attributes are read from */
 static unsigned g_purge_part; static const char *g_purge_root;
@@ -4558,12 +5419,66 @@ static AcidSlot g_acid_p, g_acid_o[AIRACE_MAX], g_acid_t[RT_TMAX];
 static int g_sfx_bottom;   /* the player's car sound event 5 param, to the next sound frame */
 static int g_sfx_spark;    /* the player's car sound event 9 (0x5f6049), to the next sound frame */
 static AcidSlot g_acid_fe;   /* the showroom car's, for the shop's Nitrous Purge preview */
+/* the cracked window sheet a car's glass mesh wears while that car's visible
+   damage shows (CarRenderInfo::UpdateCarReplacementTextures 0x615280: its
+   window slot -> WINDOW_DAMAGE0..2 by the window's level); 0 = the plain pane */
+static GLuint glass_damage_tex(const AcidSlot *a, const GpuMesh *g)
+{
+    if (!a || !a->c || !g->win || g->cat != N2_CAR_GLASS) return 0;
+    return (GLuint)aciddraw_window_tex(acid_damage_window(a->c, g->win - 1));
+}
+static GLfloat g_glass_vcol;
+static void glass_damage_on(const RProg *rp, GLint uUseTex, GLuint t)
+{
+    /* car.fx ps_1_1 as for any textured pane: r1 = 2 * tex * oD0, alpha r1.w
+       (the sheet's own alpha, ~0.9) -- not the plain pane's flat port alpha */
+    glBindTexture(GL_TEXTURE_2D, t);
+    /* GUESS: the port's glass lighting material (the tint) has a near-black diffuse, which
+       zeroes 2 * tex * oD0 -- light the cracked sheet with the default car material instead */
+    render_carfx_part(0, N2_CAR_GLASS);
+    /* the pane's vertex colour is its (near-black) flat diffuse -- not a light term for a sheet */
+    glGetUniformfv(rp->prog, rp->uVColor, &g_glass_vcol); glUniform1f(rp->uVColor, 0.0f);
+    glUniform1f(uUseTex, 1.0f); glUniform1f(rp->uDecal, 0.0f);
+    glUniform1f(rp->uTextureAlpha, 1.0f); glUniform1f(rp->uAlpha, 1.0f);
+    glUniform1f(rp->uFresnel, 0.0f);
+}
+static void glass_damage_off(const RProg *rp, GLint uUseTex)
+{
+    glUniform1f(uUseTex, 0.0f); glUniform1f(rp->uTextureAlpha, 0.0f);
+    glUniform1f(rp->uVColor, g_glass_vcol);
+    glUniform1f(rp->uFresnel, 1.0f);                             /* the glass pass's */
+}
 static float g_room_carM[16]; static int g_room_carM_ok;   /* the showroom car's model matrix */
+static float g_room_wheelM[16];                            /* ... and its wheels' (the floor reflection) */
 static void acid_slot_drop(AcidSlot *a) { acid_car_free(a->c); memset(a, 0, sizeof *a); }
 /* the car's record origin and body rows (car +0x60 / +0x90): the frame the
    record's wheel points and the model's markers are in */
+/* replay: the car being stepped shows as recorded (its sim keeps THE_PRESENT):
+   its replayed state, lamps (RPL_*) and bump-stop sum */
+static const N2State *g_acid_rpst; static int g_acid_rpl; static float g_acid_rpbot;
+/* n2sim_state's origin sits the sim's base below the record origin, along up */
+static float sim_base(const N2Sim *s)
+{
+    static N2State st; N2Body bd;
+    n2sim_state(s, &st); n2sim_body(s, &bd);
+    float b = 0.0f;
+    for (int j = 0; j < 3; j++)
+        b += (bd.pos[j] - (bd.com[0] * bd.R[j] + bd.com[1] * bd.R[4 + j] + bd.com[2] * bd.R[8 + j]) - st.pos[j]) * bd.R[8 + j];
+    return b;
+}
 static void acid_car_pose(const N2Sim *s, float pos[3], float mat[16])
 {
+    if (g_acid_rpst) {
+        const N2State *t = g_acid_rpst;
+        float b = sim_base(s);
+        for (int j = 0; j < 3; j++) pos[j] = t->pos[j] + t->rot[6 + j] * b;
+        for (int r = 0; r < 3; r++) {
+            for (int j = 0; j < 3; j++) mat[4 * r + j] = t->rot[3 * r + j];
+            mat[4 * r + 3] = 0;
+        }
+        mat[12] = pos[0]; mat[13] = pos[1]; mat[14] = pos[2]; mat[15] = 1;
+        return;
+    }
     N2Body bd; n2sim_body(s, &bd);
     for (int j = 0; j < 3; j++)
         pos[j] = bd.pos[j] - (bd.com[0] * bd.R[j] + bd.com[1] * bd.R[4 + j] + bd.com[2] * bd.R[8 + j]);
@@ -4572,6 +5487,132 @@ static void acid_car_pose(const N2Sim *s, float pos[3], float mat[16])
         mat[4 * r + 3] = 0;
     }
     mat[12] = pos[0]; mat[13] = pos[1]; mat[14] = pos[2]; mat[15] = 1;
+}
+/* CarRenderInfo::RenderFlaresOnCar 0x615630 for the main view (flareType 0,
+   no reflection), the flares from CreateCarLightFlares 0x6204d0: the
+   model's light markers (position, row 2 = direction, flags 4). Headlights
+   9db90133 / d09091c6 type 0 at 1 + 1 (car +0x93d: on, Car::
+   UpdateHeadlightsAndHorn 0x5f6190 keeps it 1 unless flashing), clamped to
+   1; brake lights 31a66786 / bf700a79 type 1 at 0.85 (0x7a6684), + 16
+   (0x7a6694) while braking, and the centre one a2a2fc7c at half that (0 when
+   not braking); car +0x944 = brake pedal > 0.05 (UpdateBrakelightsState
+   0x5f62b0). No headlight flashing: CONFIRMED -- +0x93d leaves 1 only through
+   +0x93c in UpdateHeadlightsAndHorn, which needs +0x925, and the only writes
+   to +0x925 store 0 (0x5f61d1, 0x5f629a, Car ctor 0x6045b3); the human
+   car returns first. The centre brake flare (marker a2a2fc7c, only in
+   <CAR>_KIT00_BRAKELIGHT_A/B) stays with a custom spoiler except on the six
+   cars of RemoveCentreBrakeWithCustomSpoiler (car_drops_centre_flare). Headlight hash 7a5bcf69 (type 0
+   in 0x6204d0) is in no car GEOMETRY.BIN. The markers' offset CarRenderInfo
+   +0x30 is the BODY model's translation (car_markers). */
+/* car +0x944 (UpdateBrakelightsState 0x5f62b0): brake pedal (+0x30 ->
+   +0x214) > 0.05; for DriverInfo type 2 (the AI racers: DriverInfo ctor
+   0x6373e0 called with 2 at 0x526408 / 0x53ef78; traffic 3 at 0x4fea88,
+   the human 1) and 4 it stays on until 0.5 s (0x7a563c, <=) after the last
+   such brake (+0x948 = world time, 0 = never) */
+/* RemoveCentreBrakeWithCustomSpoiler 0x60c8a0: CarType 5 CIVIC, 0xb TIBURON,
+   0xc SENTRA, 0x18 3000GT, 0x19 GTO, 0x1e IMPREZAWRX (GLOBALB 0x34600).
+   RenderFlaresOnCar 0x615630 zeroes the centre brake flare when RideInfo
+   +0x170 (the spoiler slot) holds a part whose level (byte +5 >> 5) is not 0
+   -- an aftermarket spoiler -- and this returns 1. */
+static int car_drops_centre_flare(const char *car, const N2CarConfig *cfg)
+{
+    static const char *const k[] = { "CIVIC", "TIBURON", "SENTRA", "3000GT", "GTO", "IMPREZAWRX" };
+    if (!car || !cfg || !cfg->parts[N2_PART_SPOILER]) return 0;
+    for (int i = 0; i < 6; i++) if (!strcmp(car, k[i])) return 1;
+    return 0;
+}
+static int g_acid_nocentre;   /* set by the acid_slot_step caller */
+static int car_brake_lit(const N2Sim *s)
+{
+    for (int k = 0; s && k < g_rt.n; k++)
+        if (g_rt.car[k].s == s) return g_rt.abrake_t[k] != 0.0f && g_rt.t - g_rt.abrake_t[k] <= 0.5f;
+    return s && n2sim_brake(s) > 0.05f;
+}
+/* one RenderFlaresOnCar at a pose: hk the headlights' level (0 with
+   flareType 8, 0x615798), scale param_6 (0 = none: the main call) applied
+   after the clamp to 1 (0x615924) */
+static void car_light_flares_at(const float pos[3], const float m[16], const AcidMarker *mk, int nmk,
+                                float hk, float lr, float centre, float scale)
+{
+    float bo[3] = { 0, 0, 0 };   /* CarRenderInfo +0x30, car_markers' hash-0 entry */
+    for (int i = 0; i < nmk; i++) if (!mk[i].hash) memcpy(bo, mk[i].pos, sizeof bo);
+    for (int i = 0; i < nmk; i++) {
+        uint32_t h = mk[i].hash;
+        int type; float k;
+        if (h == 0x9db90133u || h == 0xd09091c6u) { type = 0; k = hk; }
+        else if (h == 0x31a66786u || h == 0xbf700a79u) { type = 1; k = lr; }
+        else if (h == 0xa2a2fc7cu) { type = 1; k = centre; }
+        else continue;
+        if (!(k > 0.0f)) continue;
+        if (k > 1.0f) k = 1.0f;
+        if (scale != 0.0f) k *= scale;
+        const float l[3] = { mk[i].pos[0] - bo[0], mk[i].pos[1] - bo[1], mk[i].pos[2] - bo[2] };
+        const float *d = mk[i].dir;
+        float wp[3], wd[3];
+        for (int j = 0; j < 3; j++) {
+            wp[j] = l[0] * m[j] + l[1] * m[4 + j] + l[2] * m[8 + j] + pos[j];
+            wd[j] = d[0] * m[j] + d[1] * m[4 + j] + d[2] * m[8 + j];
+        }
+        aciddraw_car_flare(wp, wd, pos, type, k);
+        /* GUESS: every car takes 0x6159a4's local mirror (retail: cars with
+           +0x424 below 3 look the topology up instead) */
+        aciddraw_car_flare_mirror(l[0] * m[2] + l[1] * m[6] - l[2] * m[10] + pos[2]);
+    }
+}
+/* RenderFlares 0x61ae90 per drawn car: its flares (flareType 0), then the
+   light trail. The trail's ring is sampled once a frame (0x61ad80 from
+   RenderCars 0x6316f0: the next of 3 entries takes the car's position and
+   matrix). It is drawn while the car moves (+0x42c > 0) and either burns
+   nitrous (CarState::IsNitrousOn 0x59fa30) without the purge (Car::IsBlowOff
+   0x5ecdb0; with the purge no trail), or is highlighted (SetSpecialFX
+   0x60f530: CarRenderInfo +0x208c = 1, the Outrun challenge candidate,
+   0x41306c), or `special` (the Outrun's AI leader). Its level is 0.5
+   (0x7a675c), the nitrous left x 0.5 (0x5925b0 x 0x784260) while burning.
+   For j = 3, 2, 1 it walks from entry (newest + j + 1) % 3 toward
+   (newest + j + 2) % 3 in 8 steps (0x802920), each 1/8 further, drawing
+   the car's flares with flareType 8 (no headlights) at that position with
+   the first entry's matrix. */
+static void car_light_flares(AcidSlot *a, const N2Sim *s, const N2State *st, int special,
+                             const AcidMarker *mk, int nmk)
+{
+    if (!s || !mk || nmk <= 0) return;
+    float pos[3], m[16];
+    acid_car_pose(s, pos, m);
+    int braking = g_acid_rpst ? (g_acid_rpl & RPL_BRAKE) != 0 : car_brake_lit(s);
+    float lr = braking ? 0.85f + 16.0f : 0.85f, centre = braking && !g_acid_nocentre ? 0.5f * lr : 0.0f;
+    car_light_flares_at(pos, m, mk, nmk, 2.0f, lr, centre, 0.0f);
+    if (!a || !st) return;
+    if (a->tr_n == 0) {
+        /* GUESS: the ring starts as the car's first pose (retail: whatever the
+           CarRenderInfo's +0x2090 / +0x2150 hold before the first frames) */
+        for (int e = 0; e < 3; e++) { memcpy(a->tr_pos[e], pos, sizeof pos); memcpy(a->tr_mat[e], m, sizeof m); }
+        a->tr_n = 1;
+    }
+    if (++a->tr_idx >= 3) a->tr_idx = 0;
+    memcpy(a->tr_pos[a->tr_idx], pos, sizeof pos); memcpy(a->tr_mat[a->tr_idx], m, sizeof m);
+    float level = 0.5f;
+    int nos = st->nos_on;
+    if (nos) {
+        int purge = !(fabsf(st->throttle) > 0.001f && fabsf(st->speed) * 2.23699f >= 5.0f);
+        if (purge) nos = 0;
+        else level = st->nos_frac * 0.5f;
+    }
+    if (!(st->speed > 0.0f) || !(special || nos)) return;
+    static int tl = -1, tn;                         /* test aid (simulator): OPENUG2_FXLOG */
+    if (tl < 0) tl = getenv("OPENUG2_FXLOG") != NULL;
+    if (tl && ++tn % 60 == 1)
+        printf("flares: light trail (%s) level %.2f, ring %d, %.2f m back\n", nos ? "nitrous" : "highlight",
+               level, a->tr_idx, sqrtf((pos[0] - a->tr_pos[(a->tr_idx + 1) % 3][0]) * (pos[0] - a->tr_pos[(a->tr_idx + 1) % 3][0]) +
+                                       (pos[1] - a->tr_pos[(a->tr_idx + 1) % 3][1]) * (pos[1] - a->tr_pos[(a->tr_idx + 1) % 3][1])));
+    for (int j = 3; j > 0; j--) {
+        const int e0 = (a->tr_idx + j + 1) % 3, e1 = (a->tr_idx + j + 2) % 3;
+        const float *p0 = a->tr_pos[e0], *p1 = a->tr_pos[e1];
+        for (int t = 1; t <= 8; t++) {
+            const float f = (float)t / 8.0f;
+            const float p[3] = { p0[0] + (p1[0] - p0[0]) * f, p0[1] + (p1[1] - p0[1]) * f, p0[2] + (p1[2] - p0[2]) * f };
+            car_light_flares_at(p, a->tr_mat[e0], mk, nmk, 0.0f, lr, centre, level);
+        }
+    }
 }
 /* CarCollisionBody::AddDamage 0x593bf0: the collision's impulse on a car
    (carcoll.c apply_car) at its car-space point (the inverse of the body
@@ -4588,12 +5629,43 @@ static void acid_impulse_route(const void *sim, const float J[3], const float r[
         p[j] = r[0] * bd.R[4 * j] + r[1] * bd.R[4 * j + 1] + r[2] * bd.R[4 * j + 2] + bd.com[j];
     acid_damage_hit(a->c, p, sqrtf(J[0] * J[0] + J[1] * J[1] + J[2] * J[2]));
 }
+/* Player::ClearZone (GC 802147cc): the player car's SetDamageToZero, then
+   SetVisibleDamageEnabled(0) */
+static void acid_zone_clear(void)
+{
+    if (!g_acid_p.c) return;
+    acid_damage_zero(g_acid_p.c);
+    acid_damage_visible(g_acid_p.c, 0);
+}
+/* CheckForWildCollision 0x5a0107, RequestZone(6) granted: the collision
+   stream (EAXCollision::QueueCollisionStream 0x486130), then the player
+   car's CarDamage SetDamageToFull 0x637d30 + SetVisibleDamageEnabled(1) --
+   cracked windows and the break effects for the crash shot; ClearZone
+   repairs it (acid_zone_clear) */
+static void rt_crash_damage(void)
+{
+    int q = speech_collision_stream();
+    if (g_acid_p.c) { acid_damage_full(g_acid_p.c); acid_damage_visible(g_acid_p.c, 1); }
+    printf("crash: full visible damage%s%c", q ? ", collision stream queued" : "", 10);
+}
 static void acid_slot_step(AcidSlot *a, const N2Sim *s, int gen, const N2State *st,
                            const AcidMarker *mk, int nmk, const float eye[3], float dt, int nis_car,
                            const float *bb)
 {
     if (!g_acid_ok || !s) { if (a->c) acid_slot_drop(a); return; }
     acid_impulse_cb = acid_impulse_route;
+    jumpcam_on_clear = acid_zone_clear;
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_DMG_TEST=<s> puts the player car's full
+           visible damage on s seconds into a race (chase view, no zone) */
+        static int t0 = -1; static float at;
+        if (t0 < 0) { t0 = 0; at = getenv("OPENUG2_DMG_TEST") ? (float)atof(getenv("OPENUG2_DMG_TEST")) : 0; }
+        if (at > 0 && a == &g_acid_p && a->c && g_rt.active) {
+            static float t; t += dt;
+            if (t >= at && !a->c->dmg_vis) { acid_damage_full(a->c); acid_damage_visible(a->c, 1); printf("dmgtest: full visible damage%c", 10); }
+        }
+    }
+#endif
     /* TheRaceParameters' damage flag 0x89e7d2: on in free roam and from the
        race starts (0x53fcf8's), off for a drift (0x53f830) */
     acid_damage_enabled = !(g_rt.active && g_rt.drift);
@@ -4611,6 +5683,17 @@ static void acid_slot_step(AcidSlot *a, const N2Sim *s, int gen, const N2State *
             float mn[2] = { bb[0], bb[1] }, mx[2] = { bb[3], bb[4] };
             acid_damage_setup(a->c, mn, mx, mk, nmk);
         }
+    }
+    /* RenderFlares 0x61ae90: every drawn car -- not the player's while it is
+       skipped (inside views, ShouldCarBeRendered GC 80236c48; the reset blink,
+       IsCarBlinkingOrPoofed 0x60d4f0: RenderCars 0x6316d0 skips the car whole) */
+    if (!(a == &g_acid_p && g_cc_hide_car)) {
+        int special = 0;   /* the trail's +0x208c highlight or the Outrun leader (0x61b06f) */
+        if (a >= g_acid_o && a < g_acid_o + AIRACE_MAX && g_rt.active && a - g_acid_o < g_rt.n) {
+            const AiRacer *r = g_rt.car[a - g_acid_o].r;
+            special = r && (airacer_hilite(r) || (g_rt.w && r == aienc_trail_car(g_rt.w)));
+        }
+        car_light_flares(a, s, st, special, mk, nmk);
     }
     AcidCarFrame f; memset(&f, 0, sizeof f);
     acid_car_pose(s, f.pos, f.mat);
@@ -4633,9 +5716,9 @@ static void acid_slot_step(AcidSlot *a, const N2Sim *s, int gen, const N2State *
         wcoll_ground(g_wcoll, &g_acid_wc, f.pos, &surf, nrm, &found);
         if (found) f.centre_surface = surf;
     }
-    f.nitrous = st->nos_on;
+    f.nitrous = st->nos_on ? (g_acid_prerace ? 2 : 1) : 0;   /* 2: race stage 0..3 (0x5f6088) */
     f.throttle = fabsf(st->throttle);
-    f.bottom = st->bottom;
+    f.bottom = g_acid_rpst ? g_acid_rpbot : n2sim_take_bottom((N2Sim *)s);   /* any of this frame's steps (0x5f5730 runs per step) */
     f.gear = st->gear;
     f.rpm = st->rpm_tach;
     f.rpm_range = n2sim_param(s, 0x1f8) - n2sim_param(s, 0x1f0);
@@ -4753,11 +5836,105 @@ static void rt_free_visuals(void)
         carcoll_free(g_rt.tvcc[k]); g_rt.tvcc[k] = NULL;
     }
 }
+/* Restart / the next tournament race (g_rt_keep: the same field): the
+   opponents' loaded models, wheels, hulls and looks are parked by rt_end and
+   taken back by rt_race_setup for the same slot, car and look -- no
+   GEOMETRY.BIN / TEXTURES.BIN reads (~1 s each on the Vita), no skin
+   composite. A track switch drops them (rt_keep_drop) before its build. */
+static int rt_keep_pending(void);
+static struct {
+    int have[AIRACE_MAX];
+    char car[AIRACE_MAX][32]; N2CarConfig cfg[AIRACE_MAX]; unsigned char cfg_on[AIRACE_MAX];
+    char rim[AIRACE_MAX][16]; int rim_style[AIRACE_MAX];
+    CarSwitchCandidate vis[AIRACE_MAX]; GpuMesh wheel[AIRACE_MAX];
+    __typeof__(g_rt.olook[0]) olook[AIRACE_MAX];
+    CarColl *vcc[AIRACE_MAX];
+} g_opp_stash;
+static void rt_keep_drop(void) {
+    int n = 0;
+    for (int k = 0; k < AIRACE_MAX; k++) {
+        if (!g_opp_stash.have[k]) continue;
+        n++;
+        if (g_opp_stash.wheel[k].vbo) {
+            glDeleteBuffers(1, &g_opp_stash.wheel[k].vbo);
+            glDeleteBuffers(1, &g_opp_stash.wheel[k].nbo);
+            glDeleteBuffers(1, &g_opp_stash.wheel[k].ibo);
+        }
+        car_switch_release(&g_opp_stash.vis[k]);
+        __typeof__(g_rt.olook[0]) *L = &g_opp_stash.olook[k];
+        if (L->skin) glDeleteTextures(1, &L->skin);
+        if (L->rtex) glDeleteTextures(1, &L->rtex);
+        if (L->rptex) glDeleteTextures(1, &L->rptex);
+        if (L->sptex) glDeleteTextures(1, &L->sptex);
+        free_scene_gpu(L->rgm, L->nr);
+        n2_free_scene(&L->rl);
+        carcoll_free(g_opp_stash.vcc[k]);
+    }
+    if (n) printf("race: %d kept opponent model%s let go\n", n, n == 1 ? "" : "s");
+    memset(&g_opp_stash, 0, sizeof g_opp_stash);
+}
+/* rt_end, a same-field rerun pending: park what rt_free_visuals would free */
+static void rt_keep_park(void) {
+    if (!rt_keep_pending()) return;
+    int n = 0;
+    for (int k = 0; k < g_rt.nopp && k < AIRACE_MAX; k++) {
+        if (g_opp_stash.have[k] || !g_rt.vis[k].gpu) continue;
+        g_opp_stash.have[k] = 1; n++;
+        snprintf(g_opp_stash.car[k], sizeof g_opp_stash.car[k], "%s", g_rt.opp[k].car);
+        g_opp_stash.cfg[k] = g_rt.ocfg[k]; g_opp_stash.cfg_on[k] = g_rt.ocfg_on[k];
+        memcpy(g_opp_stash.rim[k], g_rt.orim[k], sizeof g_opp_stash.rim[k]);
+        g_opp_stash.rim_style[k] = g_rt.orim_style[k];
+        g_opp_stash.vis[k] = g_rt.vis[k]; memset(&g_rt.vis[k], 0, sizeof g_rt.vis[k]);
+        g_opp_stash.wheel[k] = g_rt.wheel[k]; memset(&g_rt.wheel[k], 0, sizeof g_rt.wheel[k]);
+        g_opp_stash.olook[k] = g_rt.olook[k]; memset(&g_rt.olook[k], 0, sizeof g_rt.olook[k]);
+        g_opp_stash.vcc[k] = g_rt.vcc[k]; g_rt.vcc[k] = NULL;
+    }
+    if (n) printf("race: %d opponent model%s kept for the same field\n", n, n == 1 ? "" : "s");
+}
+/* rt_race_setup: opponent k's parked model, if it is the same car and look */
+static int rt_keep_take(int k) {
+    if (k < 0 || k >= AIRACE_MAX || !g_opp_stash.have[k]) return 0;
+    if (strcmp(g_opp_stash.car[k], g_rt.opp[k].car) || g_opp_stash.cfg_on[k] != g_rt.ocfg_on[k] ||
+        (g_rt.ocfg_on[k] && memcmp(&g_opp_stash.cfg[k], &g_rt.ocfg[k], sizeof g_rt.ocfg[k])) ||
+        strcmp(g_opp_stash.rim[k], g_rt.orim[k]) || g_opp_stash.rim_style[k] != g_rt.orim_style[k])
+        return 0;
+    g_rt.vis[k] = g_opp_stash.vis[k]; g_rt.wheel[k] = g_opp_stash.wheel[k];
+    g_rt.olook[k] = g_opp_stash.olook[k]; g_rt.vcc[k] = g_opp_stash.vcc[k];
+    g_rt.olook[k].spin_ang = g_rt.olook[k].spin_vel = g_rt.olook[k].spin_prev = 0.0f; g_rt.olook[k].spin_t = 0;
+    memset(&g_opp_stash.vis[k], 0, sizeof g_opp_stash.vis[k]);
+    memset(&g_opp_stash.wheel[k], 0, sizeof g_opp_stash.wheel[k]);
+    memset(&g_opp_stash.olook[k], 0, sizeof g_opp_stash.olook[k]);
+    g_opp_stash.vcc[k] = NULL; g_opp_stash.have[k] = 0;
+    return 1;
+}
+/* the replay on screen (replay.c): which cars its frame has in the world */
+static int g_rp_vis; static unsigned char g_rp_on[RP_SLOTS], g_rp_lt[RP_SLOTS];
+static int g_rp_plights;                /* the player's lamps (RPL_HEAD/HIGH/FLASH/TAIL), live: recorded */
+static int g_rp_moved;                  /* replay: playback ticks moved this frame (the effects' clock) */
+static int g_rp_shifting;               /* replay: the player's recorded shift state (the sound) */
+static int g_rp_jump;                   /* replay: a snapshot restore -- the skid pens lift */
+/* RestoreSnapshot (a replay marker, THE_PRESENT at the exit): what the
+   world was doing goes with it -- the particles in the air, the collision
+   sounds' contact pairs (their scrapes), the gear the shift sound compares
+   with, the tyre marks' pens */
+static void rp_restore_play(void)
+{
+    if (getenv("OPENUG2_RP_LOG")) printf("replay: restore clears %d particles\n", acid_live_particles());   /* test aid */
+    acid_clear();
+    for (int src = 0; src < 4; src++) carsfx_coll_pairs(src, NULL, 0);
+    g_n2_prev_gear = -1;
+    g_rp_jump = 1;
+}
+static int g_rp_req;                    /* RP_FROM_*: open the replay screen (main loop) */
+#define RP_UI_ON 1                      /* the Replay menu entries (post-race / pause) */
 static void rt_end(void)
 {
     /* the race's or free roam's world goes: the next one spawns every
        smokeable again (World::World -> SpawnSmokeables 0x5b4220) */
     smk_world_reset();
+    g_pose_ring_clear = 1; g_reset_blink = 0.0f;   /* the Player goes with the world */
+    rain_world_reset();                 /* ResetWorldTime 0x576cf0 + a new Rain */
+    jumpcam_reset();                    /* ClearZone, time scale 1 */
     carsfx_race_end();
     hud_free(&g_rt.dhud);
     hud_free(&g_rt.ghud);
@@ -4783,12 +5960,15 @@ static void rt_end(void)
     ainet_free(g_rt.net);
     racepath_free(g_rt.rp);
     racepath_free(g_rt.zones);
+    rt_keep_park();
     rt_free_visuals();
     nisdraw_free(g_rt.nisd);
     nis_free(g_rt.nis);
     g_n2_nis = 0;
     g_career_nis_on = 0; g_career_zones_set = 0;   /* the career start scene / zones went with it */
     acid_race_drop();
+    rp_reset();                         /* the replay goes with the race (ReplayManager) */
+    g_rp_vis = 0;
     memset(&g_rt, 0, sizeof g_rt);
     n2_race_mode(0);
 }
@@ -4801,13 +5981,19 @@ static const CarSwitchCandidate *rt_tvisual(int i)
     if (i < 0 || i >= g_rt.ntr || g_rt.tvi[i] < 0) return NULL;
     return g_rt.tvis[g_rt.tvi[i]].gpu ? &g_rt.tvis[g_rt.tvi[i]] : NULL;
 }
-static int rt_tshown(int i) { return i >= 0 && i < g_rt.ntr && airacer_mover(g_rt.tcar[i].r) != 0; }
+static int rt_tshown(int i) {
+    if (g_rp_vis) return i >= 0 && i < g_rt.ntr && i < RT_TMAX && g_rp_on[RP_TR0 + i];
+    return i >= 0 && i < g_rt.ntr && airacer_mover(g_rt.tcar[i].r) != 0;
+}
 /* an opponent in the world (free roam's encounter cars are Deactivated,
    0x5f6e20, until the encounter manager places one) */
-static int rt_on(int k) { return k >= 0 && k < g_rt.n && g_rt.car[k].s && !(g_rt.car[k].r && airacer_off(g_rt.car[k].r)); }
+static int rt_on(int k) {
+    if (g_rp_vis) return k >= 0 && k < g_rt.n && k < AIRACE_MAX && g_rt.car[k].s && g_rp_on[RP_OPP0 + k];
+    return k >= 0 && k < g_rt.n && g_rt.car[k].s && !(g_rt.car[k].r && airacer_off(g_rt.car[k].r));
+}
 /* an Outrun's loser poofed (+0x998): out of the simulation (ExtrapolatedState
    0x550 && !0x998), the car-car collisions (0x56f170) and the map (0x4ebec0) */
-static int rt_poofed(int k) { return k >= 0 && k < g_rt.n && g_rt.car[k].r && airacer_poofed(g_rt.car[k].r); }
+static int rt_poofed(int k) { return !g_rp_vis && k >= 0 && k < g_rt.n && g_rt.car[k].r && airacer_poofed(g_rt.car[k].r); }
 /* race numbering (0..n-1 opponents, n the player, n+1+i traffic) -> sound car id */
 static int rt_snd_id(int k) { return k == g_rt.n ? 0 : k < g_rt.n ? 1 + k : 1 + AIRACE_MAX + (k - g_rt.n - 1); }
 /* the race route as 0x5f6e70 locates it (one locator, 0x5da2f0 / 0x5da330) */
@@ -4816,8 +6002,23 @@ static int rt_snd_id(int k) { return k == g_rt.n ? 0 : k < g_rt.n ? 1 + k : 1 + 
    the mixer paused. */
 static void rt_sound_begin(void)
 {
-    int rows[AIRACE_MAX], slot[3] = { -1, -1, -1 };
-    for (int k = 0; k < g_rt.n; k++) rows[k] = audio_car_row(g_rt.opp[k].car);
+    int rows[AIRACE_MAX], slot[3] = { -1, -1, -1 }, tlv[AIRACE_MAX], nlv[AIRACE_MAX], elv[AIRACE_MAX];
+    for (int k = 0; k < g_rt.n; k++) {
+        rows[k] = audio_car_row(g_rt.opp[k].car);
+        elv[k] = engine_sound_level(&g_rt.opp[k].parts);   /* CarPreSetup 0x4593b0 (EAXCar +0x94) */
+        /* the levels MatchAICarPerformanceToPlayer 0x532010 fitted, read by
+           the turbo / nitrous SetupSFX (0x45eb30 / 0x45f210: 0x5995e0(4 / 2)) */
+        tlv[k] = perf_cat_level(&g_rt.opp[k].parts, 4);
+        nlv[k] = perf_cat_level(&g_rt.opp[k].parts, 2);
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_AINOS="l0 l1 l2 ..." = the opponents' nitrous levels */
+            const char *e = getenv("OPENUG2_SIM_AINOS");
+            for (int i = 0; e && *e && i <= k; i++) { if (i == k) nlv[k] = atoi(e); while (*e && *e != ' ') e++; while (*e == ' ') e++; }
+        }
+#endif
+    }
+    carsfx_ai_perf(tlv, nlv, g_rt.n);
+    carsfx_ai_engine_level(elv, g_rt.n);
     int mix = g_rt.rtype == AIRACE_DRAG ? 2 : g_rt.rtype == AIRACE_URL ? 3 : g_rt.drift ? 1 : 0;
     int nb = carsfx_race_begin(mix, g_rt.rtype == AIRACE_STREETX, g_rt.drift, rows, g_rt.n, slot);
     int tb[CARSFX_AI_MAX], ntb = carsfx_ai_turbo_banks(tb);
@@ -4866,10 +6067,29 @@ static void rt_sound_frame(float dt, const float eye[3], const float V[16], cons
         L.pupz = g_n2s.rot[8];
         L.pbottom = g_sfx_bottom; g_sfx_bottom = 0;
         L.pspark = g_sfx_spark; g_sfx_spark = 0;
+        L.pjumpcam = jumpcam_zone() == 6;       /* the view in camera zone 6 (+0x58) */
+        L.pzone67 = jumpcam_zone() == 6 || jumpcam_zone() == 7;
+        L.pcubic = g_cc_cubic;                  /* the camera pass's (last drawn frame's) mover */
+        {   /* EAXCar +0xa8 (SFXCTL_Physics f6, CARSFX_Rain's type) = Player::GetPovType 0x5eb400 (stored at
+               0x45922c) = GetPOVTypeFromPlayerCamera 0x502500 of the Camera setting 0x83aa74: 0 bumper -> 2,
+               1 hood -> 4, 2 near -> 1, 3 far -> 0, 4 high -> 5 (jump table 0x50252c). Fixed G2 10-31 (was
+               the setting itself, which swapped the in-car and outside duck levels) */
+            static const int k_pov[5] = { 2, 4, 1, 0, 5 };
+            L.pview = g_cc_setting >= 0 && g_cc_setting < 5 ? k_pov[g_cc_setting] : 0;
+        }
         L.pgear = g_n2s.gear;
+        L.pshifting = rp_up() ? g_rp_shifting : g_n2 && n2sim_shifting(g_n2);  /* the shift window (CARSFX_Shift, replay SWTN) */
+        L.pshiftup = rp_up() ? 0 : g_n2 && n2sim_shift_up(g_n2);   /* the replay records no direction */
+        L.preplay = rp_up();
+        L.pengine_level = audio_player_engine_level();
     }
+    /* the 3D mix mode = SndCamera::m_CurCamState (GC UpdateCameras 8008db18):
+       4 an NIS animation (TheAnimManager) or the drag camera manager
+       (+0x1c44), 3 the view's camera in zone 6 / 7, 5 RaceCoordinator state
+       5 (not mapped: the port's state for it is not traced), else the POV
+       type: bumper 2 -> 1, hood 4 -> 2, the outside views 0 */
+    L.mode = nis_engine ? 4 : L.pzone67 ? 3 : L.pview == 2 ? 1 : L.pview == 4 ? 2 : 0;
     if (!g_rt.active) { carsfx_update(dt, &L, ai, 0, tr, 0); return; }
-    L.mode = nis_engine ? 4 : 0;
     L.racing = racing;                  /* race_state 1: the countdown is over */
     L.drag = g_rt.rtype == AIRACE_DRAG;
     if (g_n2) { L.car_vel[0] = g_n2s.vel[0]; L.car_vel[1] = g_n2s.vel[1]; L.car_fspeed = g_n2s.speed; }
@@ -4979,6 +6199,18 @@ static const unsigned char *rt_zone16(void *u, const float pos[2])
     (void)u;
     return racepath_zone(g_rt.rp ? g_rt.rp : g_rt.zones, pos, 16);
 }
+/* Rain::Update's cover test (0x61e700): TrackPathManager::FindZone types
+   0x20 then 0x40 at p, each counted when its height (+0x14) is above p[2] */
+static int rain_cover(const float p[3])
+{
+    const RacePath *zp = g_rt.rp ? g_rt.rp : g_rt.zones;
+    if (!zp) return 0;
+    for (int t = 0x20; t <= 0x40; t += 0x20) {
+        const unsigned char *z = racepath_zone(zp, p, t);
+        float h; if (z) { memcpy(&h, z + 0x14, 4); if (p[2] < h) return 1; }
+    }
+    return 0;
+}
 /* a new pose from the AI (its placement, a teleport): on the collision
    ground (0x5e72e0), the TrafficMover set up there (0x5f52c0) */
 static void rt_traffic_put(int i)
@@ -5021,7 +6253,7 @@ static void rt_traffic_start(const float ppos[3], float pheading, int tdiff)
     /* a drag race places its traffic its own way (0x42e4a0, aitraffic.c) */
     if (!trec || (!g_rt.rp && !g_rt.roam)) return;
 #ifdef __vita__
-    {   FILE *nf = fopen("ux0:data/OpenUG2/notraffic.txt", "rb");   /* test switch */
+    {   FILE *nf = fopen("ux0:data/NFSU2/notraffic.txt", "rb");   /* test switch */
         if (nf) { fclose(nf); printf("race traffic: off (notraffic.txt)%c", 10); RT_CRUMB("traffic: off by notraffic.txt"); return; } }
 #endif
     RT_CRUMB("traffic: setup");
@@ -5197,6 +6429,7 @@ static int rt_start_ai(const char *routes_path, const char *paths_path, const ch
         c->lap = 0; c->prevrel = 0;
     }
     g_rt.active = 1; g_rt.t = 0; g_rt.start = -1; g_rt.was_racing = 0;
+    jumpcam_reset();
     g_rt.hud_reset = 1;
     for (int k = 0; k <= AIRACE_MAX; k++) g_rt.st_gear[k] = 1;      /* 0x5f73d0: the last gear N */
     g_n2_nwall = 0;
@@ -5209,6 +6442,12 @@ static int rt_start_ai(const char *routes_path, const char *paths_path, const ch
             memset(&g_rt.dl[k], 0, sizeof g_rt.dl[k]); memset(&g_rt.pairs[k], 0, sizeof g_rt.pairs[k]);
             g_rt.prevmax[k] = 0;
         }
+        /* 0x56d850 BuildLeaderBoard: the humans, then the AI racers -- or,
+           in an offline downhill event (0x104e..0x1053), 3 set scores */
+        g_rt.dlb_n = 0;
+        g_rt.dlb[g_rt.dlb_n++] = 0;
+        if (g_rt.nvirt) for (int v = 0; v < g_rt.nvirt; v++) g_rt.dlb[g_rt.dlb_n++] = (unsigned char)(100 + v);
+        else for (int k = 1; k <= g_rt.n; k++) g_rt.dlb[g_rt.dlb_n++] = (unsigned char)k;
         printf("drift race: %s, %d racing opponents, %d with a set score\n",
                g_rt.downhill ? "downhill" : "track", g_rt.n, g_rt.nvirt);
     }
@@ -5243,6 +6482,7 @@ static int rt_roam_start(const char *troot, const char *dataroot, const char *ca
     snprintf(g_rt.dataroot, sizeof g_rt.dataroot, "%s", dataroot);
     snprintf(g_rt.reg, sizeof g_rt.reg, "L4RA");
     g_rt.ev = 4000;
+    wa_start(g_rt.ev, 0);   /* StartWorldAnimations 0x43a880 for this event */
     int ptype = airace_type_of(carname);
     g_rt.psuv = ptype >= 0 ? airace_type_suv(ptype) : 0;
     int klass = perf_class(perf_rating(g_n2rec));
@@ -5330,6 +6570,7 @@ static int rt_roam_start(const char *troot, const char *dataroot, const char *ca
    same opponents from the same start positions */
 static struct { int on, nopp; AiOpponent opp[AIRACE_MAX]; int pos[1 + AIRACE_MAX];
                 N2CarConfig ocfg[AIRACE_MAX]; unsigned char ocfg_on[AIRACE_MAX]; char orim[AIRACE_MAX][16]; int orim_style[AIRACE_MAX]; } g_rt_keep;
+static int rt_keep_pending(void) { return g_rt_keep.on; }
 /* a garage race starts: make the field (0x53f150), its start order and the
    grid; load the opponents' models. The cars are placed by rt_spawn once
    the grid's area is loaded. Moves the player to its own slot when the
@@ -5348,6 +6589,7 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
     snprintf(g_rt.dataroot, sizeof g_rt.dataroot, "%s", dataroot);
     snprintf(g_rt.reg, sizeof g_rt.reg, "%s", e->reg);
     g_rt.ev = e->id; g_rt.circuit = e->circuit;
+    wa_start(g_rt.ev, g_rt_reverse);   /* StartWorldAnimations 0x43a880: race filter, FwdRevTrack (0x89e7a4) */
     AiRng rng = { (unsigned)SDL_GetTicks() * 2654435761u + 1u };
     int ptype = airace_type_of(carname);
     g_rt.psuv = ptype >= 0 ? airace_type_suv(ptype) : 0;
@@ -5476,6 +6718,12 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
     }
     printf("garage race %d: race type %d%s\n", e->id, g_rt.rtype,
            g_rt.drift ? (g_rt.downhill ? " (downhill drift)" : " (drift)") : "");
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_PSTART")) {   /* test aid (simulator): the player on start position n (swapped) */
+        int want = atoi(getenv("OPENUG2_SIM_PSTART"));
+        for (int i = 1; i <= g_rt.nopp; i++) if (pos[i] == want) { pos[i] = pos[0]; pos[0] = want; }
+    }
+#endif
     g_rt.pslot = pos[0] - 1;
     char path[1024];
     snprintf(path, sizeof path, "%s/ROUTES%s/TrackPosMarkersAll.bin", troot, e->reg);
@@ -5496,6 +6744,12 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
         pc.crowd = 1;               /* g_CrowdEnable 0x870cd0 */
         g_rt.nis_hash = 0; g_rt.nis_var = 0;
         if (nis_init(dataroot)) nis_pick(&pc, &rng, &g_rt.nis_hash, &g_rt.nis_var);
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_SIM_NIS")) {   /* test aid (simulator): OPENUG2_SIM_NIS=<hash hex>:<variant> */
+            unsigned hh = 0; int vv = 0;
+            if (sscanf(getenv("OPENUG2_SIM_NIS"), "%x:%d", &hh, &vv) >= 1) { g_rt.nis_hash = hh; g_rt.nis_var = vv; }
+        }
+#endif
         printf("garage race %d: pre-race scene %08x variant %d (track type %d, start %d)\n",
                e->id, g_rt.nis_hash, g_rt.nis_var, pc.track_type, pos[0]);
     }
@@ -5507,6 +6761,7 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
                k, o->name, o->car, o->skill, o->rating, o->handling, o->klass, g_rt.oslot[k]);
         CarSwitchCandidate *v = &g_rt.vis[k];
         ls_pump();
+        if (rt_keep_take(k)) { printf("  opponent %d: %s kept from the last race\n", k, o->car); continue; }
         g_load_cfg = g_rt.ocfg_on[k] ? &g_rt.ocfg[k] : NULL; g_load_pp = &o->parts;
         int vok = prepare_car_switch(v, dataroot, o->car);
         g_load_cfg = NULL; g_load_pp = NULL;
@@ -5521,6 +6776,7 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
             car_candidate_global_off(v);
         } else printf("  opponent %d: model %s failed to load\n", k, o->car);
     }
+    rt_keep_drop();   /* kept models this field did not take */
     if (g_rt.ngrid < 1 + g_rt.nopp) {
         /* 0x5eb5d0: too few starting-position markers -- the field along the
            race route (0x5da370: 100 m in, two abreast 3 m off the line, a
@@ -5648,6 +6904,53 @@ static float rt_nis_ground(void *user, void *state, const float p[3], int *found
     *found = rt_ground(c, p[0], p[1], p[2], &z, nrm, &surf);
     return *found ? z : 0.0f;
 }
+/* TopologyCoordinate::NewGetElevation under a world light flare, for its
+   road reflection (aciddraw_reflect_flares; looked up once per flare) */
+static int refl_flare_ground(const float p[3], float *z)
+{
+    WCollCtx c; float nrm[3]; int surf = 0;
+    wcoll_ctx_init(&c);
+    return rt_ground(&c, p[0], p[1], p[2], z, nrm, &surf);
+}
+/* SFXCTL_Tunnel::UpdateParams 0x483250: FindZone 0x5d9c70 with the masks
+   0x20, 0x40, 0x80, 0x100000 in turn (zone types 5, 6, 7, 20), each taken when
+   its height (+0x14) is 0 or not below the car (+0x68), else the next zone of
+   the type; returns that type (+0x78), 0 = none */
+static int tunnel_zone_type(const float car[3])
+{
+    static const int types[4] = { 5, 6, 7, 20 };
+    /* FindZone 0x5d9c70 walks TheTrackPathManager's zones, and only one path
+       file is loaded into it (0x57f46a..0x57f4ed): with a race (0x89e7b0)
+       and Tracks\Routes<reg>\Paths<n>.bin present (0x57cac0) that file, else
+       PathsFreeRoam.bin. The port's race path (rt_start_ai) is the same
+       Paths<ev>.bin; free roam has PathsFreeRoam's zones (CONFIRMED G5 11-01) */
+    const RacePath *zp = g_rt.rp ? g_rt.rp : g_rt.zones;
+    if (!zp) return 0;
+    for (int k = 0; k < 4; k++)
+        for (const unsigned char *z = racepath_zone_at(zp, car, types[k], NULL); z; z = racepath_zone_at(zp, car, types[k], z)) {
+            float h;   /* the index walk: types[k]'s zones holding the car, file order */
+            memcpy(&h, z + 0x14, 4);
+            if (h == 0.0f || !(h < car[2])) return types[k];
+        }
+    return 0;
+}
+/* SFXCTL_Tunnel::UpdateDriveBySnds 0x471080's look-ahead: FindZone with the
+   masks 0x20, 0x40, 0x80 only (types 5, 6, 7) at p, the same height test
+   against car_z; returns the type (2 = none) and the zone */
+static int tunnel_zone_probe(const float p[3], float car_z, const void **zone)
+{
+    static const int types[3] = { 5, 6, 7 };
+    const RacePath *zp = g_rt.rp ? g_rt.rp : g_rt.zones;
+    *zone = NULL;
+    if (!zp) return 2;
+    for (int k = 0; k < 3; k++)
+        for (const unsigned char *z = racepath_zone_at(zp, p, types[k], NULL); z; z = racepath_zone_at(zp, p, types[k], z)) {
+            float h;
+            memcpy(&h, z + 0x14, 4);
+            if (h == 0.0f || !(h < car_z)) { *zone = z; return types[k]; }
+        }
+    return 2;
+}
 /* 0x4309d0, place count 0: the car put down standing at its path's start,
    its controller gone (0x5eba30(0)), on the NIS mover (5) */
 static void rt_nis_put(N2Sim *s, WCollCtx *wc, const NisCar *q)
@@ -5685,6 +6988,11 @@ static int rt_nis_start(float carpos[3], float *heading)
     nis_rev_init(&g_rt.rev); g_rt.rev_on = 0;
     for (int k = 0; k < AIRACE_MAX; k++) nis_rev_init(&g_rt.arev[k]);
     g_rt.cd_iv = nis_countdown_interval(g_rt.nis);          /* 0x437910 */
+    for (int i = 0; i < 8; i++)   /* each grid slot: its scene path start vs its grid spot */
+        if (g_rt.ncar[i].on || i < g_rt.ngrid)
+            printf("pre-race scene: slot %d path %s (%.1f %.1f) h %u count %d | grid (%.1f %.1f) h %.2f\n", i,
+                   g_rt.ncar[i].on ? "on" : "off", g_rt.ncar[i].x, g_rt.ncar[i].y, g_rt.ncar[i].heading, g_rt.ncar[i].count,
+                   g_rt.grid[i][0], g_rt.grid[i][1], g_rt.gridh[i]);
     for (int k = 0; k < g_rt.n; k++) {
         const NisCar *q = &g_rt.ncar[g_rt.oslot[k]];
         g_rt.nisdrv[k] = q->on;
@@ -5755,7 +7063,10 @@ static void flash_frame(void)
         int c = (int)(((255.0f * 0.0078125f - 1.0f) * g_flash.k + 1.0f) * 127.5f);
         float m = 2.0f * (float)c / 255.0f, mul[3] = { m, m, m };
         render_set_flash(mul);
-    } else render_set_flash(NULL);
+    } else {   /* else slot 2, the rain's (AddScreenEffect(2, ..) from 0x61f120) */
+        float rt[3];
+        render_set_flash(rain_tint(rt) ? rt : NULL);
+    }
 #endif
     if (g_flash.active == 1) {
         g_flash.n++;
@@ -5857,7 +7168,16 @@ static void rt_nis_events(void)
             if (s) used = n2sim_nis_event(s, e->type, e->f, e->g);
             break;
         case NIS_EV_SCREEN_FLASH: flash_trigger(); used = 1; break;
-        case NIS_EV_WORLD_MSG: g_rt.nis_msg++; break;
+        case NIS_EV_WORLD_MSG:   /* 0x4392e0 event 12: car 1 DOOR_POSITION, 2 ANIM_POSITION */
+            /* the door's shop (0x438cd2): 0x865024, else 0x827ed4. 0x865024 has no
+               writer in SPEED2.EXE (its one reference is that read); 0x827ed4 is
+               written only by GotoShopEnterNIS 0x499470 (at 0x4994fc, the engaged
+               shop's +0x30). DOOR_POSITION is sent only by ShopEnter1 / ShopExit1,
+               which the port does not play, so 0 gives the same result in every
+               scene the port plays (CONFIRMED G5 11-01) */
+            wa_message(e->car, (unsigned)e->a, e->f, e->g, 0);
+            g_rt.nis_msg++; used = 1;
+            break;
         case NIS_EV_AUDIO_PATTERN: case NIS_EV_AUDIO_REV:
             if (s && slot == g_rt.pslot) {
                 if (e->type == NIS_EV_AUDIO_PATTERN) nis_rev_msg(&g_rt.rev, 7, e->a, (int)e->f);
@@ -5967,8 +7287,10 @@ static void career_nis_frame(void)
     int r = nis_tick(g_rt.nis, 1.0f / 60.0f, g_rt.ncar);
     const NisEvent *e;
     int ne = nis_fired(g_rt.nis, &e);
-    for (int i = 0; i < ne; i++, e++)   /* WORLD_MESSAGE ANIM_POSITION only (plane / train sounds) */
+    for (int i = 0; i < ne; i++, e++) {   /* WORLD_MESSAGE ANIM_POSITION only (the jumbo plane) */
+        if (e->type == NIS_EV_WORLD_MSG) { wa_message(e->car, (unsigned)e->a, e->f, e->g, 0); continue; }
         printf("career start scene: event type %d at %.2f s -- not applied\n", e->type, nis_time(g_rt.nis));
+    }
     /* the player's car back on its physics, and on the driver's controller:
        the scene drove it in neutral (gear request 1), and free roam has no
        start-line hold whose release would put the box back in drive */
@@ -6088,7 +7410,15 @@ static void rt_style_begin(void)
     style_misc_init(&g_rt.misc[0]);
     memset(&g_rt.pairs[0], 0, sizeof g_rt.pairs[0]);
     g_rt.sty.on = 1;
-    g_rt.sty.e7 = !streetx;
+    /* 0x89e7e7 (R4 11-01): its only writers are InitWithDefaults 0x5ed5f0 (= 1; called by
+       the static init 0x77eda0, the front end's load 0x57fda0 = BeginGameFlowLoadingFrontEnd
+       GC 80197c0c, the Quick Race start 0x53fc20, the replay load 0x579190 and the skip-FE
+       race 0x53fd30) and the Quick Race street X / drift setups 0x53f370 / 0x53f830 (= 0,
+       0x53f449 / 0x53f925; 0x53fdf6 is the skip-FE race's FE copy). StartCareerEvent
+       0x5322e0, StartCareerFreeRoam 0x5404a0 and the tuning races 0x526970 / 0x526720 /
+       0x526830 never write it, and the front end loads between any Quick Race and them,
+       so it is 0 only in a Quick Race street X (drift returns above) */
+    g_rt.sty.e7 = !(streetx && !g_career_mode && !tun_active());
     g_rt.sty.burn = -1.0f;                                   /* 0x5f7410 stats +0x28 */
     printf("style points: race mask %x (%d moments)%c", mask,
            (int)(sizeof g_rt.acc[0].m / sizeof g_rt.acc[0].m[0]), 10);
@@ -6161,6 +7491,8 @@ static void rt_style_tick(int racing, int player_n2, const CarCollHit *h, int nh
         in.newcp = g_rt.ent[0].newcp; in.newlap = g_rt.ent[0].newlap;
         in.finished = !g_rt.roam && g_rt.ent[0].place != 0;          /* 0x5ee250 */
         in.wheels = st->wheels_down;
+        in.blink = g_reset_blink > 0.0f;   /* 0x5ebfa0: +0x974 set and the 2 s reset blink (+0x978) not over (R1) */
+        in.body_flag = carcoll_body_collisions(g_n2);   /* car +0x3c -> +0x18, live Collisions (R2) */
         in.speed = sp; in.fwd_speed = st->speed; in.yaw_rate = st->angvel[2];
         if (!(st->speed < 1.0f)) {                       /* 0x59fa10 */
             unsigned short hd = (unsigned short)(int)lrintf(st->heading * 10430.3779f);
@@ -6193,10 +7525,11 @@ static void rt_style_tick(int racing, int player_n2, const CarCollHit *h, int nh
             }
         }
         in.near = g_rt.sty.near; in.nnear = g_rt.sty.nnear;
-        {   /* 0x5f7410: the driven wheels' slip (0x592870: P +0x1c0 < 0.2 front, > 0.8 rear) */
+        {   /* 0x5f7410: the driven wheels' slip (0x592870: P +0x1c0 < 0.2 front, > 0.8 rear); car +0x3b4[i]
+               (GC CarState +0x36c) = Wheel +0x100 (0x5a586d; GC MellowMover::UpdateCar 801bbaa4) */
             float rf = n2sim_param(g_n2, 0x1c0), sum = 0; int cnt = 0;
             for (int q = 0; q < 4; q++)
-                if (rf < 0.2f ? q < 2 : rf > 0.8f ? q >= 2 : 1) { sum += st->wheel_lslip[q]; cnt++; }
+                if (rf < 0.2f ? q < 2 : rf > 0.8f ? q >= 2 : 1) { sum += st->wheel_slipv[q][0]; cnt++; }
             style_burnout_tick(&g_rt.sty.burn, a, racing, in.race_mode, in.race_time,
                                cnt ? sum / (float)cnt : 0.0f, g_rt.sty.dist);
         }
@@ -6217,6 +7550,13 @@ static void rt_style_tick(int racing, int player_n2, const CarCollHit *h, int nh
     }
     if (!g_rt.sty.e7) return;
     if (player_n2) {                                     /* 0x60177b */
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_NOSFRAC=<f> starts the bottle at that fraction, once */
+            static int nos_set;
+            const char *e = nos_set ? NULL : getenv("OPENUG2_SIM_NOSFRAC");
+            if (e) { nos_set = 1; n2sim_nitrous_fill(g_n2, (float)atof(e) - g_n2s.nos_frac); }
+        }
+#endif
         float pts = a->total;
         float d = pts - g_rt.sty.prev;
         g_rt.sty.prev = pts;
@@ -6338,7 +7678,7 @@ static int rt_drift_place(void)
 /* what the post-race screens read of the race, kept past rt_end */
 static struct { int drift, downhill, sprint, laps, drag; } g_prace;
 static Hud *g_results;
-enum { PR_RESTART, PR_STATS, PR_QUIT, PR_EXPLORE, PR_NEXTRACE, PR_SPONSOR, PR_WORLDMAP, PR_WORLDMAP_PAUSE };
+enum { PR_RESTART, PR_STATS, PR_QUIT, PR_EXPLORE, PR_NEXTRACE, PR_SPONSOR, PR_WORLDMAP, PR_WORLDMAP_PAUSE, PR_REPLAY };
 typedef struct { uint32_t icon, label; int act; } PostOpt;
 /* EventInProgressState (GC 80127bf8) of a multi-track career event, a
    tournament (only URL events have them): NotifyInitialize 80128044 adds the
@@ -6413,19 +7753,24 @@ static const PostOpt k_postrace_career[] = {
     { 0x70bb9626u, 0xf82df37eu, PR_STATS },
     { 0x4c9e34e6u, 0xc7e1420cu, PR_QUIT },
 };
-#define N_POSTRACE_MAX 6
+#define N_POSTRACE_MAX 8
 static const PostOpt *post_opts(int *n)
 {
     const PostOpt *b = k_postrace; int nb = (int)(sizeof k_postrace / sizeof *k_postrace);
     if (g_career_mode && tour_can_advance()) {
         b = k_postrace_career_next; nb = (int)(sizeof k_postrace_career_next / sizeof *k_postrace_career_next);
     } else if (g_career_mode) { b = k_postrace_career; nb = (int)(sizeof k_postrace_career / sizeof *k_postrace_career); }
-    if (!g_career_mode || !g_career_from_wmap) { *n = nb; return b; }
+    /* PostRaceMenu 0x4bee10: Replay (icon 0x84d1d864, "Replay" 0x7840428a)
+       before Quit when not online (0x850078 != 4), the replay on (+0x50ec)
+       and a lap snapshot taken (+0xbc > 0) */
+    int replay = RP_UI_ON && rp_lap_markers() > 0, wmap = g_career_mode && g_career_from_wmap;
+    if (!wmap && !replay) { *n = nb; return b; }
     static PostOpt o[N_POSTRACE_MAX];   /* PRReturnToWorldMap (vt 0x79503c) after Explore */
     int k = 0;
     for (int i = 0; i < nb && k < N_POSTRACE_MAX; i++) {
-        o[k++] = b[i];
-        if (b[i].act == PR_EXPLORE && k < N_POSTRACE_MAX) { o[k].icon = 0x3109913cu; o[k].label = 0x5e670a9eu; o[k++].act = PR_WORLDMAP; }
+        if (b[i].act == PR_QUIT && replay && k < N_POSTRACE_MAX) { o[k].icon = 0x84d1d864u; o[k].label = 0x7840428au; o[k++].act = PR_REPLAY; }
+        if (k < N_POSTRACE_MAX) o[k++] = b[i];
+        if (wmap && b[i].act == PR_EXPLORE && k < N_POSTRACE_MAX) { o[k].icon = 0x3109913cu; o[k].label = 0x5e670a9eu; o[k++].act = PR_WORLDMAP; }
     }
     *n = k; return o;
 }
@@ -6602,6 +7947,7 @@ static void post_close(void)
     hud_free(&g_results); hud_free(&g_post.menu); hud_free(&g_post.dlg); hud_free(&g_pst.h);
     hud_free(&g_post.reward); hud_free(&g_post.tres); hud_free(&g_post.tstand);
     hud_free(&g_post.spop); hud_free(&g_post.spon);
+    hud_screen_prefetch(NULL, NULL, NULL, 0);   /* screens decoded ahead and not opened go too */
 }
 static void post_menu_option(void)
 {
@@ -6744,9 +8090,9 @@ static void pst_fmt1(char *b, int cap, float v)          /* "%$3.1f" */
     char t[32]; snprintf(t, sizeof t, "%3.1f", v);
     char *dot = strchr(t, '.'); int il = dot ? (int)(dot - t) : (int)strlen(t), k = 0;
     for (int i = 0; t[i] && k < cap - 1; i++) {
-        b[k++] = t[i];
+        b[k++] = i == il ? n2_lang_dec() : t[i];          /* '$': the language's decimal */
         int left = il - 1 - i;
-        if (i < il && left > 0 && left % 3 == 0 && t[i] != '-' && t[i] != ' ' && k < cap - 1) b[k++] = ',';
+        if (i < il && left > 0 && left % 3 == 0 && t[i] != '-' && t[i] != ' ' && k < cap - 1) b[k++] = n2_lang_thou();
     }
     b[k] = 0;
 }
@@ -7219,6 +8565,7 @@ static void post_key_screen(int key)
         else if (key == PK_OK) {
             int n; int a = post_opts(&n)[g_post.sel].act;
             if (a == PR_STATS) { hud_free(&g_post.menu); pst_open(1); }   /* 0x4bed10: flag 0x7f45a1 = 1 */
+            else if (a == PR_REPLAY) { hud_free(&g_post.menu); g_rp_req = RP_FROM_POSTRACE; printf("post-race: Replay\n"); }
             /* PRExplore 80308e90: no next race -> 0x3411395c straight away (the
                ask is only for a tournament's Explore, 0x451e768e) */
             else if (a == PR_EXPLORE && tour_has_next()) post_open_dialog(a);   /* a tournament left: "Explore?" */
@@ -7322,7 +8669,10 @@ static struct {
     int eat_start;   /* the Start press that opened the menu (Pause + menu Start in one poll) */
     const __typeof__(k_pause_race[0]) *it;
 } g_pause;
-static int pause_locked(int act) { return act == PZ_REPLAY; }
+static int part_world_paused(void) { return g_pause.on; }
+/* IsInstantReplayAvailable: the replay on, an INSTANT_REPLAY snapshot taken
+   (+0xb8 > 0), 0x88f1a8 == 0 -- free roam never records */
+static int pause_locked(int act) { return act == PZ_REPLAY && (!RP_UI_ON || rp_instant_markers() <= 0); }
 /* the career engage dialog up over the pause (eng_open); act: what its accept
    starts once the pause is gone (the main loop: the race / the shop) */
 enum { ENG_NONE, ENG_RACE, ENG_SHOP, ENG_EVENT, ENG_SHOWCASE };
@@ -7466,6 +8816,25 @@ static int post_need_reward(void)
 {
     const unsigned char *cev = g_career.engaged_event;
     return g_career_mode && g_eng.commit && cev && g_eng.won && !career_has_completed(n2_u32(cev + 8));
+}
+/* The screens the finish opens at once (UI_PostRaceResults; a tournament's
+   UI_PostRace_TournResults after it) and the ones the first accept opens
+   (UI_PostRace; a career event's UI_PostRaceReward when it is won), decoded
+   on a worker while the race runs (hud_screen_prefetch): on the Vita each
+   load stalled the frame thread ~0.8 s. Same files, same screens. */
+static void post_prefetch(const char *dataroot)
+{
+    const char *race = g_rt.drift ? "GLOBAL/InGameDrift.bun" : "GLOBAL/InGameRace.bun";
+    const char *bun[4], *pkg[4];
+    int n = 0;
+    bun[n] = race; pkg[n++] = "UI_PostRaceResults.fng";            /* rt_results */
+    if (tour_on()) { bun[n] = "GLOBAL/InGameRace.bun"; pkg[n++] = "UI_PostRace_TournResults.fng"; }   /* tour_open_results */
+    else { bun[n] = race; pkg[n++] = "UI_PostRace.fng"; }           /* post_open_menu */
+    const unsigned char *cev = g_career.engaged_event;
+    if (g_career_mode && g_eng.commit && cev && !career_has_completed(n2_u32(cev + 8))) {
+        bun[n] = race; pkg[n++] = "UI_PostRaceReward.fng";         /* post_open_reward */
+    }
+    hud_screen_prefetch(dataroot, bun, pkg, n);
 }
 /* PostRaceRewardsScreen::Setup 800f4d98: 0x18d97a23 the sponsor points
    (GetSponsorPointsEarned 80128318 + 0.5, "%d"), 0x18d97a24 the purse
@@ -7752,7 +9121,8 @@ static const unsigned char *eng_track_rec(int id)                /* the race rec
     return NULL;
 }
 static int eng_track_id(const unsigned char *ev) { return (int16_t)(ev[0x18] | ev[0x19] << 8); }   /* track 0 */
-/* FEPrintf "%$f" (bPrintf 0x43e950): 3 decimals, the whole part grouped by 3 with ',' */
+/* FEPrintf "%$f" (bPrintf 0x43e950): 3 decimals, the whole part grouped by 3 with the
+   language's thousands character, its decimal character (n2_lang_thou / _dec) */
 static void eng_fmt_f(char *o, int cap, float v)
 {
     char t[48];
@@ -7760,8 +9130,8 @@ static void eng_fmt_f(char *o, int cap, float v)
     const char *dot = strchr(t, '.');
     int ip = dot ? (int)(dot - t) : (int)strlen(t), neg = t[0] == '-', n = 0;
     for (int i = 0; t[i] && n < cap - 1; i++) {
-        if (i > neg && i < ip && (ip - i) % 3 == 0) o[n++] = ',';
-        if (n < cap - 1) o[n++] = t[i];
+        if (i > neg && i < ip && (ip - i) % 3 == 0) o[n++] = n2_lang_thou();
+        if (n < cap - 1) o[n++] = i == ip ? n2_lang_dec() : t[i];
     }
     o[n] = 0;
 }
@@ -8186,13 +9556,20 @@ static void trig_update(int free_run)
     if (tt > 0 && tt <= 12) {
         static unsigned char fake[0x18]; static int faked;
         if (!g_trig[tt - 1].on) faked = 0;
+        else {                                      /* the car moved off (spawn teleport): put it ahead again */
+            float fx = rdf(fake + 4) - bd.pos[0], fy = rdf(fake + 8) - bd.pos[1];
+            static int ticks;
+            if (fx * fx + fy * fy > 900.0f || ++ticks % 120 == 0) faked = 0;   /* and every 2 s while it sits */
+        }
         if (!faked) {
             faked = 1;
-            float x = bd.pos[0] + bd.R[0] * 15.0f, y = bd.pos[1] + bd.R[1] * 15.0f, z = bd.pos[2] - 0.5f;
+            float tdist = getenv("OPENUG2_FXTEST_TRIG_D") ? (float)atof(getenv("OPENUG2_FXTEST_TRIG_D")) : 15.0f;
+            int tax = getenv("OPENUG2_FXTEST_TRIG_AX") ? 4 * atoi(getenv("OPENUG2_FXTEST_TRIG_AX")) : 0;
+            float x = bd.pos[0] + bd.R[tax] * tdist, y = bd.pos[1] + bd.R[tax + 1] * tdist, z = bd.pos[2] - 0.5f;
             memcpy(fake + 4, &x, 4); memcpy(fake + 8, &y, 4); memcpy(fake + 0x14, &z, 4);
             float gz = 0; int gk = trig_ground(x, y, &gz);
-            printf("trigger fx: test %s at (%.0f %.0f), ground %d %.1f, templates %s\n", k_trig_map[tt - 1].name,
-                   x, y, gk, gz, g_trig[tt - 1].tmpl ? "yes" : "none");
+            printf("trigger fx: test %s at (%.0f %.0f), ground %d %.1f, templates %s, car (%.0f %.0f %.1f)\n", k_trig_map[tt - 1].name,
+                   x, y, gk, gz, g_trig[tt - 1].tmpl ? "yes" : "none", bd.pos[0], bd.pos[1], bd.pos[2]);
         }
         use[tt - 1] = fake;
     }
@@ -8371,7 +9748,8 @@ static int wm_open(const char *dataroot, float px, float py, float phead)
     hud_screen_obj_hide(h, g_wm.loc, 1);
     /* the PC's mouse arrows and zoom label (flag 0x08); the console prompts stay */
     hud_screen_hide_h(h, 0x42faad5au, 1); hud_screen_hide_h(h, 0xcf6f0439u, 1); hud_screen_hide_h(h, 0xaba93d3fu, 1);
-    hud_screen_text_h(h, 0xcaaf9010u, "L"); hud_screen_text_h(h, 0x543a8d56u, "R");
+    hud_screen_text_h(h, 0xcaaf9010u, "$JOY_EVENT_FENG_LTRIGGER$");   /* hud.c's L / R shoulder glyphs */
+    hud_screen_text_h(h, 0x543a8d56u, "$JOY_EVENT_FENG_RTRIGGER$");
     /* the pools' objects (every one off screen until placed) */
     int cnt[15];
     for (int t = 0; t < 15; t++) {
@@ -8598,9 +9976,12 @@ static void sms_subject(const Hud *h, const CareerSmsSlot *m, char *o, int cap) 
     sms_text(h, s, arg, b, sizeof b);
     eng_fmt_s(o, cap, hud_screen_string(h, 0x4b5de3e9u), b);                     /* "Subject: %s" */
 }
-static void sms_scrollbar(Hud *h, int pos, int max)    /* FEScrollBar::Update(1, max + 1, pos + 1): the tab down 884fba76 */
+/* the list is a Scrollerina ("scrollerina_area", SideScrollBar, vertical, backing shown; GC
+   SMSMailbox ctor 800dc98c, 10 MESSAGE slots): DrawScrollBar 80156d2c -> FEScrollBar::Update(
+   slots, data, view top + 1) (CountListIndices 80156efc: +0x14 slots, +0x18 data, +0x1c top + 1) */
+static void sms_scrollbar(Hud *h, int top, int n)
 {
-    fe_scrollbar_pos(h, hud_screen_find_h(h, 0x884fba76u), hud_screen_find_h(h, 0xf31e8ed3u), 1, 1, max + 1, pos);
+    fe_scrollbar_pos(h, hud_screen_find_h(h, 0x884fba76u), hud_screen_find_h(h, 0xf31e8ed3u), 1, 10, n, top);
 }
 static void sms_free_screens(void) { hud_free(&g_sms.dlg); hud_free(&g_sms.box); hud_free(&g_sms.view); }
 static void sms_free(void)                            /* DismissSMSMailbox 0x497730 */
@@ -8633,7 +10014,7 @@ static void sms_rows(void)                            /* SyncCurrentButton 0x4b2
         hud_screen_obj_key(h, o, m->b[0] == 1 ? 0xee28ac57u : 0x4b9b8f5au);   /* ENGAGE_SMS_READ_MESSAGE / _MAIL */
         hud_screen_obj_color(h, o, sms_env_argb((signed char)m->msg[5]));
     }
-    sms_scrollbar(h, g_sms.sel, g_sms.n - 1);
+    sms_scrollbar(h, g_sms.top, g_sms.n);
     /* 0x4b2190: UP_ARROW / DOWN_ARROW by the current node (none: both off; the
        first: up off, the last: down off -- a single one counts as the first) */
     int first = g_sms.sel == 0, last = g_sms.sel == g_sms.n - 1;
@@ -8661,8 +10042,8 @@ static void sms_build(void)                           /* BuildSubjectHeaderList 
     {   /* the category bar's tab (the scroll_area FEScrollBar) */
         float x, y, w, ht;
         (void)x; (void)y; (void)w; (void)ht;
-        /* ScrollBar_Backing / _Handle, horizontal; Update(1, 5 categories, tab) assumed as the
-           world map's (the SMS Update call site not found) */
+        /* the "scroll_area" Scrollerina (ScrollBar, horizontal; GC ctor 800dc98c): one slot
+           (980822b3), the 5 MailboxCategory data -> Update(1, 5, tab) via DrawScrollBar */
         fe_scrollbar_pos(h, hud_screen_find_h(h, 0x688a1551u), hud_screen_find_h(h, 0x3fbb7a4eu), 0, 1, 5, g_sms.tab - 1);
     }
     sms_rows();
@@ -8885,13 +10266,16 @@ static void sc_hl(int i, const char *s)
     hud_screen_script_h(g_sc.h, 0x95ad0949u + i, s);
     hud_screen_script_h(g_sc.h, 0xc2ea8de7u + i, s);
 }
-/* the PC button bar (0x69ba0835..37 / strings 0xb8a7c6cc..ce): which of
-   the three show, with what label (0 hidden) */
+/* the PC button bar (0x69ba0835..37 / strings 0xb8a7c6cc..ce): PC
+   (0x49a460 etc.) shows and labels it.  The console build never does: these
+   are flag-0x8 PC objects, hidden at load by FEngHidePCObjects (GC 8014ddc4,
+   feng.c platform pass), and no GC code touches the hashes.  So only the
+   labels are kept (harmless while hidden) and the bar stays hidden. */
 static void sc_bar(uint32_t a, uint32_t b, uint32_t c)
 {
     uint32_t l[3] = { a, b, c };
     for (int i = 0; i < 3; i++) {
-        hud_screen_hide_h(g_sc.h, 0xb8a7c6ccu + i, !l[i]); hud_screen_hide_h(g_sc.h, 0x69ba0835u + i, !l[i]);
+        hud_screen_hide_h(g_sc.h, 0xb8a7c6ccu + i, 1); hud_screen_hide_h(g_sc.h, 0x69ba0835u + i, 1);
         if (l[i]) hud_screen_label_h(g_sc.h, 0xb8a7c6ccu + i, l[i]);
     }
 }
@@ -8960,6 +10344,7 @@ static int sc_open(const char *dataroot, const unsigned char *sc)
     hud_screen_script_all(h, "FadeIn");
     g_sc.item = 0;                                             /* 0x35f8620b */
     sc_hl(0, "Highlight");
+    career_speech_showcase_mode();                             /* 0x35f8620b: HandleShowcaseMode (R1) */
     g_pause.on = 1; g_pause.race = 0; g_pause.eat_start = 0;
     audio_pause_game(1); music_pause(1);
     printf("showcase: photo screen %s (kind %d, magazine %08x, mast %08x extra %08x)\n", (const char *)sc,
@@ -9340,6 +10725,9 @@ static void pause_key(const char *dataroot, int key)
         if (a == PZ_RESUME) { audio_fe_play(FE_SND_SELECT); pause_close(); printf("pause: resume\n"); }
         else if (a == PZ_RESTART || a == PZ_QUIT || a == PZ_WORLDMAP) { audio_fe_play(FE_SND_DIALOG); pause_dialog(dataroot, a); }
         else if (a == PZ_OPTIONS) { audio_fe_play(FE_SND_SELECT); g_pzo.sel = 0; pzo_open_main(dataroot); }
+        else if (a == PZ_REPLAY && !pause_locked(a)) {   /* UI_ReplayControl over the paused race */
+            audio_fe_play(FE_SND_SELECT); pause_close(); g_rp_req = RP_FROM_PAUSE; printf("pause: Replay\n");
+        }
         else { audio_fe_play(FE_SND_WRONG); printf("pause: %s is not ported yet\n", a == PZ_OPTIONS ? "Options" : "Replay"); }
     }
 }
@@ -9362,7 +10750,7 @@ static struct {
 } g_cs;
 static const char *const k_cs_page[3] = { "UI_Status_Career.fng", "UI_Status_Region.fng", "UI_Status_DVD.fng" };
 static void cs_free(void) { hud_free(&g_cs.pg); hud_free(&g_cs.m); }
-/* EA bPrintf's '$' flag: the integer part grouped by 3 with ',' */
+/* EA bPrintf's '$' flag: the integer part grouped by 3, the language's characters */
 static void cs_group(char *out, int cap, double v, int prec)
 {
     char t[48];
@@ -9372,9 +10760,9 @@ static void cs_group(char *out, int cap, double v, int prec)
     if (v < 0 && o < cap - 1) out[o++] = '-';
     for (int i = 0; i < ni && o < cap - 1; i++) {
         out[o++] = t[i];
-        if ((ni - 1 - i) % 3 == 0 && i < ni - 1 && o < cap - 1) out[o++] = ',';
+        if ((ni - 1 - i) % 3 == 0 && i < ni - 1 && o < cap - 1) out[o++] = n2_lang_thou();
     }
-    for (const char *p = dot; p && *p && o < cap - 1; p++) out[o++] = *p;
+    for (const char *p = dot; p && *p && o < cap - 1; p++) out[o++] = p == dot ? n2_lang_dec() : *p;
     out[o] = 0;
 }
 /* bSNPrintf of the game's own strings: %d / %$d / %.Nf / %$.Nf / %% from args in order */
@@ -9432,7 +10820,7 @@ static void cs_build_rows(void)
     cs_title(0x92260f04u);                                       /* Overall Status */
     cs_slider(0xabba6482u, s->completion);                       /* Game Completion Status: */
     cs_stat_h(0x13b49408u, "%$d", s->cash, 0);                   /* Bank: */
-    const CareerCar *car = career_current_car();                 /* *0x86347d (guess: always) && the career car */
+    const CareerCar *car = career_current_car();                 /* GC Setup 800dacd0: always added; 0 unless the career owns a car (+0x7e2c = *0x86347d) and its RideInfo exists */
     cs_stat_h(0x3b10cb47u, "%$d", car ? car->spent : 0, 0);      /* Total Spent On Car: (+0x7f0) */
     cs_stat_h(0xc967aee0u, "%$d", s->races, 0);                  /* Races Entered: */
     cs_stat_h(0x241be921u, "%$d", s->wins, 0);                   /* Overall Wins: */
@@ -9472,25 +10860,39 @@ static void cs_build_rows(void)
     cs_title(0xea33e5b6u);                                       /* Unlocks */
     cs_slider(0xe0af0d6au, s->parts);                            /* Parts Unlocked */
 }
-/* PreviewSlider 0x540d20 (horizontal): the tab 46 in from the base's left
-   plus t x (base width - 92), the fill that long from the same 46 in */
-static void cs_slider_place(Hud *h, uint32_t base, uint32_t tab, uint32_t fill, uint32_t beg, uint32_t end, float v, int show)
+/* cSlider::DrawHorizontal 8011f7f0 (GC; Init 8011f350, len = base w - 2 inset; inset 46
+   for the CareerStatisticScreen rows 800da2a0 and CareerRegionScreen 800db490, 72 for the
+   StarPopulator's vr_* bar 80184858): the tab's top-left (base left + inset + t len - tab w / 2,
+   base middle - tab h / 2); u = tab h / 11; the handle (fill) t len 0.95 wide, its top-left
+   (base left + inset + 4, tab top + u); Beg centred (base left + inset, tab middle - handle h
+   + 1.1 u) while the fill is non-zero, End at (tab left + 1.5 Beg w / 3, the same y) from
+   t >= 0.98. Toggle 8011ffe4 shows / hides all five */
+static void cs_slider_place(Hud *h, uint32_t base, uint32_t tab, uint32_t fill, uint32_t beg, uint32_t end,
+                            float inset, float v, int show)
 {
     int ob = hud_screen_find_h(h, base), ot = hud_screen_find_h(h, tab), of = hud_screen_find_h(h, fill);
+    int og = hud_screen_find_h(h, beg), oe = hud_screen_find_h(h, end);
     hud_screen_obj_hide(h, ob, !show); hud_screen_obj_hide(h, ot, !show); hud_screen_obj_hide(h, of, !show);
-    hud_screen_hide_h(h, beg, !show); hud_screen_hide_h(h, end, !show);
+    hud_screen_obj_hide(h, og, !show); hud_screen_obj_hide(h, oe, !show);
     if (!show || ob < 0) return;
-    float bx, by, bw, bh, tx, ty, tw = 16, th = 16, fx, fy, fw, fh = 5.75f;
+    float bx, by, bw, bh, tx, ty, tw = 16, th = 16, fx, fy, fw, fh = 5.75f, gx, gy, gw = 0, gh;
     hud_screen_obj_box(h, ob, &bx, &by, &bw, &bh);
     if (ot >= 0) hud_screen_obj_box(h, ot, &tx, &ty, &tw, &th);
     if (of >= 0) hud_screen_obj_box(h, of, &fx, &fy, &fw, &fh);
-    float t = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v, left = bx - bw * 0.5f, len = bw - 92.0f;
-    float y = by - th * 0.5f + 1.0f;                             /* base top + h/2 - tab h/2 + 1 */
-    if (ot >= 0) hud_screen_obj_pos(h, ot, left + 46.0f + t * len, y - 2.0f + th * 0.5f);
+    if (og >= 0) hud_screen_obj_box(h, og, &gx, &gy, &gw, &gh);
+    bw = fabsf(bw); bh = fabsf(bh); tw = fabsf(tw); th = fabsf(th); fh = fabsf(fh); gw = fabsf(gw);
+    float t = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v, left = bx - bw * 0.5f + inset, len = bw - 2.0f * inset;
+    float tl = left + t * len - tw * 0.5f, tt = by - th * 0.5f, u = th / 11.0f, fl = t * len * 0.95f;
+    float ly = tt + th * 0.5f - fh + 1.1f * u;
+    if (ot >= 0) hud_screen_obj_pos(h, ot, tl + tw * 0.5f, tt + th * 0.5f);
+    hud_screen_obj_hide(h, og, fl == 0.0f);
+    if (og >= 0) hud_screen_obj_pos(h, og, left, ly);
+    hud_screen_obj_hide(h, oe, !(t >= 0.98f));
+    if (oe >= 0) hud_screen_obj_pos(h, oe, tl + 1.5f * gw / 3.0f, ly);
     if (of >= 0) {
-        hud_screen_obj_hide(h, of, t <= 0.0f);
-        hud_screen_obj_size(h, of, t * len, fh);
-        hud_screen_obj_pos(h, of, left + 46.0f + t * len * 0.5f, y + fh * 0.5f);
+        hud_screen_obj_hide(h, of, fl <= 0.0f);
+        hud_screen_obj_size(h, of, fl, fh);
+        hud_screen_obj_pos(h, of, left + 4.0f + fl * 0.5f, tt + u + fh * 0.5f);
     }
 }
 /* CareerScrollerSlot::Draw 0x4b1780 for the 7 slots */
@@ -9504,35 +10906,42 @@ static void cs_career_draw(void)
         hud_screen_text_h(h, vo, r ? r->value : "");
         hud_screen_obj_color(h, hud_screen_find_h(h, lo), r && r->title ? 0xffcaf48au : 0xffffffffu);
         hud_screen_obj_color(h, hud_screen_find_h(h, 0x28887216u + (uint32_t)k), r && r->title ? 0xdcffffffu : 0x7dffffffu);
-        cs_slider_place(h, 0x654668ecu + k, 0xb830bb54u + k, 0x4e4963ddu + k, 0x7770beffu + k, 0x77abeb28u + k,
+        cs_slider_place(h, 0x654668ecu + k, 0xb830bb54u + k, 0x4e4963ddu + k, 0x7770beffu + k, 0x77abeb28u + k, 46.0f,
                         r ? r->v : 0.0f, r && r->slider);
     }
     /* RefreshHeader 0x496f50: the arrows at the ends */
     hud_screen_hide_h(h, 0x640f0f23u, g_cs.top >= g_cs.nrow - 7);
     hud_screen_hide_h(h, 0x640f0f22u, g_cs.top <= 0);
 }
-/* StarGazerGuide::BuildVisualRatingInCareerStatus 0x53d870 (internals not
-   decompiled; guess: whole stars lit, a half star where the package has one,
-   the bar the fraction above the whole number as in the shop's box) */
+/* StarGazerGuide::BuildVisualRatingInCareerStatus 0x53d870 (GC 801840e8): StarPopulator::Build
+   801848c0 (10 stars 6ec2f0de + i, REP_Half_Star_<2i+1> / <2i+2>, all hidden; the vr_* cSlider,
+   inset 72), no preview, UpdateInstalledVisualRating -> StarPopulator::Update 801849e8: whole
+   = floor(r) stars shown, then the <2i+1> half at index whole when r - whole >= 0.5 (the <2i+2>
+   set is only the preview's); stars, half and the bar's handle / Beg / End in +0xcc (202,244,138,
+   ctor 801847b0); the bar = r - whole (cSlider 0..1) */
 static void cs_rating(void)
 {
     Hud *h = g_cs.pg;
     float r = career_star_rating();
     int whole = (int)floorf(r);
     float frac = r - (float)whole;
-    /* two half-star sets authored at the 10 star places (one with rot 360);
-       guess: all hidden but the plain set's at a .5 */
     static const uint32_t half_a[10] = { 0x413f8f29u, 0x413f8f2bu, 0x413f8f2du, 0x413f8f2fu, 0x413f8f31u,
                                          0x6931747au, 0x6931747cu, 0x6931747eu, 0x69317480u, 0x69317482u };
     static const uint32_t half_b[10] = { 0x413f8f2au, 0x413f8f2cu, 0x413f8f2eu, 0x413f8f30u, 0x69317479u,
                                          0x6931747bu, 0x6931747du, 0x6931747fu, 0x69317481u, 0x6931749au };
+    const uint32_t col = 0xffcaf48au;
     for (int i = 0; i < 10; i++) {
         hud_screen_hide_h(h, 0x6ec2f0deu + (uint32_t)i, i >= whole);
         hud_screen_hide_h(h, half_a[i], !(i == whole && frac >= 0.5f));
         hud_screen_hide_h(h, half_b[i], 1);
+        hud_screen_obj_color(h, hud_screen_find_h(h, 0x6ec2f0deu + (uint32_t)i), col);
+        hud_screen_obj_color(h, hud_screen_find_h(h, half_a[i]), col);
     }
+    hud_screen_obj_color(h, hud_screen_find_h(h, 0x086db7d2u), col);   /* vr_handle / vr_Beg / vr_End */
+    hud_screen_obj_color(h, hud_screen_find_h(h, 0x81a27c94u), col);
+    hud_screen_obj_color(h, hud_screen_find_h(h, 0x81a28a7du), col);
     printf("career status: visual rating %.2f\n", r);
-    cs_slider_place(h, 0xb5f1ffe1u, 0x22dac589u, 0x086db7d2u, 0x81a27c94u, 0x81a28a7du, frac, 1);
+    cs_slider_place(h, 0xb5f1ffe1u, 0x22dac589u, 0x086db7d2u, 0x81a27c94u, 0x81a28a7du, 72.0f, frac, 1);
 }
 static void cs_region(void)                                      /* CareerRegionScreen::Setup 0x497040 */
 {
@@ -9542,9 +10951,9 @@ static void cs_region(void)                                      /* CareerRegion
         hud_screen_label_h(h, 0x4d2f5c61u, 0x2eeeaa14u);         /* Go to Car Lot */
         hud_screen_label_h(h, 0x4d2f5c62u, 0xfd123b59u);         /* Go To Garage */
         hud_screen_hide_h(h, 0x317ad6f2u, 1); hud_screen_hide_h(h, 0x317ad6f3u, 1);
-        cs_slider_place(h, 0xbdcd0d7cu, 0x8dafa5e4u, 0x7342982du, 0xd734c2cfu, 0xd734d0b8u, 0.0f, 0);
+        cs_slider_place(h, 0xbdcd0d7cu, 0x8dafa5e4u, 0x7342982du, 0xd734c2cfu, 0xd734d0b8u, 46.0f, 0.0f, 0);
     } else {
-        cs_slider_place(h, 0xbdcd0d7cu, 0x8dafa5e4u, 0x7342982du, 0xd734c2cfu, 0xd734d0b8u, s->stage_completion, 1);
+        cs_slider_place(h, 0xbdcd0d7cu, 0x8dafa5e4u, 0x7342982du, 0xd734c2cfu, 0xd734d0b8u, 46.0f, s->stage_completion, 1);
         a[0] = s->stage_completion * 100.0f; cs_fmt(t, sizeof t, "%$.2f %%", a, 1); hud_screen_text_h(h, 0x317ad6f2u, t);
         a[0] = s->world_won; a[1] = s->world_req; cs_fmt(t, sizeof t, "%$d/%$d", a, 2); hud_screen_text_h(h, 0x317ad6f3u, t);
         if (career_stage_cleared(1)) {
@@ -9610,6 +11019,9 @@ static int cs_open(const char *dataroot)                         /* CreateCareer
     memset(&g_cs, 0, sizeof g_cs);
     g_cs.dataroot = dataroot;
     career_fill_statistics(&g_cs.st);
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_CSTAGE")) g_cs.st.stage = atoi(getenv("OPENUG2_SIM_CSTAGE"));   /* test aid: the pages / rows of stage N */
+#endif
     g_cs.m = hud_init_screen(dataroot, "GLOBAL/GLOBALB.BUN", "UI_Status_Master.fng");
     if (!g_cs.m) { printf("career status: UI_Status_Master.fng not loaded\n"); return 0; }
     hud_screen_script_all(g_cs.m, "FadeIn");
@@ -9822,20 +11234,28 @@ static void rt_stats_tick(int k)
     g_rt.st_gear[k] = s->gear;
     if (k == 0 && g_rt.start >= 0.0f) {
         /* 0x5f7410's rows for the player: race time (1/4000 s) when the speed
-           (x 2.237) first reaches 60 / 100; a drag race's quarter mile at 400 m
-           (CompareDistances; GUESS: the metres driven, car +0x410) */
+           (x 2.237) first reaches 60 / 100; a drag race's quarter mile (0x5f7529 / GC 80226930):
+           |CompareDistances 0x5d5cd0(car +0x8fc, race state +0xbf8[+0xbf6] x 0.01 x the lap
+           length 0x88f2b0)| >= 400 m while stats +0x10 < 0 -> the time and car +0x42c */
         int rt = rt_q40(g_rt.t * 4000.0f) - rt_q40(g_rt.start * 4000.0f);
         float mph = fabsf(s->speed) * 2.237f;
         if (rt > 0 && !g_rt.st_t60 && mph >= 60.0f) g_rt.st_t60 = rt;
         if (rt > 0 && !g_rt.st_t100 && mph >= 100.0f) g_rt.st_t100 = rt;
         if (g_rt.drag && g_rt.st_qms == 0.0f && g_rt.st_qmt == 0) g_rt.st_qms = -1.0f;
-        if (g_rt.drag && g_rt.st_qms < 0.0f && fabsf(g_rt.pdist) >= 400.0f) { g_rt.st_qmt = rt; g_rt.st_qms = fabsf(s->speed); }
-        /* lateral G: |accel . the side row| x 0.102041 (1/9.8) x 0.21 into an
-           Average(10) while racing with the wheels down (GUESS: car +0x424 == 4
-           / +0x3c+0x18 == 0 read as these); the acceleration from the tick's
-           velocity change (car +0x80 is the sim's) */
+        if (g_rt.drag && g_rt.st_qms < 0.0f && g_rt.rp && !g_rt.pfinished && !g_rt.postrace &&   /* not the post-race finish-marker placement */
+            fabsf(racepath_diff(g_rt.rp, g_rt.loc[0].progress,
+                                g_rt.cps.cp[g_rt.cps.start] * 0.01f * racepath_lap(g_rt.rp))) >= 400.0f) {
+            g_rt.st_qmt = rt; g_rt.st_qms = s->speed;
+            printf("stats: quarter mile %.3f s at %.2f m/s (driven %.1f m)%c", rt / 4000.0f, s->speed, g_rt.pdist, 10);
+        }
+        /* lateral G (0x5f7698 / GC 80226ba4): |accel . the side row| x 0.102041 (1/9.8) x 0.21
+           into an Average(10) only with all four wheels touching (car +0x424 = carstate +0x3e4,
+           GC CarState +0x3f4: SetWheelTouchingGround's count, 4 at ResetCar) and no live
+           Collision on the body (car +0x3c -> +0x18, GC +0x16). car +0x80 (GC +0x78) = the
+           movement's velocity change over its dt (GC Car::FinishMovement 8021fc84 from
+           BeginMovement's +0x518); car +0xa0 = carstate +0x60, the side row */
         float dt = g_rt.t - g_rt.st_pt;
-        if (g_rt.st_pvok && dt > 0.0f && 2 < s->wheels_down) {
+        if (g_rt.st_pvok && dt > 0.0f && s->wheels_down == 4 && !carcoll_body_collisions(g_n2)) {
             float a = 0.0f;
             for (int i = 0; i < 3; i++) a += (s->vel[i] - g_rt.st_pvel[i]) / dt * s->rot[3 + i];
             float g = fabsf(a) * 0.102041f * 0.21f;
@@ -9872,6 +11292,7 @@ static void rt_step_batch(RtStepBatch *b)
     static double sum[8], wall; static long cnt[8]; static int batches;
     int mv[AIRACE_MAX + RT_TMAX];
     for (int i = 0; i < b->n; i++) { int m = n2sim_mover(b->s[i]); mv[i] = m >= 0 && m < 8 ? m : 0; }
+    for (int i = 0; i < b->n; i++) n2sim_set_body_collisions(b->s[i], carcoll_body_collisions(b->s[i]));   /* car +0x3c -> +0x18 */
     Uint64 t0 = SDL_GetPerformanceCounter();
     int n = b->n;
     /* hwlog25: a race tick's steps are ~0.5 ms of work (0.02 ms a traffic
@@ -9905,8 +11326,10 @@ static void rt_step_batch(RtStepBatch *b)
 }
 static int rt_tick(int racing, float player_half_len, float player_half_wid)
 {
-    const float dt = 1.0f / 60.0f;
+    const float dt = 1.0f / 60.0f;      /* the physics step: n2sim_step scales it itself */
+    const float wdt = dt * n2sim_time_scale();   /* controllers run on the world step 0x865154 (scaled by the jump-cam slow-mo) */
     if (!g_rt.active) return 0;
+    Uint64 pf_race_control = pf_stamp();
     int player_n2 = n2_active() && g_n2 && g_n2_ticked;
     /* every car's route locator (car +0x8d8, 0x5da330) */
     if (g_rt.rp) {
@@ -9930,7 +11353,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
     {   /* slot 0: the player */
         AiCarInfo pc;
         if (player_n2) {
-            aicar_from_n2(&pc, g_n2, &g_n2s, g_rt.ppv, dt);
+            aicar_from_n2(&pc, g_n2, &g_n2s, g_rt.ppv, wdt);
             memcpy(g_rt.ppv, g_n2s.vel, sizeof g_rt.ppv);
             pc.ctrl_type = g_rt.pdrv ? 3 : g_rt.pdrag ? 2 : g_n2_nis ? 0 : 1;   /* no controller during the scene (0x5eba30(0)) */
         } else memset(&pc, 0, sizeof pc);
@@ -9951,7 +11374,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         RtCar *c = &g_rt.car[k];
         n2sim_state(c->s, &c->st);
         AiCarInfo ci;
-        aicar_from_n2(&ci, c->s, &c->st, c->pv, dt);
+        aicar_from_n2(&ci, c->s, &c->st, c->pv, wdt);
         memcpy(c->pv, c->st.vel, sizeof c->pv);
         ci.half_len = c->half_len; ci.half_wid = c->half_wid;
         ci.progress = g_rt.loc[1 + k].progress;
@@ -9965,7 +11388,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         RtCar *c = &g_rt.tcar[i];
         n2sim_state(c->s, &c->st);
         AiCarInfo ci;
-        aicar_from_n2(&ci, c->s, &c->st, c->pv, dt);
+        aicar_from_n2(&ci, c->s, &c->st, c->pv, wdt);
         memcpy(c->pv, c->st.vel, sizeof c->pv);
         ci.half_len = c->half_len; ci.half_wid = c->half_wid;
         ci.progress = g_rt.tloc[i].progress;
@@ -10019,7 +11442,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
             airacer_drag_lane(g_rt.pdrag, 0, g_drag_btn[0]);
             airacer_drag_lane(g_rt.pdrag, 1, g_drag_btn[1]);
             N2Controls dc;
-            airacer_frame(g_rt.pdrag, dt, &dc);
+            airacer_frame(g_rt.pdrag, wdt, &dc);
             if (cap_now) { airacer_drag_why(g_rt.pdrag, why0, sizeof why0); cap_now = 0; }
             if (pend >= 0 && g_rt.ticks - pt0 == 36) {
                 int l1 = airacer_drag_lane_now(g_rt.pdrag);
@@ -10035,19 +11458,28 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         }
     } else if (player_n2 && g_rt.pdrv) {   /* past the line: the AI racer controller on the car (0x42c0c0) */
         g_n2_dsteer_on = 0;
-        airacer_frame(g_rt.pdrv, dt, &g_n2_aictl);
+        airacer_frame(g_rt.pdrv, wdt, &g_n2_aictl);
         g_n2_aion = 1;
     } else if (player_n2 && !g_n2_nis) {   /* the player's controller tick (0x42caa0) and pace sampler (0x602650) */
         if (!g_rt.human) {
             g_rt.human = airacer_new_human(g_rt.w, 0, g_n2, g_rt.psuv, player_half_wid);
             if (g_rt.human) printf("retail AI: player controller tracking the road net (half width %.2f m)%c", player_half_wid, 10);
         }
-        if (g_rt.human) airacer_human_frame(g_rt.human, dt);
+        if (g_rt.human) airacer_human_frame(g_rt.human, wdt);
         /* test aid (simulator): OPENUG2_AUTODRIVE hands the car to an AI
            racer controller once the race runs, as after the finish line;
            OPENUG2_AUTODRIVE=race leaves free roam to the pad */
         static int autodrive = -1;
         if (autodrive < 0) autodrive = getenv("OPENUG2_AUTODRIVE") ? (strcmp(getenv("OPENUG2_AUTODRIVE"), "race") ? 1 : 2) : 0;
+        /* ... and on the Vita (unattended perf runs): ux0:data/NFSU2/autodrive.txt, "race" = race only */
+        static int autodrive_file = -1;
+        if (autodrive_file < 0) {
+            char ab[16] = { 0 };
+            FILE *af = fopen("ux0:data/NFSU2/autodrive.txt", "r");
+            autodrive_file = 0;
+            if (af) { autodrive_file = (fgets(ab, sizeof ab, af) && !strncmp(ab, "race", 4)) ? 2 : 1; fclose(af); }
+            if (!autodrive) autodrive = autodrive_file;
+        }
         if (autodrive && !(autodrive == 2 && g_rt.roam) && g_rt.human && !g_rt.drag && 0 <= g_rt.start && g_rt.start + 1.0f < g_rt.t) {
             g_rt.pdrv = airacer_take_over(g_rt.w, g_rt.human, g_n2, g_rt.psuv, player_half_wid);
             airacer_free(g_rt.human); g_rt.human = NULL;
@@ -10070,9 +11502,10 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
             continue;
         }
         if (!rt_on(k)) continue;
-        airacer_frame(c->r, dt, &ctl);
+        airacer_frame(c->r, wdt, &ctl);
         g_rt.asteer[k] = ctl.steer;
         g_rt.abrake[k] = ctl.brake; g_rt.ahbrake[k] = ctl.handbrake;
+        if (n2sim_brake(c->s) > 0.05f) g_rt.abrake_t[k] = g_rt.t;   /* UpdateBrakelightsState 0x5f62b0: +0x948 */
         n2_skid_ctl(&g_rt.askid[k], &c->st, ctl.brake, ctl.handbrake, g_rt.askid3[k]);   /* SFXCTL_Skid */
         if (airacer_want_reset(c->r)) {          /* car +0x96c -> 0x6012b0 / 0x5fbed0 */
             float rp[3], rh, rv, z, nrm[3];
@@ -10088,8 +11521,18 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                        g_rt.nopp ? g_rt.opp[k].name : "opponent", rp[0], rp[1], rv);
             }
         }
+        if (n2sim_far_take_jump(c->s)) airacer_far_hold(c->r, 1.0f);   /* 0x59ec80 -> 0x591540 */
         int mv = airacer_mover(c->r);
-        if (mv != n2sim_mover(c->s)) n2sim_set_mover(c->s, mv);
+        if (mv != n2sim_mover(c->s)) {
+            if (mv == N2_MOVER_FAR || n2sim_mover(c->s) == N2_MOVER_FAR)
+                printf("retail AI t %.1f s: opponent %d mover %d -> %d\n", g_rt.t, k, n2sim_mover(c->s), mv);
+            n2sim_set_mover(c->s, mv);
+        }
+        if (airacer_far_repath(c->r) + n2sim_far_want(c->s) && mv == N2_MOVER_FAR) {   /* 0x5918a0 */
+            float fp[20][3], flen = 0, fvt = 0, fx234 = 0, facc = 0;
+            int fn = airacer_far_plan(c->r, n2sim_get_draft(c->s), fp, &flen, &fvt, &fx234, &facc);
+            n2sim_far_path(c->s, (const float (*)[3])fp, fn, flen, fvt, fx234, facc);
+        }
         n2sim_set_catchup(c->s, airacer_car_catchup(c->r));       /* car +0x468 */
         n2sim_controls(c->s, &ctl);
         if (c->cc) carcoll_begin(c->cc, c->s, dt);
@@ -10101,7 +11544,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         RtCar *c = &g_rt.tcar[i];
         N2Controls ctl;
         RT_FCRUMB("tick %d: traffic %d frame (mover %d)", g_rt.ticks, i, airacer_mover(c->r));
-        airacer_frame(c->r, dt, &ctl);
+        airacer_frame(c->r, wdt, &ctl);
         rt_traffic_put(i);
         int mv = airacer_mover(c->r);
         if (!mv) continue;                               /* off the road net: not simulated */
@@ -10111,6 +11554,8 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         steps.s[steps.n++] = c->s;
     }
     hitch_mark("rt.traffic_ctl");
+    pf_detail.race_control += pf_elapsed(pf_race_control);
+    Uint64 pf_race_physics = pf_stamp();
     RT_FCRUMB("tick %d: steps (%d)", g_rt.ticks, steps.n);
     rt_step_batch(&steps);
     hitch_mark("rt.steps");
@@ -10126,6 +11571,9 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         if (!g_rt.car[k].cc) continue;
         cs[nc].c = g_rt.car[k].cc; cs[nc].s = g_rt.car[k].s;
         cs[nc].wc = usew ? &g_rt.car[k].wc : NULL;
+        /* a car on the scene's path goes where the scene puts it: the walls would
+           fight the put-down where a path starts against the median */
+        if (g_rt.nisdrv[k]) cs[nc].wc = NULL;
         cs[nc].nocollide = 0; cs[nc].human = 0; g_rt.csmap[nc++] = k;
     }
     int with_player = player_n2 && g_cc && g_n2_coll && (g_rt.field_gone || nc == ncexp);   /* its step-start pose is fresh */
@@ -10157,7 +11605,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         for (int i = 0; i < ncars; i++) ids[i] = rt_snd_id(g_rt.csmap[i]);
         smk_coll_sounds(3, cs, nc, h, nh, ids);
         smk_hit_fx(cs, nc, h, nh);
-    } else carsfx_coll_pairs(3, NULL, 0);
+    } else sfx_coll_pairs(3, NULL, 0);
     {   /* the props' hits are not the race's cars' */
         int k = 0;
         for (int i = 0; i < nh; i++)
@@ -10165,6 +11613,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         nh = k;
     }
     hitch_mark("rt.contacts");
+    pf_detail.race_physics += pf_elapsed(pf_race_physics);
     for (int i = 0; i < nh && i < 32; i++) {             /* to the race's numbering */
         h[i].car = g_rt.csmap[h[i].car];
         if (h[i].other >= 0) h[i].other = g_rt.csmap[h[i].other];
@@ -10174,6 +11623,18 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         const N2Sim *sa = a == g_rt.n ? g_n2 : a < g_rt.n ? g_rt.car[a].s : g_rt.tcar[a - g_rt.n - 1].s;
         const N2Sim *sb = b < 0 ? NULL : b == g_rt.n ? g_n2 : b < g_rt.n ? g_rt.car[b].s : g_rt.tcar[b - g_rt.n - 1].s;
         acid_hit_fx(&h[i], sa, sb);
+        /* CheckForWildCollision's jump cam (0x5a0085): in the same pass that put
+           a car into crash mode, for that car when it is the player's (0x431dd0),
+           with the impulse capped at 40 (0x7a1858) at least 30 (0x7a1864) */
+        if (sb && player_n2 && ((a == g_rt.n && (h[i].wild & 1)) || (b == g_rt.n && (h[i].wild & 2)))) {
+            float jj = sqrtf(h[i].impulse[0] * h[i].impulse[0] + h[i].impulse[1] * h[i].impulse[1] + h[i].impulse[2] * h[i].impulse[2]);
+            if (jj > 40.0f) jj = 40.0f;
+            if (30.0f <= jj) {                                    /* 0x7a1864 */
+                JcCar jc; JcEnv je;
+                jc_fill(&jc, &je);
+                if (jumpcam_crash(&jc, &je, jc_fp(), g_wcoll, jj)) rt_crash_damage();
+            }
+        }
         /* the collision sound: sound ids, the lower first, the impulse on it */
         int ia = rt_snd_id(a), ib = b < 0 ? -1 : rt_snd_id(b);
         CarSfxCollCar ca, cb;
@@ -10182,8 +11643,8 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         float imp[3] = { h[i].impulse[0], h[i].impulse[1], h[i].impulse[2] };
         if (sb && ib < ia) {
             imp[0] = -imp[0]; imp[1] = -imp[1]; imp[2] = -imp[2];
-            carsfx_coll_hit(1, ib, ia, -1, h[i].point, imp, h[i].slide, &cb, &ca);
-        } else carsfx_coll_hit(1, ia, ib, sb ? -1 : h[i].poly, h[i].point, imp, h[i].slide, &ca, sb ? &cb : NULL);
+            sfx_coll_hit(1, ib, ia, -1, h[i].point, imp, h[i].slide, &cb, &ca);
+        } else sfx_coll_hit(1, ia, ib, sb ? -1 : h[i].poly, h[i].point, imp, h[i].slide, &ca, sb ? &cb : NULL);
     }
     {   /* the pairs the run still has, in sound ids */
         static int pr[512][3];
@@ -10196,7 +11657,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
             if (y >= 0 && y < x) { int t = x; x = y; y = t; }
             pr[i][0] = x; pr[i][1] = y;
         }
-        carsfx_coll_pairs(1, (const int (*)[3])pr, np);
+        sfx_coll_pairs(1, (const int (*)[3])pr, np);
     }
     int moved = 0;
     for (int i = 0; i < nh && i < 32; i++) {
@@ -10222,6 +11683,10 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                 int k = me == g_rt.n ? 0 : me + 1;
                 N2State ms;
                 n2sim_state(me == g_rt.n ? g_n2 : g_rt.car[me].s, &ms);
+                if (30.0f <= j || ms.rot[8] < -0.5f) {   /* 0x59fb70 (GC 801ac03c): visible damage on too */
+                    AcidSlot *as = me == g_rt.n ? &g_acid_p : &g_acid_o[me];
+                    if (as->c) acid_damage_visible(as->c, 1);
+                }
                 if (!g_rt.totalled[k] && (30.0f <= j || ms.rot[8] < -0.5f)) {    /* 0x7a186c / 0x787b5c */
                     g_rt.totalled[k] = 1;
                     printf("race: %s totalled (impulse %.1f, up %.2f)%c", k ? g_rt.opp[k - 1].name : "player", j, ms.rot[8], 10);
@@ -10247,6 +11712,24 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
     }
     for (int k = 0; k < g_rt.n && !g_rt.field_gone; k++) n2sim_state(g_rt.car[k].s, &g_rt.car[k].st);
     for (int i = 0; i < g_rt.ntr; i++) n2sim_state(g_rt.tcar[i].s, &g_rt.tcar[i].st);
+    if (player_n2) {                                     /* Car::FinishMovement 0x604740's camera part */
+        JcCar jc; JcEnv je;
+        jc_fill(&jc, &je);
+        jumpcam_step(&jc, &je, jc_fp(), g_wcoll);
+#ifdef OPENUG2_SIM_PRE_H
+        if (g_jc_test_crash) { g_jc_test_crash = 0; if (jumpcam_crash(&jc, &je, jc_fp(), g_wcoll, 35.0f)) rt_crash_damage(); }
+        {   /* test aid (simulator): OPENUG2_JC_SHOTS=1 shoots jc_z<zone>_<n>_<k> 0.25 / 1 / 2 s into each zone */
+            static int on = -1, zprev, n, f;
+            if (on < 0) on = getenv("OPENUG2_JC_SHOTS") != NULL;
+            int z = jumpcam_zone();
+            if (on && z != zprev) { zprev = z; f = 0; if (z) n++; }
+            if (on && z && (++f == 15 || f == 60 || f == 120)) {
+                void sim_shot_named(const char *); char nm[40];
+                snprintf(nm, sizeof nm, "jc_z%d_%d_%d", z, n, f); sim_shot_named(nm);
+            }
+        }
+#endif
+    } else if (jumpcam_zone()) jumpcam_reset();
     RT_FCRUMB("tick %d: teleporter", g_rt.ticks);
     if (g_rt.ntr) aitraffic_frame(g_rt.w, dt);           /* the teleporter 0x42f910, after the cars */
     /* a car it moved stands there at once (0x42c950 -> 0x5f52c0), before
@@ -10421,7 +11904,8 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                    sh, g_rt.ntr, nr, sh ? md : -1.0f, z ? (int)n2_u32(z + 0x3c) : -1, 10);
         }
     }
-    g_rt.t += dt;
+    g_rt.t += dt * n2sim_time_scale();               /* world time: World::GetTimestep 0x5ea360 = the real
+                                                        step x the time scale (0.4 in the jump cams) */
     g_rt.ticks++;                                    /* 0x7fb720 */
     return moved && with_player;
 }
@@ -10437,7 +11921,7 @@ static void rt_fill_car(AiCar *a, const RtCar *c, const float col[3])
     a->spd = o->speed / 60.0f;
     a->vel[0] = o->vel[0] / 60.0f; a->vel[1] = o->vel[1] / 60.0f;
     a->steer = o->wheel_steer[0] + o->wheel_steer[1];
-    a->braking = airacer_target_speed(c->r) < o->speed - 1.0f;
+    a->braking = car_brake_lit(c->s);   /* car +0x944 (0x5f62b0), as the flares */
     a->target_speed = airacer_target_speed(c->r) / 60.0f;
     PhysRideState *r = &a->ride;
     float pz = o->rot[2], rz = o->rot[5];
@@ -10484,6 +11968,143 @@ static unsigned g_rframe;
 static int rt_shown(int k) {
     return rt_on(k) && (!rt_poofed(k) || (airacer_blinking(g_rt.car[k].r) && !g_pause.on && (g_rframe & 1)));
 }
+/* ---- the replay (replay.c, step 8b) ------------------------------------
+   GUESS (replay.h): kinematic -- what the world shows of each car is
+   recorded and put back, the simulation stays frozen at THE_PRESENT */
+static void rp_from_state(RpCar *c, const N2State *s, const N2Sim *sim, int lights)
+{
+    c->on = 1; c->vis = -1;
+    c->lights = (unsigned char)(lights | (car_brake_lit(sim) ? RPL_BRAKE : 0));   /* 0x5f62b0 */
+    c->bottom = s->bottom;
+    for (int w = 0; w < 4; w++) {
+        c->wheel_skid[w] = s->wheel_skid[w]; c->wheel_skid_w[w] = s->wheel_skid_w[w];
+        c->wheel_slipv[w][0] = s->wheel_slipv[w][0]; c->wheel_slipv[w][1] = s->wheel_slipv[w][1];
+    }
+    memcpy(c->pos, s->pos, sizeof c->pos); memcpy(c->rot, s->rot, sizeof c->rot); memcpy(c->vel, s->vel, sizeof c->vel);
+    c->speed = s->speed; c->rpm = s->rpm; c->rpm_tach = s->rpm_tach; c->throttle = s->throttle;
+    c->gear = s->gear; c->nos_on = s->nos_on; c->engaged = s->engaged; c->wheels_down = s->wheels_down;
+    c->wheel_steer[0] = s->wheel_steer[0]; c->wheel_steer[1] = s->wheel_steer[1];
+    for (int w = 0; w < 4; w++) {
+        c->wheel_w[w] = s->wheel_w[w]; c->wheel_comp[w] = s->wheel_comp[w]; c->wheel_slip[w] = s->wheel_slip[w];
+        c->wheel_contact[w] = s->wheel_contact[w]; c->wheel_surface[w] = s->wheel_surface[w];
+    }
+}
+#if RP_UI_ON
+/* dt: the playback time this step (the wheels turn at their recorded rate) */
+static void rp_to_state(N2State *s, const RpCar *c, float dt, const N2Sim *sim)
+{
+    s->bottom = c->bottom;
+    for (int w = 0; w < 4; w++) {
+        s->wheel_skid[w] = c->wheel_skid[w]; s->wheel_skid_w[w] = c->wheel_skid_w[w];
+        s->wheel_slipv[w][0] = c->wheel_slipv[w][0]; s->wheel_slipv[w][1] = c->wheel_slipv[w][1];
+        s->wheel_sliding[w] = c->wheel_skid[w] > 0.0f;
+    }
+    if (sim) {   /* the wheels (n2sim_state's): the record's points (+0x10 + 0x30 i) on the recorded pose */
+        float b = sim_base(sim), o[3];
+        for (int j = 0; j < 3; j++) o[j] = c->pos[j] + c->rot[6 + j] * b;
+        for (int w = 0; w < 4; w++) {
+            float l[3], rad = n2sim_param(sim, 0x10 + 0x30 * w + 0x10);
+            for (int j = 0; j < 3; j++) l[j] = n2sim_param(sim, 0x10 + 0x30 * w + 4 * j);
+            l[2] += c->wheel_comp[w];
+            float st = w < 2 ? c->wheel_steer[w] : 0.0f, cs = cosf(st), sn = sinf(st), *M = s->wheel_mat[w];
+            for (int j = 0; j < 3; j++) {
+                s->wheel_pos[w][j] = o[j] + l[0] * c->rot[j] + l[1] * c->rot[3 + j] + l[2] * c->rot[6 + j];
+                s->wheel_cpt[w][j] = s->wheel_pos[w][j] - c->rot[6 + j] * rad;   /* GUESS: the body's up, not the ground normal */
+                M[j] = cs * c->rot[j] + sn * c->rot[3 + j];
+                M[4 + j] = -sn * c->rot[j] + cs * c->rot[3 + j];
+                M[8 + j] = c->rot[6 + j];
+                M[12 + j] = s->wheel_pos[w][j];
+            }
+            M[3] = M[7] = M[11] = 0; M[15] = 1;
+        }
+    }
+    memcpy(s->pos, c->pos, sizeof s->pos); memcpy(s->rot, c->rot, sizeof s->rot); memcpy(s->vel, c->vel, sizeof s->vel);
+    memset(s->angvel, 0, sizeof s->angvel);
+    s->heading = atan2f(c->rot[1], c->rot[0]);
+    s->speed = c->speed; s->rpm = c->rpm; s->rpm_tach = c->rpm_tach; s->throttle = c->throttle;
+    s->gear = c->gear; s->nos_on = c->nos_on; s->engaged = c->engaged; s->wheels_down = c->wheels_down;
+    s->wheel_steer[0] = c->wheel_steer[0]; s->wheel_steer[1] = c->wheel_steer[1];
+    s->wheel_steer[2] = s->wheel_steer[3] = 0;
+    for (int w = 0; w < 4; w++) {
+        s->wheel_w[w] = c->wheel_w[w]; s->wheel_comp[w] = c->wheel_comp[w]; s->wheel_slip[w] = c->wheel_slip[w];
+        s->wheel_contact[w] = c->wheel_contact[w]; s->wheel_surface[w] = c->wheel_surface[w];
+        s->wheel_spin[w] = fmodf(s->wheel_spin[w] + c->wheel_w[w] * dt, 6.28318531f);
+    }
+}
+#endif
+static float g_rp_go_t;                 /* the race clock at GO: the first lap's start */
+/* the world after a race tick, as the replay records it */
+static void rp_fill(RpFrame *f)
+{
+    memset(f, 0, sizeof *f);
+    f->t = g_rt.t;
+    const RaceEntry *pe = &g_rt.ent[0];
+    f->lap = pe->maxlap;                                   /* the HUD car's +9 */
+    int ls = pe->cpt[g_rt.cps.start < 5 ? g_rt.cps.start : 0];
+    f->laptime = g_rt.t - (ls != 0 && ls != 0x7fffffff ? (float)ls / 4000.0f : g_rp_go_t);
+    for (int s = 0; s < RP_SLOTS; s++) f->car[s].vis = -1;
+    rp_from_state(&f->car[0], &g_n2s, g_n2, g_rp_plights);
+    memcpy(f->car[0].skid3, g_n2_skid3, sizeof f->car[0].skid3);   /* the sound's inputs */
+    f->car[0].snd = g_n2 && n2sim_shifting(g_n2) ? RPS_SHIFTING : 0;
+    for (int k = 0; k < g_rt.n && k < AIRACE_MAX && !g_rt.field_gone; k++)
+        if (rt_on(k) && (!rt_poofed(k) || airacer_blinking(g_rt.car[k].r))) {
+            rp_from_state(&f->car[RP_OPP0 + k], &g_rt.car[k].st, g_rt.car[k].s, 0);
+            memcpy(f->car[RP_OPP0 + k].skid3, g_rt.askid3[k], sizeof f->car[0].skid3);
+        }
+    for (int i = 0; i < g_rt.ntr && i < RT_TMAX; i++)
+        if (rt_tshown(i) && g_rt.tcar[i].s) {
+            rp_from_state(&f->car[RP_TR0 + i], &g_rt.tcar[i].st, g_rt.tcar[i].s, 0);
+            f->car[RP_TR0 + i].vis = (signed char)g_rt.tvi[i];
+        }
+}
+#if RP_UI_ON
+/* THE_PRESENT: the live world the replay screen covers (the player's main
+   loop pose is kept by main) */
+static struct {
+    N2State n2s, car[AIRACE_MAX], tcar[RT_TMAX];
+    PhysRideState ride;
+    int tvi[RT_TMAX], ndraw, field_gone;
+} g_rpsv;
+static void rp_save_world(void)
+{
+    g_rpsv.n2s = g_n2s; g_rpsv.ride = g_ride;
+    for (int k = 0; k < AIRACE_MAX; k++) g_rpsv.car[k] = g_rt.car[k].st;
+    for (int i = 0; i < RT_TMAX; i++) { g_rpsv.tcar[i] = g_rt.tcar[i].st; g_rpsv.tvi[i] = g_rt.tvi[i]; }
+    g_rpsv.ndraw = g_rt.ndraw; g_rpsv.field_gone = g_rt.field_gone;
+}
+static void rp_restore_world(void)
+{
+    g_n2s = g_rpsv.n2s; g_ride = g_rpsv.ride;
+    for (int k = 0; k < AIRACE_MAX; k++) g_rt.car[k].st = g_rpsv.car[k];
+    for (int i = 0; i < RT_TMAX; i++) { g_rt.tcar[i].st = g_rpsv.tcar[i]; g_rt.tvi[i] = g_rpsv.tvi[i]; }
+    g_rt.ndraw = g_rpsv.ndraw; g_rt.field_gone = g_rpsv.field_gone;
+    g_rp_vis = 0;
+}
+/* a replay frame into the world: the player's car (g_n2s; main takes its
+   pose from it), the opponents and the traffic shown as recorded */
+static void rp_apply_world(const RpFrame *f, float dt)
+{
+    g_rp_vis = 1;
+    for (int s = 0; s < RP_SLOTS; s++) { g_rp_on[s] = f->car[s].on; g_rp_lt[s] = f->car[s].lights; }
+    for (int k = 0; k < g_rt.n && k < AIRACE_MAX; k++)
+        if (f->car[RP_OPP0 + k].on) {
+            rp_to_state(&g_rt.car[k].st, &f->car[RP_OPP0 + k], dt, g_rt.car[k].s);
+            memcpy(g_rt.askid3[k], f->car[RP_OPP0 + k].skid3, sizeof g_rt.askid3[k]);   /* its screech */
+        }
+    memcpy(g_n2_skid3, f->car[0].skid3, sizeof g_n2_skid3);
+    g_rp_shifting = (f->car[0].snd & RPS_SHIFTING) != 0;
+    for (int i = 0; i < g_rt.ntr && i < RT_TMAX; i++) {
+        const RpCar *c = &f->car[RP_TR0 + i];
+        if (!c->on) continue;
+        rp_to_state(&g_rt.tcar[i].st, c, dt, g_rt.tcar[i].s);   /* GUESS: the slot's sim's wheel points for its recorded visual */
+        if (c->vis >= 0 && c->vis < g_rt.ntvis) g_rt.tvi[i] = c->vis;
+        else g_rp_on[RP_TR0 + i] = 0;
+    }
+    g_rt.ndraw = g_rt.n; g_rt.field_gone = 0;
+    rp_to_state(&g_n2s, &f->car[0], dt, g_n2);
+    n2_fill_ride(&g_ride);
+}
+#endif
 #define AI_SHOWN(k)  ((k) >= RT_T0 ? rt_tshown((k) - RT_T0) : (k) >= RT_K0 ? rt_shown((k) - RT_K0) : traffic_routes[k].present)
 #define AI_VIS(k)    ((k) >= RT_T0 ? rt_tvisual((k) - RT_T0) : (k) >= RT_K0 ? rt_visual((k) - RT_K0) \
                       : (traffic[ai_traffic_visual(k)].gpu ? &traffic[ai_traffic_visual(k)] : NULL))
@@ -10952,7 +12573,7 @@ static int track_focus_cached(const char *troot, const char *track, float xy[2])
     char cp[1024], sp[1024], fp[1100];
     snprintf(cp, sizeof cp, "%s/%s.BUN", troot, stem);
     snprintf(sp, sizeof sp, "%s/%s%s", troot, track, strstr(track, ".BUN") ? "" : ".BUN");
-    snprintf(fp, sizeof fp, "ux0:data/OpenUG2/cache/%s.focus", stem);
+    snprintf(fp, sizeof fp, "ux0:data/NFSU2/cache/%s.focus", stem);
     long key[2] = { track_file_len(cp), track_file_len(sp) }, got[2];
     float f[2];
     FILE *c = fopen(fp, "rb");
@@ -10967,7 +12588,7 @@ static int track_focus_cached(const char *troot, const char *track, float xy[2])
     unsigned char *strm = res_bundle(sp, &slen);   /* pinned */
     int ok = comp && strm && winst_default_focus(comp, clen, strm, slen, xy);
     free(comp);
-    if (ok && key[0] > 0 && key[1] > 0) mkdir("ux0:data/OpenUG2/cache", 0777);
+    if (ok && key[0] > 0 && key[1] > 0) mkdir("ux0:data/NFSU2/cache", 0777);
     if (ok && key[0] > 0 && key[1] > 0 && (c = fopen(fp, "wb"))) {
         fwrite(key, sizeof key, 1, c); fwrite(xy, sizeof(float) * 2, 1, c); fclose(c);
     }
@@ -11772,7 +13393,7 @@ static int select_car_vinyl(int choice) {
    Only if the switch cannot load the new track does the app fall back to a
    relaunch: VENUE_FILE gets "<track> <event id>" and the boot reads and
    DELETES it (a crash comes back in the city). */
-#define VENUE_FILE "ux0:data/OpenUG2/venue.txt"
+#define VENUE_FILE "ux0:data/NFSU2/venue.txt"
 static int g_boot_ev;          /* the venue event to start once loaded */
 static int g_in_venue;         /* on a venue track (not the city) */
 static const char *g_switch_track;   /* queued in-process track switch */
@@ -11945,17 +13566,25 @@ static int fe_key(SDL_Keycode k) {
    (GLOBALB 0x34600; 6 PEUGOT106 and 7 CORSA are not in the US game,
    0x5022c0) that are in CARS/, with their make (+0xc0) and the stock car's
    slider values; "My Cars" = a garage-saved configuration. */
-static ShopCar g_fe_cars[40]; static int g_fe_ncars;
+static ShopCar g_fe_stock[40]; static int g_fe_nstock;
+static ShopCar g_fe_cars[40 + GARAGE_NSLOT]; static int g_fe_ncars;
+/* the shop's id of the current car: "<folder>" stock, "<folder>#<slot>" tuned */
+static const char *fe_car_id(const char *carname) {
+    static char id[48];
+    garage_id(id, sizeof id, carname, g_gslot);
+    return id;
+}
 static void fe_quick_race_data(Shop *fe, const char *carname, char (*carlist)[64], int ncars) {
-    if (!g_fe_ncars)
-        for (int t = 0; t < airace_ntypes() && t <= 30 && g_fe_ncars < 40; t++) {
+    if (!g_fe_nstock)
+        for (int t = 0; t < airace_ntypes() && t <= 30 && g_fe_nstock < 40; t++) {
             if (t == 6 || t == 7) continue;
             const char *nm = airace_type_name(t);
             int have = 0;
             for (int i = 0; i < ncars; i++) if (!strcmp(carlist[i], nm)) have = 1;
             if (!have || player_car_index(nm) < 0) continue;
-            ShopCar *c = &g_fe_cars[g_fe_ncars++];
+            ShopCar *c = &g_fe_stock[g_fe_nstock++];
             memset(c, 0, sizeof *c);
+            c->slot = -1;
             snprintf(c->folder, sizeof c->folder, "%s", nm);
             const unsigned char *rec = airace_type_rec(t);
             for (int k = 0; k < (int)sizeof c->make - 1 && rec[0xc0 + k]; k++) c->make[k] = (char)rec[0xc0 + k];
@@ -11965,12 +13594,30 @@ static void fe_quick_race_data(Shop *fe, const char *carname, char (*carlist)[64
             float st[3]; perf_car_stats(built, st);
             c->accel = st[0]; c->top_speed = st[1]; c->handling = st[2];
         }
-    for (int i = 0; i < g_fe_ncars; i++) {
-        N2CarConfig cfg;
-        g_fe_cars[i].mine = garage_load_car(g_fe_cars[i].folder, &cfg, NULL, NULL);
+    /* GetCarFiltered's walk: the stock cars (FEStockCar records), then the tuned
+       slots in slot order (no sort: SortCarList 8011d8c4 returns 1) */
+    memcpy(g_fe_cars, g_fe_stock, sizeof g_fe_stock[0] * (size_t)g_fe_nstock);
+    g_fe_ncars = g_fe_nstock;
+    char tcar[GARAGE_NSLOT][32]; int tslot[GARAGE_NSLOT];
+    int nt = garage_list(tcar, tslot, GARAGE_NSLOT);
+    for (int k = 0; k < nt; k++) {
+        const ShopCar *st = NULL;
+        for (int i = 0; i < g_fe_nstock; i++) if (!strcmp(g_fe_stock[i].folder, tcar[k])) st = &g_fe_stock[i];
+        if (!st) continue;   /* not a car of this disc */
+        ShopCar *c = &g_fe_cars[g_fe_ncars++];
+        *c = *st; c->mine = 1; c->slot = tslot[k];
+        N2CarConfig cfg; memset(&cfg, 0, sizeof cfg);
+        int t = airace_type_of(c->folder);
+        if (t >= 0 && garage_load_slot(tslot[k], c->folder, &cfg, NULL, NULL)) {   /* its own sliders (its perf parts) */
+            PerfParts pp; perf_clear(&pp); memcpy(pp.fit, cfg.perf, sizeof pp.fit);
+            static unsigned char built[N2_REC_SIZE];
+            perf_build(airace_type_rec(t), &pp, built);
+            float sv[3]; perf_car_stats(built, sv);
+            c->accel = sv[0]; c->top_speed = sv[1]; c->handling = sv[2];
+        }
     }
     shop_set_tracks(fe, g_ai_races, g_ai_nraces);
-    shop_set_cars(fe, g_fe_cars, g_fe_ncars, carname);
+    shop_set_cars(fe, g_fe_cars, g_fe_ncars, fe_car_id(carname));
 }
 /* HasArtworkOnDisc 80244120 for the career (the Car Lot's BuildCarList): the
    car type's folder is in CARS/ and the port has it as a player car */
@@ -12012,6 +13659,14 @@ static void tt_old_take(const N2Scene *car, GpuMesh *cgm, int ncar, int own_mesh
     g_tt_old.ride = g_room_ride[0]; g_tt_old.wride = g_room_ride[1];
     memcpy(g_tt_old.up, g_room_up[0], sizeof g_tt_old.up);
     g_tt_old.cfg = *cfg;
+    /* its vinyl skin moves with it (the player's is rebuilt for the new car) */
+    g_tt_old.skin = g_skin_tex; g_skin_tex = 0; g_skin_sig[0] = 0;
+    memcpy(g_tt_old.skinkey, g_skin_key, sizeof g_tt_old.skinkey);
+    if (g_tt_old.nrim > 0) {   /* its rim / spinner paint composites (the player's were for the new car) */
+        const StockPaint *rpp = cat_paint(cfg, 4, 1).on ? paint_part(cfg->paint[4]) : NULL, *spp = paint_part(cfg->paint[5]);
+        rim_lib_paint(&g_tt_old.rim, g_wt_data, g_wt_len, rpp ? rpp->rgb : NULL, spp ? spp->rgb : NULL,
+                      &g_tt_old.rptex, &g_tt_old.sptex, &g_tt_old.spmode);
+    }
     const StockPaint *pp = paint_part(cfg->paint[0]);   /* the base paint, as the car's draw picks it */
     if (pp) { for (int c = 0; c < 3; c++) g_tt_old.paint[c] = pp->rgb[c] / 255.0f; g_tt_old.pmat = pp->mat; }
     else if (g_stock_paint_ok) { memcpy(g_tt_old.paint, g_stock_paint, sizeof g_tt_old.paint); g_tt_old.pmat = g_stock_paint_mat; }
@@ -12019,36 +13674,36 @@ static void tt_old_take(const N2Scene *car, GpuMesh *cgm, int ncar, int own_mesh
     printf("turntable: the outgoing car kept (%d meshes%s, %d textures, %d rim meshes)\n",
            ncar, own_mesh ? "" : " shared", n, g_tt_old.nrim);
 }
-/* the outgoing turntable car (g_tt_old) at its slot, turned by the
-   platform and the showroom heading (+0x274) like the incoming one: the
-   body by its texture map and base paint, the wheels at its last placements
-   (its library rims or its own wheel meshes), then the glass. Leaner than
-   the player car's draw (as the AI cars' draw: no vinyl skin, own-paint
-   parts, spinners or lamp state) -- it is on screen for the 0.5 s spin. */
-static void tt_old_draw(const RProg *rp, const float MVP[16], const float carpos[3], float heading,
-                        const float look[3]) {
-    if (!g_tt_old.on || !g_tt_old.gpu || g_tt_old.nmesh <= 0) return;
-    float pa = g_tt.plat * 0.01745329f, c = cosf(pa), s = sinf(pa);
-    const float *p = k_tt_slot[g_tt_old.slot];
-    float pos[3] = { carpos[0] + c * p[0] - s * p[1] - g_room_anchor[0],
-                     carpos[1] + s * p[0] + c * p[1] - g_room_anchor[1], carpos[2] };
-    float M[16], W[16], MV[16], WV[16];
-    mat_car(pos, heading, g_tt_old.up, g_tt_old.ride, M);
-    mat_car(pos, heading, g_room_up[1], g_tt_old.wride, W);
+/* a car of the garage by its body / wheel matrices M / W (world, possibly
+   mirrored for the floor reflection); at: where its light is taken. The
+   body by its texture map, vinyl skin, base paint and the category paints
+   (spoiler / roof / mirrors, tip / calipers, carbon: as the player car's
+   draw, 0x50f310 / 0x620ae0), the wheels at its last placements (its
+   library rims or its own wheel meshes), then the glass. */
+static void tt_car_draw(const TtCar *tc, const RProg *rp, const float MVP[16], const float M[16],
+                        const float W[16], const float at0[3], const float look[3]) {
+    if (!tc->gpu || tc->nmesh <= 0) return;
+    float MV[16], WV[16];
     mat_mul(MVP, M, MV); mat_mul(MVP, W, WV);
-    const N2Scene *sc = &g_tt_old.scene; GpuMesh *gm = g_tt_old.gpu; int n = g_tt_old.nmesh;
+    const N2Scene *sc = &tc->scene; GpuMesh *gm = tc->gpu; int n = tc->nmesh;
     if (sc->count < n) n = sc->count;
     glDisable(GL_BLEND); glDepthMask(GL_TRUE); glDisable(GL_CULL_FACE);
     glUniform1f(rp->uUnlit, 0.0f); glUniform1f(rp->uSoft, 0.0f); glUniform1f(rp->uAlpha, 1.0f);
     render_carfx_begin(rp);
-    carfx_use_paint(g_tt_old.pmat);
+    carfx_use_paint(tc->pmat);
     if (render_carfx_active()) {
-        float sh[10][4], at[3] = { pos[0], pos[1], pos[2] + 0.6f };
+        float sh[10][4], at[3] = { at0[0], at0[1], at0[2] + 0.6f };
         carfx_sh(sh, at, look, NULL, 0, (int)sizeof(N2LightSrc));   /* the garage: the platform rig alone */
         render_carfx_sh(sh);
     }
     glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MV);
     render_model(rp, M);
+    const N2CarConfig *cfg = &tc->cfg;
+    CatPaint cp_spoiler = cat_paint(cfg, 1, cfg->parts[N2_PART_SPOILER] != 0);
+    CatPaint cp_roof = cat_paint(cfg, 2, cfg->parts[N2_PART_SCOOP] != 0);
+    CatPaint cp_mirror = cat_paint(cfg, 3, cfg->parts[N2_PART_MIRROR] != 0);
+    CatPaint cp_brake = cat_paint(cfg, 6, cfg->perf[0x28] || cfg->perf[0x29] || cfg->perf[0x2b]);
+    CatPaint cp_tip = cat_paint(cfg, 8, cfg->parts[N2_PART_EXHAUST] != 0);
     for (int i = 0; i < n; i++) {
         int cat = gm[i].cat, mount = sc->meshes[i].car_mount;
         int islight = cat == N2_CAR_LIGHT || cat == N2_CAR_BRAKELIGHT;
@@ -12056,8 +13711,8 @@ static void tt_old_draw(const RProg *rp, const float MVP[16], const float carpos
         if (!gm[i].vbo || !gm[i].ibo) continue;
         glUniform1f(rp->uVColor, sc->meshes[i].vcol ? 2.0f : 0.0f);
         GLuint tex = 0; int hasalpha = 0, texmode = N2_DRAW_OPAQUE;
-        for (int j = 0; j < g_tt_old.ntex; j++) if (g_tt_old.keys[j] == gm[i].texkey) {
-            tex = g_tt_old.tex[j]; hasalpha = g_tt_old.alpha[j]; texmode = g_tt_old.mode[j]; break;
+        for (int j = 0; j < tc->ntex; j++) if (tc->keys[j] == gm[i].texkey) {
+            tex = tc->tex[j]; hasalpha = tc->alpha[j]; texmode = tc->mode[j]; break;
         }
         uint32_t mat = gm[i].car_material;
         int dark = n2_car_dark_trim(mat), metal = n2_car_metal_trim(mat);
@@ -12065,7 +13720,39 @@ static void tt_old_draw(const RProg *rp, const float MVP[16], const float carpos
         glUniform1f(rp->uSpec, g_dbg.body_spec); glUniform1f(rp->uGloss, 20.0f);
         glUniform1f(rp->uEnv, .15f); glUniform1f(rp->uClearcoat, 0.0f);
         glUniform3f(rp->uEmissive, 0, 0, 0);
-        glUniform3fv(rp->uColor, 1, g_tt_old.paint);
+        glUniform3fv(rp->uColor, 1, tc->paint);
+        int part = sc->meshes[i].car_part;
+        const CatPaint *own = part == N2_PART_SPOILER + 1 && cp_spoiler.on ? &cp_spoiler
+                            : part == N2_PART_SCOOP + 1 && cp_roof.on ? &cp_roof
+                            : part == N2_PART_MIRROR + 1 && cp_mirror.on ? &cp_mirror : NULL;
+        const CatPaint *swp = mat == N2_MAT_EXHAUST_TIP && cp_tip.on ? &cp_tip
+                            : (mat == N2_MAT_CALIPER || mat == N2_MAT_CALLIPER) && cp_brake.on ? &cp_brake : NULL;
+        GLuint cft = (cat == N2_CAR_BODY || cat == N2_CAR_MISC) &&
+                     (gm[i].texkey == N2_CF_TEX || n2_carbon_mesh(cfg, sc->meshes[i].car_cf, gm[i].texkey))
+                     ? carbon_tex(g_tt_root) : 0;
+        int skin = 0;
+        for (int k = 0; tc->skin && gm[i].texkey && k < SKIN_KEYS; k++) skin |= gm[i].texkey == tc->skinkey[k];
+        if (cft) {
+            glUniform3f(rp->uColor, 1.0f, 1.0f, 1.0f);
+            glUniform1f(rp->uEnv, .50f * g_dbg.body_env);
+            glUniform1f(rp->uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, cft);
+            carfx_use_paint(N2_CF_MAT); render_carfx_swap(&mat, 1);
+            render_carfx_part(mat, cat); draw_gpumesh(&gm[i]); g_dbg.drawn++;
+            render_carfx_swap(NULL, 0); carfx_use_paint(tc->pmat);
+            continue;
+        }
+        if (swp) {
+            glUniform3fv(rp->uColor, 1, swp->rgb);
+            glUniform1f(rp->uRimTint, tex ? 1.0f : 0.0f);
+            glUniform1f(rp->uEnv, .50f * g_dbg.body_env);
+            glUniform1f(rp->uUseTex, tex ? 1.0f : 0.0f); if (tex) glBindTexture(GL_TEXTURE_2D, tex);
+            carfx_use_paint(swp->mat); render_carfx_swap(&mat, 1);
+            render_carfx_part(mat, cat); draw_gpumesh(&gm[i]); g_dbg.drawn++;
+            render_carfx_swap(NULL, 0); carfx_use_paint(tc->pmat);
+            glUniform1f(rp->uRimTint, 0.0f);
+            continue;
+        }
+        if (own && !(dark || metal)) { glUniform3fv(rp->uColor, 1, own->rgb); carfx_use_paint(own->mat); }
         if ((dark || metal) && (cat == N2_CAR_BODY || cat == N2_CAR_MISC || islight)) {
             int chrome = mat == N2_MAT_CHROME || mat == N2_MAT_MAGCHROME;
             glUniform3f(rp->uColor, dark ? .030f : .38f, dark ? .032f : .40f, dark ? .035f : .42f);
@@ -12075,13 +13762,16 @@ static void tt_old_draw(const RProg *rp, const float MVP[16], const float carpos
         } else if (cat == N2_CAR_LIGHT) {
             glUniform3f(rp->uColor, .65f, .65f, .65f); glUniform1f(rp->uEnv, .55f);
         } else if (cat == N2_CAR_BRAKELIGHT && n2_car_tail_lens(sc, i)) {
-            render_tail_lamp(rp, tex, 0, 0, 0, light_variant_gain(g_tt_old.cfg.parts[N2_PART_TAILLIGHT]));
+            render_tail_lamp(rp, tex, 0, 0, 0, light_variant_gain(tc->cfg.parts[N2_PART_TAILLIGHT]));
+        } else if (n2_car_body_lamp(sc, i)) {
+            render_tail_lamp(rp, tex, 0, 0, 0, 1.0f);   /* centre brake light lens, unlit */
         } else if (cat == N2_CAR_BODY || cat == N2_CAR_MISC) {
             glUniform1f(rp->uSpec, g_dbg.body_spec * (gm[i].trim ? .4f : 1.0f));
             glUniform1f(rp->uGloss, gm[i].trim ? 6.0f : 20.0f);
             glUniform1f(rp->uEnv, .50f * g_dbg.body_env);
             glUniform1f(rp->uClearcoat, gm[i].trim ? 0.0f : fminf(1.0f, g_dbg.body_clearcoat));
             if (tex && hasalpha) glUniform1f(rp->uDecal, 1.0f);
+            else if (!tex && skin) { tex = tc->skin; glUniform1f(rp->uDecal, 1.0f); }   /* vinyls, door lines */
         } else if (!tex) {
             if (cat == N2_CAR_TIRE) glUniform3f(rp->uColor, .05f, .05f, .06f);
             else glUniform3f(rp->uColor, .055f, .055f, .058f);
@@ -12091,48 +13781,63 @@ static void tt_old_draw(const RProg *rp, const float MVP[16], const float carpos
         if (mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE) {
             int first = mount == N2_MOUNT_FRONT_BRAKE ? 0 : 2;
             for (int w = first; w < first + 2; w++) {
-                float MB[16], BW[16]; mat_mul(WV, g_tt_old.brakeT[w], MB); mat_mul(W, g_tt_old.brakeT[w], BW);
+                float MB[16], BW[16]; mat_mul(WV, tc->brakeT[w], MB); mat_mul(W, tc->brakeT[w], BW);
                 glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MB); render_model(rp, BW);
                 render_wheel_mesh(rp, &gm[i], tex, texmode); g_dbg.drawn++;
             }
             glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MV); render_model(rp, M);
         } else { draw_gpumesh(&gm[i]); g_dbg.drawn++; }
+        if (own) carfx_use_paint(tc->pmat);
     }
     glUniform3f(rp->uEmissive, 0, 0, 0); glUniform1f(rp->uVColor, 0.0f); glUniform1f(rp->uDecal, 0.0f);
     /* the wheels: its own wheel meshes (under a library rim only those it lacks), then the rim */
     float wmvp[4][16], ww[4][16];
-    for (int w = 0; w < 4; w++) { mat_mul(WV, g_tt_old.wheelT[w], wmvp[w]); mat_mul(W, g_tt_old.wheelT[w], ww[w]); }
+    for (int w = 0; w < 4; w++) { mat_mul(WV, tc->wheelT[w], wmvp[w]); mat_mul(W, tc->wheelT[w], ww[w]); }
     int lib_tire = 0, lib_inner = 0;
-    for (int li = 0; li < g_tt_old.nrim; li++) {
-        if (g_tt_old.rgm[li].cat == N2_CAR_TIRE) lib_tire = 1;
-        if (g_tt_old.rgm[li].cat == N2_CAR_INTERIOR) lib_inner = 1;
+    for (int li = 0; li < tc->nrim; li++) {
+        if (tc->rgm[li].cat == N2_CAR_TIRE) lib_tire = 1;
+        if (tc->rgm[li].cat == N2_CAR_INTERIOR) lib_inner = 1;
     }
-    int sw = g_tt_old.stock_wheel;
+    int sw = tc->stock_wheel;
     if (sw >= 0 && sw < n && !(lib_tire && lib_inner)) {
+        int rubber = 0;   /* its wheel slices are all TIRE: under a library rim only its RUBBER */
+        for (int i = 0; i < n; i++)
+            if (sc->meshes[i].car_mount == N2_MOUNT_WHEEL && sc->meshes[i].tierid == sc->meshes[sw].tierid &&
+                gm[i].car_material == N2_MAT_RUBBER) rubber = 1;
         for (int i = 0; i < n; i++) {
             if (sc->meshes[i].car_mount != N2_MOUNT_WHEEL || sc->meshes[i].tierid != sc->meshes[sw].tierid) continue;
-            if (g_tt_old.nrim > 0 && gm[i].cat != N2_CAR_TIRE && gm[i].cat != N2_CAR_INTERIOR) continue;
+            if (tc->nrim > 0 && gm[i].cat != N2_CAR_TIRE && gm[i].cat != N2_CAR_INTERIOR) continue;
+            if (tc->nrim > 0 && rubber && gm[i].cat == N2_CAR_TIRE && gm[i].car_material != N2_MAT_RUBBER) continue;
             GLuint tex = 0; int mode = N2_DRAW_OPAQUE;
-            for (int j = 0; j < g_tt_old.ntex; j++)
-                if (g_tt_old.keys[j] == gm[i].texkey) { tex = g_tt_old.tex[j]; mode = g_tt_old.mode[j]; break; }
-            if (g_tt_old.nrim > 0) { glUniform3f(rp->uColor, .045f, .045f, .05f); glUniform1f(rp->uEnv, 0.0f); glUniform1f(rp->uSpec, .08f); }
+            for (int j = 0; j < tc->ntex; j++)
+                if (tc->keys[j] == gm[i].texkey) { tex = tc->tex[j]; mode = tc->mode[j]; break; }
+            if (tc->nrim > 0) { glUniform3f(rp->uColor, .045f, .045f, .05f); glUniform1f(rp->uEnv, 0.0f); glUniform1f(rp->uSpec, .08f); }
             render_wheel_mesh_n(rp, &gm[i], tex, mode, 4, (const float (*)[16])wmvp, (const float (*)[16])ww, rp->uMVP);
             g_dbg.drawn += 4;
         }
     }
-    if (g_tt_old.nrim > 0) {
-        glUniform1f(rp->uUseTex, g_tt_old.rtex ? 1.0f : 0.0f);
+    if (tc->nrim > 0) {
+        glUniform1f(rp->uUseTex, tc->rtex ? 1.0f : 0.0f);
         glUniform1f(rp->uEnv, 0.0f); glUniform1f(rp->uSpec, 0.85f);
         glUniform3fv(rp->uColor, 1, g_dbg.rim_color);
-        glUniform1f(rp->uRimTint, g_tt_old.rtex && g_dbg.rim_paint ? 1.0f : 0.0f);
-        CatPaint cp = cat_paint(&g_tt_old.cfg, 4, 1);   /* the rim paint (slot 0x49) */
-        if (cp.on) { glUniform3fv(rp->uColor, 1, cp.rgb); glUniform1f(rp->uRimTint, g_tt_old.rtex ? 1.0f : 0.0f); }
-        for (int li = 0; li < g_tt_old.nrim; li++) {
-            render_wheel_mesh_n(rp, &g_tt_old.rgm[li], g_tt_old.rtex, g_tt_old.rmode, 4,
+        /* the rim paint (slot 0x49): its DUMMY_WHEEL composite and the paint's light
+           material over the mag finishes, as the player's; the spinner its DUMMY_SPINNER */
+        CatPaint cp = cat_paint(&tc->cfg, 4, 1);
+        float rtint = !cp.on && tc->rtex && g_dbg.rim_paint ? 1.0f : 0.0f;
+        if (cp.on) {
+            static const uint32_t mags[3] = { N2_MAT_MAGSILVER, N2_MAT_MAGCHROME, N2_MAT_RIMPAINT3 };
+            glUniform3fv(rp->uColor, 1, cp.rgb); carfx_use_paint(cp.mat); render_carfx_swap(mags, 3);
+        }
+        for (int li = 0; li < tc->nrim; li++) {
+            int sp = tc->sptex && li < tc->rim.count && tc->rim.meshes[li].car_anim == N2_WHEEL_SPIN;
+            glUniform1f(rp->uRimTint, sp ? 0.0f : rtint);
+            render_wheel_mesh_n(rp, &tc->rgm[li], sp ? tc->sptex : tc->rptex ? tc->rptex : tc->rtex,
+                                sp ? tc->spmode : tc->rmode, 4,
                                 (const float (*)[16])wmvp, (const float (*)[16])ww, rp->uMVP);
             g_dbg.drawn += 4;
         }
         glUniform1f(rp->uRimTint, 0.0f);
+        if (cp.on) { render_carfx_swap(NULL, 0); carfx_use_paint(tc->pmat); }
     }
     /* the glass and lenses over the body */
     glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MV); render_model(rp, M);
@@ -12163,14 +13868,159 @@ static void tt_old_draw(const RProg *rp, const float MVP[16], const float carpos
     glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MVP);
     render_model(rp, NULL);
 }
+/* where the outgoing turntable car stands: its platform slot turned by the
+   platform angle, at the showroom heading (+0x274) like the incoming one.
+   mirror: the floor reflection's world reflection (NULL in the main pass). */
+static void tt_old_place(const float carpos[3], float heading, const float *mirror,
+                         float M[16], float W[16], float pos[3]) {
+    float pa = g_tt.plat * 0.01745329f, c = cosf(pa), s = sinf(pa);
+    const float *p = k_tt_slot[g_tt_old.slot];
+    pos[0] = carpos[0] + c * p[0] - s * p[1] - g_room_anchor[0];
+    pos[1] = carpos[1] + s * p[0] + c * p[1] - g_room_anchor[1];
+    pos[2] = carpos[2];
+    float m[16], w[16];
+    mat_car(pos, heading, g_tt_old.up, g_tt_old.ride, m);
+    mat_car(pos, heading, g_room_up[1], g_tt_old.wride, w);
+    if (mirror) { mat_mul(mirror, m, M); mat_mul(mirror, w, W); }
+    else { memcpy(M, m, sizeof m); memcpy(W, w, sizeof w); }
+}
+/* the outgoing turntable car (g_tt_old): on screen for the 0.5 s spin */
+static void tt_old_draw(const RProg *rp, const float MVP[16], const float carpos[3], float heading,
+                        const float look[3]) {
+    if (!g_tt_old.on) return;
+    float M[16], W[16], pos[3];
+    tt_old_place(carpos, heading, NULL, M, W, pos);
+    tt_car_draw(&g_tt_old, rp, MVP, M, W, pos, look);
+}
+/* its neon (the player car's 0x615a10 underglow + 0x60d7f0 tubes, as main's
+   neon block): additive, after the car. nt: the neon clock. */
+static void tt_old_neon(const RProg *rp, const float MVP[16], const float carpos[3], float heading,
+                        const float eye[3], float nt, const GpuMesh *quad, const char *dataroot) {
+    const TtCar *tc = &g_tt_old;
+    if (!tc->on || !(tc->cfg.neon[0][0] || tc->cfg.neon[0][1])) return;
+    float M[16], W[16], pos[3];
+    tt_old_place(carpos, heading, NULL, M, W, pos);
+    unsigned nc = n2_neon_now(&tc->cfg, 0, nt);
+    float nr = (float)(nc & 0xff) / 128.0f, ng = (float)(nc >> 8 & 0xff) / 128.0f,
+          nb = (float)(nc >> 16 & 0xff) / 128.0f, na = (float)(nc >> 24) / 128.0f;
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE); glDepthMask(GL_FALSE);
+    glUniform1f(rp->uUnlit, 0.0f); glUniform1f(rp->uSoft, 0.0f);
+    glUniform1f(rp->uEmissiveTex, 1.0f); glUniform1f(rp->uUseTex, 1.0f);
+    glUniform1f(rp->uFogDensity, 0.0f);
+    glUniform3f(rp->uColor, nr, ng, nb);
+    render_model(rp, NULL);
+    if (tc->neon_ut) {
+        float up[3] = { 0, 0, 1 }, F[16], MV[16];
+        mat_car_footprint(pos, heading, up, tc->bb, 1.05f, 1.05f, .04f, F);
+        mat_mul(MVP, F, MV);
+        glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MV);
+        glUniform1f(rp->uAlpha, fminf(4.0f * na, 1.0f));
+        glBindTexture(GL_TEXTURE_2D, tc->neon_ut);
+        draw_gpumesh(quad); g_dbg.drawn++;
+    }
+    GLuint bt = tc->nnseg ? neon_blur_tex(dataroot) : 0;
+    if (bt) {
+        static GpuMesh piece[3]; static int made;
+        if (!made) { piece[0] = neon_piece(0.0f, 0.5f); piece[1] = neon_piece(0.5f, 0.5f); piece[2] = neon_piece(0.5f, 1.0f); made = 1; }
+        float MVPc[16]; mat_mul(MVP, M, MVPc);
+        glBindTexture(GL_TEXTURE_2D, bt);
+        glUniform1f(rp->uAlpha, fminf(2.0f * na, 1.0f));
+        float dc[3] = { eye[0] - M[12], eye[1] - M[13], eye[2] - M[14] }, lc[3];
+        for (int j = 0; j < 3; j++) {
+            float l2 = M[j*4]*M[j*4] + M[j*4+1]*M[j*4+1] + M[j*4+2]*M[j*4+2];
+            lc[j] = (M[j*4]*dc[0] + M[j*4+1]*dc[1] + M[j*4+2]*dc[2]) / (l2 > 1e-8f ? l2 : 1.0f);
+        }
+        for (int s = 0; s < tc->nnseg; s++) {
+            const float *p0 = tc->nseg[s], *p1 = tc->nseg[s] + 3;
+            float d[3] = { p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2] };
+            float L = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+            if (L < 1e-4f) continue;
+            float v[3] = { .5f*(p0[0]+p1[0]) - lc[0], .5f*(p0[1]+p1[1]) - lc[1], .5f*(p0[2]+p1[2]) - lc[2] };
+            float dist = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            float k = (dist - 10.0f) / 65.0f; k = k < 0 ? 0 : k > 1 ? 1 : k;
+            float wdt = 0.045f * (1.0f + 19.0f * k);
+            float sd[3] = { d[1]*v[2] - d[2]*v[1], d[2]*v[0] - d[0]*v[2], d[0]*v[1] - d[1]*v[0] };
+            float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
+            if (sl < 1e-6f) continue;
+            for (int a = 0; a < 3; a++) sd[a] *= wdt / sl;
+            float al[3] = { d[0] * wdt / L, d[1] * wdt / L, d[2] * wdt / L };
+            for (int pc = 0; pc < 3; pc++) {
+                const float *e1 = pc == 1 ? d : al;
+                float o[3];
+                for (int a = 0; a < 3; a++)
+                    o[a] = (pc == 0 ? p0[a] - al[a] : pc == 1 ? p0[a] : p1[a]) - sd[a];
+                float T[16] = { e1[0], e1[1], e1[2], 0,  2*sd[0], 2*sd[1], 2*sd[2], 0,  0, 0, 1, 0,  o[0], o[1], o[2], 1 }, MV[16];
+                mat_mul(MVPc, T, MV);
+                glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MV);
+                draw_gpumesh(&piece[pc]); g_dbg.drawn++;
+            }
+        }
+    }
+    glUniform1f(rp->uEmissiveTex, 0.0f); glUniform1f(rp->uUseTex, 0.0f);
+    glUniform1f(rp->uFogDensity, g_dbg.fog_density);
+    glUniform1f(rp->uAlpha, 1.0f);
+    glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MVP);
+    glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+/* 0x4a7330's second pass, HandleRender(view 4, 1): only BACKDROP (z scale -1,
+   translation 0x78e004.. = 0) and PLATFORMBASE (z-mirrored, turned by the
+   platform angle) -- no discs, no locks. MR: the room's MVP. */
+static void room_draw_mirror(const RProg *rp, GLint uUseTex, GLint uColor, const float MR[16]) {
+    if (!g_room_fx || !g_room_role) return;
+    static const float S[16] = { 1,0,0,0, 0,1,0,0, 0,0,-1,0, 0,0,0,1 };
+    float MS[16]; mat_mul(MR, S, MS);
+    for (int q = 0; q < g_room_n; q++) {
+        int role = g_room_role[q];
+        if (!(g_room_fx[q] & TT_FX_BACKDROP) && role != 4) continue;
+        int md = g_room_md[q], blend = md == N2_DRAW_BLEND || md == N2_DRAW_ADD;
+        GLuint tx = g_room_mt[q];
+        if (tx) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, tx); }
+        else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.5f, 0.5f, 0.52f); }
+        glUniform1f(rp->uAlphaTest, md == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
+        if (blend) {
+            glEnable(GL_BLEND); glDepthMask(GL_FALSE); glUniform1f(rp->uTextureAlpha, 1.0f);
+            glBlendFunc(GL_SRC_ALPHA, md == N2_DRAW_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+        }
+        float X[16];
+        if (role == 4) { float Mq[16]; tt_mesh_matrix(4, Mq); mat_mul(MS, Mq, X); }
+        else memcpy(X, MS, sizeof X);
+        glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, X);
+        draw_gpumesh(&g_room_gm[q]); g_dbg.drawn++;
+        if (blend) {
+            glDisable(GL_BLEND); glDepthMask(GL_TRUE); glUniform1f(rp->uTextureAlpha, 0.0f);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
+    }
+    glUniform1f(rp->uAlphaTest, 0.0f);
+    glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MR);
+}
+/* the world light flare packs of each region bundle as the world loads */
+static void world_flares_hook(const unsigned char *d, long len, int r, int nreg)
+{
+    if (r == 0) aciddraw_world_flares_reset();
+    int n = aciddraw_world_flares_add(d, len);
+    printf("world light flares: %d (region %d of %d)%c", n, r + 1, nreg, 10);
+}
+/* eRenderWorldLightFlares' FindDrivableSection(view eye) 0x5e00d0 */
+static int world_flares_sections(const float eye[3], const short **list)
+{
+    return g_wcoll ? wcoll_visible_sections(g_wcoll, eye, list) : -2;
+}
 int main(int argc, char **argv) {
+    world_region_hook = world_flares_hook;
+    if (!getenv("OPENUG2_FLARE_OLDPICK")) aciddraw_world_flares_sections(world_flares_sections);   /* test aid: A/B the old 200 m pick */
 #ifdef __vita__
     vita_mark("main entered");
+    {   /* LiveArea Settings button / L+R held: the Settings screen, then a restart */
+        extern void vita_settings_boot(void);
+        vita_settings_boot();
+    }
     /* The Vita launches with no command line: use the game data copied to
-       ux0:data/OpenUG2 and the native 960x544 screen. */
+       ux0:data/NFSU2 and the native 960x544 screen. */
     static char vita_track[32];
-    static char *vita_argv[] = { "nfsu2", "ux0:data/OpenUG2", "--resolution", "960x544", "--hud",
-                                 "--perf-csv", "ux0:data/OpenUG2/perf.csv", "--track", vita_track, NULL };
+    static char *vita_argv[] = { "nfsu2", "ux0:data/NFSU2", "--resolution", "960x544", "--hud",
+                                 "--perf-csv", "ux0:data/NFSU2/perf.csv", "--track", vita_track, NULL };
     if (argc <= 1) {
         argc = 7; argv = vita_argv;
         FILE *vf = fopen(VENUE_FILE, "r");
@@ -12183,6 +14033,13 @@ int main(int argc, char **argv) {
         }
     }
     vita_early_init();
+    {   /* Settings "Logs: off" (nolog.txt): no perf.csv either */
+        extern int vita_logs_off(void);
+        if (vita_logs_off() && argv == vita_argv) {
+            vita_argv[5] = vita_argv[7]; vita_argv[6] = vita_argv[8]; vita_argv[7] = NULL;
+            argc -= 2;
+        }
+    }
     if (g_in_venue) vita_mark("venue boot: %s event %d", vita_track, g_boot_ev);
 #endif
     collide_walls_selftest();
@@ -12627,7 +14484,7 @@ int main(int argc, char **argv) {
     }
     static char boot_car[64];
     if (!car_given) {   /* the front end's car: the profile's current car (FEDatabase +0xe8) */
-        garage_current_car(boot_car, sizeof boot_car);
+        garage_current_car(boot_car, sizeof boot_car, &g_gslot);
         char p[1024];
         snprintf(p, sizeof p, "%s/CARS/%s/GEOMETRY.BIN", dataroot, boot_car);
         FILE *bf = fopen(p, "rb");
@@ -12906,6 +14763,7 @@ int main(int argc, char **argv) {
     char carp[1024], cartexp[1024], pathp[1024], troot[1024];
     snprintf(troot,   sizeof troot,   "%s/TRACKS", dataroot);
     world_fog_load(troot, trackname);
+    rain_load_track(troot, trackname);   /* Rain / Wind / Night Raining Fog; ResetWorldTime */
     snprintf(carp,    sizeof carp,    "%s/CARS/%s/GEOMETRY.BIN", dataroot, carname);
     snprintf(cartexp, sizeof cartexp, "%s/CARS/%s/TEXTURES.BIN", dataroot, carname);
     snprintf(pathp,   sizeof pathp,   "%s/TRACKS/%s", dataroot, circuit);
@@ -13463,7 +15321,7 @@ int main(int argc, char **argv) {
     clock_t resident_cpu_begin = clock();
 #ifdef __vita__
     int low_detail = 1;
-    FILE *detail_file = fopen("ux0:data/OpenUG2/world_detail.txt", "r");
+    FILE *detail_file = fopen("ux0:data/NFSU2/world_detail.txt", "r");
     if (detail_file) {
         char detail[16] = {0};
         if (fscanf(detail_file, "%15s", detail) == 1 && !strcmp(detail, "full")) low_detail = 0;
@@ -13474,7 +15332,7 @@ int main(int argc, char **argv) {
     vita_mark("world load start: %s", trackname);
     /* Prebuilt world tiles: converted once, before the world loads, behind a
        progress screen. Nothing reads the tiles yet (the loader comes next);
-       ux0:data/OpenUG2/notiles.txt skips the conversion. */
+       ux0:data/NFSU2/notiles.txt skips the conversion. */
     {   /* graphics up before the world loads: the loading screens need them */
         extern void vita_fast_clocks(void);
         vita_fast_clocks();
@@ -13482,15 +15340,15 @@ int main(int argc, char **argv) {
         SDL_GL_CreateContext(pw);
     }
     {   /* the game's loading screen, unless the front end is skipped */
-        FILE *nf = fopen("ux0:data/OpenUG2/nofrontend.txt", "r");
+        FILE *nf = fopen("ux0:data/NFSU2/nofrontend.txt", "r");
         if (nf) fclose(nf);
-        else if ((g_boot_fe = shop_open(dataroot, "", NULL, NULL, NULL, 0)) != NULL) {
+        else if ((g_boot_fe = shop_open_loading(dataroot)) != NULL) {   /* the menus open while the world loads */
             shop_loading(g_boot_fe);
             boot_frame();
         }
     }
     if (world2) {
-        FILE *opt_out = fopen("ux0:data/OpenUG2/notiles.txt", "r");
+        FILE *opt_out = fopen("ux0:data/NFSU2/notiles.txt", "r");
         if (opt_out) fclose(opt_out);
         else {
             /* Every playable track is converted here, once, on the boot that
@@ -13607,17 +15465,31 @@ int main(int argc, char **argv) {
     {   /* smokeable props (smokeable.c): before the first area is built, so
            its tiles already leave the props to the prop system */
         const char *stem = !strncmp(trackname, "STREAM", 6) ? trackname + 6 : trackname;
+        /* boot-load watchdog (sdl_vita.c): crumbs.txt names the step, a load
+           stuck 120 s faults for a core dump (10-31 HW hang, no dump) */
+        vita_wd_load = 1;
+        vita_crumb("boot load: smokeables %s", stem);
         smk_load(troot, stem);
+        vita_crumb("boot load: world anims");
+        if (wa_load(troot, stem)) wa_start(g_rt.ev, g_rt_reverse);   /* TrackLoader::FinishedLoadingPart1 0x57a650 */
     }
     {
         g_wl.w = &world; g_wl.root = troot; g_wl.track = trackname; g_wl.opt = &world_options;
         g_wl.world2 = world2; g_wl.done = 0;
         SDL_Thread *wt = g_boot_fe ? SDL_CreateThread(world_load_thread, "world-load", NULL) : NULL;
+        vita_crumb("boot load: world (%s)", wt ? "world-load thread" : "main thread");
         if (wt) {
-            while (!g_wl.done) { boot_frame(); SDL_Delay(15); }
+            int bfr = 0;
+            while (!g_wl.done) {
+                boot_frame();
+                if (++bfr == 4) boot_open_full(dataroot);   /* the screen is up: the menus load beside the world */
+                SDL_Delay(15);
+            }
             SDL_WaitThread(wt, NULL);
         } else world_load_thread(NULL);
         nm = g_wl.nm;
+        vita_crumb("boot load: world done, %d meshes", nm);
+        vita_wd_load = 0;
     }
 #else
     int nm = world2 ? world_load_ex(&world, troot, trackname, &world_options)
@@ -13639,6 +15511,7 @@ int main(int argc, char **argv) {
            visible distance (port) */
         long tl = 0; unsigned char *tb = n2_read_file(tp, &tl);
         int nd = tb ? acid_load(tb, tl, 0) : 0, ne = 0;
+        reverb_map_load(tb, tl);   /* ParameterMaps 0x8003b600: the city's reverb layer (reverb.c) */
         free(tb);
         for (int r = 0; r < world.neighborhood.nreg; r++)
             if (world.neighborhood.rgn[r].data)
@@ -14006,7 +15879,7 @@ int main(int argc, char **argv) {
     printf("texture path: %s\n", g_tex_s3tc ? "S3TC direct (glCompressedTexImage2D)"
                                             : "CPU DXT decode (no s3tc extension)");
 #ifdef __vita__
-    FILE *texture_mode_file = fopen("ux0:data/OpenUG2/texture_mode.txt", "r");
+    FILE *texture_mode_file = fopen("ux0:data/NFSU2/texture_mode.txt", "r");
     if (texture_mode_file) {
         char mode[16] = {0};
         if (fscanf(texture_mode_file, "%15s", mode) == 1 && !strcmp(mode, "decoded")) g_world_dxt = 0;
@@ -14504,7 +16377,7 @@ int main(int argc, char **argv) {
                 const unsigned char *ix  = f_d + f_dbase + f_off;
                 for (long q = 0; q < (long)firstw*firsth; q++) {
                     const unsigned char *c = pal + (long)ix[q]*4;
-                    px[q*3]=c[0]; px[q*3+1]=c[1]; px[q*3+2]=c[2];
+                    px[q*3]=c[2]; px[q*3+1]=c[1]; px[q*3+2]=c[0];   /* B,G,R,A palette */
                 }
                 char pp[1024]; snprintf(pp, sizeof pp, "%s_%08x_%dx%d.png",
                                         tpkrec, tpkkey, firstw, firsth);
@@ -14823,6 +16696,9 @@ int main(int argc, char **argv) {
         if (globdata && !g_ai_have) ai_take_global(globdata, globlen);
         if (globdata && !g_acid_ok && acid_load(globdata, globlen, 1) > 0)   /* 0x35021 / 0x35020 */
             g_acid_ok = aciddraw_init(dataroot, globdata, globlen);
+        {   static int rain_inited;   /* RAINDROP / RAINDROPPC from GLOBALB */
+            if (globdata && !rain_inited) { rain_inited = 1; rain_init(globdata, globlen); n2sim_rain_at = rain_desired_at; }
+        }
         carfx_load_materials(globdata, globlen);   /* car.fx light materials */
 #ifdef __vita__
         car_stock_turbo_init(globdata, globlen);
@@ -16311,11 +18187,11 @@ int main(int argc, char **argv) {
     GpuMesh quad = make_quad();
 
 #ifdef __vita__
-    /* Car Shop self-test (ux0:data/OpenUG2/shoptest.txt): drives the shop
+    /* Car Shop self-test (ux0:data/NFSU2/shoptest.txt): drives the shop
        through its screens with scripted keys before any world drawing, saves
-       a PNG of each (ux0:data/OpenUG2/shoptest_NN.png) and quits. For
+       a PNG of each (ux0:data/NFSU2/shoptest_NN.png) and quits. For
        emulators that cannot draw the world. */
-    {   FILE *tf = fopen("ux0:data/OpenUG2/shoptest.txt", "r");
+    {   FILE *tf = fopen("ux0:data/NFSU2/shoptest.txt", "r");
         if (tf) {
             fclose(tf);
             Shop *ts = shop_open(dataroot, carname, &carcfg, modification,
@@ -16355,7 +18231,7 @@ int main(int argc, char **argv) {
                                 memcpy(fl + ((size_t)y * W + x) * 3,
                                        px + ((size_t)(H - 1 - y) * W + x) * 4, 3);
                         char sp[128];
-                        snprintf(sp, sizeof sp, "ux0:data/OpenUG2/shoptest_%02d.png", step);
+                        snprintf(sp, sizeof sp, "ux0:data/NFSU2/shoptest_%02d.png", step);
                         write_png(sp, W, H, fl);
                         printf("shoptest: step %d key %d -> %s\n", step, script[step], sp);
                     }
@@ -16371,11 +18247,15 @@ int main(int argc, char **argv) {
     }
 #endif
     /* Front end: the game's title screen and main menu, before any driving.
-       ux0:data/OpenUG2/nofrontend.txt skips it (quick test runs). */
+       ux0:data/NFSU2/nofrontend.txt skips it (quick test runs). */
     int fe_customize = 0;
 #ifdef __vita__
-    {   FILE *nf = fopen("ux0:data/OpenUG2/nofrontend.txt", "r");
-        Shop *fe = g_boot_fe;   /* the loading screen's front end, already open */
+    {   FILE *nf = fopen("ux0:data/NFSU2/nofrontend.txt", "r");
+        if (g_boot_fe && !nf) boot_open_full(dataroot);   /* not yet opened (no world thread) */
+        Shop *fe = g_boot_full;   /* opened behind the loading screen */
+        g_boot_full = NULL;
+        if (g_boot_fe && !g_ls_fe) g_ls_fe = g_boot_fe;   /* kept: every later loading screen */
+        else if (g_boot_fe) shop_close(&g_boot_fe);
         g_boot_fe = NULL;
         if (fe) shop_set_car(fe, carname, &carcfg, modification);
         else if (!nf) fe = shop_open(dataroot, carname, &carcfg, modification,
@@ -16498,6 +18378,8 @@ int main(int argc, char **argv) {
     int race_start_pending = 0;  /* >0: start garage_race once the loader is idle */
     int race_place_pending = 0;  /* teleported; snap to the grid once loaded */
     int cam_snap = 0;            /* jump the chase camera (after a teleport) */
+    int post_hold = 0;           /* post-race marker outside the loaded area: held there until it streams in */
+    float post_hold_pos[4];      /* the marker spot + heading */
     int cc_cycle = 0;            /* D-pad Up while driving: next camera view */
     const char *garage_status = NULL;
 #endif
@@ -16674,6 +18556,7 @@ int main(int argc, char **argv) {
                 retired_resident = retired_waiting; retired_waiting = NULL;
                 retire_frames = retire_peak_ms = retire_total_ms = 0;
             }
+            if (pf_csv) pf_detail.stream += pf_elapsed(resident_frame_counter);
         }
         hitch_mark("retire");
         /* M89 race audit: one synthetic RETURN at 1 s, delivered through SDL so
@@ -16923,6 +18806,14 @@ int main(int argc, char **argv) {
                     if (!e.key.repeat && SDL_GetTicks() - g_prmv_t0 > 500 && (k == SDLK_KP_ENTER || k == SDLK_RETURN || k == SDLK_ESCAPE)) prmv_end("skipped");
                     continue;
                 }
+                if (rp_up()) {                           /* the replay screen has the pad (0x4d7bd0) */
+                    int rk = k == SDLK_KP_ENTER ? RP_K_ACCEPT : k == SDLK_BACKSPACE ? RP_K_BACK
+                           : k == SDLK_RETURN ? RP_K_START : k == SDLK_LEFTBRACKET ? RP_K_LTRIG
+                           : k == SDLK_RIGHTBRACKET ? RP_K_RTRIG : k == SDLK_f ? RP_K_BUTTON1
+                           : k == SDLK_DELETE ? RP_K_BUTTON0 : -1;
+                    if (rk >= 0 && !e.key.repeat) rp_key(rk);
+                    continue;
+                }
                 if (g_pause.on) {                        /* the pause menu has the pad */
                     if (g_cs.m) { cs_key(k, e.key.repeat); continue; }   /* the career status screens */
                     if (g_wm.h) { wm_key(dataroot, k, e.key.repeat); continue; }   /* the world map's */
@@ -17015,7 +18906,14 @@ int main(int argc, char **argv) {
                 /* Start while driving: the race manager's PAUSE state (0x606730
                    -> UI_Pause.fng), in a race or in free roam */
                 else if (k == SDLK_PAUSE && !e.key.repeat && race_state == 1 && world2 &&
-                         (!post_up() || (tun_active() && !tun_on_dyno()))) {   /* GUESS: a test run's results take START */
+                         (!post_up() || (tun_active() && !tun_on_dyno()))) {
+                    /* NOT retail: a test run's results take START. Retail's results run in
+                       RCState 7 (TheRaceHasFinished GC 8021d224); FinishRaceJoyHandler
+                       80214288 posts message 7 but RCStatePostRaceCallback (8021d36c, PC
+                       0x603eb0) has no case 7, and a non-drag test run's ACCEPT
+                       (0x4e9a20 -> 0x4bff80) returns at the last screen outside modes
+                       8 / 0x200 / Outrun -- the decoded retail screen is a dead end, so
+                       this escape stays until checked on the real game */
                     if (tun_active() && !tun_on_dyno()) {   /* a test run: CarTunePauseScreen (SetupTuningPause) */
                         pause_close();
                         tun_open_pause(dataroot);
@@ -17139,7 +19037,7 @@ int main(int argc, char **argv) {
                              garage_row == GARAGE_SHOP && !race_start_pending && pending_car < 0) {
                         world_tiles_trim(1);
                         g_shop = shop_open(dataroot, carname, &carcfg, modification,
-                                           wheel_brands[wheel_brand], wheel_style);
+                                           wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
                         if (!g_shop) world_tiles_trim(0);
                         garage_status = g_shop ? NULL : "CAR SHOP UNAVAILABLE";
                     }
@@ -17281,6 +19179,13 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "car switch failed for %s; keeping %s\n",
                                 next_car, carname);
                     } else {
+                        /* back to the crib with another model in front: LoadRideInfo
+                           0x4d8030 sets +0x2ce0 (car type differs) -> spun in like a scroll */
+                        if (g_tt.back && g_showroom && g_tt.discs && g_tt.state && g_tt.car_shown) {
+                            g_tt.car_req = 1; g_tt.car_scroll = 1;
+                            if (g_tt.state == 3) g_tt.state = 1;
+                        }
+                        g_tt.back = 0;
                         /* the garage turntable's car in view: it stays as the outgoing
                            rendering car (g_tt_old), turning away while the new one spins in */
                         if (g_showroom && g_tt.discs && g_tt.state && g_tt.car_shown &&
@@ -17293,6 +19198,12 @@ int main(int argc, char **argv) {
                                         &nwheelgm, &rimtex, rimmode, &carcfg, (const float (*)[16])wheelT,
                                         (const float (*)[16])brakeT);
                             nmap = 0;   /* its textures are g_tt_old's now */
+                            memcpy(g_tt_old.bb, carbb, sizeof g_tt_old.bb);   /* its shadow + underglow box */
+                            if (g_neon_seg.gen == g_car_gen) {   /* its neon tubes (found for it while it was on) */
+                                g_tt_old.nnseg = g_neon_seg.n;
+                                memcpy(g_tt_old.nseg, g_neon_seg.p, sizeof g_tt_old.nseg);
+                            }
+                            g_tt_old.neon_ut = neon_under_take(carname);
                         } else if (cgm != opponent_cgm) {
                             free_scene_gpu(cgm, ncar); n2_free_scene(&car);
                         }
@@ -17350,9 +19261,18 @@ int main(int argc, char **argv) {
                         hitch_mark("car.commit");
                         /* Refit the currently selected rim against the new car. */
                         g_rim_base = shop_rim_base(dataroot, wheel_brands[wheel_brand], wheel_style);
-                        load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
-                                       &wheellib, &wheelgm, &nwheelgm,
-                                       wtdata, wtlen, &rimtex, &rimmode, carWheelR);
+                        if (!load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
+                                            &wheellib, &wheelgm, &nwheelgm,
+                                            wtdata, wtlen, &rimtex, &rimmode, carWheelR) && nwheelgm > 0) {
+                            /* the rim part not built for the new car: retail's car then wears its own
+                               (stock) wheel, never the previous car's rim (fitted to that car's radius) */
+                            free_scene_gpu(wheelgm, nwheelgm); n2_free_scene(&wheellib);
+                            wheelgm = NULL; nwheelgm = 0;
+                            if (rimtex) glDeleteTextures(1, &rimtex);
+                            rimtex = 0;
+                            printf("rims: %s style %d not loaded for %s -- its own wheel\n",
+                                   wheel_brands[wheel_brand], wheel_style, next_car);
+                        }
                         hitch_mark("car.rim");
                         nkit_ids = n2_car_variant_numbers(cdata, clen, 1, kit_ids, 100);
                         if (nkit_ids == 0 || kit_ids[0] != 0) {
@@ -17374,8 +19294,10 @@ int main(int argc, char **argv) {
                         /* the front end's car select shows the car silent:
                            its sounds load once the menus let it go (GO,
                            Customize, Back), not on every car looked at */
+                        /* (out of the menus they load further down this frame, once
+                           garage_restore_car below has asked for the car's parts:
+                           the engine slot / shift bank follow them, 0x4593b0) */
                         g_car_sounds_pending = 1;
-                        if (!g_fe) car_load_sounds(dataroot, carname);
                         hitch_mark("car.sounds");
                         g_dbg.body_kit_current = 0; g_dbg.mod_current = carcfg;
                         g_ride_ready = 0;
@@ -17530,6 +19452,7 @@ int main(int argc, char **argv) {
                     vel[0] = vel[1] = 0.0f; speed = 0.0f;
                     g_ride_ready = 0;
                     world_fog_load(troot, trackname);
+                    rain_load_track(troot, trackname);
                     ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
                     selcirc = 0;
                     if(ncirc)load_roaming_circuit(dataroot,circlist[0],&scene,
@@ -17575,6 +19498,10 @@ int main(int argc, char **argv) {
             extern void world_instance_library_release(void);
             extern void world_instance_cache_flush(void);
             Uint32 sw_t0 = SDL_GetTicks();
+            /* L2 (keep textures + tiles on a same-track switch) reverted 11-10:
+               on hardware the switch then uploaded 0 textures / 108 batches and
+               the world was not drawn -- the old world's GPU objects are freed
+               above while those caches still listed them */
             vita_mark("track switch: %s -> %s (event %d)", trackname, next_track, next_ev);
             vita_heap_report("switch: before");
             /* --- the old track out --- */
@@ -17586,6 +19513,7 @@ int main(int argc, char **argv) {
             world_resident_free(retired_resident); retired_resident = NULL;
             world_resident_free(retired_waiting); retired_waiting = NULL;
             if (g_rt.n || g_rt.active) rt_end();
+            rt_keep_drop();   /* no kept opponents through another world's build */
             post_close();
             g_restart_ls = 0;
             world.city.race.active = 0;
@@ -17601,6 +19529,7 @@ int main(int argc, char **argv) {
             phys_wall_index_build(NULL, NULL, 0);
             wcoll_free(g_wcoll); g_wcoll = NULL;
             smk_free();
+            wa_free();
             world_tiles_reset();
             world_texture_cache_clear();
             res_unpin();
@@ -17615,6 +19544,9 @@ int main(int argc, char **argv) {
             /* --- the new track in: authored focus from the pinned bundle --- */
             const char *nstem = !strncmp(next_track, "STREAM", 6) ? next_track + 6 : next_track;
             smk_load(troot, nstem);
+            vita_mark("  switch: smokeables loaded (%u ms in)", SDL_GetTicks() - sw_t0);
+            if (wa_load(troot, nstem)) wa_start(g_rt.ev, g_rt_reverse);
+            vita_mark("  switch: world anims loaded (%u ms in)", SDL_GetTicks() - sw_t0);
             int sw_ok = 0;
             float sw_spawn[3] = {0, 0, 0}, sw_heading = 0.0f;
             {
@@ -17635,6 +19567,7 @@ int main(int argc, char **argv) {
                     while (!g_sw.done) { switch_frame(sw_ls, &rp, &quad); SDL_Delay(15); }
                     SDL_WaitThread(st, NULL);
                 }
+                vita_mark("  switch: area + city built (%u ms in)", SDL_GetTicks() - sw_t0);
                 sw_ok = st && g_sw.ok &&
                         ss_nearest_surface(&g_sw.cand->world.scene, g_sw.focus[0], g_sw.focus[1],
                                            sw_spawn, &sw_heading);
@@ -17642,10 +19575,13 @@ int main(int argc, char **argv) {
             if (sw_ok) {   /* GL half on the frame thread, a slice per loading frame */
                 WResidentBuildTiming sw_timing = {0};
                 int st;
+                /* behind the loading screen: the race placement's 24 ms slices,
+                   not the 4 ms ones that keep driving smooth */
                 while ((st = world_resident_finish_step(g_sw.cand, sw_spawn[0], sw_spawn[1], sw_spawn[2],
-                                                        64, &sw_timing)) == 0)
+                                                        256, &sw_timing)) == 0)
                     switch_frame(sw_ls, &rp, &quad);
                 sw_ok = st > 0;
+                vita_mark("  switch: GPU finish done (%u ms in)", SDL_GetTicks() - sw_t0);
             }
             if (!sw_ok) {
                 /* nothing of the old track is left to go back to: start
@@ -17664,6 +19600,7 @@ int main(int argc, char **argv) {
                 snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, nstem);
                 snprintf(tp, sizeof tp, "%s/%s.BUN", troot, nstem);
                 g_wcoll = wcoll_load(sp, tp);
+                vita_mark("  switch: collision loaded (%u ms in)", SDL_GetTicks() - sw_t0);
                 wcoll_ctx_init(&g_wcc);
                 g_acid_wc_on = 0;
                 wcoll_ctx_init(&g_ccam.wctx);
@@ -17743,6 +19680,8 @@ int main(int argc, char **argv) {
             g_ride_ready = 0; cam_snap = 1;
             skidn = skidhead = skidpen = 0;   /* the old track's tyre marks */
             world_fog_load(troot, trackname);
+            rain_load_track(troot, trackname);
+            vita_mark("  switch: fog + rain loaded (%u ms in)", SDL_GetTicks() - sw_t0);
             ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
             selcirc = 0;
             if (ncirc) load_roaming_circuit(dataroot, circlist[0], &scene, &aipath, ais, carpos, &start_idx);
@@ -17750,6 +19689,7 @@ int main(int argc, char **argv) {
             traffic_world.view[0] = cosf(heading); traffic_world.view[1] = sinf(heading);
             nai = ai_traffic_spawn(&roam_roads, &traffic_world, ais, traffic_routes, carpos, heading);
             if (!ncirc) { free(aipath.xy); aipath.xy = NULL; aipath.n = 0; }
+            vita_mark("  switch: circuit + traffic spawn (%u ms in)", SDL_GetTicks() - sw_t0);
             nsprint = selsprint = 0;
             for (int i = 0; i < world.city.nev && nsprint < WORLD_MAXEVENT; i++)
                 if (!strcmp(world.city.ev[i].reg, nstem)) sprintev[nsprint++] = i;
@@ -17773,6 +19713,8 @@ int main(int argc, char **argv) {
             select_car_vinyl(choice);
         }
 #ifdef __vita__
+        if (g_fe_boot_wait)   /* clears once: the boot load over and its car switch done */
+            g_fe_boot_wait = g_fe && (shop_boot_pending(g_fe) || pending_car >= 0);
         {   int want_room = (g_shop || g_fe) && race_state == 3;
             int plat = g_fe ? shop_platform(g_fe) : g_shop ? shop_platform(g_shop) : 1;
             if (want_room && g_showroom && plat != g_room_plat) {   /* GarageMainScreen::ChangePlatform */
@@ -17958,9 +19900,12 @@ int main(int argc, char **argv) {
         }
         /* the GLOBALB cache goes once driving: menus, the garage, the shop
            and a race's setup (opponents, traffic) are what load cars */
-        if (g_car_global_shared && !g_fe && !g_shop && !g_boot_fe && !g_qr_pending && !g_career_go && !race_start_pending &&
-            pending_car < 0 && (race_state == 1 || (race_state == 0 && !race_place_pending)))
-            car_global_drop();
+        if ((g_car_global_shared || g_rimlib.sc.count || g_opp_stash.have[0]) && !g_fe && !g_shop && !g_boot_fe && !g_qr_pending && !g_career_go && !race_start_pending &&
+            pending_car < 0 && (race_state == 1 || (race_state == 0 && !race_place_pending))) {
+            if (g_car_global_shared) car_global_drop();
+            rim_lib_forget();   /* the parsed wheel library too (~5 MB): menus only */
+            if (!g_rt_keep.on) rt_keep_drop();
+        }
         if (g_car_sounds_pending && !g_fe) car_load_sounds(dataroot, carname);
         if (g_fe) {
             shop_update(g_fe, FE_DT);   /* the frame's real time: menus ran half speed at 30 fps */
@@ -17972,14 +19917,45 @@ int main(int argc, char **argv) {
                     if ((sa.kind == SHOP_ACT_CAREER || sa.kind == SHOP_ACT_CAREER_RIDE) && g_career_prev_car < 0)
                         g_career_prev_car = g_main_prev_car;
                 }
-                if (sa.kind == SHOP_ACT_QR_CAR) {           /* the car select's car on the platform */
+                if ((sa.kind == SHOP_ACT_QR_CAR || sa.kind == SHOP_ACT_CUSTOMIZE || sa.kind == SHOP_ACT_QR_GO) &&
+                    sa.slot != -2 && sa.slot != g_gslot) {
+                    /* F2.4: another of the garage's cars -- a tuned slot or the stock car; the
+                       same model as the one in view loads again (LoadRideInfo: a new ride) */
+                    g_gslot = sa.slot;
+                    if (selcar >= 0 && selcar < ncars && !strcmp(carlist[selcar], sa.car)) { pending_car = selcar; g_car_reload = 1; }
+                    printf("garage: car select -> %s %s%d\n", sa.car, sa.slot >= 0 ? "tuned slot " : "stock ", sa.slot);
+                }
+                if (sa.kind == SHOP_ACT_QR_CAR && sa.career_handle) {   /* the crib car select / car lot: the slot's ride */
+                    const CareerCar *cc = career_car_by_handle(sa.career_handle);
+                    const char *ccar = cc && cc->has ? career_car_name(cc) : NULL;
+                    int sty = cc ? -1 : career_stock_type(sa.career_handle);
+                    if (sty >= 0) ccar = airace_type_name(sty);   /* the lot's stock car: FillFromStockCar, no parts */
+                    int idx = -1;
+                    for (int i = 0; ccar && i < ncars; i++) if (!strcmp(carlist[i], ccar)) idx = i;
+                    if (idx >= 0) {
+                        g_career_preset_on = 1;
+                        snprintf(g_career_preset_car, sizeof g_career_preset_car, "%s", ccar);
+                        memset(&g_career_preset_cfg, 0, sizeof g_career_preset_cfg);   /* stock */
+                        g_career_preset_rim[0] = 0; g_career_preset_rs = 0;
+                        if (cc && cc->cfg[0] && !garage_parse_line(cc->cfg, ccar, &g_career_preset_cfg, g_career_preset_rim, &g_career_preset_rs))
+                            printf("career: slot customization for %s unreadable, stock\n", ccar);
+                        if (g_career_prev_car < 0) g_career_prev_car = selcar;
+                        if (idx != selcar || pending_car >= 0) pending_car = idx;
+                        else career_apply_preset();   /* the same model: the other slot's parts in place */
+                        printf("crib car select: slot %08x %s on the platform\n", (unsigned)sa.career_handle, ccar);
+                    }
+                } else if (sa.kind == SHOP_ACT_QR_CAR) {           /* the car select's car on the platform */
                     for (int i = 0; i < ncars; i++)
                         if (!strcmp(carlist[i], sa.car) && i != selcar) pending_car = i;
+                } else if (sa.kind == SHOP_ACT_DELETE_CAR) {   /* DeleteTunedCar: the select has moved on already */
+                    int was = g_gslot;
+                    garage_delete_slot(sa.slot);
+                    if (was == sa.slot) g_gslot = was;   /* the car in view stays until the next car comes in */
                 } else if (sa.kind == SHOP_ACT_CUSTOMIZE) {     /* the car select stays up until the car is in */
                     for (int i = 0; i < ncars; i++)
                         if (!strcmp(carlist[i], sa.car) && i != selcar) pending_car = i;
                     g_cust_pending = 1;
-                    printf("customize: car %s\n", sa.car);
+                    printf("customize: car %s (%s %d)\n", sa.car, g_gslot >= 0 ? "tuned slot" : "stock, a new tuned slot on change", g_gslot);
                 } else if (sa.kind == SHOP_ACT_CAREER_PARTS) {   /* the crib's Change Parts, once its car is in */
                     g_crib_from_main = shop_crib_from_main(g_fe);
                     g_crib_parts_pending = 1;
@@ -18023,7 +19999,7 @@ int main(int argc, char **argv) {
                     }
                     if (pending_car < 0) {   /* the profile's current car (FEDatabase +0xe8), else the one in view */
                         char cur[64]; int ci = -1;
-                        garage_current_car(cur, sizeof cur);
+                        garage_current_car(cur, sizeof cur, &g_gslot);
                         for (int i = 0; i < ncars; i++) if (!strcmp(carlist[i], cur)) ci = i;
                         if (ci < 0) ci = selcar;
                         if (ci >= 0) { pending_car = ci; g_car_reload = 1; }
@@ -18047,6 +20023,9 @@ int main(int argc, char **argv) {
                     shop_close(&g_fe);
                     g_fe_in = 0;
                     g_career_mode = 1; g_career_go = 1; g_career_nis_pending = sa.career_nis;
+#ifdef OPENUG2_SIM_PRE_H
+                    if (getenv("OPENUG2_WATEST_NIS")) g_career_nis_pending = 1;   /* test aid (simulator): the career start scene */
+#endif
                     g_gps.pend = 'B';                    /* NotifyFreeRoamBegun 0x5412d0 */
                     hud_event_reset();
                     g_career_zones_set = 0; g_career_spawn_on = 0;
@@ -18189,12 +20168,13 @@ int main(int argc, char **argv) {
         }
         /* 0x552cc0(3): Customize -> the Car Shop for the picked car (UI_ChooseCustomizeCategory),
            back to the Customize Car Select after */
+        if (g_tt_cust_back && g_fe && g_fe_in) { g_tt_cust_back = 0; g_cust_pending = 1; }
         if (g_cust_pending && g_fe && pending_car < 0) {
             g_cust_pending = 0;
             shop_close(&g_fe);
             g_fe_in = 0;
             g_shop = shop_open(dataroot, carname, &carcfg, modification,
-                               wheel_brands[wheel_brand], wheel_style);
+                               wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
             g_shop_from_fe = g_shop != NULL;
             if (g_shop) profile_snapshot();   /* the save check on the way out compares with this */
             if (!g_shop) { world_tiles_trim(0); race_state = 1; g_ride_ready = 0; }
@@ -18206,7 +20186,7 @@ int main(int argc, char **argv) {
             shop_close(&g_fe);
             g_fe_in = 0;
             g_shop = shop_open(dataroot, carname, &carcfg, modification,
-                               wheel_brands[wheel_brand], wheel_style);
+                               wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
             if (g_shop && shop_career_customize(g_shop, 1, NULL)) g_shop_career = 1;
             else {
                 shop_close(&g_shop);
@@ -18329,7 +20309,11 @@ int main(int argc, char **argv) {
             if (!tun_active()) {   /* SetupPlayerCarsAndStuff(i, eTuningSetting): the career car's set for the race type */
                 const CareerCar *ccc = g_career_mode ? career_current_car() : NULL;
                 const uint8_t *want = ccc ? ccc->tune[tune_setting_for_race(g_qr.type)] : NULL;
-                if (want != g_tune_cur) n2_retune(want);
+                /* a front-end car rides on its FEPlayerCarDB settings too (FillRideWith 80134d4c) */
+                const uint8_t (*fe)[TUNE_BYTES] = ccc || g_career_mode ? NULL : garage_tune_get(carname);
+                if (fe) want = fe[tune_setting_for_race(g_qr.type)];
+                if (want != g_tune_cur || fe) n2_retune(want);
+                if (fe) printf("quick race: %s on its stored tunings (setting %d)\n", carname, tune_setting_for_race(g_qr.type));
             }
             g_rt_opponents = g_qr.opponents; g_rt_difficulty = g_qr.difficulty;
             g_rt_traffic = g_qr.traffic; g_rt_catchup = g_qr.catchup; g_rt_reverse = g_qr.reverse;
@@ -18368,7 +20352,10 @@ int main(int argc, char **argv) {
             /* NotifyFreeRoamBegun 0x5412d0 runs on every free-roam start (career start, after a
                race, a shop or the crib): MaybeTargetGPSForShopEvent(DDAY_EVENT_B) -- after the
                stage-0 car lot this is what puts the GPS on B's shop */
-            g_gps.pend = 'B';
+            if (g_career.current_event == CAREER_DDAY_A && g_career.s0.state == 9)
+                g_gps.pend = 'A';   /* resumed before visiting the car lot */
+            else
+                g_gps.pend = 'B';
             g_roam_level = 3;
             if (g_rt.n || g_rt.active) rt_end();
             float sp[3] = {0, 0, 0}; uint16_t h16 = 0; int ok = 0;
@@ -18383,6 +20370,14 @@ int main(int argc, char **argv) {
                     ok = 1; from = "event 4000's start line";
                 }
             }
+#ifdef OPENUG2_SIM_PRE_H
+            {   /* test aid (simulator): OPENUG2_SIM_CAREER_SPAWN="x y z h16" puts the career free roam there */
+                const char *ev = getenv("OPENUG2_SIM_CAREER_SPAWN"); unsigned th = 0;
+                if (ev && sscanf(ev, "%f %f %f %u", &sp[0], &sp[1], &sp[2], &th) >= 3) {
+                    h16 = (uint16_t)th; ok = 1; from = "OPENUG2_SIM_CAREER_SPAWN";
+                }
+            }
+#endif
             if (ok) {
                 g_career_spawn_on = 1;
                 memcpy(g_career_spawn, sp, sizeof g_career_spawn);
@@ -18417,7 +20412,7 @@ int main(int argc, char **argv) {
         if (g_tt_act && tun_active() && !g_qr_pending && !race_start_pending) {
             int a = g_tt_act;
             g_tt_act = 0;
-            if ((a == TT_ACT_TEST_RUN || a == TT_ACT_QUIT) && tun_on_dyno() && !g_tt_exit_go) {
+            if (a == TT_ACT_TEST_RUN && tun_on_dyno() && !g_tt_exit_go) {
                 tun_close_screens();
                 nis_rev_init(&g_tt_revs); nis_rev_msg(&g_tt_revs, 7, 2, 1); g_tt_rev = 1;
                 if (tt_nis_start(troot, dataroot, "DynoExit", carpos, &heading)) {   /* the outro: the car off the dyno */
@@ -18456,15 +20451,23 @@ int main(int argc, char **argv) {
                 tun_set_on_dyno(1);
                 g_tt_dyno_wait = 1;
             } else if (a == TT_ACT_SAVE) {   /* Save Profile: commit + EnterMemcard(0x51) */
-                const CareerCar *ccc = career_current_car();
+                /* entry 2 (a front-end garage car): CommitCustomTuningsToFEDatabase 8017cbb8 ->
+                   its FEPlayerCarDB record (PresetCarSlot +0x348) = its garage.txt line's TUNE */
+                const CareerCar *ccc = g_tt_entry == 2 ? NULL : career_current_car();
                 CareerCar *cm = ccc ? career_car_by_handle(ccc->handle) : NULL;
-                tun_commit(cm ? cm->tune : NULL);
+                if (g_tt_entry == 2) {
+                    static uint8_t ft[TUNE_NSET][TUNE_BYTES];
+                    tun_commit(ft); garage_tune_put(carname, (const uint8_t (*)[TUNE_BYTES])ft, g_cust_last_line);
+                } else tun_commit(cm ? cm->tune : NULL);
                 if (profile_named()) printf("tuning: profile saved (%s)%c", profile_save() ? "ok" : "FAILED", 10);
                 else printf("tuning: no named profile -- not saved%c", 10);
             } else if (a == TT_ACT_QUIT) {   /* DoQuitTuning 8017e65c: the commit, UI_CareerCrib */
-                const CareerCar *ccc = career_current_car();
+                const CareerCar *ccc = g_tt_entry == 2 ? NULL : career_current_car();
                 CareerCar *cm = ccc ? career_car_by_handle(ccc->handle) : NULL;
-                tun_commit(cm ? cm->tune : NULL);
+                if (g_tt_entry == 2) {   /* the front-end car's record (see Save above) */
+                    static uint8_t ft[TUNE_NSET][TUNE_BYTES];
+                    tun_commit(ft); garage_tune_put(carname, (const uint8_t (*)[TUNE_BYTES])ft, g_cust_last_line);
+                } else tun_commit(cm ? cm->tune : NULL);
                 if (tun_quit_save() && profile_named()) printf("tuning: profile saved (%s)%c", profile_save() ? "ok" : "FAILED", 10);
                 tun_end(); pause_close(); post_close();
                 n2_retune(NULL);
@@ -18475,12 +20478,42 @@ int main(int argc, char **argv) {
                 resident_args.scenery_event = -1;
                 g_ride_ready = 0;
                 if (g_tt_entry == 1 && g_tt_shop) {
-                    /* DoQuitTuning entry 1: UI_ChoosePerformanceCategory. GUESS: Explore Mode
-                       loads (StartCareerFreeRoam, the shop's saved spawn) and the shop reopens
-                       on its performance menu -- the original goes straight to the FE screen */
-                    g_tt_ret_shop = g_tt_shop; g_tt_shop = NULL; g_tt_entry = 0;
-                    g_career_go = 1;
-                    printf("tuning: quit -- back to the performance shop%c", 10);
+                    /* DoQuitTuning 8017e65c entry 1: FEngSetFirstFrontendScreen("UI_ChoosePerformanceCategory")
+                       + FEngSetLastButton(0) + UnloadTrack: straight to the shop's front end (its platform
+                       room, the Test Track icon in front) -- no Explore Mode in between. Leaving the shop
+                       then is the shop's own ExitToRoamHelper (StartCareerFreeRoam at the shop's saved
+                       spawn, cs == 2 below). The dyno track stays loaded behind the room (Vita: no unload
+                       + reload of L4RG for a menu) */
+                    const unsigned char *sd = g_tt_shop;
+                    g_tt_shop = NULL; g_tt_entry = 0; g_tt_ret_shop = NULL;
+                    race_state = 3; garage_row = 0; garage_status = NULL; garage_race = -1;
+                    vel[0] = vel[1] = 0; speed = 0;
+                    menuspin = atan2f(cam[1]-carpos[1], cam[0]-carpos[0]);
+                    world_tiles_trim(1);
+                    if (!g_shop) g_shop = shop_open(dataroot, carname, &carcfg, modification,
+                                                    wheel_brands[wheel_brand], wheel_style);
+                    cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
+                    if (g_shop && shop_career_customize(g_shop, 0, sd)) {
+                        g_shop_career = 2; g_cshop_cur = sd;
+                        shop_perf_select_tt(g_shop);
+                        printf("tuning: quit -- the performance shop's front end%c", 10);
+                    } else {   /* no shop screens: Explore Mode at the shop as before */
+                        shop_close(&g_shop); world_tiles_trim(0);
+                        race_state = 1; g_career_go = 1;
+                        printf("tuning: quit -- the shop could not be opened, Explore Mode%c", 10);
+                    }
+                } else if (g_tt_entry == 2) {
+                    /* DoQuitTuning 8017e65c entry 2: FEngSetFirstFrontendScreen("UI_ChooseCustomizeCategory")
+                       -- the Car Shop again on the same car, then back to the Customize Car Select */
+                    g_tt_entry = 0;
+                    world_tiles_trim(1);
+                    Shop *fe = shop_open(dataroot, carname, &carcfg, modification, wheel_brands[wheel_brand], wheel_style);
+                    if (fe) {   /* the showroom takes the parked car first (g_fe), then the Car Shop opens */
+                        shop_main_menu(fe);
+                        fe_quick_race_data(fe, carname, carlist, ncars);
+                        g_fe = fe; g_fe_in = 0; g_tt_cust_back = 1;
+                        printf("tuning: quit -- the Car Shop%c", 10);
+                    } else { printf("tuning: the Car Shop could not be opened%c", 10); world_tiles_trim(0); }
                 } else {
                 world_tiles_trim(1);
                 Shop *fe = shop_open(dataroot, carname, &carcfg, modification, wheel_brands[wheel_brand], wheel_style);
@@ -18604,6 +20637,9 @@ int main(int argc, char **argv) {
                 }
                 printf("sim: OPENUG2_SIM_CSHOP %s -> %s\n", getenv("OPENUG2_SIM_CSHOP"),
                        g_cshop_pending ? (const char *)g_cshop_pending : "none");
+                if (g_cshop_pending && (signed char)g_cshop_pending[0x50] == 4 && !g_eng.act) {   /* the car lot: as its engage dialog's accept */
+                    g_eng.shop = g_cshop_pending; g_eng.act = ENG_ACT_SHOP; g_eng.mv_shop = 1; g_cshop_pending = NULL;
+                }
                 if (g_cshop_pending) career_enter_shop(g_cshop_pending, carpos, (uint16_t)((int)lrintf(heading * 10430.3779f) - 0x4000));
                 if (g_cshop_pending && g_career.wcs.state == CWC_IN_SHOP && career_uniques_shop()) g_cshop_pending = career_uniques_shop();
             }
@@ -18621,7 +20657,7 @@ int main(int argc, char **argv) {
             garage_race = -1;
             world_tiles_trim(1);
             if (!g_shop) g_shop = shop_open(dataroot, carname, &carcfg, modification,
-                                            wheel_brands[wheel_brand], wheel_style);
+                                            wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
             if (g_shop && shop_career_customize(g_shop, 0, sd)) {
                 g_shop_career = 2; g_cshop_cur = sd;
                 if (g_tt_ret_shop == sd) { shop_perf_select_tt(g_shop); g_tt_ret_shop = NULL; }
@@ -18642,7 +20678,7 @@ int main(int argc, char **argv) {
             if (!g_shop) {
                 world_tiles_trim(1);
                 g_shop = shop_open(dataroot, carname, &carcfg, modification,
-                                   wheel_brands[wheel_brand], wheel_style);
+                                   wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
                 if (!g_shop) world_tiles_trim(0);
             }
         }
@@ -18652,10 +20688,11 @@ int main(int argc, char **argv) {
                entry 0 / 1) 8017d508: TakeControl (its tunings), StartCarTuningRace(1) 8011c904 -- SetupDynoRun:
                event 4706 "Speedway Dyno Testing" on L4RG (its scenery); no route, the car
                on 4706's ForwardStartingPosition slot 0 (TrackPosMarkersAll) */
-            const CareerCar *ccc = career_current_car();
+            const CareerCar *ccc = g_tt_entry == 2 ? NULL : career_current_car();   /* entry 2: FE garage car */
             if (getenv("OPENUG2_SIM_TUNEPARTS"))   /* test aid (simulator): every perf package up to this level fitted */
                 perf_fit_level(&g_n2_pp, -1, atoi(getenv("OPENUG2_SIM_TUNEPARTS")));
-            tun_begin(g_tt_entry, g_n2rec_raw, &g_n2_pp, ccc ? (const uint8_t (*)[TUNE_BYTES])ccc->tune : NULL);
+            tun_begin(g_tt_entry, g_n2rec_raw, &g_n2_pp, ccc ? (const uint8_t (*)[TUNE_BYTES])ccc->tune :
+                      g_tt_entry == 2 ? garage_tune_get(carname) : NULL);   /* TakeControl 8017c710: the FE car's record */
             n2_retune(tun_temp());
             g_tt_career_was = g_career_mode; g_career_mode = 0;
             g_tt_dyno_wait = 1; g_tt_have_spot = 0; g_tt_nis = 0;
@@ -18706,7 +20743,13 @@ int main(int argc, char **argv) {
                         }
                         printf("career shop: %s committed to slot %08x ($%d left)\n", carname,
                                cc ? (unsigned)cc->handle : 0u, g_career.cash);
-                    } else garage_save_car(carname, &sa.cfg, sa.rim_folder, sa.rim_style);
+                    } else {
+                        garage_format_line(g_cust_last_line, sizeof g_cust_last_line, carname, &sa.cfg, sa.rim_folder, sa.rim_style);
+                        if (g_gslot < 0 && !memcmp(&sa.cfg, &g_cust_cfg0, sizeof sa.cfg) &&
+                            !strcmp(sa.rim_folder, g_cust_rim0) && sa.rim_style == g_cust_rs0)
+                            printf("garage: %s left stock -- no tuned slot (MaybeCommitChangesToCarStable)\n", carname);
+                        else garage_save_car(carname, &sa.cfg, sa.rim_folder, sa.rim_style);
+                    }
                     shop_close(&g_shop);
                     world_tiles_trim(0);
                     kit_globalb_release();
@@ -18731,6 +20774,11 @@ int main(int argc, char **argv) {
                         g_cshop_dirty = 0;
                         g_career_go = 1;
                         printf("career shop: back to Explore Mode\n");
+                        break;
+                    }
+                    if (!cs && tt && g_shop_from_fe) {      /* the Car Shop's Test Track: entry 2 */
+                        g_shop_from_fe = 0;
+                        g_tt_entry = 2; g_tt_shop = NULL; g_tt_begin = 1;
                         break;
                     }
                     if (g_shop_from_fe) {                   /* Customize returns to its car select */
@@ -18769,6 +20817,7 @@ int main(int argc, char **argv) {
                      load_rim_style(cand, cand_len, wkeys, nwkeys, g_shop_rim_style,
                                        &wheellib, &wheelgm, &nwheelgm,
                                        wtdata, wtlen, &rimtex, &rimmode, carWheelR)) {
+                rim_lib_forget();   /* another wheel library */
                 if (cand != wldata) free(wldata);
                 wldata = cand; wllen = cand_len;
                 wheel_brand = brand; wheel_style = g_shop_rim_style;
@@ -18922,6 +20971,7 @@ int main(int argc, char **argv) {
         /* Race-grid placement may be kilometres from the menu resident.
          * Prepare it during countdown, then keep following the player. */
         hitch_mark("frame_start");
+        Uint64 pf_stream = pf_stamp();
         int resident_enabled = world2 && (race_state == 0 || race_state == 1) &&
             (!shot || daudit || resident_drive_audit) && !sstatic &&
             (!capture_policy.freeze_motion || resident_route_audit || resident_drive_audit);
@@ -18944,7 +20994,17 @@ int main(int argc, char **argv) {
             else if (race_state == 1 && !(world.city.race.active && !world.city.race.finished)) {
                 /* free roam: follow the road network (recomputed 4x a second) */
                 static float road_aim[2]; static int road_ok, road_tick;
-                if (++road_tick >= 15) {
+                static uint32_t road_seen;
+                /* recompute at once after a gap (race, menu, track switch) or
+                   when the kept aim is out of the car's reach: a stale aim
+                   from the previous track sent the first career free-roam
+                   build to the map edge, 26 s behind the loading screen (HW 11-02) */
+                uint32_t road_now = SDL_GetTicks();
+                int road_stale = road_now - road_seen > 250u ||
+                    (road_ok && hypotf(road_aim[0] - carpos[0], road_aim[1] - carpos[1]) >
+                                max_lead + resident_policy.cell_size);
+                road_seen = road_now;
+                if (road_stale || ++road_tick >= 15) {
                     road_tick = 0;
                     road_ok = road_lead_point(&world, carpos, vmps, al, max_lead, road_aim);
                 }
@@ -19377,6 +21437,7 @@ int main(int argc, char **argv) {
         /* Includes a ready result whose cell has since been marked failed. */
         world_resident_free(prepared);
         hitch_mark("stream_tail");
+        pf_detail.stream += pf_elapsed(pf_stream);
         if (resident_route_pending) {
             int source_fail = 0;
             for (int i = 0; i < nobst; i++)
@@ -19418,6 +21479,31 @@ int main(int argc, char **argv) {
            before the showroom is up (race_state 3), so g_fe counts too:
            else the boot frames start the in-game list. */
         int fe_side = race_state == 3 || g_fe;
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_MUSIC0")) g_opt.fe_music = g_opt.ig_music = 0.0f;   /* test aid: both music sliders at 0 */
+#endif
+        /* EAXS_UpdateMusic 0x482180 in game: the ambience beds when the in-game
+           music or master level is 0 or in a drag / drift race */
+        {   int amb_force = g_opt.ig_music <= 0.0f || g_opt.master <= 0.0f || (g_rt.active && (g_rt.drag || g_rt.drift));
+#ifdef OPENUG2_SIM_PRE_H
+            if (getenv("OPENUG2_AMB_FORCE")) amb_force = 1;   /* test aid: the beds with the music on */
+#endif
+            music_set_ambience_force(amb_force);
+            /* the front end's shop beds: GetAmbientZone's FE zone, the beds when
+               the front-end music level is 0 */
+            int fe_force = g_opt.fe_music <= 0.0f;
+#ifdef OPENUG2_SIM_PRE_H
+            if (getenv("OPENUG2_AMB_FORCE")) fe_force = 1;
+#endif
+            int fe_zone = shop_fe_ambient_zone(g_shop ? g_shop : g_fe, g_career_mode);
+            music_fe_ambience(fe_zone, fe_force);
+#ifdef OPENUG2_SIM_PRE_H
+            static int fez_was = -1;
+            if (fe_side && fe_zone != fez_was && getenv("OPENUG2_AMB_LOG"))
+                printf("[ambience] front end zone %d, bed %d\n", fe_zone, music_ambience_bed());
+            if (fe_side) fez_was = fe_zone;
+#endif
+        }
         music_set_mode(fe_side ? MUSIC_FE : MUSIC_IG);
         /* the options (options.h) the game reads each frame */
         audio_set_levels(g_opt.master, g_opt.sfx, g_opt.engine, g_opt.tire,
@@ -19446,7 +21532,9 @@ int main(int argc, char **argv) {
         /* paused (UI_Pause): the simulation reads race state 4, which none of
            its steps run in -- the race manager's PAUSE state stops the world */
         int pause_rs = -1;
-        if (g_pause.on && !tun_dyno_live()) { pause_rs = race_state; race_state = 4; }
+        /* the replay screen too: the world stays at THE_PRESENT while the
+           replay's frames are shown (replay.c) */
+        if ((g_pause.on || rp_up()) && !tun_dyno_live()) { pause_rs = race_state; race_state = 4; }
         if (g_tt_rev) {   /* the DynoEnter revs (one step a tick, as the race NIS's) */
             nis_rev_step(&g_tt_revs, 1);
             g_engine.target_rpm = g_tt_revs.rpm;
@@ -19484,11 +21572,11 @@ int main(int argc, char **argv) {
         if (post_pad) steer = 0.0f;
         int handbrake = (race_state==1 && !post_pad && ks[SDL_SCANCODE_SPACE]);
 #ifdef __vita__
-        /* Handling test (ux0:data/OpenUG2/drivetest.txt): a fixed pedal and
+        /* Handling test (ux0:data/NFSU2/drivetest.txt): a fixed pedal and
            steering script from the moment the car can drive, logging the
            simulation 4x a second, so a build can be judged without a driver. */
         {   static int dt_on = -1; static uint32_t dt_t0, dt_log;
-            if (dt_on < 0) { FILE *f = fopen("ux0:data/OpenUG2/drivetest.txt", "r");
+            if (dt_on < 0) { FILE *f = fopen("ux0:data/NFSU2/drivetest.txt", "r");
                              dt_on = f != NULL; if (f) fclose(f); }
             if (dt_on && race_state == 1) {
                 uint32_t now = SDL_GetTicks();
@@ -19707,6 +21795,11 @@ int main(int argc, char **argv) {
         int beam_high = g_dbg.headlight_mode==1 || (beam_keys && ks[SDL_SCANCODE_L]);
         int beam_flash = beam_keys && ks[SDL_SCANCODE_J];
         int headlights_on = (g_dbg.night_mode && (g_dbg.headlight_mode!=2 || beam_high)) || beam_flash;
+        if (rp_up()) {          /* replay: the lamps as recorded (the keys belong to UI_ReplayControl) */
+            beam_high = (g_rp_lt[0] & RPL_HIGH) != 0; beam_flash = (g_rp_lt[0] & RPL_FLASH) != 0;
+            headlights_on = (g_rp_lt[0] & RPL_HEAD) != 0;
+        } else g_rp_plights = (g_rp_plights & RPL_TAIL) | (headlights_on ? RPL_HEAD : 0)
+                            | (beam_high ? RPL_HIGH : 0) | (beam_flash ? RPL_FLASH : 0);
         int nitro_active = race_state == 1 &&
                            ks[SDL_SCANCODE_N] && throttle > 0.1f && speed > 0.02f;
 #ifdef __vita__
@@ -19721,7 +21814,7 @@ int main(int argc, char **argv) {
         g_n2_freeroam = !(world.city.race.active && !world.city.race.finished);
         if (n2_active()) {     /* the retail bottle in n2sim burns and empties */
             nitro_active = g_n2s.nos_on;
-            nos_tank = g_n2s.nos_frac < 0 ? 0 : g_n2s.nos_frac > 1 ? 1 : g_n2s.nos_frac;
+            nos_tank = g_n2s.nos_frac < 0 ? 0 : g_n2s.nos_frac > 2 ? 2 : g_n2s.nos_frac;   /* 0..2: a second bottle reads on the gauge (0x4c7b20) */
         } else {               /* arcade model: the old 8 s stand-in tank */
             if (nos_tank <= 0.0f) nitro_active = 0;
             if (nitro_active) {
@@ -19738,6 +21831,17 @@ int main(int argc, char **argv) {
                         !(fabsf(g_n2s.throttle) > 0.001f && fabsf(g_n2s.speed) * 2.23699f >= 5.0f);
             if (!g_showroom) g_purge = purge;   /* the showroom: the shop's preview owns it */
             g_nitro = nitro_active && !purge;
+            /* the car's turbo / nitrous banks by its levels (SetupSFX
+               0x45eb30 / 0x45f210); the front end's purge is always
+               Nitrous_00 (EAXSound::InitializeFrontEnd 0x486650 loads
+               0x7ed1a0 [0] at 0x486885), so the showroom keeps bank 0.
+               Reloads only when a bank changes. */
+            audio_set_player_perf(g_n2_aud_lv[0], g_showroom ? 0 : g_n2_aud_lv[1]);
+            /* the engine slot (CarPreSetup 0x4593b0: row x 4 + the engine sound level) and
+               shift bank (0x45c376: + the transmission level) follow the fitted parts; the
+               sounds reload once the menus let the car go (car_load_sounds) */
+            if (!g_car_sounds_pending && audio_set_player_engine_level(g_n2_aud_lv[2], g_n2_aud_lv[3]))
+                g_car_sounds_pending = 1;
         }
         /* Turbo pressure for the HUD dial, -1 (full vacuum) .. +1 (gauge
            end). Closed throttle pulls vacuum; on throttle the turbo builds
@@ -19745,11 +21849,11 @@ int main(int argc, char **argv) {
            fast). Display + audio only: the power curve is unchanged. */
         g_turbo_fitted = car_has_turbo(carname);
         {
-            float tgt = -0.70f;
-            if (race_state == 1 && throttle > 0.05f) {
+            float tgt = -0.70f, thr = rp_up() ? g_n2s.throttle : throttle;   /* the replay: the recorded pedal */
+            if ((race_state == 1 || rp_up()) && thr > 0.05f) {
                 float spool = (g_engine.target_rpm - 2000.0f) / 3500.0f;
                 spool = spool < 0.0f ? 0.0f : spool > 1.0f ? 1.0f : spool;
-                tgt = -0.25f + (0.25f + 0.60f * spool) * throttle;
+                tgt = -0.25f + (0.25f + 0.60f * spool) * thr;
                 if (nitro_active) tgt += 0.15f;
             }
             turbo_boost += (tgt - turbo_boost) * (tgt > turbo_boost ? 0.05f : 0.20f);
@@ -19905,6 +22009,13 @@ int main(int argc, char **argv) {
             printf("race start: placed %u ms after the start was asked\n", SDL_GetTicks() - g_race_ask_ms);
             g_race_ask_ms = 0;
             vel[0] = vel[1] = 0; speed = 0; g_ride_ready = 0;
+            /* n2_player_tick puts it down standing on the slot (n2sim_reset).
+               rt_race_setup stood the car on the slot's SHIPPED Z while the
+               area loaded (4174: 0.46 m under the road, springs at full
+               bump), and the lift onto the ground here is under the 3 m
+               re-seat test, so the sim only moved it and kept the spring
+               kick: the car flew ~2 m at the drift start (HW 11-02). */
+            g_n2_live = 0;
             racetimer = 0; race_place_pending = 0; cam_snap = 1;
             nos_tank = 1.0f;   /* a full bottle for every race */
             g_n2_nos_refill = 1;
@@ -19951,6 +22062,7 @@ int main(int argc, char **argv) {
             else rt_nis_frame(race_state == 1);
         }
         hitch_mark("sim.nis");
+        Uint64 pf_player_physics = pf_stamp();
         g_pf_nis = g_rt.nis && !g_rt.post_done ? (g_rt.nis_cam ? 1 : 2) : 0;
         if (!sstatic && !capture_policy.freeze_motion && race_state != 4) {
             if (race_auto) dmag = speed / 60.0f;
@@ -19991,13 +22103,18 @@ int main(int argc, char **argv) {
                 int both_pedals = race_state == 1 && !post_pad && ks[SDL_SCANCODE_W] && ks[SDL_SCANCODE_S];
                 /* countdown: held on the line in neutral, gas revs the engine */
                 int on_line = race_state == 0 && !race_auto;
+                /* R1 11-01: the nitrous press has no race-stage gate (Player 0x6034b6 ->
+                   IsNitrousAvailable 0x5eb560 / StartNitrous only), so it also burns on the
+                   line -- standing, that is the blow-off (SPRAY SHOW) -- and 0x5f6088 adds
+                   the second NOS_BLOWOFF while *0x890118 is 0..3 (acid frame nitrous 2) */
+                g_acid_prerace = race_state == 0;
                 if (n2_active())
                     dmag = n2_player_tick(&scene, carpos, vel, &heading, &speed,
                                           on_line ? (ks[SDL_SCANCODE_W] ? 1.0f : 0.0f) :
                                           both_pedals ? 1.0f : throttle > 0 ? throttle : 0,
                                           both_pedals ? 1.0f : throttle < 0 ? -throttle : 0,
                                           steer, handbrake, (g_manual || g_rt.drag) && race_state <= 1, shift_req,
-                                          on_line, race_state == 1 && !post_pad && ks[SDL_SCANCODE_N] &&
+                                          on_line, (race_state == 1 || on_line) && !post_pad && ks[SDL_SCANCODE_N] &&
                                           g_n2_nos_level > 0);   /* the fitted bottle (shop or garage row) */
                 else {
                 dmag = phys_player_step(carpos, vel, &heading, &speed,
@@ -20051,8 +22168,8 @@ int main(int argc, char **argv) {
            the throttle for 150ms and let the revs sag (idles during the
            countdown, since throttle is locked out until GO). */
         { float sp = (speed < 0 ? -speed : speed) / PHYS_MAXSPD;
-          if (g_n2_ticked)
-              shift_req = 0;   /* the sim's gearbox took it */
+          if (g_n2_ticked || rp_up())
+              shift_req = 0;   /* the sim's gearbox took it (the replay: the recorded one) */
           else if (g_manual) {
               eng_gearbox_manual(sp, throttle, 1.0f/60.0f, &gear, &shift_t, shift_req);
               shift_req = 0;   /* one shift per press, not per tick */
@@ -20060,7 +22177,7 @@ int main(int argc, char **argv) {
               if (gear < 1) gear = 1;   /* left manual in N or R */
               eng_gearbox_step(sp, throttle, 1.0f/60.0f, &gear, &shift_t);
           }
-          if (g_n2_ticked) {
+          if (g_n2_ticked || rp_up()) {        /* the replay: its recorded gear shifts sound again */
               int ng = g_n2s.gear - 1;             /* sim 0 R, 1 N, 2 1st -> -1, 0, 1 */
               if (ng != g_n2_prev_gear && g_n2_prev_gear >= 0 && ng >= 0)
                   eng_shift_event(ng > g_n2_prev_gear ? 1 : -1);
@@ -20301,6 +22418,7 @@ int main(int argc, char **argv) {
            and, on unpause, its body too) */
         (void)ride_nsup;
         hitch_mark("sim.walls_ground");
+        pf_detail.player_physics += pf_elapsed(pf_player_physics);
         /* the opponents on the retail AI: one tick each, then every car's
            contacts, the player's car included */
         /* the countdown (0x603bc0 -> 0x5fc900(3); there is no pre-race
@@ -20314,7 +22432,12 @@ int main(int argc, char **argv) {
         float cd_iv = g_rt.cd_iv > 0 ? g_rt.cd_iv : 0.9f;
         if (race_state == 0 && !race_place_pending && world2 && world.city.race.active && !g_rt.nis_on) {
             if (cd_n < 0) cd_n = 0; else cd_n++;
-            if (cd_n >= (int)lrintf(3.0f * cd_iv * 60.0f)) { race_state = 1; racetimer = 0; cd_n = -1; go_n = 0; }
+            if (cd_n >= (int)lrintf(3.0f * cd_iv * 60.0f)) {
+                race_state = 1; racetimer = 0; cd_n = -1; go_n = 0;
+                /* RCStateRaceInProgressCallback -> MarkTheBeginningOfTime 0x57aad0:
+                   a race (mode not 0, not 7 = getaway), one human, offline */
+                if (RT_RACE && !tun_active()) { g_rp_go_t = g_rt.t; rp_begin(g_rt.t); }
+            }
         } else {
             if (race_state != 0) cd_n = -1;
             if (go_n >= 0 && (race_state != 1 || ++go_n > (int)lrintf(cd_iv * 60.0f))) go_n = -1;
@@ -20332,9 +22455,21 @@ int main(int argc, char **argv) {
                 if (!world2 || !strstr(trackname, "L4RA")) rt_end();
                 rt_go = g_rt.active && race_state == 1 && !race_place_pending;
             } else if (g_rt.active || g_rt.setup) rt_end();
+            /* not behind a front end: the boot's menus covered a free roam
+               nobody drove (hw_1109: 6.8 s of encounter cars + traffic at
+               boot, all loaded again by the career's own LoadTrack) */
             else if (world2 && race_state == 1 && g_ride_ready && !race_place_pending && g_n2 && g_n2_ticked &&
+                     !g_fe && !g_boot_fe && !g_shop &&
                      strstr(trackname, "L4RA"))                 /* free roam's world: once per load */
                 rt_roam_start(troot, dataroot, carname, g_n2s.pos, g_n2s.heading);
+            /* the post-race screens decoded ahead once the race runs: 1 s into
+               the countdown (the grid is in, the car stands, the race HUD's
+               own load on the first frame is done) */
+            if (rt_go && RT_RACE && g_rt.t >= 1.0f && !g_rt.post_pre && !g_rt.post_done) {
+                g_rt.post_pre = 1;
+                post_prefetch(dataroot);
+            }
+            hud_screen_prefetch_pump();
             if (g_career_mode && g_rt.roam && g_rt.active && race_state == 1 && !race_place_pending) {
                 /* career free roam, each tick (1/60 s of career time) */
                 g_career_ms_frac += 1000.0f / 60.0f;
@@ -20357,9 +22492,11 @@ int main(int argc, char **argv) {
 #ifdef OPENUG2_SIM_PRE_H
                     if (getenv("OPENUG2_SIM_SMS")) {   /* simulator test aid: 12 messages queued, the odd ones read and sorted */
                         int q = 0;
-                        for (int i = 0; i < career_nsms_data() && q < 12; i += 13) {
+                        int qn = atoi(getenv("OPENUG2_SIM_SMS")), st = qn > 12 ? 3 : 13;   /* N > 12: N unsorted */
+                        if (qn <= 12) qn = 12;
+                        for (int i = 0; i < career_nsms_data() && q < qn; i += st) {
                             CareerSmsSlot *m = career_sms_add(career_sms_data(i));
-                            if (m && (q & 1)) { career_sms_read(m); m->b[3] = 1; }
+                            if (m && (q & 1) && qn == 12) { career_sms_read(m); m->b[3] = 1; }
                             if (m) q++;
                         }
                         printf("sim: OPENUG2_SIM_SMS -- %d messages queued, %d unread\n", q, career_sms_unread());
@@ -20396,15 +22533,21 @@ int main(int argc, char **argv) {
                     last = seq;
                 }
                 {   unsigned char f = (unsigned char)((g_career.b873e ? 1 : 0) | (g_career.b873f ? 2 : 0));
-                    if (f != g_career_s0_flags) { g_career_s0_flags = f; career_recalc_zones(); }
+                    if (f != g_career_s0_flags) {
+                        if ((f & 1) && !(g_career_s0_flags & 1) && g_career.stage == 0 &&
+                            g_career.current_event == CAREER_DDAY_A)
+                            g_gps.pend = 'A';   /* the optional races have closed */
+                        g_career_s0_flags = f;
+                        career_recalc_zones();
+                    }
                 }
                 {   /* Player::UpdateCurrentTrackPathZone 80218c44: the type 13..15 zones holding
                        the car, FindZone order; NotifyInBankTriggerZone for a type 19 one */
                     uint32_t zh[16]; int nzh = 0;
                     float p2[2] = { carpos[0], carpos[1] };
                     for (int t = 13; t <= 15; t++)
-                        for (const unsigned char *z = racepath_zone_next(g_rt.zones, NULL); z && nzh < 16; z = racepath_zone_next(g_rt.zones, z))
-                            if ((int)n2_u32(z) == t && racepath_zone_holds(z, p2)) zh[nzh++] = n2_u32(z + 0x30);
+                        for (const unsigned char *z = racepath_zone_at(g_rt.zones, p2, t, NULL); z && nzh < 16; z = racepath_zone_at(g_rt.zones, p2, t, z))
+                            zh[nzh++] = n2_u32(z + 0x30);
                     {   /* simulator test aid: OPENUG2_SIM_ENGAGE counts the first unlocked event
                            zone the pile can enter as holding the car until a race is engaged, so a
                            script can Engage it from where the car is */
@@ -20503,6 +22646,7 @@ int main(int argc, char **argv) {
             }
             if (g_rt.active || g_rt.setup || g_sc.h)        /* a garage race has its own traffic (aitraffic.c); the photo screen none */
                 for (int k = 0; k < N_OPENWORLD_AI; k++) traffic_routes[k].present = 0;
+            hitch_mark("sim.career");   /* the career free-roam block above (zones, SMS, speech) */
             RT_FCRUMB("frame: tick (go %d)", rt_go);
             if (rt_go && rt_tick(rt_racing, (carbb[3]-carbb[0])*.5f, (carbb[4]-carbb[1])*.5f)) {
                 memcpy(carpos, g_n2s.pos, sizeof g_n2s.pos);
@@ -20510,6 +22654,11 @@ int main(int argc, char **argv) {
                 heading = g_n2s.heading; speed = g_n2s.speed / 60.0f;
                 memcpy(g_n2_out, carpos, sizeof g_n2_out);
                 g_n2_outv[0] = vel[0]; g_n2_outv[1] = vel[1]; g_n2_outh = heading;
+            }
+            if (rt_go && rp_recording()) {   /* ReplayManager BeginFrame/EndFrame, recording */
+                static RpFrame rpf;
+                rp_fill(&rpf);
+                rp_record(&rpf);
             }
             /* the retail race manager decides the finish (its checkpoints
                run from the event's own start, which the old gate tracker
@@ -20525,6 +22674,7 @@ int main(int argc, char **argv) {
                    standing on the start line marker -- a sprint's finish
                    line -- facing its heading + 0x4000 (0x42fc60 -> 0x5fbd60) */
                 g_rt.post_done = 1;
+                rp_end_of_time();               /* TheRaceHasFinished -> MarkTheEndOfTime */
                 g_rt.field_gone = 1; g_rt.ndraw = 0;
                 nisdraw_free(g_rt.nisd); g_rt.nisd = NULL;   /* 0x43b640: the scene stops */
                 rt_results(dataroot, carname);
@@ -20583,6 +22733,14 @@ int main(int argc, char **argv) {
                     cam_snap = 1;               /* 0x5fa820(1) */
                     printf("race: post-race, the car on the %s marker (%.0f %.0f)\n",
                            g_rt.p2p ? "finish line" : "start line", mp[0], mp[1]);
+                    /* port streaming: a car that did not reach the line (engine
+                       blown, totalled) jumps up to the route's length; the active
+                       resident may not hold ground there (it held the drag strip
+                       start: the safety net pulled the car back to its edge and it
+                       fell, 11-01). Held on the marker until the area is in, as
+                       race_place_pending does for the grid. */
+                    post_hold = 1;
+                    memcpy(post_hold_pos, carpos, 3 * sizeof(float)); post_hold_pos[3] = heading;
                 } else printf("race: post-race, no %s marker for event %d\n",
                               g_rt.p2p ? (g_rt_reverse ? "BackwardFinishLine" : "ForwardFinishLine")
                                   : (g_rt_reverse ? "BackwardStartLine" : "ForwardStartLine"), g_rt.ev);
@@ -20590,6 +22748,31 @@ int main(int argc, char **argv) {
         }
 #ifdef __vita__
         hitch_mark("sim.race_tick");
+        if (post_hold) {   /* the post-race marker: stood there once the resident covers it */
+            if (!g_rt.active || !g_rt.post_done) post_hold = 0;
+            else if (active_resident && hypotf(post_hold_pos[0] - active_resident->center[0],
+                                               post_hold_pos[1] - active_resident->center[1]) <
+                                            active_resident->radius - 50.0f) {
+                post_hold = 0;
+                float z = post_hold_pos[2];
+                if (g_wcoll) {
+                    WCollCtx gc; wcoll_ctx_init(&gc);
+                    float q[3] = { post_hold_pos[0], post_hold_pos[1], post_hold_pos[2] + 1.0f };
+                    int found = 0;
+                    float gz = wcoll_ground(g_wcoll, &gc, q, NULL, NULL, &found);
+                    if (found) z = gz;
+                }
+                carpos[0] = post_hold_pos[0]; carpos[1] = post_hold_pos[1]; carpos[2] = z;
+                heading = post_hold_pos[3]; vel[0] = vel[1] = 0; speed = 0;
+                g_n2_live = 0; g_rt.put_down = 1; g_ride_ready = 0; cam_snap = 1;
+                printf("race: post-race marker area in (gen %lu), the car put down at (%.0f %.0f z %.2f)\n",
+                       active_resident->generation, carpos[0], carpos[1], z);
+            } else {
+                memcpy(carpos, post_hold_pos, 3 * sizeof(float)); heading = post_hold_pos[3];
+                vel[0] = vel[1] = 0; speed = 0;
+                g_n2_live = 0;
+            }
+        }
         if (tick_n < 3) {
             memcpy(tick_pos[tick_n], carpos, sizeof tick_pos[0]);
             tick_fwd[tick_n][0] = fwd[0]; tick_fwd[tick_n][1] = fwd[1];
@@ -20671,7 +22854,7 @@ int main(int argc, char **argv) {
            below where the car last stood on the road. Log what the active
            resident holds where contact was lost (to trace the hole), then
            put the car back on an earlier all-wheels-down pose. */
-        if (race_state == 1 && g_ride_ready && active_resident) {
+        if (race_state == 1 && g_ride_ready && active_resident && !post_hold) {
             static float good[2][4]; static int have_good, ground_run, air_run;
             static float lost[3];
             if (g_ride.contact_mask == 0xf) {
@@ -20731,40 +22914,66 @@ int main(int argc, char **argv) {
            x the route's way . the car's, at most 8 m/s) when it is within 150 m
            (0x78a584); else the oldest of the player's four saved poses
            (+0xbc / +0xc0 / +0x100, (index + 1) & 3), standing.
-           GUESS: the route spot is the locator's projection, not the previous
-           route node (no wall / intersection re-pick, no drag lane offset);
-           the poses are saved every 0.5 s on all four wheels; no blink. */
+           The route reset uses the controller's own route point (car +0x2c
+           -> +0xc, g_rt.human; 0x5fbed0 heads along its section), not the
+           locator. The poses (Player::UpdateGameState 0x602b00): every 32nd
+           frame (0x7fb724 & 31), when the car is over 16 m (0x79c684) from
+           the newest pose in 2D and has ground (HasTopology 0x5e7e80), the
+           car +0x60 position and +0x40c heading are saved; the first save
+           (index 0) fills all four. Every reset blinks the car 2 s
+           (0x7a55c4; IsCarBlinkingOrPoofed 0x60d4f0: hidden on odd frames
+           while the game runs). The drag race's lane offset is ported
+           (airacer_drag_reset_offset). The wall / intersection re-pick
+           (0x600bdc..0x600cde) and the 150 m test from the box centre are in
+           airacer_player_reset_pose (11-08): SegmentIntersectsPossiblyLong
+           0x5e7ed0 / PointIsCloserThanThisToWall 0x5e8110 over the wcoll
+           polygons, GetNearestRoutePoint 0x40f180(car, 0x1020, car +0x8fc);
+           skipped when IsTooFarFromDragTrack (rs_too_far_from_drag_track). */
         {   static float ring[4][4]; static int ring_i, ring_n, ring_run, rs_prev, rs_ticks = 1 << 20;
             int rs = g_reset_req; g_reset_req = 0;
             rs_ticks++;
-            if (race_state == 1 && g_ride_ready && g_ride.contact_mask == 0xf) {
-                if (++ring_run >= 30 || !ring_n) {
-                    ring_run = 0;
+            if (g_reset_blink > 0.0f && !g_pause.on) g_reset_blink -= FE_DT;   /* the frame's game ticks */
+            if (g_pose_ring_clear) { g_pose_ring_clear = 0; ring_i = ring_n = 0; ring_run = 0; }
+            if (race_state == 1 && g_ride_ready && ((++ring_run & 31) == 0 || !ring_n)) {
+                const float *nw = ring[ring_i];
+                int has = !g_wcoll;
+                if (ring_n && hypotf(nw[0] - carpos[0], nw[1] - carpos[1]) <= 16.0f) has = 0;
+                else if (g_wcoll) {
+                    WCollCtx gc; wcoll_ctx_init(&gc);
+                    float q[3] = { carpos[0], carpos[1], carpos[2] + 2.0f };
+                    wcoll_ground(g_wcoll, &gc, q, NULL, NULL, &has);
+                }
+                for (int k = has ? (ring_n ? 1 : 4) : 0; k > 0; k--) {
                     ring_i = (ring_i + 1) & 3;
                     ring[ring_i][0] = carpos[0]; ring[ring_i][1] = carpos[1];
                     ring[ring_i][2] = carpos[2]; ring[ring_i][3] = heading;
-                    if (ring_n < 4) ring_n++;
+                    ring_n = 4;
                 }
-            } else ring_run = 0;
+            }
             float mph = fabsf(speed) * 60.0f * 2.237f;
             int early =g_rt.active && g_rt.start >= 0.0f && g_rt.t - g_rt.start < 3.0f;
             if (rs && !rs_prev && race_state == 1 && !g_showroom && !g_rt.postrace && mph <= 60.0f && !early &&
                 rs_ticks >= 120 && ring_n) {
-                float p[3], h, v = 0.0f, fx = cosf(heading), fy = sinf(heading);
+                float p[3], h, v = 0.0f;
                 const unsigned char *z = g_rt.rp ? racepath_zone(g_rt.rp, carpos, 4) : NULL;
-                const RpLoc *l = &g_rt.loc[0];
                 const char *how;
+                float rpt[3], box[3], org[3];
+                int repicked = 0;
                 if (z) {
                     float zz[4]; memcpy(zz, z + 4, 16);
                     p[0] = zz[0]; p[1] = zz[1]; p[2] = carpos[2]; h = atan2f(zz[3], zz[2]); v = 8.0f;
                     how = "reset zone";
-                } else if (RT_RACE && g_rt.rp && l->node >= 0 &&
-                           hypotf(l->spt[0] - carpos[0], l->spt[1] - carpos[1]) < 150.0f) {
-                    float d = l->dir[0] * fx + l->dir[1] * fy;
-                    v = fabsf(speed) * 60.0f * (d > 0.0f ? d : 0.0f);
-                    if (v > 8.0f) v = 8.0f;
-                    p[0] = l->spt[0]; p[1] = l->spt[1]; p[2] = carpos[2]; h = atan2f(l->dir[1], l->dir[0]);
-                    how = "race route";
+                } else if (g_rt.human && airacer_route_point(g_rt.human, rpt) &&
+                           (rs_box(box, org, carpos),
+                            airacer_player_reset_pose(g_rt.human,   /* re-pick + bDistBetween(box, point) < 150 */
+                                                     g_rt.rp && racepath_lap(g_rt.rp) > 0.0f ? g_rt.loc[0].dir : NULL,
+                                                     rs_too_far_from_drag_track() ? NULL : g_wcoll, box, org,
+                                                     p, &h, &v, &repicked))) {
+                    how = repicked ? "race route, re-picked off a wall" : "race route";
+                    if (g_rt.active && g_rt.drag) {   /* 0x89e7d8 || 0x890108: the nearest traffic lane (0x600d0b) */
+                        float lp[3], off = airacer_drag_reset_offset(g_rt.human, carpos, lp);
+                        if (off != 0.0f) { p[0] = lp[0]; p[1] = lp[1]; p[2] = lp[2]; how = "race route, drag lane"; }
+                    }
                 } else {
                     const float *r = ring[(ring_i + 5 - ring_n) & 3];
                     p[0] = r[0]; p[1] = r[1]; p[2] = r[2]; h = r[3];
@@ -20780,10 +22989,12 @@ int main(int argc, char **argv) {
                 printf("reset: %s (%.1f, %.1f) heading %.2f at %.1f m/s, from (%.1f, %.1f) %.0f mph\n",
                        how, p[0], p[1], h, v, carpos[0], carpos[1], mph);
                 carpos[0] = p[0]; carpos[1] = p[1]; carpos[2] = p[2]; heading = h;
-                vel[0] = cosf(h) * v / 60.0f; vel[1] = sinf(h) * v / 60.0f; speed = v / 60.0f;
+                vel[0] = cosf(h) * (v + 0.1f) / 60.0f; vel[1] = sinf(h) * (v + 0.1f) / 60.0f;   /* ResetCore 0x5f52c0: speed + 0.1 */
+                speed = v / 60.0f;
                 g_n2_live = 0; g_ride_ready = 0; cam_snap = 1;
                 world.city.race.havep = 0;   /* the jump crosses no gate */
                 rs_ticks = 0;
+                g_reset_blink = 2.0f;        /* 0x7a55c4 */
             }
             rs_prev = rs;
         }
@@ -20803,7 +23014,7 @@ int main(int argc, char **argv) {
         hitch_mark("post.crash_fall");
         /* Soft boundary at the edge of the loaded area: beyond it there is no
            ground, so hold the car inside and cancel outward velocity. */
-        if (active_resident && race_state == 1) {
+        if (active_resident && race_state == 1 && !post_hold) {   /* not a car held on its post-race marker */
             float bdx = carpos[0] - active_resident->center[0];
             float bdy = carpos[1] - active_resident->center[1];
             float bd = sqrtf(bdx*bdx + bdy*bdy);
@@ -20828,6 +23039,91 @@ int main(int argc, char **argv) {
             }
         }
 #endif
+        {   /* the replay screen (ReplayMenu, replay.c): opened from the
+               post-race / pause menu over the frozen world (THE_PRESENT
+               kept here), its frames shown, the live world back on exit */
+            static float rp_carpos[3], rp_heading, rp_vel[2], rp_speed;
+            static int rp_ride_ready;
+            if (g_rp_req && !rp_up()) {
+                int from = g_rp_req;
+                g_rp_req = 0;
+                rp_save_world();
+                memcpy(rp_carpos, carpos, sizeof rp_carpos);
+                rp_heading = heading; rp_vel[0] = vel[0]; rp_vel[1] = vel[1]; rp_speed = speed;
+                rp_ride_ready = g_ride_ready;
+                if (!rp_open(dataroot, from, g_rt.drag || g_rt.drift, g_rt.cps.laps > 0 ? g_rt.cps.laps : g_rt.laps)) {
+                    if (from == RP_FROM_POSTRACE) post_open_menu(); else pause_open(dataroot, g_pause.race);
+                } else {
+                    /* the sound in the replay: the pause path's RequestUnPause(5) ->
+                       EAXSound::ExitPauseMenu(5) (GC 8007cab4) clears only the game
+                       sound's pause flags -- the song stays held (game state 5,
+                       PATH_pause) and the speech paused (EnterPauseMenu's
+                       PauseSpeech); the post-race path's ~PostRaceMenu ->
+                       ExitPauseMenu(3) purges the speech and sets state 5 too. So
+                       the cars sound, the music and the speech do not. */
+                    audio_pause_game(0); music_pause(1); speech_pause(1);
+                }
+            }
+            if (rp_up()) {
+#ifdef __vita__
+                int rp_n = vita_ticks;
+#else
+                int rp_n = 1;
+#endif
+                int moved = 0;
+                rp_contact_fx = rp_contact_play;   /* the recorded contacts' sparks, at their ticks */
+                rp_sound_fx = sfx_coll_play;       /* and their sounds */
+                rp_restore_fx = rp_restore_play;
+                for (int i = 0; i < rp_n; i++) moved += rp_tick();
+                /* GUESS: the replay's pause (and its loading waits) silence the
+                   cars; slow motion keeps the recorded revs' pitch (retail's
+                   EAX timing under the replay's world-time scale is not decoded) */
+                audio_pause_game(rp_rate() == 0.0f);
+                g_rp_moved = moved;
+                RpFrame *rpf = NULL; static RpFrame rpf_buf;
+                if (rp_sample(&rpf_buf)) rpf = &rpf_buf;
+                if (rpf) {
+                    rp_apply_world(rpf, (float)moved / 60.0f);
+                    memcpy(carpos, g_n2s.pos, sizeof g_n2s.pos);
+                    heading = g_n2s.heading;
+                    vel[0] = g_n2s.vel[0] / 60.0f; vel[1] = g_n2s.vel[1] / 60.0f; speed = g_n2s.speed / 60.0f;
+                    g_ride_ready = 1;
+                    g_engine.target_rpm = g_n2s.rpm_tach;
+                    g_engine.load = g_n2s.throttle > 0.0f ? 1.0f : 0.0f;
+                }
+                rp_frame((float)rp_n / 60.0f, g_ccam.setting, fabsf(g_n2s.speed));
+                static int rlg = -1, rlf;          /* test aid (simulator): OPENUG2_RP_LOG */
+                if (rlg < 0) rlg = getenv("OPENUG2_RP_LOG") != NULL;
+                if (rlg && ++rlf % 60 == 0)
+                    printf("replay fx: %d particles live, player lamps %x skid %.2f slip %.2f | snd rpm %.0f (synth %.0f) load %.0f "
+                           "gear %d nos %d boost %.2f screech %.2f %.2f %.2f muted %d\n", acid_live_particles(),
+                           g_rp_lt[0], g_n2s.wheel_skid[0] + g_n2s.wheel_skid[1] + g_n2s.wheel_skid[2] + g_n2s.wheel_skid[3],
+                           fabsf(g_n2s.wheel_slipv[2][0]) + fabsf(g_n2s.wheel_slipv[3][0]), g_engine.target_rpm,
+                           g_engine.current_rpm, g_engine.load, g_n2s.gear, g_nitro, g_turbo_boost, g_skid3[0], g_skid3[1], g_skid3[2],
+                           rp_rate() == 0.0f);
+            }
+            int rp_from = rp_closed();
+            if (rp_from) {          /* Exit 0x4a50e0: THE_PRESENT restored, the screen before */
+                rp_restore_world();
+                memcpy(carpos, rp_carpos, sizeof rp_carpos);
+                heading = rp_heading; vel[0] = rp_vel[0]; vel[1] = rp_vel[1]; speed = rp_speed;
+                g_ride_ready = rp_ride_ready;
+                g_cc_snap = 1;
+                /* Exit (GC 800f9894) switches back to the package before (FEngSwitchPackages):
+                   PostRaceMenu::Setup (800f3190) focuses FEngGetLastButton, the option
+                   the IconScrollerMenu stored when it was chosen (8015a134): Replay;
+                   PauseMenu::Setup (800fff7c) sets it to 0 first: Resume */
+                if (rp_from == RP_FROM_POSTRACE) {
+                    /* Exit's EnterPauseMenu(-1) holds the sound again; the port's
+                       post-race screen keeps the sound it had before (none paused) */
+                    audio_pause_game(0); music_pause(0); speech_pause(0);
+                    post_open_menu();
+                    int n; const PostOpt *o = post_opts(&n);
+                    for (int i = 0; g_post.menu && i < n; i++)
+                        if (o[i].act == PR_REPLAY) { g_post.sel = i; post_menu_option(); break; }
+                } else pause_open(dataroot, g_pause.race);
+            }
+        }
         if (raudit) {   /* observe the production state, after every push */
             float adz = da_dz < 0 ? -da_dz : da_dz;
             if (ground_cat != WSURF_NONE && adz > 0.10f && ra_ground_spikes < 80) {
@@ -21182,21 +23478,22 @@ int main(int argc, char **argv) {
         int drifting = (dmag > PHYS_MAXSPD*0.2f && speed > PHYS_MAXSPD*0.22f) ||
                        (g_drift.level > 0.5f && fabsf(g_drift.slip) > 0.12f);
         /* tyre screech scales with how hard the back is sliding */
-        g_skid3_on = g_n2_ticked;   /* retail skid channels drive the screech */
+        g_skid3_on = g_n2_ticked || rp_up();   /* retail skid channels drive the screech (the replay: recorded) */
         g_skid = (race_state==1 && drifting)
                ? (0.12f + 0.45f*fmaxf(0.0f, dmag - PHYS_MAXSPD*0.2f)/PHYS_MAXSPD
                   + 0.2f*fabsf(g_drift.slip)*g_drift.level) : 0.0f;
         if (g_skid > 0.35f) g_skid = 0.35f;
-        if (g_n2_ticked) {
+        if (g_n2_ticked || (rp_up() && g_rp_moved)) {   /* replay: the recorded marks, as its re-simulation lays them */
             /* Retail simulation: every wheel marks the road by its own state
                (n2sim wheel_skid, the rule of 0x59dbb0) -- wheelspin, locked
                brakes and hard cornering as well as slides. A mark extends its
                last segment until it is 0.6 m long, so a long mark stays a few
                draws. */
             static int wpen[4], wseg[4];
+            if (g_rp_jump) { memset(wpen, 0, sizeof wpen); g_rp_jump = 0; }   /* a restore: no mark across the jump */
             float skmax = 0.0f;
             for (int k = 0; k < 4; k++) {
-                float in = race_state == 1 && !sstatic ? g_n2s.wheel_skid[k] : 0.0f;
+                float in = (race_state == 1 || rp_up()) && !sstatic ? g_n2s.wheel_skid[k] : 0.0f;
                 if (in <= 0.0f) { wpen[k] = 0; continue; }
                 float cur[3] = { g_n2s.wheel_cpt[k][0], g_n2s.wheel_cpt[k][1], g_n2s.wheel_cpt[k][2] + 0.03f };
                 if (in > skmax) skmax = in;
@@ -21224,10 +23521,12 @@ int main(int argc, char **argv) {
             /* screech: the retail skid controller's three channels */
             (void)skmax;
             g_skid = 0.0f;
-            for (int c = 0; c < 3; c++) g_skid3[c] = race_state == 1 && !sstatic ? g_n2_skid3[c] : 0.0f;
+            for (int c = 0; c < 3; c++) g_skid3[c] = (race_state == 1 || rp_up()) && !sstatic ? g_n2_skid3[c] : 0.0f;
+            for (int c = 0; c < 6; c++)   /* per side (a replay keeps only the mean) */
+                g_skid3s[c / 3][c % 3] = rp_up() ? g_skid3[c % 3] : race_state == 1 && !sstatic ? g_n2_skid3s[c / 3][c % 3] : 0.0f;
             g_skid3_on = 1;
             skidpen = 0;
-        } else if (drifting) {
+        } else if (drifting && !rp_up()) {   /* a held replay frame lays nothing */
             float rx = carpos[0]-nf[0]*1.6f, ry = carpos[1]-nf[1]*1.6f;
             float rz = carpos[2]+0.05f;
             float curL[3]={rx+nr[0], ry+nr[1], rz}, curR[3]={rx-nr[0], ry-nr[1], rz};
@@ -21458,13 +23757,24 @@ int main(int argc, char **argv) {
         }
         float look[3] = { camtgt[0]-cam[0], camtgt[1]-cam[1], camtgt[2]-cam[2] };
         /* the showroom FOV is 4:3 horizontal (as chasecam_out) */
+        int W, H; SDL_GL_GetDrawableSize(win, &W, &H);
         float cam_fovy = g_showroom ? 2.0f * atanf(tanf(0.5f * g_room_fov) * 0.75f) : 0.9f;
+        /* projection aspect (x scale = y scale / cam_aspect) and the camera's 4:3 fov for
+           the markers; retail_view_proj replaces both on the player views */
+        float cam_aspect = (float)W / H, cam_hfov = atanf(tanf(cam_fovy * 0.5f) / 0.75f) * 2.0f;
+        /* The garage scene is eView 1: GarageMainScreen ctor 0x4ea900 stores its arg 2 at +0x220
+           (0x4ea9f4), the only constructor call (factory 0x4eb130 -> 0x4eb175) passes 1, and
+           HandleRender 0x4a7330 draws the room with eGetView(+0x220). View 1 is a player view of
+           CalculateViewMatricies 0x5c7ec0 (k 1.1, v = H/W x 1.1 / 0.8696), the same projection as
+           the drive views (D 11-01; magazine covers, car select, shops, crib) */
+        if (g_showroom) retail_view_proj(g_room_fov, W, H, &cam_fovy, &cam_aspect);
 
         /* Driving under the retail simulation: the retail player camera
            (CubicCameraMover, chasecam.c) -- per-car view offsets from the
            GLOBALB record, the game's cubic smoothing, acceleration lag,
            nitrous pull-back, speed/road shake and wall/car avoidance. */
         CcOut cc_out; int cc_on = 0;
+        g_cc_cubic = 0;
         g_cc_hide_car = 0; g_rvm_on = 0;
         if (n2_active() && g_n2 && race_state != 3 && !orbit_active && shotyaw >= 1e8f &&
             !g_showroom && !sstatic && !poseshot) {
@@ -21475,6 +23785,13 @@ int main(int argc, char **argv) {
                 g_cc_ready = 1;
                 printf("camera: retail views, %d entries from the car record, setting %d (view %d)\n",
                        got, g_ccam.setting, g_ccam.view);
+            }
+            {   /* the replay's camera (CycleReplayCameraType / UpdateIceCameras /
+                   RestoreCameraMover, replay.c) */
+                int rs, rf = rp_camera(&rs);
+                if (rf & 1) chasecam_set(&g_ccam, rs >= 0 ? rs : g_cc_setting, NULL);
+                if (rf & 2) chasecam_snap(&g_ccam);
+                if (rp_up()) cc_cycle = 0;
             }
             if (!cc_cycle && g_opt.p[0].camera != g_cc_setting) {   /* the Camera option changed */
                 g_cc_setting = g_opt.p[0].camera;
@@ -21488,14 +23805,15 @@ int main(int argc, char **argv) {
             }
             if (g_cc_snap) { chasecam_snap(&g_ccam); g_cc_snap = 0; }
             {   /* 0x602bd0 event 0x7e: Look Back while the binding is held */
-                int lb = SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B] != 0;
+                int lb = SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B] != 0 && !rp_up();   /* replay: the pad is UI_ReplayControl's */
                 if (lb != g_ccam.lookback) printf("camera: look back %s\n", lb ? "on" : "off");
                 g_ccam.lookback = lb;
             }
 #ifdef __vita__
-            float cc_dt = (float)vita_ticks / 60.0f;
+            float cc_dt = (float)vita_ticks / 60.0f * n2sim_time_scale();   /* the world step (0x865154) */
+            if (rp_playing() && rp_rate() > 0.0f) cc_dt *= rp_rate();      /* the replay's slow motion */
 #else
-            float cc_dt = 1.0f / 60.0f;
+            float cc_dt = 1.0f / 60.0f * n2sim_time_scale();
 #endif
             CcCar cc;
             memset(&cc, 0, sizeof cc);
@@ -21556,6 +23874,11 @@ int main(int argc, char **argv) {
             } else {
                 g_nis_znear = 0;
                 chasecam_update(&g_ccam, &cc, cc_dt, g_wcoll, cobs, ncobs, &cc_out);
+                {   /* the jump cam zones' TrackCarCameraMover (ChangeCameraMover 0xf / 0x10) */
+                    JcCar jc; JcEnv je;
+                    jc_fill(&jc, &je);
+                    g_cc_cubic = !jumpcam_camera(&jc, cc_dt, &cc_out);   /* 0xf / 0x10 fall back to Cubic */
+                }
                 g_nis_znear = cc_out.znear;   /* camera +0xbc: 0.5 */
                 /* Player::DetermineHudFeatures 0x600090: HUD feature 0x1000 (the
                    rear-view mirror; FEngHud::SetHudFeatures 0x4ca090 creates /
@@ -21564,16 +23887,22 @@ int main(int argc, char **argv) {
                    the Camera option bumper or hood (0x83aa74 0 / 1), in the
                    normal driving HUD -- not on the race over / post-race mask,
                    nor the test track's tuning HUD (0x5f34c0) */
+#ifdef OPENUG2_SIM_PRE_H
+                if (getenv("OPENUG2_RVM_COST")) g_opt.mirror = 1;   /* sim aid: the cost run forces the option on */
+#endif
                 g_rvm_on = g_opt.mirror && !g_ccam.lookback && (g_opt.p[0].camera == 0 || g_opt.p[0].camera == 1) &&
-                           !(g_rt.active && (g_rt.pfinished || g_rt.postrace)) && !post_up() && !tun_active();
+                           !(g_rt.active && (g_rt.pfinished || g_rt.postrace)) && !post_up() && !tun_active() &&
+                           !(jumpcam_zone() == 6 || jumpcam_zone() == 7);   /* zones 6 / 7: mask 0 */
                 if (g_rvm_on) chasecam_rvm(&cc, &g_rvm_cc);
             }
             cc_on = 1;
-            g_cc_hide_car = cc_out.hide_car;
+            g_cc_hide_car = cc_out.hide_car ||   /* IsCarBlinkingOrPoofed 0x60d4f0: odd frames of the reset blink */
+                            (g_reset_blink > 0.0f && !g_pause.on && (g_rframe & 1));
             memcpy(cam, cc_out.eye, sizeof cc_out.eye);
             memcpy(look, cc_out.fwd, sizeof cc_out.fwd);
             memcpy(camtgt, idealtgt, sizeof idealtgt);
-            cam_fovy = cc_out.fovy;
+            retail_view_proj(cc_out.hfov43, W, H, &cam_fovy, &cam_aspect);
+            cam_hfov = cc_out.hfov43;
             static int cc_log;
             if (++cc_log % 600 == 1) {
                 float d[3] = { cam[0]-cc.pos[0], cam[1]-cc.pos[1], cam[2]-cc.pos[2] };
@@ -21634,7 +23963,8 @@ int main(int argc, char **argv) {
                 look[c] = g_dycam.pos[c] - cam[c];
                 camtgt[c] = g_dycam.pos[c];
             }
-            cam_fovy = 2.0f * atanf(tanf(8000.0f * (3.14159265f / 65536.0f)) * 0.75f);
+            cam_hfov = 8000.0f * (6.2831853f / 65536.0f);
+            retail_view_proj(cam_hfov, W, H, &cam_fovy, &cam_aspect);
             g_nis_znear = 0.5f;
             cc_on = dy_on = 1;
         } else g_dycam.fresh = 1;
@@ -21642,7 +23972,6 @@ int main(int argc, char **argv) {
         memcpy(g_rt.eye, cam, sizeof g_rt.eye); g_rt.have_eye = 1;
 
 
-        int W, H; SDL_GL_GetDrawableSize(win, &W, &H);
         glViewport(0, 0, W, H);
 #ifdef __vita__
         render_scene_begin(W, H, 720.0f / (float)W);   /* 3D at 720x408 (no-op when the display already is) */
@@ -21659,14 +23988,22 @@ int main(int argc, char **argv) {
             static float fog_k, fog_floor;
             static int old_fog = -1;
             if (old_fog < 0) {   /* A/B: the port's fog before the regional tables */
-                FILE *of = fopen("ux0:data/OpenUG2/oldfog.txt", "r");
+                FILE *of = fopen("ux0:data/NFSU2/oldfog.txt", "r");
                 old_fog = 0; if (of) fclose(of);   /* retired: the shaders only do linear fog now */
                 printf("fog: %s\n", old_fog ? "old exp2 fog (oldfog.txt)" : "regional tables");
                 if (old_fog) { fog_k = 0.0f; fog_floor = -1.0f; }
             }
             float fstart, ffloor, frgb[3];
             g_fog_linear = 0;
+            {   /* CalculateFogInfo 0x614300: "Night Raining Fog" by the rain's intensity */
+                float rv[8]; int rn = rain_intensity() > 0.0f ? rain_fog_values(cam[0], cam[1], rv) : 0;
+                world_fog_set_rain(rain_intensity(), rn ? rv : NULL, rn);
+            }
             if (!old_fog && world_fog_eval(cam[0], cam[1], &fstart, &ffloor, frgb)) {
+                const float *fm = world_fog_values();   /* the rain's tint colour (Rain +0x4edc..): confirmed G2
+                                                           10-31, CalculateFogInfo 0x614742..0x614767 -> 0x613020(
+                                                           ftol(I x rain[k] + (1 - I) x base[k])), k = 2, 3, 4 */
+                if (fm) rain_set_fog_colour((int)fm[2], (int)fm[3], (int)fm[4]);
                 g_fog_linear = 1;
                 g_dbg.fog_r = frgb[0]; g_dbg.fog_g = frgb[1]; g_dbg.fog_b = frgb[2];
                 g_dbg.fog_density = 1.0f / (250.0f - fstart);
@@ -21694,10 +24031,27 @@ int main(int argc, char **argv) {
         float zfar = g_dbg.fog_density > 1e-5f
                    ? 1.2f * sqrtf(-logf(0.01f)) / g_dbg.fog_density : 2000.0f;
         if (zfar < 500.0f) zfar = 500.0f;
+        /* A track without a "Normal Fog" table (L4RB / L4RD, the drag strips)
+           keeps the last track's density (CalculateFogInfo 0x614300 returns 0
+           and its caller 0x5cb02d keeps the old FogInfo), but nothing fogs the
+           cut there: at 500 m the clear colour (that stale fog colour, green
+           from L4RA) showed along the horizon (HW 11-09). Retail draws to
+           10000+; the fog-off 2000 m covers the strips and is cheap there
+           (opaque world ~0.5 ms). */
+        if (!g_fog_linear) zfar = 2000.0f;
+        /* Retail far clip (eViewPlatInfo::CalculateViewMatricies 0x5c7ec0): player
+           view 1 -- the view the NIS cameras drive too -- uses 15000 m outright
+           (other views take Camera +0xc0, 10000 from CameraMover's ctor 0x44ab90;
+           GC eDisplayFrame passes 0 = "camera far" for views 0-2). Only the NIS
+           scenes get it here (the jet / trains run kilometres out); the world
+           batches stay gated by view_dist below, so the cost is the frustum's
+           far plane only. Gameplay keeps the fog-derived plane (perf pass). */
+        float zfar_world = zfar;
+        if (g_career_nis_on || (g_rt.active && g_rt.nis && race_state == 0)) zfar = 15000.0f;
         /* The showroom backdrop is framed for the game's narrow front-end
            camera (measured off the reference: ~40 deg across at 16:9); the
            driving FOV sees past its edges. */
-        mat_persp(cam_fovy, (float)W/H, znear, zfar, P);
+        mat_persp(cam_fovy, cam_aspect, znear, zfar, P);
         phys_landing_camera(&landing_offset,&landing_velocity,
             g_ride_ready && !sstatic && !capture_policy.freeze_motion && !race_auto
             ? g_ride.impact:0,1.0f/60.0f);
@@ -21725,7 +24079,12 @@ int main(int argc, char **argv) {
         if (g_showroom && g_room_roll != 0.0f) {
             /* 0x444de0: mover +0xb8 > 1e-5 turns the view about its forward
                axis (eCreateAxisRotationMatrix 0x5ba8b0); the scene turns
-               counter-clockwise on screen by the roll */
+               counter-clockwise on screen by the roll. CONFIRMED (G3 11-01):
+               0x444de0 builds the view as columns r, u, f (f = target - eye,
+               r = (0,0,-1) x f, u = f x r: view y points down) and then
+               M = R(f, roll) M, i.e. Rz = [c -s; s c] (row vectors, 0x5ba8b0
+               [1] = xy(1-c) - z s) in a y-down view: CCW on a y-up screen, as
+               this R does in GL's y-up view space. No matrix inverse is used. */
             float a = g_room_roll * 0.01745329f, c = cosf(a), sn = sinf(a), Vr[16];
             const float R[16] = { c, sn, 0, 0, -sn, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
             mat_mul(R, V, Vr);
@@ -21746,7 +24105,7 @@ int main(int argc, char **argv) {
            reflection detail" level is not reversed yet). */
         {   static int refl_on = -1;
             if (refl_on < 0) {
-                FILE *nr = fopen("ux0:data/OpenUG2/noreflect.txt", "r");
+                FILE *nr = fopen("ux0:data/NFSU2/noreflect.txt", "r");
                 refl_on = !nr; if (nr) fclose(nr);
                 printf("road reflection: %s\n", refl_on ? "on" : "off (noreflect.txt)");
             }
@@ -21781,13 +24140,14 @@ int main(int argc, char **argv) {
             /* Updated every second frame (the original has a reflection
                rate option too); in between the last one is reused -- the
                blur hides the half-frame lag. */
-            static int refl_tick, refl_valid;
+            static unsigned refl_tick;
+            static int refl_valid;
             int refl_wanted = refl_on && world2 && !g_showroom && race_state != 3 &&
                               g_dbg.show_track && VITA_PROBE(8);
             if (!refl_wanted) refl_valid = 0;
             g_refl_ready = refl_valid;
-            /* unlocked: the road reflection and one env-map face alternate
-               frames; locked 30 has the time for both every frame */
+            /* At locked 30, refresh both outdoor reflections every frame.
+               The unlocked mode alternates the road and a cube face. */
             extern int vita_lock30;
             int refl_every = vita_lock30 > 0;
             /* a catch-up frame (3 sim ticks after an overrun, hwlog25: the
@@ -21819,7 +24179,7 @@ int main(int argc, char **argv) {
                     render_model(&rp, NULL);
                     if (nsky) {   /* the dome, mirrored below the horizon */
                         float Psky[16], tmp[16], MVPs[16];
-                        mat_persp(cam_fovy, (float)W/H, znear, 30000.0f, Psky);
+                        mat_persp(cam_fovy, cam_aspect, znear, 30000.0f, Psky);
                         mat_mul(Psky, V, tmp); mat_mul(tmp, Rm, MVPs);
                         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPs);
                         glUniform1f(rp.uEmissiveTex, 1.0f); glUniform1f(uUseTex, 1.0f);
@@ -21887,15 +24247,117 @@ int main(int argc, char **argv) {
                         rdraws += rblend;
                     }
                     if (nglow) render_world_glows(&rp, glowbatch, nglow, MVPr);
+                    if (g_acid_ok) {   /* the reflection view's flares (flareType 2), the camera unmirrored */
+                        rdraws += aciddraw_reflect_flares(V, MVP, 0.5f * (float)H / tanf(0.5f * cam_fovy),
+                                                          rain_wetness(), refl_flare_ground);
+                        glUseProgram(rp.prog);
+                        glEnable(GL_DEPTH_TEST);
+                    }
                     glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
                     if (cull) glEnable(GL_CULL_FACE);
                     vita_use_lite(0);
                     g_refl_ready = refl_valid = 1;
+                    pf_detail.road_reflection_updated = 1;
                     static int refl_logged;
                     if (!refl_logged++) printf("road reflection: first frame, %d world draws\n", rdraws);
                 }
                 render_refl_end(W, H);
                 render_scene_begin(W, H, 720.0f / (float)W);
+            }
+            /* The garage floor reflection (view 4): 0x5cab15's reflection view with
+               g_RoadReflectionEnable > 1 renders the FE's HandleRender(view, 1) (room_draw_mirror)
+               and then 0x630de0(view 4, 1): the FE cars mirrored, z' = 2 * 0.15 (0x7f45a8) - z in
+               the room. The main pass adds it on the worldreflect solids (DISC01-03,
+               BACKDROP_FLOOR: room_draw_meshes refl). Vita: 240x136, every second frame as the
+               road's; the cars by tt_car_draw (no lamps / neon / decals beyond the skin). */
+            {
+                static int room_refl_tick;
+                int rwant = refl_on && g_showroom && g_room_n && g_tt.discs && ncar && VITA_PROBE(5) &&
+                            !getenv("OPENUG2_NO_ROOMREFL");
+#ifdef __vita__
+                float rmag[9];
+                if (rwant && g_fe && shop_mag_view(g_fe, rmag)) rwant = 0;   /* the cover: no room */
+#endif
+                if (!rwant) g_room_refl_ready = 0;
+                else if (!(catchup && g_room_refl_ready) &&
+                         ((room_refl_tick++ & 1) == 0 || refl_every || !g_room_refl_ready)) {
+#ifdef OPENUG2_SIM_PRE_H
+                    static int rr_cost = -1; static double rr_ms; static int rr_np;
+                    if (rr_cost < 0) rr_cost = getenv("OPENUG2_ROOMREFL_COST") != NULL;
+                    Uint64 rr_t0 = 0;
+                    if (rr_cost) { glFinish(); rr_t0 = SDL_GetPerformanceCounter(); }
+#endif
+                    float black[3] = { 0, 0, 0 };
+                    if (render_refl_begin(240, 136, black)) {
+                        float T[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0,
+                                        carpos[0] - g_room_anchor[0], carpos[1] - g_room_anchor[1],
+                                        carpos[2] - g_room_anchor[2], 1 }, MRr[16];
+                        mat_mul(MVP, T, MRr);
+                        GLboolean cull = glIsEnabled(GL_CULL_FACE);
+                        glDisable(GL_CULL_FACE);   /* the mirror flips the winding */
+                        glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST);
+                        vita_use_lite(1);
+                        glUniform1f(uUnlit, 0.0f); glUniform1f(uSpec, 0.0f); glUniform1f(uAlpha, 1.0f);
+                        glUniform1f(rp.uTextureAlpha, 0.0f); glUniform1f(rp.uFogDensity, 0.0f);
+                        glUniform1f(rp.uVColor, g_dbg.vcolor);
+                        render_model(&rp, NULL);
+                        room_draw_mirror(&rp, uUseTex, uColor, MRr);
+                        glUniform1f(rp.uVColor, 0.0f);
+                        vita_use_lite(0);
+                        float h = carpos[2] - g_room_anchor[2] + 0.15f;   /* room z 0.15 in the world */
+                        float Rc[16] = { 1,0,0,0, 0,1,0,0, 0,0,-1,0, 0,0,2.0f * h,1 };
+                        if (g_room_carM_ok && !tt_car_hidden()) {   /* the player car through a TtCar view */
+                            static TtCar view;
+                            view.scene = car; view.gpu = cgm; view.nmesh = ncar; view.stock_wheel = stock_wheel;
+                            int nv = nmap < 128 ? nmap : 128;
+                            memcpy(view.keys, mapkey, nv * sizeof *mapkey); memcpy(view.tex, maptex, nv * sizeof *maptex);
+                            memcpy(view.alpha, mapalpha, nv); memcpy(view.mode, mapmode, nv); view.ntex = nv;
+                            int geo = nwheelgm > 0 && !(stock_wheel >= 0 && car.meshes[stock_wheel].vcol &&
+                                                        wheel_brand == 0 && wheel_style == 1);
+                            if (geo) { view.rim = wheellib; view.rgm = wheelgm; view.nrim = nwheelgm; }
+                            else { memset(&view.rim, 0, sizeof view.rim); view.rgm = NULL; view.nrim = 0; }
+                            view.rtex = rimtex; view.rmode = rimmode;
+                            const StockPaint *rpp = cat_paint(&carcfg, 4, 1).on ? paint_part(carcfg.paint[4]) : NULL;
+                            const StockPaint *spp = paint_part(carcfg.paint[5]);
+                            view.rptex = geo && rimtex && rpp ? rimp_tex(rpp->rgb) : 0;
+                            view.sptex = geo ? spin_tex(spp && !g_dbg.paint_override ? spp->rgb : NULL) : 0;
+                            view.spmode = g_spin_mode;
+                            memcpy(view.wheelT, wheelT, sizeof view.wheelT);
+                            memcpy(view.brakeT, brakeT, sizeof view.brakeT);
+                            view.cfg = carcfg;
+                            view.skin = g_skin_tex; memcpy(view.skinkey, g_skin_key, sizeof view.skinkey);
+                            const StockPaint *pp = paint_part(carcfg.paint[0]);
+                            if (pp) { for (int c = 0; c < 3; c++) view.paint[c] = pp->rgb[c] / 255.0f; view.pmat = pp->mat; }
+                            else if (g_stock_paint_ok) { memcpy(view.paint, g_stock_paint, sizeof view.paint); view.pmat = g_stock_paint_mat; }
+                            else { view.paint[0] = view.paint[1] = view.paint[2] = 0.5f; view.pmat = g_stock_paint_mat; }
+                            float M[16], Wm[16], at[3] = { g_room_carM[12], g_room_carM[13], g_room_carM[14] };
+                            mat_mul(Rc, g_room_carM, M); mat_mul(Rc, g_room_wheelM, Wm);
+                            tt_car_draw(&view, &rp, MVP, M, Wm, at, look);
+                        }
+                        if (g_tt_old.on) {   /* the outgoing turntable car */
+                            float M[16], Wm[16], pos[3];
+                            tt_old_place(carpos, heading, Rc, M, Wm, pos);
+                            tt_car_draw(&g_tt_old, &rp, MVP, M, Wm, pos, look);
+                        }
+                        glUseProgram(rp.prog);
+                        glEnable(GL_DEPTH_TEST);
+                        glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
+                        if (cull) glEnable(GL_CULL_FACE);
+                        glUniform1f(rp.uFogDensity, g_dbg.fog_density);
+                        g_room_refl_ready = 1;
+                        static int rr_logged;
+                        if (!rr_logged++) printf("garage floor reflection: first frame\n");
+                    }
+                    render_refl_end(W, H);
+                    render_scene_begin(W, H, 720.0f / (float)W);
+#ifdef OPENUG2_SIM_PRE_H
+                    if (rr_cost) {
+                        glFinish();
+                        rr_ms += (double)(SDL_GetPerformanceCounter() - rr_t0) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+                        if (++rr_np == 300) { printf("garage floor reflection: %.2f ms/pass\n", rr_ms / rr_np); rr_ms = 0; rr_np = 0; }
+                    }
+#endif
+                }
             }
             WT_MARK(8);
             /* Rear-view mirror (eView 3, 0x5caad0): RearViewMirrorCameraMover's
@@ -21911,15 +24373,28 @@ int main(int argc, char **argv) {
             g_rvm_ready = g_rvm_on && g_rvm_ready;
             if (g_rvm_on && world2 && g_dbg.show_track && !g_showroom && race_state != 3 &&
                 !(catchup && g_rvm_ready) && ((refl_tick & 1) == 1 || refl_every || !g_rvm_ready)) {
+#ifdef OPENUG2_SIM_PRE_H
+                /* sim aid OPENUG2_RVM_COST=1: the pass's own time (glFinish both sides, so the GPU
+                   work is inside), mean per pass every 300 passes */
+                static int rvm_cost = -1; static double rvm_ms; static int rvm_np;
+                if (rvm_cost < 0) rvm_cost = getenv("OPENUG2_RVM_COST") != NULL;
+                Uint64 rvm_t0 = 0;
+                if (rvm_cost) { glFinish(); rvm_t0 = SDL_GetPerformanceCounter(); }
+#endif
                 float fc[3] = { g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b };
                 if (render_rvm_begin(256, 96, fc)) {
                     const float rfar = 192.0f;                          /* 0x7870d8 */
                     float Pr[16], MVPm[16];
-                    /* GUESS: the FOV 20000 spans the mirror's width, its height
-                       from the drawn 240x80 (3:1) -- the eView's own aspect for
-                       view 3 is not decoded */
-                    float rfy = 2.0f * atanf(tanf(0.5f * g_rvm_cc.hfov43) / 3.0f);
-                    mat_persp(rfy, 3.0f, g_rvm_cc.znear, rfar, Pr);
+                    /* eViewPlatInfo::CalculateViewMatricies 0x5c7ec0 (GC
+                       CreateViewMatricies 801d8c68): x scale cot(fov x k / 2),
+                       y scale cot(fov x H/W of the view's target / 2), k = 1
+                       and no 1.1 / 1.15 factors for view 3; its target is
+                       256 x 256 (0x5ba1a0), so both are cot(fov / 2): a square
+                       view, squeezed 3:1 into the 240x80 mirror by the
+                       composite (0x5cbf40) -- the image looks flattened, as
+                       on the PC */
+                    float rfy = g_rvm_cc.hfov43;
+                    mat_persp(rfy, 1.0f, g_rvm_cc.znear, rfar, Pr);
                     mat_mul(Pr, g_rvm_cc.V, MVPm);
                     vita_use_lite(1);
                     GLboolean cull = glIsEnabled(GL_CULL_FACE);
@@ -21933,7 +24408,7 @@ int main(int argc, char **argv) {
                     render_model(&rp, NULL);
                     if (nsky) {   /* the dome */
                         float Psky[16], MVPs[16];
-                        mat_persp(rfy, 3.0f, g_rvm_cc.znear, 30000.0f, Psky);
+                        mat_persp(rfy, 1.0f, g_rvm_cc.znear, 30000.0f, Psky);
                         mat_mul(Psky, g_rvm_cc.V, MVPs);
                         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPs);
                         glUniform1f(rp.uEmissiveTex, 1.0f); glUniform1f(uUseTex, 1.0f);
@@ -22036,7 +24511,18 @@ int main(int argc, char **argv) {
                 }
                 render_rvm_end(W, H);
                 render_scene_begin(W, H, 720.0f / (float)W);
+#ifdef OPENUG2_SIM_PRE_H
+                if (rvm_cost) {
+                    glFinish();
+                    rvm_ms += (double)(SDL_GetPerformanceCounter() - rvm_t0) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+                    if (++rvm_np == 300) {
+                        printf("rear-view mirror cost: %.3f ms a pass (mean of 300, sim, glFinish)\n", rvm_ms / 300.0);
+                        rvm_ms = 0; rvm_np = 0;
+                    }
+                }
+#endif
             }
+            WT_MARK(10);
             /* car.fx environment: the game renders a 128 px cube around the
                car; here one 64 px face per frame, on the frames the road
                reflection skips (every frame when that is off). Contents as
@@ -22050,6 +24536,7 @@ int main(int argc, char **argv) {
                 float fc[3] = { g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b };
                 int face = env_face; env_face = (env_face + 1) % 6;
                 if (render_env_begin(face, fc)) {
+                    pf_detail.car_env_updated = 1;
                     float eye[3] = { carpos[0], carpos[1], carpos[2] + 1.0f };
                     float Ve[16], Pe[16], MVPe[16];
                     render_env_view(face, eye, Ve);
@@ -22073,7 +24560,7 @@ int main(int argc, char **argv) {
                         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MR);
                         glUniform1f(rp.uVColor, g_dbg.vcolor);
                         glUniform1f(rp.uFogDensity, 0.0f);
-                        room_draw_meshes(&rp, uUseTex, uColor, MR);
+                        room_draw_meshes(&rp, uUseTex, uColor, MR, 0);
                         glUniform1f(rp.uFogDensity, g_dbg.fog_density);
                         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
                         if (cull) glEnable(GL_CULL_FACE);
@@ -22148,6 +24635,18 @@ int main(int argc, char **argv) {
                         edraws += eblend;
                     }
                     if (nglow) render_world_glows(&rp, glowbatch, nglow, MVPe);
+                    if (g_acid_ok) {   /* the cube face's flares (flareType 1, 0x5cadd0); GUESS: the face view's
+                                          +0xc taken as retail's 128 px 90-degree face (64), the port's faces are 64 px */
+                        int ef = aciddraw_env_flares(Ve, MVPe, 64.0f);
+                        edraws += ef > 0;
+                        glUseProgram(rp.prog);
+                        glEnable(GL_DEPTH_TEST);
+#ifdef OPENUG2_SIM_PRE_H
+                        static int ef_log;
+                        if (ef > 0 && ef_log < 4 && getenv("OPENUG2_FLARE_LOG")) { ef_log++;
+                            printf("car environment face %d: %d flare quads (flareType 1)\n", face, ef); }
+#endif
+                    }
                     glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
                     if (cull) glEnable(GL_CULL_FACE);
                     vita_use_lite(0);
@@ -22223,7 +24722,7 @@ int main(int argc, char **argv) {
             vita_use_lite(1);   /* the dome covers most of the screen: cheap FS */
 #endif
             float MVPsky[16], Psky[16];
-            mat_persp(cam_fovy, (float)W/H, znear, 30000.0f, Psky);
+            mat_persp(cam_fovy, cam_aspect, znear, 30000.0f, Psky);
             mat_mul(Psky, V, MVPsky);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
             glUniform1f(uUnlit, 0.0f);
@@ -22286,7 +24785,7 @@ int main(int argc, char **argv) {
            track's linear density in g_dbg: taken as exp2 it cut the world
            at ~2.15 x (250 - that fog start), ~100 m -- closures popped in
            at the last second. */
-        float view_dist = zfar;
+        float view_dist = zfar_world;
         (void)VIEW_MINCONTRIB;
         { static int logged_fog = -1;
           if (logged_fog != g_fog_linear) {
@@ -22323,7 +24822,7 @@ int main(int argc, char **argv) {
         if (nvista && tier == 2 && g_dbg.show_track && !g_showroom && (passmode == 0 || passmode == 1)) {
             const float VISTA_MINCONTRIB = 0.35f;
             float Pv[16], MVPv[16];
-            mat_persp(cam_fovy, (float)W/H, znear, vista_far, Pv);
+            mat_persp(cam_fovy, cam_aspect, znear, vista_far, Pv);
             mat_mul(Pv, V, MVPv);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPv);
             float vd = vista_far > 1.0f
@@ -22466,6 +24965,24 @@ int main(int argc, char **argv) {
         int ndefblend = 0, ndefadd = 0, ndefcut = 0, nopaque = 0;
 #ifdef __vita__
         float world_planes[6][4]; world_view_planes(MVP,world_planes);
+        /* Buildings whose tile just entered the object radius (N2Batch.fade_in,
+           world_tiles.c) fade in over WFADE_MS from the activation of the
+           build that brought them, instead of popping: drawn after the opaque
+           and cutout world, blended at that strength with depth writes on. */
+        #define WFADE_MS 900u
+        static int fadeq[2048]; int nfadeq = 0;
+        static unsigned fade_gen = ~0u; static Uint32 fade_t0;
+        float fade_p = 1.0f;
+        if (active_resident) {
+            Uint32 now = SDL_GetTicks();
+            if ((unsigned)active_resident->generation != fade_gen) { fade_gen = (unsigned)active_resident->generation; fade_t0 = now; }
+            if (now - fade_t0 < WFADE_MS) fade_p = (float)(now - fade_t0) / (float)WFADE_MS;
+        }
+        {   static int fhold = -1;   /* test aid: OPENUG2_FADE_HOLD=<0..1> pins the fade strength */
+            if (fhold < 0) fhold = getenv("OPENUG2_FADE_HOLD") ? 1 : 0;
+            if (fhold) fade_p = (float)atof(getenv("OPENUG2_FADE_HOLD"));
+        }
+        if (render_dof_writes()) fade_p = 1.0f;   /* the frame's alpha holds depth then */
 #endif
         if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
@@ -22481,6 +24998,9 @@ int main(int argc, char **argv) {
         }
         #endif
         glUniform1f(rp.uVColor, g_dbg.vcolor);   /* apply source prelight to world geom */
+        static int tall_on = -1;   /* test aid: OPENUG2_NO_TALL culls the tall stand-ins at the view distance again */
+        if (tall_on < 0) tall_on = getenv("OPENUG2_NO_TALL") ? 0 : 1;
+        static long tall_far, tall_res;   /* tall batches drawn past the view distance / held (60-frame sums) */
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
             N2Batch *b = &wbatch[k];
@@ -22502,13 +25022,16 @@ int main(int argc, char **argv) {
               while (bd < 5 && dd >= BAND[bd]) bd++;
               band_b[bd]++; band_m[bd] += b->nmesh;
               for (int sc=0;sc<8;sc++) band_sc[bd][sc] += b->scen_count[sc]; }
-            if (dx*dx + dy*dy > VIEW_DIST*VIEW_DIST) {
+            if (dx*dx + dy*dy > (b->tall && tall_on ? zfar_world*zfar_world : VIEW_DIST*VIEW_DIST)) {
                 far_meshes += b->nmesh; far_batches++;
                 for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
                 continue;
             }
             #ifdef __vita__
             if (!world_box_in_view(world_planes,b->bbox_min,b->bbox_max)) continue;
+            if (b->tall) { tall_res++; if (dx*dx + dy*dy > VIEW_DIST*VIEW_DIST) tall_far++; }
+            if (b->fade_in && fade_p < 1.0f && VITA_PROBE(2) && b->drawmode != N2_DRAW_BLEND && b->drawmode != N2_DRAW_ADD &&
+                nfadeq < (int)(sizeof fadeq / sizeof *fadeq)) { fadeq[nfadeq++] = k; continue; }
             #endif
             if (b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD) {
                 if (defcap > 0) {
@@ -22611,6 +25134,32 @@ int main(int argc, char **argv) {
                 if (nviskept < 4096) viskept[nviskept++] = defcut[q];
             }
         }
+        #ifdef __vita__
+        if (nfadeq && !g_showroom) {   /* the arriving buildings (see WFADE_MS); none in a showroom (no world there) */
+            float fa = fade_p * fade_p * (3.0f - 2.0f * fade_p);   /* smoothstep */
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glUniform1f(rp.uAlpha, fa < 0.02f ? 0.02f : fa);
+            for (int q = 0; q < nfadeq; q++) {
+                N2Batch *b = &wbatch[fadeq[q]];
+                if (b->tex != lasttex) {
+                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                    else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                    lasttex = b->tex;
+                }
+                if (b->drawmode != lastmode) {
+                    glUniform1f(rp.uAlphaTest, b->drawmode == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
+                    lastmode = b->drawmode;
+                }
+                draw_batch(b);
+                ndrawn += b->nmesh; g_dbg.drawn++; wbdrawn++;
+                for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
+                if (nviskept < 4096) viskept[nviskept++] = fadeq[q];
+            }
+            glUniform1f(rp.uAlpha, 1.0f);
+            glDisable(GL_BLEND);
+        }
+        #endif
         if (lastmode == N2_DRAW_CUTOUT) glUniform1f(rp.uAlphaTest, 0.0f);
         if (g_dbg.show_track && (passmode == 0 || passmode == 1) && active_resident) {
             /* the smokeable props: their meshes are out of the batches */
@@ -22618,8 +25167,10 @@ int main(int argc, char **argv) {
                          active_resident->resources.mesh_modes, active_resident->generation);
             #ifdef __vita__
             smk_draw(&rp, MVP, cam, VIEW_DIST, (const float (*)[4])world_planes);
+            wa_draw(&rp, MVP, (const float (*)[4])world_planes);   /* RenderWorldModels 0x61d4b0 */
             #else
             smk_draw(&rp, MVP, cam, VIEW_DIST, NULL);
+            wa_draw(&rp, MVP, NULL);
             #endif
             if (tun_active() && tun_on_dyno()) dyroll_draw(&rp, MVP);   /* RenderCars -> RenderRollers */
             lasttex = (GLuint)-1; lastmode = -1;
@@ -22632,10 +25183,10 @@ int main(int argc, char **argv) {
                 int nrefl_res = 0;
                 for (int k = 0; k < nbatch; k++) nrefl_res += wbatch[k].reflect;
                 printf("world draws/frame: opaque %.0f cutout %.0f blend %.0f (of %d batches); "
-                       "wet road %.0f drawn/frame, %d of the area's batches reflective%s\n",
+                       "wet road %.0f drawn/frame, %d of the area's batches reflective%s; tall stand-ins drawn %.1f, %.1f of them past %.0f m\n",
                        wo/60.0, wc/60.0, wb/60.0, nbatch, g_refl_batches/60.0, nrefl_res,
-                       g_refl_ready ? "" : " (reflection off)");
-                g_refl_batches = 0;
+                       g_refl_ready ? "" : " (reflection off)", tall_res/60.0, tall_far/60.0, VIEW_DIST);
+                g_refl_batches = 0; tall_res = tall_far = 0;
                 if (g_ai_tilt.tilt > 0) {
                     AiTiltRecord r = g_ai_tilt; memset(&g_ai_tilt, 0, sizeof g_ai_tilt);
                     printf("traffic tilt %.1f deg (pitch %.1f roll %.1f) at (%.1f, %.1f, z %.2f) len %.1f; "
@@ -22722,7 +25273,15 @@ int main(int argc, char **argv) {
             glUniform1f(rp.uFogDensity, 0.0f);
             GLboolean room_cull = glIsEnabled(GL_CULL_FACE);
             glDisable(GL_CULL_FACE);
-            room_draw_meshes(&rp, uUseTex, uColor, MR);
+            if (g_room_refl_ready) {
+                glActiveTexture(GL_TEXTURE0 + RENDER_REFL_UNIT);
+                glBindTexture(GL_TEXTURE_2D, render_refl_texture());
+                glActiveTexture(GL_TEXTURE0);
+            }
+            memcpy(g_room_T, T, sizeof g_room_T); memcpy(g_room_look, look, sizeof g_room_look);
+            g_room_lock_fx = 1;
+            room_draw_meshes(&rp, uUseTex, uColor, MR, g_room_refl_ready);
+            g_room_lock_fx = 0;
             glUniform1f(rp.uFogDensity, g_dbg.fog_density);
             if (room_cull) glEnable(GL_CULL_FACE);
             vita_use_lite(0);
@@ -22788,9 +25347,9 @@ int main(int argc, char **argv) {
         WT_MARK(6);
         #ifdef __vita__
         if (++wt_frames == 60) {
-            printf("world_draw ms/frame: fog %.2f camclip %.2f refl %.2f env %.2f carvis+lights %.2f "
+            printf("world_draw ms/frame: fog %.2f camclip %.2f refl %.2f env %.2f mirror %.2f carvis+lights %.2f "
                    "sky %.2f vista %.2f opaque+cull %.2f cut+blend %.2f rest %.2f\n",
-                   wt_ms[0]/60, wt_ms[7]/60, wt_ms[8]/60, wt_ms[9]/60, wt_ms[1]/60,
+                   wt_ms[0]/60, wt_ms[7]/60, wt_ms[8]/60, wt_ms[9]/60, wt_ms[10]/60, wt_ms[1]/60,
                    wt_ms[2]/60, wt_ms[3]/60, wt_ms[4]/60, wt_ms[5]/60, wt_ms[6]/60);
             memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0;
         }
@@ -22836,6 +25395,18 @@ int main(int argc, char **argv) {
                 float MV[16]; mat_mul(MVP,M,MV);
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MV); draw_gpumesh(&quad);
                 g_dbg.drawn++;
+            }
+            if (g_showroom && g_tt_old.on) {   /* the outgoing turntable car's shadow, from its own body box */
+                float TM[16], TW[16], tp[3];
+                tt_old_place(carpos, heading, NULL, TM, TW, tp);
+                WGroundHit ground;
+                if (world_ground_hit(&scene, tp[0], tp[1], tp[2], &ground) != WSURF_NONE) {
+                    float gp[3] = { tp[0], tp[1], ground.z }, M[16], MV[16];
+                    mat_car_footprint(gp, heading, ground.normal, g_tt_old.bb, 1.10f, 1.35f, .03f, M);
+                    mat_mul(MVP, M, MV);
+                    glUniformMatrix4fv(uMVP, 1, GL_FALSE, MV); draw_gpumesh(&quad);
+                    g_dbg.drawn++;
+                }
             }
             glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f);
             glDepthMask(GL_TRUE); glDisable(GL_BLEND);
@@ -22893,6 +25464,23 @@ int main(int argc, char **argv) {
 
         /* car: solid-shaded, positioned + banked to the road (up = car_up) */
         if (ncar && VITA_PROBE(5) && !(g_showroom && tt_car_hidden())) {
+#ifdef __vita__
+            static int brake_mode_checked;
+            if (!brake_mode_checked) {
+                brake_mode_checked = 1;
+                FILE *baseline = fopen("ux0:data/NFSU2/brakebaseline.txt", "r");
+                g_pair_player_brakes = baseline == NULL;
+                if (baseline) fclose(baseline);
+                printf("player brake setup: %s\n", g_pair_player_brakes ? "paired per axle" : "baseline per side");
+            }
+#endif
+            int pf_live_body = pf_csv && race_state == 1 && g_rt.was_racing && !rp_up();
+#ifdef PF_VITA_THREAD
+            SceKernelThreadInfo pf_body_thread_start;
+            int pf_have_body_thread = pf_live_body && pf_thread_info(&pf_body_thread_start);
+#endif
+            Uint64 pf_player_body = pf_stamp();
+            int pf_player_start_draws = g_dbg.drawn;
             float Model[16], MVPc[16], WheelModel[16], MVPwheel[16];
             /* Wheel contact ride is this car's own measured tyre radius. Body
                ride may sit slightly lower for a per-car stock suspension tune;
@@ -22907,6 +25495,7 @@ int main(int argc, char **argv) {
             mat_car(bodypos, heading, body_up, ride, Model);
             if (g_showroom) {
                 memcpy(g_room_carM, Model, sizeof g_room_carM); g_room_carM_ok = 1;
+                mat_car(wheelpos, heading, car_up, car_ride, g_room_wheelM);
                 g_room_ride[0] = ride; g_room_ride[1] = car_ride;   /* for tt_old_take */
                 memcpy(g_room_up[0], body_up, sizeof g_room_up[0]); memcpy(g_room_up[1], car_up, sizeof g_room_up[1]);
             }
@@ -23084,6 +25673,8 @@ int main(int argc, char **argv) {
             if (g_dbg.paint_override) cp_spoiler.on = cp_roof.on = cp_mirror.on = cp_brake.on = cp_tip.on = 0;
             int ncat_paint[5] = { 0, 0, 0, 0, 0 };   /* spoiler, roof, tip, brakes, mirrors: meshes this frame */
             int brake_lights=(throttle < -0.1f && speed > 0.01f) || handbrake;
+            if (rp_up()) brake_lights = (g_rp_lt[0] & RPL_TAIL) != 0;   /* replay: as recorded */
+            else g_rp_plights = (g_rp_plights & ~RPL_TAIL) | (brake_lights ? RPL_TAIL : 0);
             int tail_on=g_dbg.night_mode || brake_lights;
             int vq=g_dbg.vehicle_quality<0?0:g_dbg.vehicle_quality>2?2:g_dbg.vehicle_quality;
             static const float qspec[3]={.55f,1.0f,1.10f};
@@ -23107,8 +25698,9 @@ int main(int argc, char **argv) {
                 float sh[10][4], at[3] = { carpos[0], carpos[1], carpos[2] + 0.6f };
                 /* the front end's garage has no track lights (QueryLightDatabase
                    is the world's): the platform's shaper rig alone */
-                int nl = carfx_sh(sh, at, look, g_showroom ? NULL : world.neighborhood.lights,
-                                  g_showroom ? 0 : world.neighborhood.nlights, (int)sizeof(N2LightSrc));
+                int nl = carfx_sh_revision(sh, at, look, g_showroom ? NULL : world.neighborhood.lights,
+                                  g_showroom ? 0 : world.neighborhood.nlights, (int)sizeof(N2LightSrc),
+                                  world.neighborhood.lights_revision);
                 render_carfx_sh(sh);
                 static unsigned shlog;
                 if (shlog++ % 600 == 0)
@@ -23139,20 +25731,24 @@ int main(int argc, char **argv) {
                         uint32_t mat = cgm[i].car_material;
                         ok[i] = cgm[i].vbo && cgm[i].ibo && m->car_mount == N2_MOUNT_BODY && !m->car_anim &&
                                 !m->car_decal && c != N2_CAR_GLASS && c != N2_CAR_LIGHT && c != N2_CAR_BRAKELIGHT &&
-                                !n2_lamp_clear_cover(c, mat) &&
+                                !n2_lamp_clear_cover(c, mat) && !n2_car_body_lamp(&car, i) &&
                                 part != N2_PART_SPOILER + 1 && part != N2_PART_SCOOP + 1 && part != N2_PART_MIRROR + 1 &&
                                 mat != N2_MAT_EXHAUST_TIP && mat != N2_MAT_CALIPER && mat != N2_MAT_CALLIPER &&
                                 cgm[i].texkey != N2_CF_TEX && !n2_carbon_mesh(&carcfg, m->car_cf, cgm[i].texkey);
                     }
                     pm_gpu = upload_scene_merged(&car, cgm, ok, pm_lead, &pm_n);
                     int cand = 0; for (int i = 0; i < ncar; i++) cand += ok[i];
-                    printf("player car draws: %d body meshes -> %d merged draws\n", cand, pm_n);
+                    int draws = pm_n;
+                    for (int i = 0; i < ncar; i++) draws += ok[i] && pm_lead[i] == -2;
+                    printf("player car draws: %d body meshes -> %d draws\n", cand, draws);
                 }
                 if (!pm_gpu) { free(pm_lead); pm_lead = NULL; pm_n = 0; }
                 free(ok);
 #endif
             }
             const short *plead = pm_gpu && !g_shop ? pm_lead : NULL;
+            Uint64 pf_mesh_start = pf_live_body ? SDL_GetPerformanceCounter() : 0;
+            Uint64 pf_submit_ticks = 0;
             /* per-mesh: each part wears its own bound texture (body/wheel/...);
                parts with no in-TPK texture get a sensible flat colour by class. */
             for (int i = 0; !follow_roam_ai && !g_cc_hide_car && i < ncar; i++) {
@@ -23172,9 +25768,11 @@ int main(int argc, char **argv) {
                 /* A tail light is an assembly, not a lamp: only its lens slices
                    emit. The trim, chrome and clear cover around them are the
                    same object and used to glow with it. */
-                int emitting = c==N2_CAR_LIGHT ? n2_headlight_emitter(&car,i) && headlights_on
-                                              : c==N2_CAR_BRAKELIGHT && tail_on
-                                                && n2_car_tail_lens(&car,i);
+                /* Retail never lights lamp geometry: UpdateLightStateTextures
+                   0x60c940 always swaps the HEADLIGHT/BRAKELIGHT[_GLASS] textures
+                   to <CAR>_..._OFF (every slot hashes "_OFF", 0x6322a1+); the lit
+                   look is the flares (RenderFlaresOnCar 0x615630) only. */
+                int emitting = 0;
                 /* A lamp that is ON stays on the LIT path. uUnlit returns a
                    flat uColor and throws away the specular, the fresnel rim
                    sheen and the environment reflection -- everything that
@@ -23235,7 +25833,9 @@ int main(int argc, char **argv) {
                                     ? &cp_brake : NULL;
                 /* carbon fibre: the part's skin swapped for CARBONFIBRE and its
                    paint for the CARBONFIBER material (0x620ae0 / 0x636840) */
-                GLuint cft = (c == N2_CAR_BODY || c == N2_CAR_MISC) &&
+                int body_lamp = n2_car_body_lamp(&car, i);   /* centre brake light lens */
+                if (body_lamp) { own = NULL; swp = NULL; }
+                GLuint cft = !body_lamp && (c == N2_CAR_BODY || c == N2_CAR_MISC) &&
                              (cgm[i].texkey == N2_CF_TEX ||
                               n2_carbon_mesh(&carcfg, car.meshes[i].car_cf, cgm[i].texkey))
                              ? carbon_tex(dataroot) : 0;
@@ -23287,8 +25887,11 @@ int main(int argc, char **argv) {
                     glUniform1f(uUseTex,tex?1.0f:0.0f);
                     if(tex)glBindTexture(GL_TEXTURE_2D,tex);
                 } else if (c == N2_CAR_BRAKELIGHT && n2_car_tail_lens(&car,i)) {
-                    render_tail_lamp(&rp,tex,g_dbg.night_mode,brake_lights,0,   /* nitrous does not light the brake lamps */
+                    render_tail_lamp(&rp,tex,0,0,0,   /* _OFF always (0x60c940): flares light it */
                                      light_variant_gain(carcfg.parts[N2_PART_TAILLIGHT]));
+                } else if (body_lamp) {
+                    /* centre brake light lens: _OFF always, its flare a2a2fc7c lights it */
+                    render_tail_lamp(&rp,tex,0,0,0,1.0f);
                 } else if (c == N2_CAR_BODY || c == N2_CAR_MISC) {
                     /* glossy paint; a mesh that references the badge/vinyl
                        atlas in its OWN 0x134012 slot list (a real per-mesh
@@ -23366,18 +25969,40 @@ int main(int argc, char **argv) {
 #endif
                 render_carfx_part(cgm[i].car_material, c);
                 if (mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE) {
+                    Uint64 pf_brake_start = pf_stamp();
                     int first = mount == N2_MOUNT_FRONT_BRAKE ? 0 : 2;
                     glDisable(GL_CULL_FACE); /* the opposite side mirrors Y */
-                    for (int k=first;k<first+2;k++) {
-                        float MB[16]; mat_mul(MVPwheel,brakeT[k],MB);
-                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);
-                        render_model(&rp,brakeWorld[k]);
-                        render_wheel_mesh(&rp, &cgm[i], tex, texmode); g_dbg.drawn++;
+                    if (g_pair_player_brakes) {
+                        float brake_mvp[2][16];
+                        for (int side = 0; side < 2; side++)
+                            mat_mul(MVPwheel, brakeT[first + side], brake_mvp[side]);
+                        render_wheel_mesh_n(&rp, &cgm[i], tex, texmode, 2,
+                                            (const float (*)[16])brake_mvp,
+                                            (const float (*)[16])&brakeWorld[first], uMVP);
+                    } else {
+                        for (int k = first; k < first + 2; k++) {
+                            float brake_mvp[16];
+                            mat_mul(MVPwheel, brakeT[k], brake_mvp);
+                            glUniformMatrix4fv(uMVP, 1, GL_FALSE, brake_mvp);
+                            render_model(&rp, brakeWorld[k]);
+                            render_wheel_mesh(&rp, &cgm[i], tex, texmode);
+                        }
                     }
+                    g_dbg.drawn += 2;
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                     render_model(&rp,Model);
                     if (g_dbg.car_cull) glEnable(GL_CULL_FACE);
-                } else { draw_gpumesh(plead && plead[i] >= 0 ? &pm_gpu[plead[i]] : &cgm[i]); g_dbg.drawn++; }
+                    if (pf_brake_start) {
+                        pf_detail.player_brakes += pf_elapsed(pf_brake_start);
+                        pf_detail.player_brake_meshes++;
+                    }
+                } else {
+                    GpuMesh *mesh = plead && plead[i] >= 0 ? &pm_gpu[plead[i]] : &cgm[i];
+                    Uint64 pf_submit_start = pf_live_body ? SDL_GetPerformanceCounter() : 0;
+                    draw_gpumesh(mesh);
+                    pf_submit_ticks += pf_elapsed(pf_submit_start);
+                    g_dbg.drawn++;
+                }
                 if (own) ncat_paint[own == &cp_spoiler ? 0 : own == &cp_mirror ? 4 : 1]++;
                 if (swp) ncat_paint[swp == &cp_tip ? 2 : 3]++;
                 if (own || swp || cft) {   /* back to the base paint */
@@ -23391,6 +26016,13 @@ int main(int argc, char **argv) {
                 if (insp_on && g_dbg.insp_flipn) glUniform1f(rp.uFlipN, 0.0f);
                 if (insp_on && g_dbg.insp_cull) { if (g_dbg.car_cull) glCullFace(GL_BACK); else glDisable(GL_CULL_FACE); }
 #endif
+            }
+            if (pf_mesh_start) {
+                Uint64 elapsed = pf_elapsed(pf_mesh_start);
+                Uint64 measured = pf_submit_ticks + pf_detail.player_brakes;
+                pf_detail.player_mesh_submit = pf_submit_ticks;
+                /* Includes material, texture and per-mesh bookkeeping. */
+                pf_detail.player_mesh_state = elapsed > measured ? elapsed - measured : 0;
             }
             glUniform1f(uUnlit, 0.0f);
             glUniform3f(rp.uEmissive, 0.0f, 0.0f, 0.0f);
@@ -23414,7 +26046,20 @@ int main(int argc, char **argv) {
                            ncat_paint[0], ncat_paint[1], ncat_paint[4], ncat_paint[2], ncat_paint[3]);
                 }
             }
+            pf_detail.player_body += pf_elapsed(pf_player_body);
+#ifdef PF_VITA_THREAD
+            SceKernelThreadInfo pf_body_thread_end;
+            if (pf_have_body_thread && pf_thread_info(&pf_body_thread_end)) {
+                pf_detail.player_body_thread_sample = 1;
+                if (pf_body_thread_end.runClocks >= pf_body_thread_start.runClocks)
+                    pf_detail.player_body_thread_us = pf_body_thread_end.runClocks - pf_body_thread_start.runClocks;
+                pf_detail.player_body_preempts = pf_body_thread_end.threadPreemptCount - pf_body_thread_start.threadPreemptCount;
+                pf_detail.player_body_interrupts = pf_body_thread_end.intrPreemptCount - pf_body_thread_start.intrPreemptCount;
+                pf_detail.player_body_releases = pf_body_thread_end.threadReleaseCount - pf_body_thread_start.threadReleaseCount;
+            }
+#endif
             pf_mark(PF_PLAYER_DRAW); pf_gpu(pf_frame,1);
+            pf_detail.player_draws += g_dbg.drawn - pf_player_start_draws;
             /* AI rivals use the same parsed material categories as the player.
                Their geometry is the initial car snapshot, so its stance and
                wheel tier must stay paired with it after an in-process switch. */
@@ -23422,7 +26067,8 @@ int main(int argc, char **argv) {
             /* AI draw split: per car kind (0 free-roam traffic, 1 racer,
                2 race traffic) ms in setup / lighting / body / wheels / glass,
                logged every 300 frames */
-            static double ads_ms[3][5]; static long ads_cars[3], ads_draws[3]; static int ads_frames;
+            static double ads_ms[3][5]; static long ads_cars[3], ads_draws[3], ads_reduced;
+            static int ads_frames;
             double ads_f = 1000.0 / (double)SDL_GetPerformanceFrequency();
             for (int ki = 0; ki < AI_N_ALL && VITA_PROBE(6); ki++) {
                 int k = AI_K(ki);
@@ -23453,6 +26099,15 @@ int main(int argc, char **argv) {
                 if(tv && tv->has_n2rec && rec_ride(tv->n2rec,&orb,NULL)) obodyride=orb;
                 float oradius=fmaxf(draw_profile.wheel_r*oscale,0.05f);
                 ais[k].wheel_angle=fmodf(ais[k].wheel_angle+ais[k].spd/oradius,6.2831853f);
+                if(olk&&olk->sptex){   /* its spinners (0x5ecac0): the rate eases toward the wheel's, vel += (w - vel) * 0.0035 / 0.0225 * dt */
+                    uint32_t now=SDL_GetTicks();
+                    float tdt=olk->spin_t?(now-olk->spin_t)/1000.0f:1.0f/60.0f;
+                    if(tdt<=0.0f)tdt=1.0f/60.0f;else if(tdt>0.1f)tdt=0.1f;
+                    float d=olk->spin_t?ais[k].spd/oradius:0.0f;   /* this frame's wheel turn, unwrapped */
+                    olk->spin_t=now;olk->spin_prev=ais[k].wheel_angle;
+                    olk->spin_vel+=(d/tdt-olk->spin_vel)*(0.0035f/0.0225f)*tdt;
+                    olk->spin_ang=fmodf(olk->spin_ang+olk->spin_vel*tdt,6.2831853f);
+                }
                 if(!ais[k].render_visible)continue;   /* wheel spin kept current above */
                 int ads_kind = k >= RT_T0 ? 2 : k >= RT_K0 ? 1 : 0, ads_d0 = g_dbg.drawn;
                 Uint64 ads_t[6]; ads_t[0] = SDL_GetPerformanceCounter();
@@ -23467,16 +26122,21 @@ int main(int argc, char **argv) {
                 if(ais[k].ride_ready)phys_ride_body_up(&ais[k].ride,ais[k].head,aup);
                 mat_car(ais[k].pos, ais[k].head, aup, obodyride, AIModel);
                 mat_mul(MVP, AIModel, AIMVPc);
+                int reduced_detail = 0;
+#ifdef __vita__
+                reduced_detail = ads_kind == 1 && g_rt.was_racing && !rp_up();
+                ads_reduced += reduced_detail;
+#endif
                 for(int w=0;w<4;w++){
                     mat_mul(AIWheelModel,aiWheelT[w],aiWheelWorld[w]);
-                    mat_mul(AIWheelModel,aiBrakeT[w],aiBrakeWorld[w]);
+                    if (!reduced_detail) mat_mul(AIWheelModel,aiBrakeT[w],aiBrakeWorld[w]);
                 }
                 glUniformMatrix4fv(uMVP, 1, GL_FALSE, AIMVPc);
                 render_model(&rp,AIModel);
                 if (render_carfx_active()) {
                     float sh[10][4], at[3] = { ais[k].pos[0], ais[k].pos[1], ais[k].pos[2] + 0.6f };
-                    carfx_sh(sh, at, look, world.neighborhood.lights, world.neighborhood.nlights,
-                             (int)sizeof(N2LightSrc));
+                    carfx_sh_revision(sh, at, look, world.neighborhood.lights, world.neighborhood.nlights,
+                             (int)sizeof(N2LightSrc), world.neighborhood.lights_revision);
                     render_carfx_sh(sh);
                 }
                 ads_t[1] = SDL_GetPerformanceCounter();
@@ -23494,16 +26154,44 @@ int main(int argc, char **argv) {
                             ok[i] = draw_gpu[i].vbo && draw_gpu[i].ibo &&
                                     draw_scene->meshes[i].car_mount == N2_MOUNT_BODY &&
                                     c != N2_CAR_GLASS && c != N2_CAR_LIGHT && c != N2_CAR_BRAKELIGHT &&
-                                    !n2_lamp_clear_cover(c, draw_gpu[i].car_material);
+                                    !n2_lamp_clear_cover(c, draw_gpu[i].car_material) &&
+                                    !n2_car_body_lamp(draw_scene, i);
                         }
                         mc->mgpu = upload_scene_merged(draw_scene, draw_gpu, ok, mc->mlead, &mc->nmgpu);
-                        int cand = 0; for (int i = 0; i < draw_nmesh; i++) cand += ok[i];
-                        printf("ai car draws: %d body meshes -> %d merged draws\n", cand, mc->nmgpu);
+                        int cand = 0, draws = mc->nmgpu;
+                        for (int i = 0; i < draw_nmesh; i++) {
+                            cand += ok[i];
+                            draws += ok[i] && mc->mlead[i] == -2;
+                        }
+                        printf("ai car draws: %d body meshes -> %d draws\n", cand, draws);
                     }
                     if (!mc->mgpu) { free(mc->mlead); mc->mlead = NULL; mc->nmgpu = 0; }
                     free(ok);
+                    /* Keep one existing interior draw behind the glass in
+                       live races. Prefer the largest batch by index count. */
+                    mc->cabin_mesh = -1;
+                    int cabin_indices = 0;
+                    for (int i = 0; i < draw_nmesh; i++) {
+                        if (draw_gpu[i].cat != N2_CAR_INTERIOR ||
+                            draw_scene->meshes[i].car_mount != N2_MOUNT_BODY ||
+                            !draw_gpu[i].vbo || !draw_gpu[i].ibo) continue;
+                        int batch = mc->mlead ? mc->mlead[i] : -2;
+                        if (batch == -1) continue;
+                        int indices = batch >= 0 ? mc->mgpu[batch].nidx : draw_gpu[i].nidx;
+                        if (indices > cabin_indices) {
+                            cabin_indices = indices;
+                            mc->cabin_mesh = i;
+                        }
+                    }
                 }
                 const short *mlead = tv && tv->mgpu ? tv->mlead : NULL;
+                int pf_rival_body = pf_csv && ads_kind == 1;
+                Uint64 pf_rival_begin = pf_rival_body ? SDL_GetPerformanceCounter() : 0;
+                int pf_body_start_draws = g_dbg.drawn;
+                unsigned pf_body_binds = 0;
+#ifdef __vita__
+                unsigned pf_body_switches = pf_rival_body ? vita_variant_switch_total() : 0;
+#endif
                 for (int i = 0; i < draw_nmesh; i++) {
                     if (mlead && mlead[i] == -1) continue;   /* drawn with its group */
                     int c=draw_gpu[i].cat;
@@ -23511,6 +26199,8 @@ int main(int argc, char **argv) {
                     int islight=c==N2_CAR_LIGHT||c==N2_CAR_BRAKELIGHT;
                     if(mount==N2_MOUNT_WHEEL||c==N2_CAR_GLASS||
                        n2_lamp_clear_cover(c,draw_gpu[i].car_material))continue;
+                    if (reduced_detail && ((c == N2_CAR_INTERIOR && tv && i != tv->cabin_mesh) ||
+                        mount == N2_MOUNT_FRONT_BRAKE || mount == N2_MOUNT_REAR_BRAKE)) continue;
                     if((c==N2_CAR_BODY&&!g_dbg.show_body)||(islight&&!g_dbg.show_lights)||
                        (c==N2_CAR_TIRE&&!g_dbg.show_tires)||
                        ((c==N2_CAR_MISC||c==N2_CAR_MECH||c==N2_CAR_INTERIOR)&&!g_dbg.show_misc))continue;
@@ -23521,8 +26211,7 @@ int main(int argc, char **argv) {
                     }
                     uint32_t material=draw_gpu[i].car_material;
                     int dark=n2_car_dark_trim(material),metal=n2_car_metal_trim(material);
-                    int heademit=c==N2_CAR_LIGHT&&g_dbg.night_mode&&
-                                 n2_headlight_emitter(draw_scene,i);
+                    int heademit=0;   /* lamp textures stay _OFF (0x60c940) */
                     glUniform1f(uUnlit,0.0f);glUniform1f(rp.uDecal,0.0f);
                     glUniform1f(uSpec,g_dbg.body_spec*qspec[vq]);glUniform1f(uGloss,qgloss[vq]);
                     glUniform1f(rp.uEnv,.15f);glUniform1f(rp.uClearcoat,0.0f);
@@ -23541,8 +26230,13 @@ int main(int argc, char **argv) {
                         if(heademit)glUniform3f(rp.uEmissive,gain*bc[0],gain*bc[1],gain*bc[2]);
                         glUniform1f(rp.uEnv,.55f);
                     }else if(c==N2_CAR_BRAKELIGHT&&n2_car_tail_lens(draw_scene,i)){
-                        render_tail_lamp(&rp,tex,g_dbg.night_mode,ais[k].braking,0,
+                        render_tail_lamp(&rp,tex,0,0,0,
                             light_variant_gain(draw_config.parts[N2_PART_TAILLIGHT]));
+                        pf_body_binds += tex != 0;
+                    }else if(n2_car_body_lamp(draw_scene,i)){
+                        /* centre brake light lens: _OFF always (0x60c940) */
+                        render_tail_lamp(&rp,tex,0,0,0,1.0f);
+                        pf_body_binds += tex != 0;
                     }else if(c==N2_CAR_BODY||c==N2_CAR_MISC){
                         glUniform1f(uSpec,g_dbg.body_spec*qspec[vq]*(draw_gpu[i].trim?.4f:1.0f));
                         glUniform1f(uGloss,draw_gpu[i].trim?6.0f:qgloss[vq]);
@@ -23561,6 +26255,7 @@ int main(int argc, char **argv) {
                         else glUniform3f(uColor,.055f,.055f,.058f);
                     }
                     glUniform1f(uUseTex,tex?1.0f:0.0f);if(tex)glBindTexture(GL_TEXTURE_2D,tex);
+                    pf_body_binds += tex != 0;
                     render_carfx_part(draw_gpu[i].car_material, c);
                     if (mount==N2_MOUNT_FRONT_BRAKE || mount==N2_MOUNT_REAR_BRAKE) {
                         int first=mount==N2_MOUNT_FRONT_BRAKE?0:2;
@@ -23568,11 +26263,20 @@ int main(int argc, char **argv) {
                             glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);
                             render_model(&rp,aiBrakeWorld[w]);
                             render_wheel_mesh(&rp,&draw_gpu[i],tex,texmode);g_dbg.drawn++;}
+                        pf_body_binds += 4; /* bind and restore per wheel */
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,AIMVPc);
                         render_model(&rp,AIModel);
                     } else { draw_gpumesh(mlead && mlead[i] >= 0 ? &tv->mgpu[mlead[i]] : &draw_gpu[i]); g_dbg.drawn++; }
                 }
                 ads_t[2] = SDL_GetPerformanceCounter();
+                if (pf_rival_body) {
+                    pf_detail.rival_body += ads_t[2] - pf_rival_begin;
+                    pf_detail.rival_draws += g_dbg.drawn - pf_body_start_draws;
+                    pf_detail.rival_binds += pf_body_binds;
+#ifdef __vita__
+                    pf_detail.rival_switches += vita_variant_switch_total() - pf_body_switches;
+#endif
+                }
                 /* A lit lamp (headlight emitter / tail lamp) can be the body
                    loop's last draw: its uEmissive must not carry into the
                    wheels and glass (render_wheel_mesh and the glass pass keep
@@ -23587,11 +26291,17 @@ int main(int argc, char **argv) {
                         if(olk->rgm[li].cat==N2_CAR_TIRE)olib_tire=1;
                         if(olk->rgm[li].cat==N2_CAR_INTERIOR)olib_inner=1;
                     }
+                    int orubber=0;   /* the model's wheel slices are all TIRE: under a library rim only its RUBBER */
+                    for(int i=0;orims&&authored&&i<draw_nmesh;i++)
+                        if(draw_scene->meshes[i].car_mount==N2_MOUNT_WHEEL&&
+                           draw_scene->meshes[i].tierid==draw_scene->meshes[draw_stock_wheel].tierid&&
+                           draw_gpu[i].car_material==N2_MAT_RUBBER)orubber=1;
                     for(int i=0;authored&&i<draw_nmesh;i++){
                         if(draw_scene->meshes[i].car_mount!=N2_MOUNT_WHEEL||
                            draw_scene->meshes[i].tierid!=draw_scene->meshes[draw_stock_wheel].tierid)continue;
                         /* a library rim is a whole assembly; an incomplete one keeps the model's tyre */
                         if(orims&&((olib_tire&&olib_inner)||(draw_gpu[i].cat!=N2_CAR_TIRE&&draw_gpu[i].cat!=N2_CAR_INTERIOR)))continue;
+                        if(orims&&orubber&&draw_gpu[i].cat==N2_CAR_TIRE&&draw_gpu[i].car_material!=N2_MAT_RUBBER)continue;
                         GLuint tex=0;int mode=N2_DRAW_OPAQUE;
                         for(int j=0;j<draw_nmap;j++)if(draw_mapkey[j]==draw_gpu[i].texkey){tex=draw_maptex[j];mode=draw_mapmode[j];break;}
                         float MW[4][16];for(int w=0;w<4;w++)mat_mul(AIWheelMVP,aiWheelT[w],MW[w]);
@@ -23599,30 +26309,49 @@ int main(int argc, char **argv) {
                                             (const float(*)[16])aiWheelWorld,uMVP);
                         g_dbg.drawn+=4;
                     }
-                    if(orims){   /* the opponent's rims (as the player's library rims; spinners drawn still) */
-                        float wmvp[4][16]; int nr=olk->nr, order[4*AIRACE_RIM_MAX];
+                    if(orims){   /* the opponent's rims (as the player's library rims: DUMMY_WHEEL / DUMMY_SPINNER) */
+                        float wmvp[4][16], smvp[4][16], sworld[4][16]; int nr=olk->nr, order[4*AIRACE_RIM_MAX];
                         if(nr>AIRACE_RIM_MAX)nr=AIRACE_RIM_MAX;
                         for(int w=0;w<4;w++)mat_mul(AIWheelMVP,aiWheelT[w],wmvp[w]);
+                        if(olk->sptex){   /* the spinner: the same hub, its own angle (0x5ec7f0) */
+                            float sT[4][16], sB[4][16];
+                            ai_wheel_matrices(&draw_wheel,oscale,olk->spin_ang,steer,ais[k].ride_ready?&ais[k].ride:NULL,sT,sB);
+                            for(int w=0;w<4;w++){mat_mul(AIWheelMVP,sT[w],smvp[w]);mat_mul(AIWheelModel,sT[w],sworld[w]);}
+                        }
                         for(int q=0;q<4*nr;q++)order[q]=q;
                         if(olk->rtex&&olk->rmode==N2_DRAW_BLEND&&nr==olk->nr)render_wheel_order(&olk->rl,wmvp,order);
                         glUniform1f(uUseTex,olk->rtex?1.0f:0.0f);
                         glUniform1f(rp.uEnv,0.0f);glUniform1f(uSpec,0.85f);
                         glUniform3fv(uColor,1,g_dbg.rim_color);
-                        glUniform1f(rp.uRimTint,olk->rtex&&g_dbg.rim_paint?1.0f:0.0f);
-                        CatPaint ocp=cat_paint(&draw_config,4,1);   /* the rim paint (slot 0x49) */
-                        if(ocp.on){glUniform3fv(uColor,1,ocp.rgb);glUniform1f(rp.uRimTint,olk->rtex?1.0f:0.0f);}
+                        /* the rim paint (slot 0x49): the DUMMY_WHEEL composite, and the paint's
+                           light material in place of the mag finishes (as the player's) */
+                        CatPaint ocp=cat_paint(&draw_config,4,1);
+                        float rtint=!ocp.on&&olk->rtex&&g_dbg.rim_paint?1.0f:0.0f;
+                        GLuint ortex=olk->rptex?olk->rptex:olk->rtex;
+                        if(ocp.on){
+                            static const uint32_t omags[3]={N2_MAT_MAGSILVER,N2_MAT_MAGCHROME,N2_MAT_RIMPAINT3};
+                            glUniform3fv(uColor,1,ocp.rgb);carfx_use_paint(ocp.mat);render_carfx_swap(omags,3);
+                        }
+                        glUniform1f(rp.uRimTint,rtint);
                         if(olk->rtex&&olk->rmode==N2_DRAW_BLEND&&nr==olk->nr){   /* painter order across the 4 wheels */
                             for(int q=0;q<4*nr;q++){
                                 int w=order[q]/nr,li=order[q]%nr;
-                                glUniformMatrix4fv(uMVP,1,GL_FALSE,wmvp[w]);render_model(&rp,aiWheelWorld[w]);
-                                render_wheel_mesh(&rp,&olk->rgm[li],olk->rtex,olk->rmode);g_dbg.drawn++;
+                                int sp=olk->sptex&&li<olk->rl.count&&olk->rl.meshes[li].car_anim==N2_WHEEL_SPIN;
+                                glUniformMatrix4fv(uMVP,1,GL_FALSE,sp?smvp[w]:wmvp[w]);render_model(&rp,sp?sworld[w]:aiWheelWorld[w]);
+                                if(sp)glUniform1f(rp.uRimTint,0.0f);   /* the spinner wears its own paint */
+                                render_wheel_mesh(&rp,&olk->rgm[li],sp?olk->sptex:ortex,sp?olk->spmode:olk->rmode);g_dbg.drawn++;
+                                if(sp)glUniform1f(rp.uRimTint,rtint);
                             }
                         }else for(int li=0;li<nr;li++){   /* one state setup per mesh, then its 4 wheels */
-                            render_wheel_mesh_n(&rp,&olk->rgm[li],olk->rtex,olk->rmode,4,
-                                                (const float(*)[16])wmvp,(const float(*)[16])aiWheelWorld,uMVP);
+                            int sp=olk->sptex&&li<olk->rl.count&&olk->rl.meshes[li].car_anim==N2_WHEEL_SPIN;
+                            if(sp)glUniform1f(rp.uRimTint,0.0f);
+                            render_wheel_mesh_n(&rp,&olk->rgm[li],sp?olk->sptex:ortex,sp?olk->spmode:olk->rmode,4,
+                                                (const float(*)[16])(sp?smvp:wmvp),(const float(*)[16])(sp?sworld:aiWheelWorld),uMVP);
+                            if(sp)glUniform1f(rp.uRimTint,rtint);
                             g_dbg.drawn+=4;
                         }
                         glUniform1f(rp.uRimTint,0.0f);
+                        if(ocp.on){render_carfx_swap(NULL,0);carfx_use_paint(0);}
                     }
                     else if(!authored&&have_wheel){
                         glUniform1f(uUseTex,1.0f);glBindTexture(GL_TEXTURE_2D,texWheel);
@@ -23649,7 +26378,10 @@ int main(int argc, char **argv) {
                         glUniform1f(uAlpha,window?.46f:g_dbg.headlight_lens_alpha);
                         if(window)glUniform3f(uColor,.020f,.024f,.032f);else glUniform3f(uColor,.30f,.32f,.34f);
                         render_carfx_part(draw_gpu[i].car_material, draw_gpu[i].cat);
+                        GLuint dwt=k>=RT_K0&&k<RT_T0?glass_damage_tex(&g_acid_o[k-RT_K0],&draw_gpu[i]):0;
+                        if(dwt)glass_damage_on(&rp,uUseTex,dwt);
                         draw_gpumesh(&draw_gpu[i]);g_dbg.drawn++;
+                        if(dwt)glass_damage_off(&rp,uUseTex);
                     }
                     glUniform1f(uAlpha,1.0f);glUniform1f(rp.uFresnel,0.0f);
                     glDepthMask(GL_TRUE);glDisable(GL_BLEND);
@@ -23670,9 +26402,12 @@ int main(int argc, char **argv) {
                         kn[q], ads_ms[q][4] / ads_frames, (double)ads_cars[q] / ads_frames,
                         ads_draws[q] / ads_cars[q], ads_ms[q][0] / ads_frames, ads_ms[q][1] / ads_frames,
                         ads_ms[q][2] / ads_frames, ads_ms[q][3] / ads_frames);
+                if (ads_reduced && len > 0 && (size_t)len < sizeof line)
+                    snprintf(line + len, sizeof line - (size_t)len,
+                             " | reduced-detail rivals %.1f/frame", (double)ads_reduced / ads_frames);
                 if (len > 0 && (ads_cars[0] || ads_cars[1] || ads_cars[2])) printf("%s\n", line);
                 memset(ads_ms, 0, sizeof ads_ms); memset(ads_cars, 0, sizeof ads_cars);
-                memset(ads_draws, 0, sizeof ads_draws); ads_frames = 0;
+                memset(ads_draws, 0, sizeof ads_draws); ads_frames = 0; ads_reduced = 0;
             }
             pf_mark(PF_AI_DRAW); pf_gpu(pf_frame,2);
             /* Player::RenderGetAwayArrow 0x5f3ae0 (from RenderCars 0x6316d0):
@@ -23681,7 +26416,7 @@ int main(int argc, char **argv) {
                 float tgt[3];
                 if (g_rt.roam && g_rt.w && race_state != 3 && aienc_arrow(g_rt.w, tgt) &&
                     marker_load(dataroot, MK_DIRECTION))
-                    marker_draw(&rp, MK_DIRECTION, V, MVP, 2.0f * atanf(tanf(0.5f * cam_fovy) / 0.75f), tgt);
+                    marker_draw(&rp, MK_DIRECTION, V, MVP, cam_hfov, tgt);
             }
             /* Player::RenderGPSArrow 0x5f3cb0, right after: free roam, the
                controller on a route; the last aim held while it re-routes */
@@ -23691,7 +26426,7 @@ int main(int argc, char **argv) {
                 if (aigps_arrow_point(g_gps.pf, g_n2s.pos, g_n2s.speed, tgt)) { memcpy(g_gps.arrow, tgt, sizeof tgt); g_gps.arrow_ok = 1; }
                 else if (cs != 1 && cs != 2) g_gps.arrow_ok = 0;
                 if (g_gps.arrow_ok && (cs == 1 || cs == 2) && marker_load(dataroot, MK_GPS))
-                    marker_draw(&rp, MK_GPS, V, MVP, 2.0f * atanf(tanf(0.5f * cam_fovy) / 0.75f), g_gps.arrow);
+                    marker_draw(&rp, MK_GPS, V, MVP, cam_hfov, g_gps.arrow);
             }
             /* the pre-race scene's characters (0x61d150, worldbone.fx) */
             if (g_rt.nisd && g_rt.nis && !g_rt.post_done) {
@@ -23720,6 +26455,8 @@ int main(int argc, char **argv) {
                 glUseProgram(rp.prog);
             }
             /* Opponents use their own matrices; restore player shader space. */
+            Uint64 pf_player_late = pf_stamp();
+            pf_player_start_draws = g_dbg.drawn;
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
             render_model(&rp,Model);
             /* Decals (0x61ff40): each location's slices wearing their slot's
@@ -23800,7 +26537,10 @@ int main(int argc, char **argv) {
                     if(selected && g_dbg.insp_wire)glPolygonMode(GL_FRONT_AND_BACK,GL_LINE);
 #endif
                     render_carfx_part(cgm[i].car_material, cgm[i].cat);
+                    GLuint dwt = glass_damage_tex(&g_acid_p, &cgm[i]);
+                    if (dwt) glass_damage_on(&rp, uUseTex, dwt);
                     draw_gpumesh(cgm+i);g_dbg.drawn++;
+                    if (dwt) glass_damage_off(&rp, uUseTex);
                     if (tm) {
                         render_carfx_swap(NULL, 0); carfx_use_paint(g_dbg.paint_override ? 0 : pmat);
                         glUniform1f(rp.uTextureAlpha, 0.0f); glUniform1f(rp.uFresnel, 1.0f);
@@ -23821,7 +26561,10 @@ int main(int argc, char **argv) {
                so the halo has a soft edge; plain ONE/ONE would be a hard disc).
                Depth-tested (occluded by nearer body) but no depth write; nudged
                slightly toward the camera so it sits over its own lens. */
-            if (!follow_roam_ai && !g_cc_hide_car && g_dbg.show_lights && (tail_on || headlights_on)) {
+            /* OFF: port invention. Retail draws no lamp halo of its own; the car's
+               lit lamps are its flares (RenderFlaresOnCar 0x615630, car_light_flares)
+               over _OFF lamp textures (0x60c940). */
+            if (0 && !follow_roam_ai && !g_cc_hide_car && g_dbg.show_lights && (tail_on || headlights_on)) {
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
                 glDepthMask(GL_FALSE);
                 glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
@@ -23901,9 +26644,8 @@ int main(int argc, char **argv) {
                    plain part's 0x40 makes a full 0x80 tube) */
                 float nr = (float)(nc & 0xff) / 128.0f, ng = (float)(nc >> 8 & 0xff) / 128.0f,
                       nb = (float)(nc >> 16 & 0xff) / 128.0f, na = (float)(nc >> 24) / 128.0f;
-                static struct { int gen, n; float p[24][6]; } nseg = { -1, 0 };
-                if (nseg.gen != g_car_gen) {
-                    nseg.gen = g_car_gen; nseg.n = 0;
+                if (g_neon_seg.gen != g_car_gen) {
+                    g_neon_seg.gen = g_car_gen; g_neon_seg.n = 0;
                     Uint64 nt0 = SDL_GetPerformanceCounter();
                     static const char *const where[3] = { "FRONT", "SIDE", "REAR" };
                     /* all 48 markers in one walk of the car's sources */
@@ -23919,11 +26661,11 @@ int main(int argc, char **argv) {
                     n2_car_sockets(cdata, clen, &car, keys, 48, m, res);
                     for (int s = 0; s < 24; s++) {
                         if (res[s * 2] != 1 || res[s * 2 + 1] != 1) continue;
-                        memcpy(nseg.p[nseg.n], m[s * 2] + 12, 3 * sizeof(float));
-                        memcpy(nseg.p[nseg.n] + 3, m[s * 2 + 1] + 12, 3 * sizeof(float));
-                        nseg.n++;
+                        memcpy(g_neon_seg.p[g_neon_seg.n], m[s * 2] + 12, 3 * sizeof(float));
+                        memcpy(g_neon_seg.p[g_neon_seg.n] + 3, m[s * 2 + 1] + 12, 3 * sizeof(float));
+                        g_neon_seg.n++;
                     }
-                    printf("neon: %d tube(s), %.1f ms\n", nseg.n,
+                    printf("neon: %d tube(s), %.1f ms\n", g_neon_seg.n,
                            (double)(SDL_GetPerformanceCounter() - nt0) * 1000.0 / (double)SDL_GetPerformanceFrequency());
                 }
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
@@ -23946,7 +26688,7 @@ int main(int argc, char **argv) {
                     glBindTexture(GL_TEXTURE_2D, ut);
                     draw_gpumesh(&quad); g_dbg.drawn++;
                 }
-                GLuint bt = nseg.n ? neon_blur_tex(dataroot) : 0;
+                GLuint bt = g_neon_seg.n ? neon_blur_tex(dataroot) : 0;
                 if (bt) {
                     static GpuMesh piece[3]; static int made;
                     if (!made) { piece[0] = neon_piece(0.0f, 0.5f); piece[1] = neon_piece(0.5f, 0.5f); piece[2] = neon_piece(0.5f, 1.0f); made = 1; }
@@ -23958,8 +26700,8 @@ int main(int argc, char **argv) {
                         float l2 = Model[j*4]*Model[j*4] + Model[j*4+1]*Model[j*4+1] + Model[j*4+2]*Model[j*4+2];
                         lc[j] = (Model[j*4]*dc[0] + Model[j*4+1]*dc[1] + Model[j*4+2]*dc[2]) / (l2 > 1e-8f ? l2 : 1.0f);
                     }
-                    for (int s = 0; s < nseg.n; s++) {
-                        const float *p0 = nseg.p[s], *p1 = nseg.p[s] + 3;
+                    for (int s = 0; s < g_neon_seg.n; s++) {
+                        const float *p0 = g_neon_seg.p[s], *p1 = g_neon_seg.p[s] + 3;
                         float d[3] = { p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2] };
                         float L = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
                         if (L < 1e-4f) continue;
@@ -24032,7 +26774,7 @@ int main(int argc, char **argv) {
                    (that, not the texture, was the old green cast) and a strong
                    specular adds the chrome highlight over the diffuse.
                    uColor is ignored on the textured path (base = t.rgb). */
-                float rim_tint = 0.0f; GLuint spintex = 0;
+                float rim_tint = 0.0f; GLuint spintex = 0, rimdraw = rimtex;
                 int geo = nwheelgm > 0 && !(stock_wheel>=0 &&
                     car.meshes[stock_wheel].vcol && wheel_brand==0 && wheel_style==1);
                 if (geo) {
@@ -24049,13 +26791,23 @@ int main(int argc, char **argv) {
                     }
                     if (stock_wheel >= 0 && !(library_tire && library_interior)) {
                         /* Draw rubber first, then the authored annular INTERIOR
-                           backing produced by n2_open_wheel_backing(). */
+                           backing produced by n2_open_wheel_backing(). Every
+                           stock wheel slice is category TIRE (name rule), so
+                           pass 0 keeps only the RUBBER material: the stock rim
+                           face (MAGSILVER/MAGCHROME/...) must not cover the
+                           aftermarket rim and its paint. */
+                        int stock_rubber = 0;
+                        for (int i = 0; i < ncar; i++)
+                            if (car.meshes[i].car_mount == N2_MOUNT_WHEEL &&
+                                car.meshes[i].tierid == car.meshes[stock_wheel].tierid &&
+                                cgm[i].car_material == N2_MAT_RUBBER) stock_rubber = 1;
                         for (int pass = 0; pass < 2; pass++) {
                             int wanted = pass == 0 ? N2_CAR_TIRE : N2_CAR_INTERIOR;
                             for (int i = 0; i < ncar; i++) {
                                 if (car.meshes[i].car_mount != N2_MOUNT_WHEEL ||
                                     car.meshes[i].tierid != car.meshes[stock_wheel].tierid ||
                                     cgm[i].cat != wanted) continue;
+                                if (pass == 0 && stock_rubber && cgm[i].car_material != N2_MAT_RUBBER) continue;
                                 GLuint stex=0; int smode=N2_DRAW_OPAQUE;
                                 for (int j=0; j<nmap; j++)
                                     if (mapkey[j] == cgm[i].texkey) {
@@ -24086,15 +26838,18 @@ int main(int argc, char **argv) {
                        slot 0x1d) wear it in place of their mag finishes */
                     CatPaint cp_rim = cat_paint(&carcfg, 4, !(wheel_brand == 0 && wheel_style == 1)
                                                             && !g_dbg.paint_override);
+                    const StockPaint *rpp = cp_rim.on ? paint_part(carcfg.paint[4]) : NULL;
+                    GLuint rimpt = rimtex && rpp ? rimp_tex(rpp->rgb) : 0;   /* DUMMY_WHEEL (0x6343a0) */
                     if (cp_rim.on) {
                         static const uint32_t mags[3] = { N2_MAT_MAGSILVER, N2_MAT_MAGCHROME, N2_MAT_RIMPAINT3 };
                         glUniform3fv(uColor, 1, cp_rim.rgb);
-                        glUniform1f(rp.uRimTint, rimtex ? 1.0f : 0.0f);
+                        glUniform1f(rp.uRimTint, 0.0f);
                         carfx_use_paint(cp_rim.mat);
                         render_carfx_swap(mags, 3);
                     }
-                    if (rimtex) glBindTexture(GL_TEXTURE_2D, rimtex);
-                    rim_tint = cp_rim.on ? (rimtex ? 1.0f : 0.0f) : rimtex && g_dbg.rim_paint ? 1.0f : 0.0f;
+                    if (rimpt) rimdraw = rimpt;   /* this frame's rim texture: the painted composite */
+                    if (rimdraw) glBindTexture(GL_TEXTURE_2D, rimdraw);
+                    rim_tint = cp_rim.on ? 0.0f : rimtex && g_dbg.rim_paint ? 1.0f : 0.0f;
                     const StockPaint *spp = paint_part(carcfg.paint[5]);   /* Spinners (slot 0x4a) */
                     spintex = spin_tex(spp && !g_dbg.paint_override ? spp->rgb : NULL);
                 } else {
@@ -24114,7 +26869,7 @@ int main(int argc, char **argv) {
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,sp?smvp[k]:wmvp[k]);
                         render_model(&rp,sp?spinWorld[k]:wheelWorld[k]);
                         if (sp) glUniform1f(rp.uRimTint, 0.0f);   /* the spinner wears its own paint */
-                        render_wheel_mesh(&rp,&wheelgm[i],sp && spintex ? spintex : rimtex,sp && spintex ? g_spin_mode : rimmode);
+                        render_wheel_mesh(&rp,&wheelgm[i],sp && spintex ? spintex : rimdraw,sp && spintex ? g_spin_mode : rimmode);
                         if (sp) glUniform1f(rp.uRimTint, rim_tint);
                     }
                 } else for(int k=0;k<4;k++) {
@@ -24133,12 +26888,18 @@ int main(int argc, char **argv) {
             render_model(&rp,NULL);   /* back to world */
             glUniform1f(rp.uEnv, 0.0f);   /* reflections are cars-only */
             glUniform3f(rp.uEmissive, 0.0f, 0.0f, 0.0f);   /* lamps-only */
+            pf_detail.player_late += pf_elapsed(pf_player_late);
+            pf_detail.player_draws += g_dbg.drawn - pf_player_start_draws;
         }
 
         /* Rival lamp halos use the decoded model anchors too. Rear lamps also
            appear while braking in daylight; front lamps remain night-only. */
         render_carfx_end();   /* never leak the car variant into later passes */
-        if (g_showroom && VITA_PROBE(5)) tt_old_draw(&rp, MVP, carpos, heading, look);   /* the outgoing turntable car */
+        if (g_showroom && VITA_PROBE(5)) {   /* the outgoing turntable car */
+            tt_old_draw(&rp, MVP, carpos, heading, look);
+            tt_old_neon(&rp, MVP, carpos, heading, cam, race_state == 3 ? 1.0f : (float)SDL_GetTicks() * 0.001f,
+                        &quad, dataroot);
+        }
         pf_mark(PF_MID_DRAW);
         if (race_state != 3 && nai > 0 && g_dbg.show_lights) {
             float lz=sqrtf(look[0]*look[0]+look[1]*look[1]+look[2]*look[2]); if(lz<1e-4f)lz=1;
@@ -24203,7 +26964,7 @@ int main(int argc, char **argv) {
         pf_mark(PF_AI_LAMPS);
 #ifdef __vita__
         if (g_ai_async_on < 0) {
-            FILE *af = fopen("ux0:data/OpenUG2/noaiasync.txt", "r");
+            FILE *af = fopen("ux0:data/NFSU2/noaiasync.txt", "r");
             g_ai_async_on = !af; if (af) fclose(af);
             printf("traffic steps: %s\n", g_ai_async_on ? "pipelined (worker cores, overlap the HUD)"
                                                         : "in place (noaiasync.txt)");
@@ -24264,11 +27025,19 @@ int main(int argc, char **argv) {
         pf_mark(PF_PD_SOUND);
         /* The car effects (0x5f5730 per car, once per drawn frame) and the
            particle system's tick (0x492e10), then its draw (0x48bdf0) */
+        {   /* the world animations (0x4321c0), on the particles' clock */
+#ifdef __vita__
+            float wa_dt = g_pause.on ? 0.0f : (float)vita_ticks / 60.0f * n2sim_time_scale();
+#else
+            float wa_dt = 1.0f / 60.0f * n2sim_time_scale();
+#endif
+            wa_update(wa_dt, g_career_nis_on || (g_rt.active && g_rt.nis && race_state == 0));
+        }
         if (g_acid_ok) {
 #ifdef __vita__
-            float acid_dt = g_pause.on ? 0.0f : (float)vita_ticks / 60.0f;   /* paused: smoke holds */
+            float acid_dt = rp_up() ? (float)g_rp_moved / 60.0f : g_pause.on ? 0.0f : (float)vita_ticks / 60.0f * n2sim_time_scale();   /* paused: smoke holds; replay: the playback ticks */
 #else
-            float acid_dt = 1.0f / 60.0f;
+            float acid_dt = rp_up() ? (float)g_rp_moved / 60.0f : 1.0f / 60.0f * n2sim_time_scale();
 #endif
             acid_set_cameras((const float (*)[3])view_cam, 1);
             int live = race_state != 3 && !sstatic && !g_showroom;
@@ -24276,8 +27045,11 @@ int main(int argc, char **argv) {
                 static AcidMarker pmk[64]; static int pnmk;
                 if (!g_acid_p.c || g_acid_p.s != g_n2 || g_acid_p.gen != g_n2rec_gen)
                     pnmk = car_markers(cdata, clen, &car, pmk, 64);
+                if (rp_up()) { g_acid_rpst = &g_n2s; g_acid_rpl = g_rp_lt[0]; g_acid_rpbot = g_rp_moved ? g_n2s.bottom : 0.0f; }
+                g_acid_nocentre = selcar >= 0 && selcar < ncars && car_drops_centre_flare(carlist[selcar], &carcfg);
                 acid_slot_step(&g_acid_p, g_n2, g_n2rec_gen, &g_n2s, pmk, pnmk, view_cam, acid_dt,
                                RT_RACE ? g_rt.pslot + 1 : 0, carbb);
+                g_acid_rpst = NULL; g_acid_nocentre = 0;
             } else acid_slot_drop(&g_acid_p);
             {   /* the Nitrous Purge browser's Square preview (0x568d30 +0x116): the
                    showroom car built with the highlighted kit (0x634800) fires
@@ -24307,21 +27079,44 @@ int main(int argc, char **argv) {
                 int on = live && g_rt.active && k < g_rt.n && !g_rt.field_gone && rt_on(k);
                 if (on) {
                     const CarSwitchCandidate *v = rt_visual(k);
+                    if (rp_up()) { g_acid_rpst = &g_rt.car[k].st; g_acid_rpl = g_rp_lt[RP_OPP0 + k];
+                                   g_acid_rpbot = g_rp_moved ? g_rt.car[k].st.bottom : 0.0f; }
+                    g_acid_nocentre = v && car_drops_centre_flare(g_rt.opp[k].car, &v->config);
                     acid_slot_step(&g_acid_o[k], g_rt.car[k].s, 0, &g_rt.car[k].st,
                                    v ? v->mk : NULL, v ? v->nmk : 0, view_cam, acid_dt, g_rt.oslot[k] + 1,
                                    v ? v->bb : NULL);
+                    g_acid_rpst = NULL; g_acid_nocentre = 0;
                 } else if (g_acid_o[k].c) acid_slot_drop(&g_acid_o[k]);
             }
             for (int i = 0; i < RT_TMAX; i++) {
                 int on = live && g_rt.active && i < g_rt.ntr && rt_tshown(i) && g_rt.tcar[i].s;
                 if (on) {
                     const CarSwitchCandidate *v = rt_tvisual(i);
+                    if (rp_up()) { g_acid_rpst = &g_rt.tcar[i].st; g_acid_rpl = g_rp_lt[RP_TR0 + i]; g_acid_rpbot = 0.0f; }
                     acid_slot_step(&g_acid_t[i], g_rt.tcar[i].s, 0, &g_rt.tcar[i].st,
                                    v ? v->mk : NULL, v ? v->nmk : 0, view_cam, acid_dt, 0,
                                    v ? v->bb : NULL);
+                    g_acid_rpst = NULL;
                 } else if (g_acid_t[i].c) acid_slot_drop(&g_acid_t[i]);
             }
             trig_update(live && g_career_mode && g_rt.active && g_rt.roam && n2_active());   /* UpdateTriggerEffects */
+            {   /* The showroom stands in room space at the car's world spot (DISC01 under the
+                   car), so a shop zone's marker (and any other world particle there) would
+                   be drawn inside it, round the camera. The front end draws no world
+                   particles: drop them all once as it opens (the purge preview starts after). */
+                static int room_was;
+                if (g_showroom && !room_was) {
+                    int n = acid_live_particles();
+                    for (int k = 0; k < 12; k++) if (g_trig_init) acid_trigger_off(&g_trig[k]);
+                    acid_slot_drop(&g_acid_fe);
+                    acid_clear();
+                    printf("showroom: %d world particles dropped\n", n);
+                }
+                room_was = g_showroom;
+            }
+            { static int rf; rf = g_showroom ? rf + 1 : 0;   /* HW check: should stay 0 (purge preview aside) */
+              if (rf == 120) printf("showroom: %d particles live after 120 frames%s\n", acid_live_particles(), g_acid_fe.c ? " (purge preview on)" : ""); }
+            acid_world_pause(g_showroom);   /* the shop's own entrance marker would refill it */
             acid_tick(acid_dt);
             if (VITA_PROBE(7) || (g_showroom && (g_acid_fe.c || acid_live_particles() > 0))) {   /* showroom: the purge preview */
                 /* pixels per unit size at unit depth: the screen-size clamp's
@@ -24329,6 +27124,9 @@ int main(int argc, char **argv) {
                 float proj = 0.5f * (float)H / tanf(0.5f * cam_fovy);
                 const AcidOwner *incar = cc_on && g_ccam.setting <= 1 && !(g_rt.nis && g_rt.nis_cam) && g_acid_p.c
                                        ? &g_acid_p.c->own : NULL;
+                /* eRenderWorldLightFlares runs in the game's state 6 only (not the front end) */
+                aciddraw_world_flares_enable(!g_showroom && g_dbg.show_track && (passmode == 0 || passmode == 2));
+                { const WorldNeighborhood *fa = active_resident ? &active_resident->world : &world.neighborhood; aciddraw_world_flares_area(fa->center[0], fa->center[1], fa->radius); }   /* no flares over unplaced buildings */
                 g_dbg.drawn += aciddraw_draw(V, MVP, proj, incar);
                 glUseProgram(rp.prog);
                 glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
@@ -24337,7 +27135,10 @@ int main(int argc, char **argv) {
         pf_mark(PF_PD_PARTICLES);
 
         /* Authored point lights are render-only; gameplay owns no part of this pass. */
-        if (world.neighborhood.nlights && district_light_tex && g_dbg.show_track &&
+        /* port-only lamp halos from the 0x135003 lights (the eLight database, which the
+           original only queries for lighting): off when the world's own light flares
+           (0x80135100, drawn by aciddraw_draw) are loaded */
+        if (world.neighborhood.nlights && district_light_tex && g_dbg.show_track && !aciddraw_flares_pending() &&
             g_dbg.night_mode && (passmode == 0 || passmode == 2) && VITA_PROBE(4)) {
             districtdraws = render_district_lights(&rp, &quad, district_light_tex,
                 world.neighborhood.lights, world.neighborhood.nlights, cam, look, MVP,
@@ -24347,7 +27148,147 @@ int main(int argc, char **argv) {
 
         if(nglow && g_dbg.show_track && (passmode==0 || passmode==2) && VITA_PROBE(4))
             g_dbg.drawn+=render_world_glows(&rp,glowbatch,nglow,MVP);
-        pf_mark(PF_PD_GLOWS);
+        {   /* Rain::UpdateAndRender (0x61f120, game state 6): the drops, then the
+               screen drops (0x5c7ab0, before the flash and the HUD) */
+            RainFrame rf; memset(&rf, 0, sizeof rf);
+            rf.in_game = race_state != 3 && !sstatic && !g_showroom && !g_fe && n2_active() && g_n2;
+#ifdef __vita__
+            rf.paused = g_pause.on;
+            rf.steps = vita_ticks > 0 ? vita_ticks : 1;
+            rf.dt = (float)rf.steps / 60.0f * n2sim_time_scale();
+#else
+            rf.steps = 1; rf.dt = 1.0f / 60.0f * n2sim_time_scale();
+#endif
+            if (rf.in_game) {
+                float cm[16];
+                acid_car_pose(g_n2, rf.car_pos, cm);
+                for (int r = 0; r < 3; r++) for (int j = 0; j < 3; j++) rf.car_R[3 * r + j] = cm[4 * r + j];
+                for (int j = 0; j < 3; j++) rf.eye[j] = view_cam[j];
+                rf.fwd[0] = -V[2]; rf.fwd[1] = -V[6]; rf.fwd[2] = -V[10];
+                rf.test_track = tun_active();
+                rf.cubic_cam = cc_on && g_cc_cubic;
+                rf.cover = rain_cover;
+            }
+            rain_update(&rf);
+            carsfx_set_rain(rf.in_game ? rain_intensity() : 0.0f);
+            /* the RaceCoordinator state for QueueWeatherStream (R4 11-01, decoded from
+               the state callbacks: PC table 0x80214c, GC RCState*Callback 8021c084..8021d36c):
+               - LOADING (1): a race's world loading (race_place_pending; EndLoading(+0x18)
+                 leaves it, BeginGameFlowRacing 801973e4), and the end NIS: TheRaceHasFinished
+                 -> POSTRACE enter (+0x48 = 1 from InitForRace) -> BeginLoading(5), back to 7
+                 once EndNIS_SafeUpdate finishes (0x6038e0 msg 3). Only the dyno has an
+                 end NIS in the port (DynoExit, g_tt_nis 3); a race's has none, so its
+                 LOADING(5) is the sections check only
+               - CAMERA_FLYBY (2): left on its first update (0x603af0 msg 3 -> PRERACE),
+                 never a whole frame
+               - PRERACE (3): the intro NIS up to its StartCountdown marker
+                 (0x603bc0: msg 1 / msg 3 with stage 2 and 0x438760 = not past marker
+                 0x827afc; msg 6 = skip); the port's hand-off at the same marker clears
+                 nis_on. The countdown itself (race stage 3) runs in RACE_IN_PROGRESS.
+                 The career start NIS is a ShopNIS, played in RACE_IN_PROGRESS (8021c6ec)
+               - INSTANT_REPLAY (5) for the replay screen, also from the post race
+               - PAUSE (6); the dyno screens are pushed in RACE_IN_PROGRESS (8021c6ec)
+               - POSTRACE (7); an Outrun's end stays in 4 (EndGetAway, 8021d224)
+               race mode 8 = SetupDynoRun's dyno run (8011c894), not online */
+            {
+                int rcs = 4;
+                if (race_place_pending || g_tt_nis == 3) rcs = 1;
+                else if (rp_up()) rcs = 5;
+                else if (g_rt.active && g_rt.postrace) rcs = 7;
+                else if (g_pause.on && !(tun_active() && tun_on_dyno())) rcs = 6;
+                else if (g_rt.nis_on && !g_career_nis_on) rcs = 3;
+                carsfx_set_race_flow(rcs, tun_active() && tun_on_dyno() ? 8 : 0, world_resident_loader_busy());
+            }
+            {   /* SFXCTL_Tunnel::UpdateParams 0x483250, each frame for the player's car;
+                   UpdateDriveBySnds 0x471080 first (on last frame's tunnel state) */
+                if (rf.in_game && g_n2) {
+                    /* the look-ahead: car + normalised forward (+0x90, +0x94) x forward speed (+0x42c) x 0.3 */
+                    float fx = g_n2s.rot[0], fy = g_n2s.rot[1], fl = sqrtf(fx * fx + fy * fy);
+                    if (fl > 0) { fx /= fl; fy /= fl; }
+                    float pr[3] = { rf.car_pos[0] + fx * g_n2s.speed * 0.3f, rf.car_pos[1] + fy * g_n2s.speed * 0.3f, rf.car_pos[2] };
+                    const void *pz;
+                    int pt = tunnel_zone_probe(pr, rf.car_pos[2], &pz);
+                    float sp = sqrtf(g_n2s.vel[0] * g_n2s.vel[0] + g_n2s.vel[1] * g_n2s.vel[1] + g_n2s.vel[2] * g_n2s.vel[2]);
+                    carsfx_set_driveby(pt, pz, pr, rf.car_pos[2], sp, rf.dt);
+                } else carsfx_set_driveby(2, NULL, rf.car_pos, rf.car_pos[2], 0.0f, rf.dt);
+                int tt = rf.in_game ? tunnel_zone_type(rf.car_pos) : 0;
+#ifdef OPENUG2_SIM_PRE_H
+                static int tt_was;
+                if (tt != tt_was && getenv("OPENUG2_TUNNEL_LOG"))
+                    printf("[tunnel] zone type %d at (%.0f,%.0f,%.1f)\n", tt, rf.car_pos[0], rf.car_pos[1], rf.car_pos[2]);
+                tt_was = tt;
+#endif
+                carsfx_set_tunnel(tt);
+                /* the tunnel / city reverb (SFXCTL_Tunnel 0x483250 -> UpdateCityVerb, the level update) */
+                reverb_update(rf.in_game, rf.car_pos, tt, rf.dt);
+            }
+            if (rf.in_game) {   /* the ambience beds: GetAmbientZone 0x46b330 at the player's car, then
+                                   SetupAmbientStreams (no loading screen is up while the world runs) */
+                static int amb_zone, amb_vol;
+                rain_ambience_at(rf.car_pos[0], rf.car_pos[1], &amb_zone, &amb_vol);
+                music_ambience(amb_zone, amb_vol, 0, rf.dt);
+#ifdef OPENUG2_SIM_PRE_H
+                static int amb_was = -2;
+                if (amb_zone != amb_was && getenv("OPENUG2_AMB_LOG"))
+                    printf("[ambience] zone %d vol %d at (%.0f,%.0f), bed %d\n", amb_zone, amb_vol,
+                           rf.car_pos[0], rf.car_pos[1], music_ambience_bed());
+                amb_was = amb_zone;
+#endif
+            }
+            {   /* CSTATEMGR_Planes::EnterWorld 0x476e00: drag (0x89e7d8) off the
+                   city's drag events 4400..4499 -> PlanesDrag 0x7ed6d8, those ->
+                   PlanesOrganicDrag 0x7ed718, URL (0x89e7e1) -> PlanesURL 0x7ed760,
+                   else PlanesMain 0x7ed690: {world anim instance id, entity hash} */
+                static const unsigned k_main[6][2] = { { 0x22, 0xa1672f31u }, { 0x24, 0xa1672f32u }, { 0x26, 0xa1672f33u },
+                                                       { 0x28, 0xa1672f2du }, { 0x2a, 0xa1672f2fu }, { 0x2c, 0xa1672f30u } };
+                static const unsigned k_drag[5][2] = { { 1, 0x09123e81u }, { 3, 0x09123ec8u }, { 5, 0x09123ec0u },
+                                                       { 7, 0x09123ec3u }, { 10, 0x09123ec5u } };
+                static const unsigned k_url[3][2] = { { 1, 0x09123e81u }, { 2, 0x09123e82u }, { 3, 0x09123e83u } };
+                const unsigned (*pl)[2] = k_main; int npl = 6;
+                if (g_rt.active && g_rt.drag) {
+                    if (g_rt.ev < 4400 || g_rt.ev >= 4500) { pl = k_drag; npl = 5; }
+                } else if (g_rt.active && g_rt.rtype == AIRACE_URL) { pl = k_url; npl = 3; }
+                CarSfxPlane pp[6];
+                for (int i = 0; i < npl; i++)
+                    pp[i].ok = rf.in_game && wa_anim_position(pl[i][0], pl[i][1], pp[i].pos, &pp[i].delay);
+                carsfx_set_planes(pp, rf.in_game ? npl : 0, rf.car_pos);
+                carsfx_set_url(g_rt.active && g_rt.rtype == AIRACE_URL);
+                /* CSTATEMGR_Trains' uTrainIDs 0x7ed798: {world anim instance id, entity hash} */
+                static const unsigned k_trn[24][2] = {
+                    { 0x84, 0x863f23f3u }, { 0x84, 0x863f23f2u }, { 0x84, 0x863f23f1u }, { 0x7e, 0x863f23f0u },
+                    { 0x7e, 0x863f23efu }, { 0x7e, 0x863f23cbu }, { 0x6e, 0x863f23ecu }, { 0x72, 0x863f23edu },
+                    { 0x76, 0x863f23eeu }, { 0x6a, 0x863f23ebu }, { 0x6a, 0x863f23eau }, { 0x6a, 0x863f23d2u },
+                    { 0x71, 0x863f23ccu }, { 0x71, 0x863f23cdu }, { 0x71, 0x863f23ceu }, { 0x79, 0x863f23d1u },
+                    { 0x79, 0x863f23d0u }, { 0x79, 0x863f23cfu }, { 0x10, 0x5289c4c8u }, { 0x10, 0x5289c4c9u },
+                    { 0x10, 0x863f236bu }, { 0x10, 0x863f236du }, { 0x10, 0x863f236au }, { 0x10, 0x863f2387u } };
+                CarSfxPlane tp[24];
+                for (int i = 0; i < 24; i++)
+                    tp[i].ok = rf.in_game && wa_anim_position(k_trn[i][0], k_trn[i][1], tp[i].pos, &tp[i].delay);
+                carsfx_set_trains(tp, rf.in_game ? 24 : 0);
+                {   int env_ev = g_rt.active ? g_rt.ev : 0;
+#ifdef OPENUG2_SIM_PRE_H
+                    if (getenv("OPENUG2_EMIT_EVENT")) env_ev = atoi(getenv("OPENUG2_EMIT_EVENT"));   /* test aid: the fountains' event */
+#endif
+                    carsfx_set_event(env_ev);
+                }
+            }
+            pf_mark(PF_PD_GLOWS);   /* perf.csv: the rain's draws are pd_rain */
+            if (rf.in_game && g_dbg.show_track && (passmode == 0 || passmode == 2) && rain_has_draws()) {
+                {   /* the streaks take the world pass's fog as it stands */
+                    float fc[3], fd = 0, fk = 0, ff = 1;
+                    glGetUniformfv(rp.prog, rp.uFogColor, fc);
+                    glGetUniformfv(rp.prog, rp.uFogDensity, &fd);
+                    glGetUniformfv(rp.prog, rp.uFogK, &fk);
+                    glGetUniformfv(rp.prog, rp.uFogFloor, &ff);
+                    rain_set_world_fog(fc, fd, fk, ff);
+                }
+                g_dbg.drawn += rain_draw(MVP);
+                g_dbg.drawn += rain_draw_screen();
+                glUseProgram(rp.prog);
+                glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
+            }
+        }
+        pf_mark(PF_PD_RAIN);
 
         /* HUD: race-position leaderboard — one colour bar per car, ordered by
            progress along the racing line (leader on top); player bar wider. */
@@ -24690,15 +27631,15 @@ int main(int argc, char **argv) {
                     case 0:
                         hs.split_new = g_rt.hd_newsplit; hs.split_gap = g_rt.hd_gap; break;
                     case 1:
-                        hs.split_new = g_rt.hd_newlap; hs.split_gap = e0->split[fin]; break;
+                        hs.split_new = hs.lap_new; hs.split_gap = e0->split[fin]; break;
                     case 2: {
                         int d = e0->split[fin] - e0->best[fin];
-                        hs.split_new = g_rt.hd_newlap;
+                        hs.split_new = hs.lap_new;
                         hs.split_gap = d != 0 ? d : L >= 1 ? e0->lapt[L - 1] - e0->best[fin] : 0;
                         break;
                     }
                     default:
-                        hs.split_new = g_rt.hd_newlap && L > 1;
+                        hs.split_new = hs.lap_new && L > 1;
                         hs.split_gap = L > 1 ? e0->lapt[L] - e0->lapt[L - 1] : 0;
                         break;
                     }
@@ -24706,9 +27647,8 @@ int main(int argc, char **argv) {
                 }
                 /* leaderboard: feature 0x800000 (0x5f33b0: the player's
                    Leaderboard option, 0x83aa69) in a race with laps, not drag;
-                   one human, the drift branch (0x4aac50 / 0x4aadc0) not ported
-                   -> off in drift races */
-                hs.lb_on = !g_rt.drift && g_opt.p[0].leaderboard;
+                   one human; a drift race shows the drift board (below) */
+                hs.lb_on = g_opt.p[0].leaderboard;
                 RaceEntry *order[AIRACE_MAX + 1];
                 int n = 0;
                 for (int k = 0; k <= g_rt.n && !g_rt.field_gone; k++) order[n++] = &g_rt.ent[k];
@@ -24722,6 +27662,36 @@ int main(int argc, char **argv) {
                     snprintf(hs.lb[q].name, sizeof hs.lb[q].name, "%s", k ? g_rt.opp[k - 1].name : (myname ? myname : ""));
                     hs.lb[q].me = k == 0;
                     hs.lb[q].gap = k ? rt_gap(k, 0) : 0;            /* 0x4c6f30 -> 0x5f82d0(entry, player) */
+                }
+                hs.lb_drift = g_rt.drift;
+                if (g_rt.drift && g_rt.dlb_n) {
+                    /* 0x56ddd0 DriftManager::UpdateLeaderBoard, every Race::Update:
+                       a racer's node score = its accumulator moment 0 +0x2c (the
+                       banked total), a set score stays; then bList::Sort with
+                       0x56cdd0 / GC 80190084 (b <= a = in order): an in-order pass
+                       + MergeSort -> highest first, ties keep last frame's order
+                       (a stable insertion sort here); 0x4da570 FEUpdateDriftLeaderBoard
+                       copies the first 4 nodes to the board (GC 8010b858) */
+                    float sc[1 + AIRACE_MAX + 3];
+                    for (int i = 0; i < g_rt.dlb_n; i++) {
+                        int id = g_rt.dlb[i];
+                        sc[i] = id >= 100 ? g_rt.vscore[id - 100] : drift_score(&g_rt.acc[id]);
+                    }
+                    for (int i = 1; i < g_rt.dlb_n; i++)
+                        for (int j = i; j > 0 && sc[j - 1] < sc[j]; j--) {
+                            float t = sc[j]; sc[j] = sc[j - 1]; sc[j - 1] = t;
+                            unsigned char u = g_rt.dlb[j]; g_rt.dlb[j] = g_rt.dlb[j - 1]; g_rt.dlb[j - 1] = u;
+                        }
+                    hs.lb_n = g_rt.dlb_n < 8 ? g_rt.dlb_n : 8;
+                    for (int q = 0; q < hs.lb_n; q++) {
+                        int id = g_rt.dlb[q];
+                        const char *nm = id >= 100 ? g_rt.vname[id - 100] : id ? g_rt.opp[id - 1].name : myname;
+                        snprintf(hs.lb[q].name, sizeof hs.lb[q].name, "%s", nm ? nm : "");
+                        hs.lb[q].me = id == 0;
+                        hs.lb[q].hl = id < 100;                     /* node +0x14: 1 for a racing car */
+                        hs.lb[q].score = sc[q];
+                        hs.lb[q].gap = 0;
+                    }
                 }
             }
             {   /* the minimap's TRACKMAP (0x4ca840, event 0x89e7a0): the race's
@@ -24740,6 +27710,11 @@ int main(int argc, char **argv) {
                         if (!g_rt.shud) g_rt.shud = hud_init_short(dataroot);
                         hud_set_trackmap(g_rt.shud, dataroot, mev, x0, y0, sz, zm);
                     }
+                    /* the drift / drag HUDs are drawn instead of the race HUD
+                       (below): they need the event's TRACKMAP too, else the
+                       panel falls back to the bare route line */
+                    if (g_rt.dhud) hud_set_trackmap(g_rt.dhud, dataroot, mev, x0, y0, sz, zm);
+                    if (g_rt.ghud) hud_set_trackmap(g_rt.ghud, dataroot, mev, x0, y0, sz, zm);
                     /* 0x4ec950: in a race (not drift) the start line's indicator at
                        racemgr +0xc10, heading +0xba x 0.00549316 deg */
                     if (g_rt.active && !g_rt.drift && g_rt.rp) {
@@ -25133,11 +28108,13 @@ int main(int argc, char **argv) {
                 hs.no_pos = hs.no_laps = 1;
                 hs.split_on = hs.lb_on = 0;
             }
-            int hud_postrace = (g_rt.active && g_rt.postrace) || post_up();
+            int hud_postrace = (g_rt.active && g_rt.postrace) || post_up() || rp_up();   /* replay: no HUD features (RC state 5) */
             /* the Test Track's dyno: DetermineHudFeatures (GC 802158f8) returns 0 for a
                tuning race (803fcaa4) while DynoManager::IsCarOnDyno -- no HUD on the dyno */
             if (tun_active() && tun_on_dyno()) hud_postrace = 1;
             if (hs.dyno && hs.race_over && !g_rt.drag) hud_postrace = 1;   /* IsFinishedRacing: mask 0 */
+            /* DetermineHudFeatures 0x600090: player zone 6 / 7 (the jump cams) -> 0, no HUD */
+            if (jumpcam_zone() == 6 || jumpcam_zone() == 7) hud_postrace = 1;
             if (VITA_PROBE(10) && !g_rt.nis_cam && !hud_postrace) hud_draw(hud_now, &rp, &quad, &hs, W, H);   }
             pf_mark(PF_PD_HUD);
 #ifdef __vita__
@@ -25200,12 +28177,19 @@ int main(int argc, char **argv) {
                     }
                 }
                 was_finished = fin;
-                if (post_up()) {
+                if (post_up() && !rp_up()) {        /* the replay screen takes the post-race screens' place */
                     static Uint32 rs_last;
                     Uint32 rs_now = SDL_GetTicks();
                     int dms = rs_last ? (int)(rs_now - rs_last) : 0;
                     rs_last = rs_now;
                     post_draw(&rp, &quad, W, H, dms < 0 ? 0 : dms > 100 ? 100 : dms);
+                }
+                if (rp_up()) {                      /* UI_ReplayControl over the replayed race */
+                    static Uint32 rq_last;
+                    Uint32 rq_now = SDL_GetTicks();
+                    int dms = rq_last ? (int)(rq_now - rq_last) : 0;
+                    rq_last = rq_now;
+                    rp_draw(&rp, &quad, W, H, dms < 0 ? 0 : dms > 100 ? 100 : dms);
                 }
                 if (g_pause.on || g_sc.h) {         /* UI_Pause over the stopped game (the photo screen, also running) */
                     static Uint32 pz_last;
@@ -25334,6 +28318,7 @@ int main(int argc, char **argv) {
                                &wheellib, &wheelgm, &nwheelgm,
                                wtdata, wtlen, &rimtex, &rimmode, carWheelR);
             if (!g_dbg.wheel_load_failed) {
+                rim_lib_forget();   /* another wheel library */
                 if (candidate_data != wldata) free(wldata);
                 wldata = candidate_data; wllen = candidate_len;
                 wheel_brand = brand; wheel_style = style;
@@ -26094,6 +29079,8 @@ int main(int argc, char **argv) {
         SDL_GL_SwapWindow(win);
         pf_mark(PF_SWAP);
         if (pf_csv) {
+            pf_detail.race_event = race_state == 1 && world.city.race.active && !world.city.race.finished
+                ? world.city.ev[world.city.race.ev].id : 0;
             memcpy(g_pf_pos, carpos, sizeof g_pf_pos);
             int pf_vis=0;
             pf_vis=g_dbg.traffic_visible;

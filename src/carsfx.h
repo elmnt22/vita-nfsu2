@@ -58,7 +58,7 @@ typedef struct {
 typedef struct {
     float cam[2], cam_fwd[2];
     float car[2], car_fwd[2];
-    int   mode;             /* mix mode 0x82bb48: 4 = intro scene, else 0 */
+    int   mode;             /* 3D mix mode 0x82bb48 (SndCamera cam state): 0 outside, 1 bumper, 2 hood, 3 zone 6/7, 4 NIS */
     int   racing;           /* race manager state not 0/2/3 (pre-race) */
     float car_vel[2];       /* the player's car +0x70/+0x74, m/s */
     float car_fspeed;       /* its +0x42c, forward speed m/s (signed) */
@@ -81,7 +81,17 @@ typedef struct {
     int   pbottom;          /* car sound event 5 (0x5f5d8f) param, 0..32767; 0 none */
     int   pgear;            /* car +0x434 (0 R, 1 N, 2 first ..) */
     int   pjumpcam;         /* the nearest view (0x459ac0) is in camera zone 6, the jump cam (+0x58) */
+    int   pzone67;          /* the player's camera zone (+0x58) is 6 or 7 (SFXCTL_Physics 0x470a60) */
+    int   pcubic;           /* player +0x238 (its CameraMover) +0xc == 1: the CubicCameraMover */
     int   pspark;           /* car sound event 9 (0x5f6049, the neutral rev flame) this frame */
+    int   pview;            /* EAXCar +0xa8 (SFXCTL_Physics f6): the POV type, Player::GetPovType 0x5eb400
+                               (bumper 2, hood 4, near 1, far 0, high 5) */
+    int   pshifting;        /* a gear change is under way (n2sim_shifting): CARSFX_Shift's output and the
+                               replay's SWTN; live, the SWTN keys off pgear going up (BeginUpShift) */
+    int   pshiftup;         /* that change is an upshift (SFXCTL_Shifting +0x80 == 1: BeginUpShift GC
+                               8009094c; BeginDownShift sets 4) -- CARSFX_Shift output 6 (0x40010016) */
+    int   preplay;          /* a replay plays the player's car (no gear recorded: the SWTN keeps pshifting) */
+    int   pengine_level;    /* the player's engine upgrade level (the 0x7f2230 column) */
 } CarSfxListener;
 
 /* a car in a collision, as the collision sound reads it */
@@ -97,13 +107,25 @@ typedef struct {
 /* Parse the four mixmaps (MAPOUTPUT, DFT, DRG, URL). Returns maps read. */
 int  carsfx_init(const char *dataroot);
 /* the player's car changed (audio row): its SWTN_CAR_xx_MB.abk -- the
-   CAR_Sputter patch and its samples (inside audio_hold or before
-   audio_init). Returns 1 when the patch loaded. */
+   CAR_Sputter patch and its samples -- by the engine slot at the level
+   audio_set_player_engine_level gave, and its skid bank (0x465b90: the
+   row's engine class + the race's drift flag) (inside audio_hold or
+   before audio_init). Returns 1 when the patch loaded. */
 int  carsfx_player_car(const char *dataroot, int row);
 /* the SOUND/TURBO banks the AI racers need (0x7f3338 indexes, one per
    distinct bank); valid after carsfx_race_begin. Returns how many. */
 int  carsfx_ai_turbo_banks(int tbank[CARSFX_AI_MAX]);
-/* A new race field: the mixmap for the race type (0x4869a0: drag DRG,
+/* the AI racers' fitted turbo (perf cat 4) and nitrous (cat 2) upgrade
+   levels, 0x5995e0 of each car's DriverInfo +0x300 (CARSFX_Turbo /
+   CARSFX_Nitrous SetupSFX 0x45eb30 / 0x45f210 read them for driver types
+   1 and 2). Call before carsfx_race_begin; NULL = all 0. */
+void carsfx_ai_perf(const int *turbo_level, const int *nos_level, int n);
+/* the AI racers' engine sound levels (CarPreSetup 0x4593b0: EAXCar +0x94 =
+   3 / 2 / 1 with perf part 0x18 / 0x13 / 0xf fitted, else 0): each car's
+   own engine slot is the 0x7f2230 record at row x 4 + level (the bank pick
+   0x463f60 reads it). Call before carsfx_race_begin; NULL = all 0. */
+void carsfx_ai_engine_level(const int *level, int n);
+/* A new race field:the mixmap for the race type (0x4869a0: drag DRG,
    URL race URL, drift DFT, else the default) and the AI racers' audio rows
    (audio_car_row of each opponent's car). Picks the AI engine banks
    (0x463f60, at most 3 for the field); bank_slot[] receives the engine
@@ -113,6 +135,40 @@ int  carsfx_race_begin(int mixmap, int streetx, int drift, const int *rows, int 
 /* which loaded bank (0..2) AI car k plays, -1 = none */
 int  carsfx_ai_bank(int k);
 void carsfx_race_end(void);
+/* EAXCommon::PlayCarPartSnd 0x481500: an in-game hood / trunk / door
+   sound, collision stitch `type` (door close 0 / open 1, hood 2 / 3,
+   trunk 4 / 5); the front end plays its own FE sounds instead */
+void carsfx_part_snd(int type);
+/* view 1's rain intensity (Rain +0x1f0, rain_intensity) for CARSFX_Rain */
+void carsfx_set_rain(float I);
+/* QueueWeatherStream 0x4852a0's gates: rcstate = the RaceCoordinator state
+   (*pRaceCoordinator 0x8900d8: 0 NONE, 1 LOADING, 2 CAMERA_FLYBY, 3 PRERACE,
+   4 RACE_IN_PROGRESS, 5 INSTANT_REPLAY, 6 PAUSE, 7 POSTRACE, 8 TUTORIAL),
+   race_mode = 0x89e7b0, loading = the world streamer is loading
+   (TheTrackStreamer 0x88eb00 +0x168 != 0, read at 0x474829) */
+void carsfx_set_race_flow(int rcstate, int race_mode, int loading);
+/* SFXCTL_Tunnel::UpdateParams 0x483250 for the player's car: the tunnel zone
+   type it is in (5, 6, 7, 20), 0 = none; the mix sources 60010070..73 */
+void carsfx_set_tunnel(int type);
+/* CSTATEMGR_Planes' list (EnterWorld 0x476e00) as GetAnimPosition 0x439f40
+   gives it this frame: ok = found, delay = its controller is delaying; car =
+   the player's car (3D) */
+typedef struct { float pos[3]; int ok, delay; } CarSfxPlane;
+void carsfx_set_planes(const CarSfxPlane *p, int n, const float car[3]);
+/* URL (0x89e7e1): SFXObj_Plane takes the FX_MAIN_MEM patch instead of ENV_STATIC */
+void carsfx_set_url(int url);
+/* CSTATEMGR_Trains' uTrainIDs (0x7ed798, 24 world anim trains) as
+   GetAnimPosition gives them this frame; n = 0 out of the world (EnterWorld
+   clears the entries' state) */
+void carsfx_set_trains(const CarSfxPlane *p, int n);
+/* TheRaceParameters' event (0x89e7a0): CSTATEMGR_Enviro's fountains run in
+   events 4000..4198; 0 = none */
+void carsfx_set_event(int ev);
+/* SFXCTL_Tunnel::UpdateDriveBySnds 0x471080, once a frame in game before
+   carsfx_set_tunnel: the zone FindZone gives at the look-ahead point (car +
+   forward x forward speed x 0.3, the car's height): type 5 / 6 / 7, 2 none,
+   zone = its identity (NULL none); probe = that point; speed = car +0x430 */
+void carsfx_set_driveby(int probe_type, const void *zone, const float probe[3], float car_z, float speed, float dt);
 /* one drawn frame; dt in seconds */
 void carsfx_update(float dt, const CarSfxListener *L, const CarSfxCar *ai, int nai,
                    const CarSfxCar *tr, int ntr);

@@ -422,7 +422,7 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
     if (!p) p = &dummy;
     memset((void *)p, 0, sizeof *p);
     p->start_ms = p->now_ms = wt_ms();
-    wt_mkdir("ux0:data/OpenUG2/cache");
+    wt_mkdir("ux0:data/NFSU2/cache");
     wt_mkdir(WTILE_DIR);
     float bb[4];
     if (!world_instance_bounds(troot, trackname, bb)) {
@@ -820,7 +820,7 @@ int world_tiles_enabled(const char *track) {
 #ifdef __vita__
     if (g_wt_converting) return 0;
     if (g_wt_enabled < 0) {
-        FILE *off = fopen("ux0:data/OpenUG2/notileload.txt", "r");
+        FILE *off = fopen("ux0:data/NFSU2/notileload.txt", "r");
         if (off) { fclose(off); g_wt_off_file = 1; }
         g_wt_enabled = !off && wt_index_load(track);
         printf("world tiles: %s\n", g_wt_enabled ? "loading the world from prebuilt tiles"
@@ -1069,6 +1069,7 @@ static volatile char *g_wt_owned_ground;
 static volatile long long g_wt_ready_bytes;
 static volatile float g_wt_aim[2]; static volatile int g_wt_aim_set;
 static volatile float g_wt_radius = 400.0f;
+static volatile float g_wt_object_radius = 400.0f;
 static volatile int g_wt_prefetch_on;
 static volatile int g_wt_paused;      /* world_tiles_trim(1) .. (0) */
 static volatile long long g_wt_prefetch_hits;
@@ -1300,7 +1301,8 @@ static int wt_prefetch_thread(void *arg) {
            builds ran back to back at speed. */
         extern int world_resident_texture_fetch(void);
         if (world_resident_texture_fetch()) continue;
-        float ax = g_wt_aim[0], ay = g_wt_aim[1], radius = g_wt_radius, reach = radius + 60.0f;
+        float ax = g_wt_aim[0], ay = g_wt_aim[1], reach = g_wt_radius + 60.0f;
+        float object_radius = g_wt_object_radius;
         /* drop prepared tiles that went stale (well away from the aim) */
         for (int i = 0; i < g_wt_nindex; i++) {
             float far = reach + 256.0f;
@@ -1325,7 +1327,7 @@ static int wt_prefetch_thread(void *arg) {
             const WtIndexEntry *e = &g_wt_index[i];
             if (e->x == -32768) continue;
             int st = g_wt_state[i];
-            int want_up = st == 3 && g_wt_owned_ground[i] && g_wt_upst[i] == 0 && wt_objects_at(e, ax, ay, radius);
+            int want_up = st == 3 && g_wt_owned_ground[i] && g_wt_upst[i] == 0 && wt_objects_at(e, ax, ay, object_radius);
             if (st != 0 && !want_up) continue;
             float d = wt_tile_d2(e, ax, ay);
             if (d < bd) { bd = d; best = i; up = want_up; }
@@ -1346,7 +1348,7 @@ static int wt_prefetch_thread(void *arg) {
         }
         if (!__sync_bool_compare_and_swap(&g_wt_state[best], 0, 1)) continue;
         WtLoaded *t = (WtLoaded *)calloc(1, sizeof *t);
-        int ok = t && wt_read_decode_t(g_wt_track, e->x, e->y, t, 0, !wt_objects_at(e, ax, ay, radius));
+        int ok = t && wt_read_decode_t(g_wt_track, e->x, e->y, t, 0, !wt_objects_at(e, ax, ay, object_radius));
         if (ok) { g_wt_ready[best] = t; __sync_fetch_and_add(&g_wt_ready_bytes, (long long)t->bytes); }
         else free(t);
         __sync_synchronize();
@@ -1365,7 +1367,7 @@ static int wt_thread_up(void) {
     if (g_wt_thread_up) return 1;
     if (!__sync_bool_compare_and_swap(&claimed, 0, 1)) return 0;   /* another thread is starting it */
     if (off < 0) {
-        FILE *f = fopen("ux0:data/OpenUG2/noreadahead.txt", "r");   /* A/B switch */
+        FILE *f = fopen("ux0:data/NFSU2/noreadahead.txt", "r");   /* A/B switch */
         off = f != NULL;
         if (f) { fclose(f); printf("world tiles: read-ahead off (noreadahead.txt)\n"); }
     }
@@ -1820,11 +1822,19 @@ static int wt_push(N2Scene *s, const N2Mesh *src, int role, int drop_vcol) {
     return 1;
 }
 
+/* Buildings arriving at the edge: which tiles gave objects to the last
+   assembly, so this one can mark the ones that are new (N2Mesh.fade_in; main
+   fades them in instead of popping). A first build, or one that is mostly new
+   (a teleport, a switch), marks nothing. */
+static unsigned char *g_wt_obj_prev, *g_wt_obj_cur;
+static int g_wt_obj_n, g_wt_obj_have_prev;
+
 /* Same near/far rule as the instance build (WINST_LOD_NEAR_M). */
 #define WT_LOD_NEAR_M 280.0f
 
 static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, const char *track,
-                            float fx, float fy, float radius, int scenery_event, WInstStats *stats);
+                            float fx, float fy, float radius, float object_radius,
+                            int scenery_event, WInstStats *stats);
 static WGSelection sel; static int sel_event = 0x7fffffff, sel_effective;
 static void wt_forget_all(void) {
     for (int i = 0; i < g_wt_nloaded; i++) wt_forget(&g_wt_loaded[i]);
@@ -1835,6 +1845,7 @@ static void wt_scene_drop(N2Scene *s) {
     free(s->meshes); memset(s, 0, sizeof *s);
 }
 void world_tiles_reset(void) {
+    g_wt_obj_have_prev = 0;
     int was_paused = g_wt_paused;
     g_wt_paused = 1;
     __sync_synchronize();
@@ -1868,13 +1879,16 @@ void world_tiles_reset(void) {
 int world_tiles_assemble(N2Scene *scene, N2Scene *vista, const char *troot, const char *track,
                          float fx, float fy, float radius, int scenery_event, WInstStats *stats) {
     __sync_fetch_and_add(&g_wt_assembling, 1);   /* the migration keeps off the card */
-    int n = wt_assemble_once(scene, vista, troot, track, fx, fy, radius, scenery_event, stats);
+    int n = wt_assemble_once(scene, vista, troot, track, fx, fy, radius, radius, scenery_event, stats);
     if (n <= 0) {
-        /* out of memory part way: let go of every cached tile and try once more */
+        /* Keep overlapping tiles and road coverage. Re-reading the whole
+           neighborhood leaves the car driving toward a stale resident. */
         wt_scene_drop(scene); wt_scene_drop(vista);
-        wt_forget_all();
-        printf("world tiles: retrying with an empty tile cache\n");
-        n = wt_assemble_once(scene, vista, troot, track, fx, fy, radius, scenery_event, stats);
+        float object_radius = radius * 0.6f;
+        printf("world tiles: retrying with scenery radius %.0f m, road and terrain radius %.0f m\n",
+               object_radius, radius + 60.0f);
+        n = wt_assemble_once(scene, vista, troot, track, fx, fy, radius, object_radius,
+                             scenery_event, stats);
         if (n <= 0) { wt_scene_drop(scene); wt_scene_drop(vista); }
     }
     __sync_fetch_and_sub(&g_wt_assembling, 1);
@@ -1882,8 +1896,48 @@ int world_tiles_assemble(N2Scene *scene, N2Scene *vista, const char *troot, cons
     return n;
 }
 static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, const char *track,
-                            float fx, float fy, float radius, int scenery_event, WInstStats *stats) {
+                            float fx, float fy, float radius, float object_radius,
+                            int scenery_event, WInstStats *stats) {
     if (!scene || !vista || !wt_index_load(track)) return 0;
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_SKY_CENSUS -- the skyline's candidates over every tile */
+        static int done;
+        if (!done && getenv("OPENUG2_SKY_CENSUS")) {
+            done = 1;
+            static const float H[5] = { 20, 30, 45, 60, 90 };
+            long cnt[3][5] = {{0}}, vtx[3][5] = {{0}}, tri[3][5] = {{0}}, tiles = 0;
+            float zmin = 1e9f; int texn[5] = {0};
+            for (int k = 0; k < g_wt_nindex; k++) {
+                const WtIndexEntry *e = &g_wt_index[k];
+                if (e->x == -32768) continue;
+                WtLoaded t; memset(&t, 0, sizeof t);
+                if (!wt_read_decode(track, e->x, e->y, &t, 0)) continue;
+                tiles++;
+                for (int i = 0; i < t.n; i++) {
+                    const N2Mesh *m = &t.m[i];
+                    if (m->cat == N2_ROAD || m->cat == N2_TERRAIN || m->cat == N2_SKY) continue;
+                    int r = m->world_role == 2 ? 0 : m->world_role == 0 ? 1 : 2;
+                    float top = m->world_bounds[5];
+                    if (m->world_bounds[2] < zmin) zmin = m->world_bounds[2];
+                    float h = m->world_bounds[5] - m->world_bounds[2];
+                    (void)top;
+                    for (int j = 0; j < 5; j++) if (h >= H[j]) { cnt[r][j]++; vtx[r][j] += m->nverts; tri[r][j] += m->nidx / 3; }
+                    for (int j = 0; j < 5; j++) if (h >= H[j] && r != 2) {
+                        static uint32_t keys[5][4096]; static int nk[5];
+                        int f = 0; for (int q = 0; q < nk[j] && !f; q++) f = keys[j][q] == m->texkey;
+                        if (!f && nk[j] < 4096) keys[j][nk[j]++] = m->texkey;
+                        if (k == g_wt_nindex - 1 || 1) texn[j] = nk[j];
+                    }
+                }
+                wt_release(&t);
+            }
+            printf("sky census: %ld tiles, lowest z %.0f, textures %d %d %d %d %d\n", tiles, zmin, texn[0], texn[1], texn[2], texn[3], texn[4]);
+            for (int r = 0; r < 3; r++) for (int j = 0; j < 5; j++)
+                printf("sky census: role %s h>=%.0f: %ld meshes, %ld verts, %ld tris\n",
+                       r == 0 ? "standin" : r == 1 ? "plain" : "full", H[j], cnt[r][j], vtx[r][j], tri[r][j]);
+        }
+    }
+#endif
     unsigned t0 = wt_ms();
     long long read0 = g_wt_bytes_read, hits0 = g_wt_prefetch_hits;
     long long npack0 = g_wt_n_pack, nloose0 = g_wt_n_loose, npre0 = g_wt_n_pre;
@@ -1891,6 +1945,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
        it): with no aim yet (a switch, the boot), it works round this build's
        own centre beside the loader */
     g_wt_radius = radius;
+    g_wt_object_radius = object_radius;
     if (!g_wt_aim_set) world_tiles_aim(fx, fy);
     wt_prefetch_start();
     g_wt_read_ms = g_wt_decode_ms = 0;
@@ -1924,13 +1979,40 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
             return 0;
     }
     float reach = radius + 60.0f;   /* ground is placed out to radius + 60 */
+    /* Release the cache's references before acquiring any more tiles.
+       Residents keep their own references until the swap and retirement. */
+    int kept = 0, downgraded = 0;
+    for (int i = 0; i < g_wt_nloaded; i++) {
+        WtLoaded *t = &g_wt_loaded[i];
+        int k = wt_index_of(t->tx, t->ty);
+        if (k < 0 || wt_tile_d2(&g_wt_index[k], fx, fy) > reach * reach) {
+            wt_forget(t);
+            continue;
+        }
+        if (object_radius < radius && !t->ground &&
+            !wt_objects_at(&g_wt_index[k], fx, fy, object_radius) && wt_downgrade(t)) {
+            if (g_wt_owned_ground) g_wt_owned_ground[k] = 1;
+            downgraded++;
+        }
+        g_wt_loaded[kept++] = *t;
+    }
+    g_wt_nloaded = kept;
+    if (g_wt_obj_n != g_wt_nindex) {
+        free(g_wt_obj_prev); free(g_wt_obj_cur);
+        g_wt_obj_prev = (unsigned char *)calloc((size_t)(g_wt_nindex ? g_wt_nindex : 1), 1);
+        g_wt_obj_cur = (unsigned char *)calloc((size_t)(g_wt_nindex ? g_wt_nindex : 1), 1);
+        g_wt_obj_n = g_wt_obj_prev && g_wt_obj_cur ? g_wt_nindex : 0;
+        g_wt_obj_have_prev = 0;
+    }
+    if (g_wt_obj_n) memset(g_wt_obj_cur, 0, (size_t)g_wt_obj_n);
+    int scene0 = scene->count, obj_tiles = 0, obj_new = 0, faded = 0;
     for (int k = 0; k < g_wt_nindex; k++) {
         const WtIndexEntry *e = &g_wt_index[k];
         /* a tile whose meshes' union box touches the reach circle */
         if (e->x == -32768 || wt_tile_d2(e, fx, fy) > reach * reach) continue;
         /* edge tiles (centre beyond the radius) give only their ground:
            decoded ground only, and upgraded once their buildings are due */
-        int tile_objects = wt_objects_at(e, fx, fy, radius);
+        int tile_objects = wt_objects_at(e, fx, fy, object_radius);
         int had = g_wt_nloaded;
         WtLoaded *t = wt_get(track, k, e->x, e->y, tile_objects);
         if (!t) return 0;
@@ -1948,6 +2030,12 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         float tcy = ((float)e->y + 0.5f) * WTILE_SIZE - fy;
         float tc2 = tcx*tcx + tcy*tcy;
         int near = tc2 < WT_LOD_NEAR_M * WT_LOD_NEAR_M;
+        int fresh = 0;
+        if (tile_objects && g_wt_obj_n) {
+            g_wt_obj_cur[k] = 1; obj_tiles++;
+            fresh = g_wt_obj_have_prev && !g_wt_obj_prev[k];
+            obj_new += fresh;
+        }
         for (int i = 0; i < t->n; i++) {
             const N2Mesh *m = &t->m[i];
             const float *b = m->world_bounds;
@@ -1966,26 +2054,33 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                drawn by smokeable.c, not batched */
             if (role != 1 && m->scen_has && smk_is_prop(m->scen_region, m->scen_index)) role = 3;
             if (!wt_push(scene, m, role, drop_vcol)) return 0;
+            if (fresh && !ground && role != 3) { scene->meshes[scene->count - 1].fade_in = 1; faded++; }
         }
     }
+    if (faded && obj_new * 3 > obj_tiles) {   /* mostly new: a teleport, not the edge moving */
+        for (int i = scene0; i < scene->count; i++) scene->meshes[i].fade_in = 0;
+        faded = 0;
+    }
+    if (g_wt_obj_n) {
+        unsigned char *sw = g_wt_obj_prev; g_wt_obj_prev = g_wt_obj_cur; g_wt_obj_cur = sw;
+        g_wt_obj_have_prev = 1;
+    }
+    if (faded) printf("world tiles: %d new edge tiles, %d meshes fade in\n", obj_new, faded);
     /* keep only the tiles this build used: meshes the resident uses stay
        alive through its own references anyway */
-    int kept = 0, kept_ground = 0, downgraded = 0; size_t kept_bytes = 0;
+    int kept_ground = 0; size_t kept_bytes = 0;
     for (int i = 0; i < g_wt_nloaded; i++) {
         WtLoaded *t = &g_wt_loaded[i];
         int k = wt_index_of(t->tx, t->ty);
-        if (k < 0 || wt_tile_d2(&g_wt_index[k], fx, fy) > reach * reach) { wt_forget(t); continue; }
         /* well behind the object radius (half a tile past it, so a tile on
            the edge does not flip back and forth; the kept band ends only
            ~150 m past the radius): ground only from here on */
-        if (!t->ground && !wt_objects_at(&g_wt_index[k], fx, fy, radius + 0.5f * WTILE_SIZE) && wt_downgrade(t)) {
+        if (!t->ground && !wt_objects_at(&g_wt_index[k], fx, fy, object_radius + 0.5f * WTILE_SIZE) && wt_downgrade(t)) {
             if (g_wt_owned_ground) g_wt_owned_ground[k] = 1;
             downgraded++;
         }
         kept_bytes += t->bytes; kept_ground += t->ground;
-        g_wt_loaded[kept++] = *t;
     }
-    g_wt_nloaded = kept;
     if (stats) {
         memset(stats, 0, sizeof *stats);
         snprintf(stats->bundle, sizeof stats->bundle, "%s", track);

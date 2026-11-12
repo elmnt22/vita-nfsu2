@@ -15,7 +15,7 @@ static size_t mesh_geo(const N2Mesh *m) {
 }
 
 int main(int argc, char **argv) {
-    const char *track = "STREAML4RA", *troot = "ux0:data/OpenUG2/TRACKS";
+    const char *track = "STREAML4RA", *troot = "ux0:data/NFSU2/TRACKS";
     int event = argc > 1 ? atoi(argv[1]) : -1;
     float radius = 400.0f;
     static const float way[][2] = { { -60, 4 }, { -80, 80 }, { -400, 160 }, { -640, -160 }, { -320, -640 },

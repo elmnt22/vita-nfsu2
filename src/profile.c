@@ -12,8 +12,8 @@
 #include <unistd.h>
 
 #ifdef __vita__
-#define PROFILE_DIR "ux0:data/OpenUG2/profiles"
-#define SCORES_FILE "ux0:data/OpenUG2/scores.bin"
+#define PROFILE_DIR "ux0:data/NFSU2/profiles"
+#define SCORES_FILE "ux0:data/NFSU2/scores.bin"
 #else
 #define PROFILE_DIR "profiles"
 #define SCORES_FILE "scores.bin"

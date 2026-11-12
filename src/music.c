@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 /* SPEED2.EXE 0x7ecd80: title, artist, album, where it plays */
@@ -50,7 +51,25 @@ static uint32_t g_mus_off, g_mus_size;
 static int g_nstreams;
 static uint32_t g_stream_off[MAX_STREAMS];   /* in the .mus */
 static int g_song_stream[MUSIC_SONGS];       /* -1 unmapped */
+#define MAX_EVENTS 96
+static int g_ev_stream[MAX_EVENTS];          /* every MPF event's stream (27.. = the ambience beds), -1 none */
 static int g_ok;
+
+/* the ambience beds (EAXS_PFController::SetupAmbientStreams 0x47b260):
+   0x7ecc10, 8 bytes a zone, the first dword the zone's PATH event (-1 none);
+   the second (each bed's twin event, the same sample) is not read there */
+static const short k_amb_event[31] = {
+    0x1b, 0x2f, 0x31, 0x33, 0x35, 0x37, 0x39, 0x3b, 0x3d, 0x3f, 0x1b, 0x1b, 0x1b, 0x47, 0x49, -1,
+    0x43, -1, -1, -1, 0x4b, 0x4d, 0x1d, 0x1f, 0x21, 0x23, 0x25, 0x27, 0x29, 0x2b, 0x2d };
+static int g_amb_force;                      /* EAXS_UpdateMusic 0x482180's ambience branch */
+static int g_fe_amb_force;                   /* its front-end one (music_fe_ambience) */
+static volatile int g_amb_ev = -1;           /* the bed playing (+0x14 >= 0x1b), -1 none */
+static int g_amb_zone_play = -1, g_amb_vol_set; /* +0xb0, +100 */
+static int g_amb_fading;                     /* +200 */
+static float g_amb_fade = 1.0f;              /* SFXObj_Ambience's mix output (vt +0x38), 0..1 */
+static int g_amb_fade_dir;                   /* its +0xc (1: fade out) / +0x10 (-1: fade in) */
+static float g_amb_from, g_amb_to, g_amb_t = 1.0f, g_amb_now = 1.0f;   /* cInterpLine (300) */
+static volatile float g_amb_gain = 1.0f;     /* SndStrmWrapper::SetVol of the bed, 0..1 */
 
 /* playlist (FUN_0046baa0 state) */
 static unsigned char g_pl_song[MUSIC_SONGS], g_pl_mode[MUSIC_SONGS];
@@ -101,8 +120,8 @@ static int parse_mpf(const unsigned char *b, int n) {
     int last = (int)le16(b + 0x20 + (nnodes - 1) * 2) * 4;
     int evt = last + 0x14;
     if (evt + nevents * 2 > n) return 0;
-    for (int s = 0; s < MUSIC_SONGS; s++) {
-        g_song_stream[s] = -1;
+    for (int s = 0; s < MAX_EVENTS; s++) {
+        g_ev_stream[s] = -1;
         if (s >= nevents) continue;
         int eo = (int)le16(b + evt + s * 2) * 4;
         if (eo + 0x20 > n) continue;
@@ -113,29 +132,39 @@ static int parse_mpf(const unsigned char *b, int n) {
             if (no + 0x14 > n) break;
             if (b[no + 7] == 4) {
                 int idx = (int)le16(b + no) - 1;
-                if (idx >= 0 && idx < g_nstreams) g_song_stream[s] = idx;
+                if (idx >= 0 && idx < g_nstreams) g_ev_stream[s] = idx;
                 break;
             }
             if (b[no + 0x11] != 0x7f) break;
             node = b[no + 0x12];
         }
     }
+    for (int s = 0; s < MUSIC_SONGS; s++) g_song_stream[s] = g_ev_stream[s];
     return 1;
 }
 
 /* ---- decoder thread ---- */
 static uint32_t ring_free(void) { return RING - 1 - ((g_w - g_r) & (RING - 1)); }
 
+static void (*volatile g_io_hook)(void);
+static volatile int g_thread_up;
+int music_set_io_hook(void (*fn)(void)) {
+    g_io_hook = fn;
+    return g_thread_up;
+}
+
 static int decoder_thread(void *ud) {
     (void)ud;
     FILE *f = fopen(g_viv, "rb");
-    if (!f) return 0;
+    if (!f) { g_thread_up = 0; return 0; }
     Eal3 *d = eal3_new();
     static unsigned char blk[0x10000];
     static int16_t pcm[2 * 8192];
     int gen = g_req_gen, song = -1;
     uint32_t pos = 0, end = 0;
     while (!g_quit) {
+        {   void (*io)(void) = g_io_hook;   /* speech clip reads (perf: off the frame thread) */
+            if (io) io(); }
         if (gen != g_req_gen) {
             gen = g_req_gen; song = g_req_song;
             /* drop what's queued: the reader jumps to w */
@@ -144,8 +173,8 @@ static int decoder_thread(void *ud) {
             if (!g_flush_ack) { g_r = g_w; g_flush = 0; }
             eal3_reset(d);
             pos = end = 0;
-            if (song >= 0 && g_song_stream[song] >= 0) {
-                int si = g_song_stream[song];
+            if (song >= 0 && song < MAX_EVENTS && g_ev_stream[song] >= 0) {   /* a song or a bed's event */
+                int si = g_ev_stream[song];
                 pos = g_mus_off + g_stream_off[si];
                 end = g_mus_off + (si + 1 < g_nstreams ? g_stream_off[si + 1] : g_mus_size);
                 fseek(f, (long)pos, SEEK_SET);
@@ -209,8 +238,11 @@ int music_init(const char *dataroot) {
     music_set_playlist(song, def, 0);
     printf("music: %d streams; songs ->", g_nstreams);
     for (int s = 0; s < MUSIC_SONGS; s++) printf(" %d", g_song_stream[s]);
+    printf("; ambience beds ->");
+    for (int z = 0; z < 31; z++) printf(" %d", k_amb_event[z] >= 0 ? g_ev_stream[k_amb_event[z]] : -1);
     printf("\n");
-    if (!SDL_CreateThread(decoder_thread, "music", NULL)) return 0;
+    g_thread_up = 1;
+    if (!SDL_CreateThread(decoder_thread, "music", NULL)) { g_thread_up = 0; return 0; }
     g_ok = 1;
     return 1;
 }
@@ -275,6 +307,7 @@ static int next_song(uint32_t mask, uint32_t *left, int *last) {
 
 static void play(int song) {
     g_cur = song;
+    g_amb_ev = -1;
     g_req_song = song;
     __sync_synchronize();
     g_req_gen = g_req_gen + 1;
@@ -289,9 +322,16 @@ static void start_next(void) {
            list leaves song 0 the only one remaining */
         if (g_first_fe && (g_pl_mode[0] & 1)) { g_fe_left = 1; g_fe_last = -1; }
         g_first_fe = 0;
-        s = next_song(g_fe_mask, &g_fe_left, &g_fe_last);
-    } else if (g_mode == MUSIC_IG) s = next_song(g_ig_mask, &g_ig_left, &g_ig_last);
-    else s = -1;
+        /* EAXS_UpdateMusic's front-end branch: the shop beds instead
+           (music_fe_ambience) */
+        if (g_fe_amb_force || !g_fe_mask) { if (g_amb_ev >= 0) return; s = -1; }
+        else s = next_song(g_fe_mask, &g_fe_left, &g_fe_last);
+    } else if (g_mode == MUSIC_IG) {
+        /* EAXS_UpdateMusic 0x482180: the ambience beds instead of the songs
+           (music_ambience); a bed already playing carries on */
+        if (g_amb_force || !g_ig_mask) { if (g_amb_ev >= 0) return; s = -1; }
+        else s = next_song(g_ig_mask, &g_ig_left, &g_ig_last);
+    } else s = -1;
     play(s);
 }
 
@@ -299,6 +339,8 @@ void music_set_mode(int mode) {
     if (!g_ok || mode == g_mode) return;
     g_mode = mode;
     g_paused = 0;
+    g_amb_zone_play = -1; g_amb_fading = 0; g_amb_fade = 1.0f; g_amb_fade_dir = 0;
+    if (g_amb_ev >= 0) play(-1);   /* a new playlist: the bed stops (PATH_stop, SetGameState) */
     start_next();
 }
 
@@ -310,13 +352,126 @@ void music_play_song(int song) {
     play(song);
 }
 
+/* the stream ended and the ring has played out (music_mix needs two
+   frames to interpolate, so a lone last frame never drains) */
+static int stream_done(void) {
+    return g_ended_gen == g_req_gen && g_thr_gen == g_req_gen && ((g_w - g_r) & (RING - 1)) < 2;
+}
+
 void music_update(void) {
     if (!g_ok || g_mode == MUSIC_OFF || g_paused) return;
-    /* the stream ended and the ring has played out (music_mix needs two
-       frames to interpolate, so a lone last frame never drains) */
-    if (g_ended_gen == g_req_gen && g_thr_gen == g_req_gen && ((g_w - g_r) & (RING - 1)) < 2)
-        start_next();
+    if (g_amb_ev >= 0) return;   /* a bed restarts itself (music_ambience) */
+    if (stream_done()) start_next();
 }
+
+/* a bed's PATH event (PATH_event 0x7399e0 / 0x4580e0, then play): -1 = none
+   (PATH_event(-1) starts nothing: silence) */
+static void amb_start(int ev) {
+    g_cur = -1;
+    g_req_song = ev >= 0 && ev < MAX_EVENTS ? ev : -1;
+    g_amb_ev = g_req_song;
+    __sync_synchronize();
+    g_req_gen = g_req_gen + 1;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_AMB_LOG"))
+        printf("music: ambience bed event %d (stream %d), zone %d\n", ev, g_amb_ev >= 0 ? g_ev_stream[g_amb_ev] : -1,
+               g_amb_zone_play);
+#endif
+}
+
+void music_set_ambience_force(int force) { g_amb_force = force; }
+
+/* GetFloatFromHundredthsdB */
+static float cdb_lin(int cdb) { return powf(10.0f, (float)cdb / 2000.0f); }
+/* cInterpLine::Initialize(from, to, 300, 0) 0x459990: the int x 0.001
+   (0x78435c) = 0.3 s (<= 0 -> 0.01 s); curve 0 is Update 0x46b100's default
+   branch, from + (to - from) x t / d, done (= to) once t >= d (CONFIRMED G5 11-01) */
+static void amb_interp(float from, float to) { g_amb_from = from; g_amb_to = to; g_amb_t = 0.0f; g_amb_now = from; }
+
+/* In game, once a frame (EAXS_PFController::Update 0x482350 in game states 3
+   / 6 -> EAXS_UpdateMusic 0x482180 -> SetupAmbientStreams 0x47b260, then
+   cInterpLine::Update). zone / vol_cdb: GetAmbientZone 0x46b330 (the
+   Ambience / Volumes maps at the player's car); loading: IsLoadingScreenUp
+   0x4a9330 (PC_Loading.fng). */
+void music_ambience(int zone, int vol_cdb, int loading, float dt) {
+    if (!g_ok || g_mode != MUSIC_IG || g_paused) return;
+    /* SFXObj_Ambience's mix output (vt +0x38): +0xc = 1 fades it out, +0x10 = 1
+       back in. GUESS: a 1 s linear ramp each way (the dyn mixmap's fade not decoded) */
+    if (g_amb_fade_dir > 0) { g_amb_fade -= dt; if (g_amb_fade < 0.0f) g_amb_fade = 0.0f; }
+    else if (g_amb_fade_dir < 0) { g_amb_fade += dt; if (g_amb_fade >= 1.0f) { g_amb_fade = 1.0f; g_amb_fade_dir = 0; } }
+    if (!(g_amb_force || !g_ig_mask)) {
+        /* the songs' branch: a bed playing stops (PATH_stop), SetupMusicStreams
+           starts the next song */
+        if (g_amb_ev >= 0) { play(-1); start_next(); }
+        goto interp;
+    }
+    if (g_cur >= 0) play(-1);   /* a song playing stops (PATH_stop) */
+    if (loading) goto interp;
+    {
+        int ev_of = zone >= 0 && zone < 31 ? zone : -1;   /* GUESS: retail indexes 0x7ecc10 unchecked */
+        int ev = ev_of >= 0 ? k_amb_event[ev_of] : -1;
+        if (g_amb_ev < 0) {   /* +0x14 < 0x1b: no bed yet (or the zone has none) */
+            amb_interp(cdb_lin(g_amb_vol_set), cdb_lin(vol_cdb));
+            g_amb_vol_set = vol_cdb;
+            g_amb_fade_dir = g_amb_fade < 1.0f ? -1 : 0;   /* the fader's +0xc = 0 */
+            g_amb_zone_play = zone;
+            if (ev >= 0 || g_req_song >= 0) amb_start(ev);
+            g_amb_gain = g_amb_now * g_amb_fade;
+            goto interp;
+        }
+        if (vol_cdb != g_amb_vol_set) { amb_interp(g_amb_now, cdb_lin(vol_cdb)); g_amb_vol_set = vol_cdb; }
+        if (g_amb_zone_play != zone) {   /* a new zone: fade the bed out first */
+            g_amb_fade_dir = 1; g_amb_fading = 1;
+            g_amb_zone_play = zone;
+            goto interp;
+        }
+        if (!g_amb_fading) {
+            /* the bed ended (m_PathStatus 0x82afd4 == -1): the zone's event again.
+               GUESS: the RaceCoordinator (0x8900d8) taken as present in game and
+               the stream channel's +0x1a0 (busy) as clear */
+            if (stream_done()) amb_start(ev);
+            g_amb_gain = g_amb_now * g_amb_fade;   /* SetVol(interp x output >> 23) */
+        } else {
+            g_amb_gain = g_amb_fade;               /* SetVol(output >> 8) */
+            if (g_amb_fade <= 0.0f) {              /* faded out: the new zone's bed, faded in */
+                amb_start(ev);
+                g_amb_fade_dir = -1; g_amb_fading = 0;
+            }
+        }
+    }
+interp:
+    if (g_amb_t < 1.0f) {
+        g_amb_t += dt / 0.3f;
+        if (g_amb_t > 1.0f) g_amb_t = 1.0f;
+        g_amb_now = g_amb_from + (g_amb_to - g_amb_from) * g_amb_t;
+    }
+}
+
+/* The front end, once a frame (SetupAmbientStreams 0x47b260 with
+   GetAmbientZone's FE zone): the bed plays at 0 dB (PATH_volume(-1, 0)); a
+   new zone stops the bed (PATH_stop), the next frame starts the zone's */
+void music_fe_ambience(int zone, int force) {
+    g_fe_amb_force = force;
+    if (!g_ok || g_mode != MUSIC_FE || g_paused) return;
+    if (!(force || !g_fe_mask)) {
+        if (g_amb_ev >= 0) { play(-1); start_next(); }
+        return;
+    }
+    if (g_cur >= 0) play(-1);
+    int ev = zone >= 0 && zone < 31 ? k_amb_event[zone] : -1;
+    g_amb_gain = 1.0f;
+    g_amb_fading = 0; g_amb_fade = 1.0f; g_amb_fade_dir = 0;
+    if (g_amb_ev < 0) {                     /* no bed: the zone's at once */
+        g_amb_zone_play = zone;
+        if (ev >= 0 || g_req_song >= 0) amb_start(ev);
+        return;
+    }
+    if (g_amb_zone_play != zone) { g_amb_zone_play = zone; play(-1); return; }
+    /* m_PathStatus 0x82afd4 == -1: the bed ended, the zone's event again */
+    if (stream_done()) amb_start(ev);
+}
+
+int music_ambience_bed(void) { return g_amb_ev; }
 
 int music_current(void) { return g_cur; }
 int music_song_serial(void) { return g_serial; }
@@ -325,6 +480,7 @@ void music_mix(float *lr, int n, int rate) {
     if (!g_ring) return;
     if (g_flush) { g_r = g_flush_to; g_frac = 0; __sync_synchronize(); g_flush = 0; g_flush_ack = 1; }
     float target = g_paused ? 0.0f : (g_mode == MUSIC_FE ? g_vol_fe : g_mode == MUSIC_IG ? g_vol_ig : 0.0f);
+    if (g_amb_ev >= 0) target *= g_amb_gain;   /* a bed: SetupAmbientStreams' SetVol */
     if (g_paused && g_gain_now <= 0.0f) return;
     float step = 32000.0f / (float)rate, ramp = 1.0f / (0.03f * (float)rate);
     for (int i = 0; i < n; i++) {
