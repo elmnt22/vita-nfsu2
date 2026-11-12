@@ -18,16 +18,6 @@ engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
 > code. You need your own legally owned copy of the PC game. This project is
 > not affiliated with, authorized or endorsed by Electronic Arts.
 
-| Main menu | Circuit race |
-| --- | --- |
-| ![Main menu over the showroom](docs/screenshots/main_menu.png) | ![Circuit race with AI and traffic](docs/screenshots/race.png) |
-
-| Quick Race track select | Car Specialties Shop |
-| --- | --- |
-| ![Quick Race track select](docs/screenshots/track_select.png) | ![Car Specialties Shop, neon](docs/screenshots/car_shop.png) |
-
-*Screenshots from the Windows simulator, at the Vita's 720×408 3D render size.*
-
 ---
 
 ## Contents
@@ -69,13 +59,13 @@ engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
 - **Audio.** Per-car engine, turbo, shift, skid and collision sounds from the
   game's own sound banks, plus music and speech.
 - **Graphics.** The original world shading, car reflections, bloom, regional
-  fog, particles, the speed and nitrous blur, and smackable props.
+  fog, rain, particles, the speed and nitrous blur, and smackable props.
 - **World streaming.** The whole city streams in while you drive.
 - **Languages.** The game uses the Vita's system language when the original
   game has it. That covers English, French, German, Italian, Spanish, Dutch,
   Swedish and Danish. Other languages fall back to English.
 
-**Not in the port yet:** Online and LAN play, replays and rain.
+**Not in the port yet:** Online and LAN play.
 
 ---
 
@@ -283,7 +273,7 @@ supported targets are the three scripts above.
 | `sim/` | Windows simulator of the Vita build, plus self-tests in `sim/test/` |
 | `converter/` | UG2Converter: PC-side world conversion, cache builders, PC save import, FTP send |
 | `tools/` | Asset dump/audit tools, LiveArea and loading-screen art helpers |
-| `docs/` | Player guide for the converter, file format notes, developer guide, screenshots |
+| `docs/` | Player guide for the converter, file format notes, developer guide |
 | `third_party/` | Dear ImGui (desktop debug UI) |
 
 ---
