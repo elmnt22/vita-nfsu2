@@ -32,8 +32,6 @@ scratchpad/
 *.png
 !docs/images/
 !docs/images/*.png
-!docs/screenshots/
-!docs/screenshots/*.png
 mesh_out.*
 src/generated_world_debug_shaders.h
 *.log
