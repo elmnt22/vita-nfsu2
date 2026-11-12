@@ -296,6 +296,90 @@ static int n2_mod_brakes(const char *root,const char *model,const uint32_t *keys
     return 1;
 }
 
+/* License plate (slot 0x21 LICENSE_PLATE): CarRenderInfo::CarRenderInfo
+ * 0x638190 lists every REAR_LICENSE_PLATE (0xc805f7e0) / LICENSE_PLATE_REAR
+ * (0x494ed280) marker of the car's fitted part models (+0x620), and Render
+ * 0x620ae0 draws the plate part's model -- CARS/PLATES LICENSE_PLATE_STYLE01
+ * -- at each one through eRotateY(0x4000) * marker (LOD < 3), the exhaust
+ * axis change. Its texture LICENSE_PLATE (0x029a22f7) is GLOBALB's; no car
+ * pack holds a <CAR>_LICENSE_PLATE. FRONT_LICENSE_PLATE markers (+0x618)
+ * feed only the damage breakables, no model. The parsed plate is kept. */
+#define N2_PLATE_TEX 0x029a22f7u
+static N2Scene n2_plate_lib;static int n2_plate_tried;
+static int n2_mod_plate(const char *root,const unsigned char *data,long len,N2Scene *car) {
+    if(!root || !data)return 0;
+    if(!n2_plate_tried) {
+        n2_plate_tried=1;
+        char path[1024];long bytes=0;
+        snprintf(path,sizeof path,"%s/CARS/PLATES/GEOMETRY.BIN",root);
+        unsigned char *d=n2_read_file(path,&bytes);
+        if(d) {
+            static const uint32_t keys[1]={N2_PLATE_TEX};
+            N2CarConfig cfg={.hood_style=1};
+            n2_walk_car(d,0,bytes,&n2_plate_lib,keys,1,&cfg,0);
+            int kept=0;
+            for(int i=0;i<n2_plate_lib.count;i++) {
+                N2Mesh *m=n2_plate_lib.meshes+i;char name[64];long off=m->car_source;
+                name[0]=0;if(off>=8 && off<=bytes)n2_car_mesh_name(d,off,off+n2_u32(d+off-4),name);
+                if(!strstr(name,"LICENSE_PLATE")){n2_mesh_geometry_release(m);continue;}
+                n2_plate_lib.meshes[kept++]=*m;
+            }
+            n2_plate_lib.count=kept;n2_car_dedupe_lod(&n2_plate_lib);
+            free(d);
+        }
+        printf("car: license plate model %d meshes\n",n2_plate_lib.count);
+    }
+    if(!n2_plate_lib.count)return 0;
+    /* the markers of every fitted model, distinct placements once */
+    float mk[8][16];int nmk=0;
+    for(int i=0;i<car->count;i++) {
+        long off=car->meshes[i].car_source;
+        if(off<8 || off>len)continue;
+        int seen=0;for(int j=0;j<i && !seen;j++)seen=car->meshes[j].car_source==off;
+        if(seen)continue;
+        uint32_t size=n2_u32(data+off-4);if((long)size>len-off)continue;
+        N2Leaf leaf[4];int nl=0;n2_find_leaves(data,off,off+size,0x0013401au,leaf,&nl,4);
+        for(int l=0;l<nl;l++) {
+            const unsigned char *p=data+leaf[l].off;long bytes=leaf[l].size;
+            int pad=n2_skip_filler(p,(int)bytes);p+=pad;bytes-=pad;
+            if(bytes%80)continue;
+            for(long at=0;at<bytes && nmk<8;at+=80) {
+                uint32_t key=n2_u32(p+at);
+                if(key!=0xc805f7e0u && key!=0x494ed280u)continue;
+                float m[16];memcpy(m,p+at+16,sizeof m);
+                int bad=0;for(int a=0;a<16;a++)if(!isfinite(m[a]))bad=1;
+                if(bad)continue;
+                int dup=0;
+                for(int q=0;q<nmk && !dup;q++) {
+                    float e=0;for(int a=0;a<16;a++)e+=fabsf(mk[q][a]-m[a]);
+                    dup=e<1e-3f;
+                }
+                if(!dup)memcpy(mk[nmk++],m,sizeof m);
+            }
+        }
+    }
+    if(!nmk)return 0;
+    int total=car->count+n2_plate_lib.count*nmk;
+    N2Mesh *grown=(N2Mesh *)realloc(car->meshes,(size_t)total*sizeof *grown);
+    if(!grown)return 0;
+    car->meshes=grown;car->cap=total;
+    for(int k=0;k<nmk;k++)for(int i=0;i<n2_plate_lib.count;i++) {
+        const N2Mesh *src=n2_plate_lib.meshes+i;N2Mesh *dst=car->meshes+car->count;
+        int fl=src->authored_normals?8:5;
+        *dst=*src;dst->inst=0;dst->car_source=0;dst->famkey=0;dst->car_part=0;
+        dst->car_anim=0;dst->car_mount=N2_MOUNT_BODY;dst->cat=N2_CAR_MISC;dst->vcol=NULL;
+        dst->verts=(float *)malloc((size_t)src->nverts*fl*sizeof(float));
+        dst->idx=(uint16_t *)malloc((size_t)src->nidx*sizeof(uint16_t));
+        if(!dst->verts || !dst->idx){free(dst->verts);free(dst->idx);return 0;}
+        memcpy(dst->verts,src->verts,(size_t)src->nverts*fl*sizeof(float));
+        memcpy(dst->idx,src->idx,(size_t)src->nidx*sizeof(uint16_t));
+        n2_car_transform(dst,mk[k],1);
+        car->count++;
+    }
+    printf("car: license plate at %d marker%s\n",nmk,nmk==1?"":"s");
+    return nmk;
+}
+
 static int g_mod_fail_part=-1,g_mod_fail_value;   /* the part n2_mod_assemble gave up on */
 static int n2_mod_assemble(const char *root,const unsigned char *data,long len,
                            const N2CarConfig *cfg,N2Scene *car) {
@@ -316,6 +400,7 @@ static int n2_mod_assemble(const char *root,const unsigned char *data,long len,
     }
     g_mod_fail_part=-1;
     n2_mod_audio(root,data,len,cfg,car);
+    n2_mod_plate(root,data,len,car);
     return 1;
 }
 #endif

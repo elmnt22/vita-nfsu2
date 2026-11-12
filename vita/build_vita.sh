@@ -47,7 +47,7 @@ for s in $SRC; do
     o="$OUT/obj/$(basename "${s%.c}").o"
     OBJS+=("$o")
     if [ ! -f "$o" ] || [ "$ROOT/$s" -nt "$o" ] ||
-        { [ "$s" = vita/sdl_vita.c ] && [ "$ROOT/vita/vu_shim.inc" -nt "$o" ]; } ||
+        { [ "$s" = vita/sdl_vita.c ] && { [ "$ROOT/vita/vu_shim.inc" -nt "$o" ] || [ "$ROOT/vita/boot_settings.inc" -nt "$o" ]; }; } ||
         [ -n "$(find "$ROOT/src" "$ROOT/vita/include" -name '*.h' -newer "$o" -print -quit)" ]; then
         echo "CC $s"
         throttle

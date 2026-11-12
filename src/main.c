@@ -495,6 +495,10 @@ static void garage_delete_slot(int slot) {
    is the stock car of type *0x7faa48 = 21, the RX8 (0x515800). Kept as the
    "CURRENT" line of the garage file; *slot = its tuned slot (-1 stock). */
 #define GARAGE_DEFAULT_CAR "RX8"
+/* port addition (user 11-12, not retail): a new current car is saved with the
+   profile the next time the main menu is up, so a Quick Race / Customize
+   pick survives a reboot (retail only keeps it if a later save happens) */
+static int g_garage_cur_dirty;
 static void garage_current_car(char *out, size_t cap, int *slot) {
     GarageFile g; garage_read(&g);
     int s = g.cur[0] ? garage_id_split(g.cur, out, cap) : -1;
@@ -512,6 +516,7 @@ static void garage_set_current_car(const char *car) {
     snprintf(g.cur, sizeof g.cur, "%s", id);
     garage_write(&g);
     garage_free(&g);
+    g_garage_cur_dirty = 1;
     printf("garage: current car %s\n", id);
 }
 /* the Car Shop's car as it opened (MaybeCommitChangesToCarStable's
@@ -2631,6 +2636,7 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
                     candidate->keys, candidate->nkeys, &candidate->config,
                     candidate->texdata && candidate->texlen==0) <= 0 ||
         (n2_mod_brakes(dataroot, candidate->brake, candidate->keys, candidate->nkeys, &candidate->scene), 0) ||
+        (n2_mod_plate(dataroot, candidate->data, candidate->len, &candidate->scene), 0) ||
         !car_body_metrics(&candidate->scene, candidate->bb, candidate->bloom)) {
         printf("car load %s failed: %s\n", name, !candidate->data ? "GEOMETRY.BIN unreadable"
                : candidate->scene.count <= 0 ? "no meshes parsed" : "bad mesh data");
@@ -9093,6 +9099,9 @@ static void pause_open(const char *dataroot, int in_race)
     uint32_t keys[8];
     for (int i = 0; i < g_pause.n; i++) keys[i] = g_pause.it[i].icon;
     int got = hud_screen_strip(g_pause.menu, dataroot, "GLOBAL/InGameCommon.bun", keys, g_pause.n);
+    /* pm_QuitToCrib's icon is SHOP_ICON_CRIB (0xb8038ac0), a GLOBALB texture
+       (always resident on PC), not one of InGameCommon's INGAME_ICON_* */
+    if (got < g_pause.n) got += hud_screen_strip_more(g_pause.menu, dataroot, "GLOBAL/GLOBALB.BUN", keys, g_pause.n);
     for (int i = 0; i < g_pause.n; i++) hud_screen_strip_lock(g_pause.menu, i, pause_locked(g_pause.it[i].act));
     hud_screen_label(g_pause.menu, "Header_text", 0x6c839fbeu);     /* "Pause" */
     hud_screen_label(g_pause.menu, "Back_button", 0x933dd695u);     /* "Back" */
@@ -16713,6 +16722,7 @@ int main(int argc, char **argv) {
         ncar = n2_load_car_colored(cdata, clen, &car, ckeys, nck, &carcfg,
                                    ctdata && ctlen==0);
         if (ncar > 0 && n2_mod_brakes(dataroot, g_kit_brake, ckeys, nck, &car)) ncar = car.count;
+        if (ncar > 0 && n2_mod_plate(dataroot, cdata, clen, &car)) ncar = car.count;
         /* Wheels are modelled once at the origin (the SolidObject transform is
            identity for every part — verified), so a lone wheel mesh renders
            buried in the body. Place it at 4 arch positions derived from the body
@@ -20094,6 +20104,11 @@ int main(int argc, char **argv) {
             /* UI_Main (UIMain ctor): the DDAY_PLAYER_CAR preset while the career has no car,
                else BuildCurrentRideForPlayer(0), the front end's current car */
             if (g_fe && !g_career_mode && shop_on_main_menu(g_fe) && pending_car < 0 && !g_car_reload) {
+                if (g_garage_cur_dirty) {   /* the picked car into the profile (see g_garage_cur_dirty) */
+                    g_garage_cur_dirty = 0;
+                    if (g_opt.autosave && profile_named())
+                        printf("profile: current car saved (%s)\n", profile_save() ? "ok" : "FAILED");
+                }
                 if (!g_career.b873d && !g_main_preset_on && !g_career_preset_on) {
                     static int dday_read;   /* GLOBALB is read once: 1 found, -1 not */
                     static char pcar[32]; static N2CarConfig pc; static char prim[16]; static int prs;

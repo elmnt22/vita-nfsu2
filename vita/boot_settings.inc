@@ -2,11 +2,9 @@
    (template.xml frame3 settings.png, psla:-settings) or by holding L+R while
    the game starts. It runs before the engine loads anything. Text uses the
    Vita's own system font (ScePvf; the simulator stands in a Windows font),
-   rasterised into an atlas once. The look follows the Vita's own Settings
-   app: a title bar, full-width rows with dividers and a grey description
-   line, a tick box / blue value on the right, a flat blue focus bar. Boxes,
-   ticks and button icons are drawn by one small shader (distance fields),
-   all of a frame's quads in one draw.
+   rasterised into an atlas once. The layout follows the green Vita Settings
+   app: inset outlined rows, white labels and checkboxes, a blue focus row,
+   and a separate description below the list. Shapes use distance fields.
    Each setting is one of the switch files in ux0:data/NFSU2 the game
    already reads at boot:
      Logs        nolog.txt   present = log.txt and perf.csv are not written
@@ -243,16 +241,12 @@ static void bs_text(const BsFont *f, const char *s, float x, float yc, const flo
         x += g->adv;
     }
 }
-/* a face button glyph as on the Vita: a dark disc with the symbol in its colour */
+/* White face-button symbols used by the system footer. */
 static void bs_face_button(float cx, float cy, float r, int cross)
 {
-    bs_shape(cx - r, cy - r, 2 * r, 2 * r, 1.0f, r, 0, BSC(225, 228, 234, 1.0f), BSC(190, 195, 204, 1.0f));
-    float s = r * 0.48f;
-    if (cross) bs_shape(cx - s, cy - s, 2 * s, 2 * s, 3.0f, 0, r * 0.2f, BSC(60, 120, 215, 1.0f), NULL);
-    else {
-        s = r * 0.56f;
-        bs_shape(cx - s, cy - s, 2 * s, 2 * s, 4.0f, 0, r * 0.19f, BSC(225, 60, 70, 1.0f), NULL);
-    }
+    float s = r * 0.65f;
+    if (cross) bs_shape(cx - s, cy - s, 2 * s, 2 * s, 3.0f, 0, 1.8f * r / 9.0f, BSC(255, 255, 255, 1.0f), NULL);
+    else bs_shape(cx - s, cy - s, 2 * s, 2 * s, 4.0f, 0, 1.8f * r / 9.0f, BSC(255, 255, 255, 1.0f), NULL);
 }
 
 static void boot_settings_run(void) {
@@ -270,14 +264,14 @@ static void boot_settings_run(void) {
                 bsf_build(&f_small, 0, (int)(14.5f * S + 0.5f));
     if (!fonts) printf("settings: drawing unavailable, keys still work\n");
 
-    static const char *names[I_N] = { "Logs", "Frame rate", "Reset caches", "Start game" };
+    static const char *names[I_N] = { "Enable logging", "Limit frame rate", "Reset caches", "Start game" };
     static const char *help[I_N] = {
-        "Write log.txt each run, for bug reports.",
-        "30 FPS is locked and even. Unlocked runs up to 60 but varies.",
-        "Delete converted world data and shaders. The next boot converts again.",
-        "Restart into the game with these settings." };
+        "Save logs for bug reports.",
+        "Limit to 30 FPS. Turn off to allow up to 60 FPS.",
+        "Clear converted data and shaders. Your saves are kept.",
+        "Start the game with these settings." };
     /* the title bar, then the rows full width, then the button bar */
-    const float hb = 54 * S, rx = 30 * S, ry0 = hb, rh = 72 * S, fb = 40 * S;
+    const float hb = 66 * S, rx = 30 * S, ry0 = hb + 12 * S, rh = 57 * S, fb = 40 * S;
 
     while (!quit) {
         unsigned now = bs_pad(), hit = now & ~prev;
@@ -286,7 +280,7 @@ static void boot_settings_run(void) {
         if (bs_tap(&tx, &ty)) {   /* a tap on a row picks it and presses it */
             for (int i = 0; i < I_N; i++) {
                 float y = ry0 + i * rh;
-                if (ty >= y && ty < y + rh) {
+                if (tx >= rx && tx < BS_W - rx && ty >= y && ty < y + rh - 5 * S) {
                     if (sel != i) confirm = 0;
                     sel = i; act = 1;
                 }
@@ -328,56 +322,57 @@ static void boot_settings_run(void) {
         glClear(GL_COLOR_BUFFER_BIT);
         if (fonts) {
             const float W = (float)BS_W, H = (float)BS_H;
-            const float *white = BSC(255, 255, 255, 1.0f), *grey = BSC(150, 150, 156, 1.0f),
-                        *blue = BSC(110, 175, 245, 1.0f), *divider = BSC(255, 255, 255, 0.16f);
+            const float *white = BSC(255, 255, 255, 1.0f);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            /* background: near black, a little lighter at the top */
-            bs_fill(0, 0, W, H, 0, BSC(24, 25, 28, 1.0f), BSC(4, 4, 6, 1.0f));
-            /* title bar */
-            bs_fill(0, 0, W, hb, 0, BSC(58, 60, 66, 1.0f), BSC(34, 35, 40, 1.0f));
-            bs_fill(0, hb - 1 * S, W, 1 * S, 0, BSC(0, 0, 0, 0.8f), NULL);
-            bs_text(&f_title, "Settings", rx, hb * 0.5f, white);
+            /* Vita Settings green, with a soft light across the upper half. */
+            bs_fill(0, 0, W, H, 0, BSC(112, 173, 18, 1.0f), BSC(29, 91, 9, 1.0f));
+            bs_fill(0, 0, W, hb, 0, BSC(255, 255, 255, 0.08f), BSC(255, 255, 255, 0.0f));
+            bs_text(&f_title, "Settings", rx + 10 * S, hb * 0.5f, white);
             const char *sub = "Need for Speed Underground 2";
-            bs_text(&f_small, sub, W - rx - bs_text_w(&f_small, sub), hb * 0.5f, grey);
+            bs_text(&f_small, sub, W - rx - bs_text_w(&f_small, sub), hb * 0.5f, BSC(255, 255, 255, 0.8f));
+            bs_fill(rx, hb, W - 2 * rx, 1 * S, 0, BSC(255, 255, 255, 0.45f), NULL);
 
             for (int i = 0; i < I_N; i++) {
-                float y = ry0 + i * rh, on = i == sel;
-                if (on) {   /* the focus bar */
-                    bs_fill(0, y, W, rh, 0, BSC(30, 110, 215, 1.0f), BSC(16, 78, 170, 1.0f));
-                    bs_fill(0, y, W, 1 * S, 0, BSC(130, 190, 255, 0.7f), NULL);
-                }
-                if (i < I_N - 1) bs_fill(rx, y + rh - 1 * S, W - 2 * rx, 1 * S, 0, divider, NULL);
-                bs_text(&f_label, names[i], rx, y + rh * 0.38f, white);
-                const char *d = (on && status[0] && i == I_RESET) ? status
-                              : (i == I_RESET && on && confirm) ? "Press the button again to delete the caches."
-                              : help[i];
-                bs_text(&f_small, d, rx, y + rh * 0.70f, on ? BSC(205, 225, 250, 1.0f) : grey);
-                float vr = W - rx, yc = y + rh * 0.5f;
-                if (i == I_LOGS) {   /* tick box */
-                    float b = 26 * S, bx = vr - b, by = yc - b * 0.5f;
-                    if (logs) bs_fill(bx, by, b, b, 4 * S, BSC(60, 150, 245, 1.0f), BSC(30, 110, 215, 1.0f));
-                    else bs_fill(bx, by, b, b, 4 * S, BSC(20, 20, 24, 0.6f), NULL);
-                    bs_line(bx, by, b, b, 4 * S, 1.5f * S, BSC(230, 232, 236, 0.9f));
-                    if (logs) bs_shape(bx + 4 * S, by + 4 * S, b - 8 * S, b - 8 * S, 5.0f, 0, 3.0f * S, white, NULL);
-                } else if (i == I_FPS) {
-                    const char *v = unlocked ? "Unlocked" : "30 FPS";
-                    bs_text(&f_label, v, vr - bs_text_w(&f_label, v), yc, on ? white : blue);
-                } else if (i == I_RESET && on && confirm) {
-                    const char *v = "Delete?";
-                    bs_text(&f_label, v, vr - bs_text_w(&f_label, v), yc, white);
+                float y = ry0 + i * rh, h = rh - 5 * S, yc = y + h * 0.5f;
+                int on = i == sel;
+                bs_fill(rx, y, W - 2 * rx, h, 6 * S,
+                        on ? BSC(38, 145, 225, 1.0f) : BSC(18, 72, 4, 0.18f),
+                        on ? BSC(8, 93, 184, 1.0f) : NULL);
+                bs_line(rx, y, W - 2 * rx, h, 6 * S, (on ? 2.0f : 1.0f) * S,
+                        BSC(255, 255, 255, on ? 1.0f : 0.55f));
+                bs_text(&f_label, names[i], rx + 18 * S, yc, white);
+                float vr = W - rx - 18 * S;
+                if (i == I_LOGS || i == I_FPS) {
+                    int checked = i == I_LOGS ? logs : !unlocked;
+                    float b = 24 * S, bx = vr - b, by = yc - b * 0.5f;
+                    bs_fill(bx, by, b, b, 2 * S, BSC(0, 0, 0, 0.12f), NULL);
+                    bs_line(bx, by, b, b, 2 * S, 1.5f * S, white);
+                    if (checked) bs_shape(bx + 3 * S, by + 3 * S, b - 6 * S, b - 6 * S,
+                                          5.0f, 0, 2.8f * S, white, NULL);
+                    if (i == I_FPS) {
+                        const char *v = unlocked ? "Up to 60 FPS" : "30 FPS";
+                        bs_text(&f_small, v, bx - 16 * S - bs_text_w(&f_small, v), yc, white);
+                    }
+                } else {
+                    /* Small right-facing chevron, as in system setting rows. */
+                    bs_text(&f_label, ">", vr - bs_text_w(&f_label, ">"), yc, white);
                 }
             }
-            /* button bar */
+            const char *d = sel == I_RESET && status[0] ? status
+                          : sel == I_RESET && confirm ? "Select again to delete caches. Saves are kept."
+                          : help[sel];
+            float dy = ry0 + I_N * rh + 17 * S;
+            bs_text(&f_small, d, (W - bs_text_w(&f_small, d)) * 0.5f, dy, white);
+            /* Quiet footer, using the same white symbols as system menus. */
             float fy = H - fb * 0.5f;
-            bs_fill(0, H - fb, W, fb, 0, BSC(30, 31, 35, 1.0f), BSC(16, 16, 19, 1.0f));
-            bs_fill(0, H - fb, W, 1 * S, 0, BSC(255, 255, 255, 0.10f), NULL);
-            float br = 10 * S, x = W - rx;
-            const char *t2 = "Start game", *t1 = "Select";
+            bs_fill(0, H - fb, W, 1 * S, 0, BSC(255, 255, 255, 0.25f), NULL);
+            float br = 9 * S, x = W - rx;
+            const char *t2 = "Start game", *t1 = "Enter";
             x -= bs_text_w(&f_small, t2); bs_text(&f_small, t2, x, fy, white);
-            x -= 6 * S + br; bs_face_button(x, fy, br, 0); x -= br + 22 * S;
+            x -= 7 * S + br; bs_face_button(x, fy, br, 0); x -= br + 24 * S;
             x -= bs_text_w(&f_small, t1); bs_text(&f_small, t1, x, fy, white);
-            x -= 6 * S + br; bs_face_button(x, fy, br, 1);
+            x -= 7 * S + br; bs_face_button(x, fy, br, 1);
             bsr_flush();
             glDisable(GL_BLEND);
             glUseProgram(0);

@@ -1876,11 +1876,11 @@ static int pvf_size(int face, int px)
 {
     ScePvfFontId f = g_pvf[face];
     if (g_pvf_px[face] == px) return 1;
-    scePvfSetCharSize(f, 10.0f, 10.0f);
+    if (scePvfSetCharSize(f, 10.0f, 10.0f) < 0) return 0;
     ScePvfCharInfo ci; memset(&ci, 0, sizeof ci);
-    if (scePvfGetCharInfo(f, 'H', &ci) < 0 || ci.bitmapTop <= 0) return 0;
-    float sz = 10.0f * (0.70f * (float)px) / (float)ci.bitmapTop;
-    scePvfSetCharSize(f, sz, sz);
+    if (scePvfGetCharInfo(f, 'H', &ci) < 0 || ci.glyphMetrics.horizontalBearingY64 <= 0) return 0;
+    float sz = 10.0f * (0.70f * (float)px) * 64.0f / (float)ci.glyphMetrics.horizontalBearingY64;
+    if (scePvfSetCharSize(f, sz, sz) < 0) return 0;
     g_pvf_px[face] = px;
     return 1;
 }
@@ -1899,7 +1899,9 @@ static int bs_font_raster_v(int face, int px, unsigned cp, unsigned char *buf, i
         ScePvfError err = 0;
         g_pvf_lib = scePvfNewLib(&r, &err);
         if (g_pvf_lib) {
-            scePvfSetResolution(g_pvf_lib, 72.0f, 72.0f);
+            /* PVF needs an EM scale as well as a resolution (as in libvita2d). */
+            scePvfSetEM(g_pvf_lib, 72.0f / (10.125f * 128.0f));
+            scePvfSetResolution(g_pvf_lib, 128.0f, 128.0f);
             g_pvf[0] = pvf_open(0); g_pvf[1] = pvf_open(1);
             if (!g_pvf[1]) g_pvf[1] = g_pvf[0];
         } else vita_mark("settings: scePvfNewLib failed 0x%08x", (unsigned)err);
@@ -1917,14 +1919,18 @@ static int bs_font_raster_v(int face, int px, unsigned cp, unsigned char *buf, i
     ScePvfCharInfo ci; memset(&ci, 0, sizeof ci);
     if (scePvfGetCharInfo(f, (ScePvfCharCode)cp, &ci) < 0) return ps_glyph_raster(face, px, cp, buf, stride, cap, g);
     g->adv = (float)ci.glyphMetrics.horizontalAdvance64 / 64.0f;
-    g->left = ci.bitmapLeft; g->top = ci.bitmapTop;
-    g->w = (int)ci.bitmapWidth; g->h = (int)ci.bitmapHeight;
+    g->left = ci.glyphMetrics.horizontalBearingX64 >> 6;
+    g->top = ci.glyphMetrics.horizontalBearingY64 >> 6;
+    ScePvfIrect rect; memset(&rect, 0, sizeof rect);
+    if (scePvfGetCharImageRect(f, (ScePvfCharCode)cp, &rect) < 0)
+        return ps_glyph_raster(face, px, cp, buf, stride, cap, g);
+    g->w = rect.width; g->h = rect.height;
     if (g->w > stride) g->w = stride;
     if (g->h > cap) g->h = cap;
     if (g->w <= 0 || g->h <= 0) { g->w = g->h = 0; return 1; }   /* a space */
     ScePvfUserImageBufferRec ib; memset(&ib, 0, sizeof ib);
     ib.pixelFormat = SCE_PVF_USERIMAGE_DIRECT8;
-    ib.xPos64 = -ci.bitmapLeft * 64; ib.yPos64 = ci.bitmapTop * 64;   /* pen origin: the bitmap lands at (0,0) */
+    ib.xPos64 = -ci.glyphMetrics.horizontalBearingX64; ib.yPos64 = ci.glyphMetrics.horizontalBearingY64;   /* pen origin: the bitmap lands at (0,0) */
     ib.rect.width = (ScePvfU16)stride; ib.rect.height = (ScePvfU16)cap;
     ib.bytesPerLine = (ScePvfU16)stride;
     ib.buffer = buf;
