@@ -7678,7 +7678,9 @@ static int rt_drift_place(void)
 /* what the post-race screens read of the race, kept past rt_end */
 static struct { int drift, downhill, sprint, laps, drag; } g_prace;
 static Hud *g_results;
-enum { PR_RESTART, PR_STATS, PR_QUIT, PR_EXPLORE, PR_NEXTRACE, PR_SPONSOR, PR_WORLDMAP, PR_WORLDMAP_PAUSE, PR_REPLAY };
+enum { PR_RESTART, PR_STATS, PR_QUIT, PR_EXPLORE, PR_NEXTRACE, PR_SPONSOR, PR_WORLDMAP, PR_WORLDMAP_PAUSE, PR_REPLAY,
+       PR_QUIT_PAUSE, /* the pause menu's Quit to Main Menu (QuitGame__9PauseMenu 80100a5c: no commit) */
+       PR_EXPLORE_ABANDON /* a tournament's "Explore?" OK (0x451e768e -> QuitRaceToFreeRoam 800f30c4: no commit) */ };
 typedef struct { uint32_t icon, label; int act; } PostOpt;
 /* EventInProgressState (GC 80127bf8) of a multi-track career event, a
    tournament (only URL events have them): NotifyInitialize 80128044 adds the
@@ -8549,7 +8551,7 @@ static void post_key_screen(int key)
             spon_choose();
         } else if (key == PK_OK && g_post.dsel == 0) {
             hud_free(&g_post.dlg);
-            g_post.action = g_post.dact;
+            g_post.action = g_post.dact == PR_EXPLORE ? PR_EXPLORE_ABANDON : g_post.dact;   /* the dialog is only a tournament's Explore */
             printf("post-race: %s confirmed\n", g_post.dact == PR_RESTART ? "Restart"
                    : g_post.dact == PR_EXPLORE ? "Explore" : g_post.dact == PR_WORLDMAP ? "Return to World Map" : "Quit to Main Menu");
         } else if (key == PK_OK || key == PK_BACK) hud_free(&g_post.dlg);
@@ -8643,7 +8645,7 @@ static void post_results_tick(float dt)
    without one). Restart (0x4c25d0) / Quit (0x4c2820) ask with
    UI_InGameDialog first: "Restart Race?" 0972a44b, "Quit to Main Menu?"
    30ed2368; OK -> the post-race paths (race message 3 / 6). */
-enum { PZ_RESUME, PZ_RESTART, PZ_OPTIONS, PZ_REPLAY, PZ_QUIT, PZ_WORLDMAP };
+enum { PZ_RESUME, PZ_RESTART, PZ_OPTIONS, PZ_REPLAY, PZ_QUIT, PZ_WORLDMAP, PZ_QUITRACE, PZ_GARAGE };
 static const struct { uint32_t icon, label; int act; } k_pause_race[] = {
     { 0x12bb5ea2u, 0xf6601088u, PZ_RESUME },    /* "Resume Race"       (0x4c24c0) */
     { 0xb295a6b6u, 0x80833fc2u, PZ_RESTART },   /* "Restart"           (0x4c25d0) */
@@ -8654,11 +8656,31 @@ static const struct { uint32_t icon, label; int act; } k_pause_race[] = {
     { 0x3109913cu, 0x5e670a9eu, PZ_WORLDMAP },  /* "Return to World Map" (0x4c2560) */
     { 0x12bb5ea2u, 0xf6601088u, PZ_RESUME },
     { 0xb295a6b6u, 0x80833fc2u, PZ_RESTART },
+    { 0x62aa0df6u, 0xdb4e3c0du, PZ_QUITRACE },  /* career: "Quit Race" (pm_QuitRaceToFreeRoam) */
+    { 0x520de4e3u, 0xb34993c9u, PZ_OPTIONS },
+    { 0x84d1d864u, 0x7840428au, PZ_REPLAY },
+    { 0x4c9e34e6u, 0xc7e1420cu, PZ_QUIT },
+}, k_pause_race_c[] = {   /* SetupRace 801005c4 in career: NeedToSeeQuitRaceToExploreMode 80100200
+                            (career, race mode != 7) adds pm_QuitRaceToFreeRoam after Restart */
+    { 0x12bb5ea2u, 0xf6601088u, PZ_RESUME },
+    { 0xb295a6b6u, 0x80833fc2u, PZ_RESTART },
+    { 0x62aa0df6u, 0xdb4e3c0du, PZ_QUITRACE },  /* "Quit Race" */
     { 0x520de4e3u, 0xb34993c9u, PZ_OPTIONS },
     { 0x84d1d864u, 0x7840428au, PZ_REPLAY },
     { 0x4c9e34e6u, 0xc7e1420cu, PZ_QUIT },
 }, k_pause_roam[] = {
     { 0x62aa0df6u, 0xc44a6515u, PZ_RESUME },    /* "Return to Free Run" (0x4c2510) */
+    { 0x520de4e3u, 0xb34993c9u, PZ_OPTIONS },
+    { 0x84d1d864u, 0x7840428au, PZ_REPLAY },
+    { 0x4c9e34e6u, 0xc7e1420cu, PZ_QUIT },
+}, k_pause_roam_c[] = {   /* SetupExplore 80100320 in career (0x803ce800 == 1): label 0xc3e5bcdc */
+    { 0x62aa0df6u, 0xc3e5bcdcu, PZ_RESUME },
+    { 0x520de4e3u, 0xb34993c9u, PZ_OPTIONS },
+    { 0x84d1d864u, 0x7840428au, PZ_REPLAY },
+    { 0x4c9e34e6u, 0xc7e1420cu, PZ_QUIT },
+}, k_pause_roam_cg[] = {  /* + NeedToSeeJumpToGarage 801000e8 (career, +0x7f58 crib_in_event) */
+    { 0x62aa0df6u, 0xc3e5bcdcu, PZ_RESUME },
+    { 0xb8038ac0u, 0x453890e1u, PZ_GARAGE },    /* "Jump to Garage" (pm_QuitToCrib) */
     { 0x520de4e3u, 0xb34993c9u, PZ_OPTIONS },
     { 0x84d1d864u, 0x7840428au, PZ_REPLAY },
     { 0x4c9e34e6u, 0xc7e1420cu, PZ_QUIT },
@@ -8801,7 +8823,9 @@ static void career_mark_event_complete(void)
     if (!g_eng.commit || !cev) return;
     g_eng.commit = 0;
     if (career_has_completed(n2_u32(cev + 8))) { g_eng.won = 0; return; }   /* HasAlreadyClaimedReward */
-    if (g_eng.won) career_commit_win(n2_u32(cev + 8), 1, g_eng.margin);
+    /* IsPossibleToWinReward 8012858c: not for a race the crib World Map started (+0xc) --
+       still won and counted, no purse and no sponsor points */
+    if (g_eng.won) career_commit_win(n2_u32(cev + 8), !g_career_from_wmap, g_eng.margin);
     else career_commit_lose(n2_u32(cev + 8));
     printf("career: %s %s\n", career_string((uint16_t)(cev[0] | cev[1] << 8)),
            g_eng.won ? "won (CommitWinEvent)" : "lost (CommitLoseEvent)");
@@ -8815,7 +8839,8 @@ static void career_mark_event_complete(void)
 static int post_need_reward(void)
 {
     const unsigned char *cev = g_career.engaged_event;
-    return g_career_mode && g_eng.commit && cev && g_eng.won && !career_has_completed(n2_u32(cev + 8));
+    return g_career_mode && g_eng.commit && cev && g_eng.won && !g_career_from_wmap   /* IsPossibleToWinReward (+0xc) */
+        && !career_has_completed(n2_u32(cev + 8));
 }
 /* The screens the finish opens at once (UI_PostRaceResults; a tournament's
    UI_PostRace_TournResults after it) and the ones the first accept opens
@@ -9059,10 +9084,12 @@ static void pause_open(const char *dataroot, int in_race)
     if (!g_pause.menu) { printf("pause: UI_Pause.fng not loaded\n"); return; }
     g_pause.race = in_race;
     int wm = in_race && g_career_mode && g_career_from_wmap;
-    g_pause.it = wm ? k_pause_race_wm : in_race ? k_pause_race : k_pause_roam;
-    g_pause.n = wm ? (int)(sizeof k_pause_race_wm / sizeof k_pause_race_wm[0])
-              : in_race ? (int)(sizeof k_pause_race / sizeof k_pause_race[0])
-                        : (int)(sizeof k_pause_roam / sizeof k_pause_roam[0]);
+#define PZ_LIST(a) (g_pause.it = a, g_pause.n = (int)(sizeof a / sizeof a[0]))
+    if (wm) PZ_LIST(k_pause_race_wm);
+    else if (in_race) { if (g_career_mode) PZ_LIST(k_pause_race_c); else PZ_LIST(k_pause_race); }
+    else if (g_career_mode) { if (g_career.crib_in_event) PZ_LIST(k_pause_roam_cg); else PZ_LIST(k_pause_roam_c); }
+    else PZ_LIST(k_pause_roam);
+#undef PZ_LIST
     uint32_t keys[8];
     for (int i = 0; i < g_pause.n; i++) keys[i] = g_pause.it[i].icon;
     int got = hud_screen_strip(g_pause.menu, dataroot, "GLOBAL/InGameCommon.bun", keys, g_pause.n);
@@ -9095,7 +9122,9 @@ static void pause_dialog(const char *dataroot, int act)
     if (!g_pause.dlg) { printf("pause: UI_InGameDialog.fng not loaded\n"); return; }
     g_pause.dact = act;
     /* pm_ReturnToWorldMap 0x4c2560: racing -> "...^All unsaved race progress will be lost." */
-    uint32_t msg = act == PZ_RESTART ? 0x0972a44bu : act == PZ_WORLDMAP ? 0xe761c8b8u : 0x30ed2368u;
+    /* pm_QuitRaceToFreeRoam 8030a178: racing 0x07cd17b0 (else 0x60b42afb); pm_QuitToCrib 8030a0b4: 0xc9ba9e3e */
+    uint32_t msg = act == PZ_RESTART ? 0x0972a44bu : act == PZ_WORLDMAP ? 0xe761c8b8u
+                 : act == PZ_QUITRACE ? 0x07cd17b0u : act == PZ_GARAGE ? 0xc9ba9e3eu : 0x30ed2368u;
     hud_screen_text(g_pause.dlg, "message_blurb", hud_screen_string(g_pause.dlg, msg));
     hud_screen_label(g_pause.dlg, "BUTTON_TEXT_1", 0x639u);        /* "OK" */
     hud_screen_label(g_pause.dlg, "BUTTON_TEXT_2", 0x541389e5u);   /* "Cancel" */
@@ -10708,8 +10737,12 @@ static void pause_key(const char *dataroot, int key)
             int a = g_pause.dact;
             audio_fe_play(FE_SND_SELECT);
             pause_close();
-            g_post.action = a == PZ_RESTART ? PR_RESTART : a == PZ_WORLDMAP ? PR_WORLDMAP_PAUSE : PR_QUIT;
-            printf("pause: %s confirmed\n", a == PZ_RESTART ? "Restart" : a == PZ_WORLDMAP ? "Return to World Map" : "Quit to Main Menu");
+            /* QuitRaceToFreeRoam 801009b0 (RC message 0xb -> NotifyEnterFreeRoamFromPause: no commit);
+               QuitToCrib 801009dc = QuitToWorldMap 80100a1c (NotifyEnterCribFromPauseMenu, UI_CareerCrib) */
+            g_post.action = a == PZ_RESTART ? PR_RESTART : a == PZ_WORLDMAP || a == PZ_GARAGE ? PR_WORLDMAP_PAUSE
+                          : a == PZ_QUITRACE ? PR_EXPLORE_ABANDON : PR_QUIT_PAUSE;
+            printf("pause: %s confirmed\n", a == PZ_RESTART ? "Restart" : a == PZ_WORLDMAP ? "Return to World Map"
+                   : a == PZ_GARAGE ? "Jump to Garage" : a == PZ_QUITRACE ? "Quit Race" : "Quit to Main Menu");
         } else if (key == PK_OK || key == PK_BACK) {
             audio_fe_play(key == PK_OK ? FE_SND_SELECT : FE_SND_BACK);
             hud_free(&g_pause.dlg);
@@ -10723,7 +10756,7 @@ static void pause_key(const char *dataroot, int key)
     else if (key == PK_OK) {
         int a = g_pause.it[g_pause.sel].act;
         if (a == PZ_RESUME) { audio_fe_play(FE_SND_SELECT); pause_close(); printf("pause: resume\n"); }
-        else if (a == PZ_RESTART || a == PZ_QUIT || a == PZ_WORLDMAP) { audio_fe_play(FE_SND_DIALOG); pause_dialog(dataroot, a); }
+        else if (a == PZ_RESTART || a == PZ_QUIT || a == PZ_WORLDMAP || a == PZ_QUITRACE || a == PZ_GARAGE) { audio_fe_play(FE_SND_DIALOG); pause_dialog(dataroot, a); }
         else if (a == PZ_OPTIONS) { audio_fe_play(FE_SND_SELECT); g_pzo.sel = 0; pzo_open_main(dataroot); }
         else if (a == PZ_REPLAY && !pause_locked(a)) {   /* UI_ReplayControl over the paused race */
             audio_fe_play(FE_SND_SELECT); pause_close(); g_rp_req = RP_FROM_PAUSE; printf("pause: Replay\n");
@@ -12341,39 +12374,22 @@ static float seg_d2_m112(float px,float py,float ax,float ay,float bx,float by,
 }
 
 #ifdef __vita__
-/* ---- garage menu (Start while driving) ---------------------------------- */
 /* The cars a player can drive in UG2. CARS/ also holds traffic vehicles and
-   shared part folders, which the garage skips. */
+   shared part folders, which the front end's car lists skip. */
 static const char *const k_player_cars[] = {
     "240SX", "3000GT", "350Z", "A3", "CELICA", "CIVIC", "COROLLA", "ECLIPSE",
     "ESCALADE", "FOCUS", "G35", "GOLF", "GTO", "HUMMER", "IMPREZA", "IMPREZAWRX",
     "IS300", "LANCER", "LANCEREVO8", "MIATA", "MUSTANGGT", "NAVIGATOR", "NEON",
     "PEUGOT", "RSX", "RX7", "RX8", "S2000", "SENTRA", "SKYLINE", "SUPRA",
     "TIBURON", "TT" };
-static const char *const k_player_car_names[] = {
-    "NISSAN 240SX", "MITSUBISHI 3000GT", "NISSAN 350Z", "AUDI A3", "TOYOTA CELICA",
-    "HONDA CIVIC", "TOYOTA COROLLA", "MITSUBISHI ECLIPSE", "CADILLAC ESCALADE",
-    "FORD FOCUS", "INFINITI G35", "VOLKSWAGEN GOLF", "PONTIAC GTO", "HUMMER H2",
-    "SUBARU IMPREZA", "SUBARU IMPREZA WRX", "LEXUS IS300", "MITSUBISHI LANCER",
-    "MITSUBISHI LANCER EVO VIII", "MAZDA MIATA", "FORD MUSTANG GT", "LINCOLN NAVIGATOR",
-    "DODGE NEON", "PEUGEOT 206", "ACURA RSX", "MAZDA RX-7", "MAZDA RX-8", "HONDA S2000",
-    "NISSAN SENTRA", "NISSAN SKYLINE GT-R", "TOYOTA SUPRA", "HYUNDAI TIBURON", "AUDI TT" };
 #define N_PLAYER_CARS ((int)(sizeof k_player_cars / sizeof *k_player_cars))
 static int player_car_index(const char *folder) {
     for (int i = 0; i < N_PLAYER_CARS; i++) if (!strcmp(folder, k_player_cars[i])) return i;
     return -1;
 }
-static const char *player_car_name(const char *folder) {
-    int i = player_car_index(folder);
-    return i >= 0 ? k_player_car_names[i] : folder;
-}
-/* Fitted performance parts per car (garage NITROUS / TURBO rows): 0 = the
-   car's stock fitment, 1 = fitted, 2 = removed. Stock: no car carries
-   nitrous (in UG2 it is bought); a turbo where the car's GLOBALB record has
-   a non-zero stock turbo curve (n2_global_car_turbo -- the same test the
-   game uses to show its turbo gauge), filled once at start-up.
-   Not persisted (no settings file). */
-static unsigned char g_fit_nos[N_PLAYER_CARS], g_fit_turbo[N_PLAYER_CARS];
+/* Stock turbo: where the car's GLOBALB record has a non-zero stock turbo
+   curve (n2_global_car_turbo -- the same test the game uses to show its
+   turbo gauge), filled once at start-up. */
 static unsigned char g_stock_turbo[N_PLAYER_CARS];
 static void car_stock_turbo_init(const unsigned char *g, long glen) {
     char list[256]; list[0] = 0;
@@ -12388,31 +12404,6 @@ static int car_stock_turbo(const char *folder) {
     int i = player_car_index(folder);
     return i >= 0 && g_stock_turbo[i];
 }
-static int car_has_nos(const char *folder) {
-    int i = player_car_index(folder);
-    return i >= 0 && g_fit_nos[i] == 1;
-}
-static int car_has_turbo(const char *folder) {
-    int i = player_car_index(folder);
-    if (i >= 0 && g_fit_turbo[i]) return g_fit_turbo[i] == 1;
-    return car_stock_turbo(folder);
-}
-/* garage LEFT/RIGHT: flip between fitted and removed */
-static void car_toggle_part(unsigned char *fit, const char *folder, int has) {
-    int i = player_car_index(folder);
-    if (i >= 0) fit[i] = has ? 2 : 1;
-}
-/* Paint: entry 0 keeps the car's own colour. */
-static const struct { const char *name; float rgb[3]; } k_paints[] = {
-    {"STOCK", {0, 0, 0}}, {"RED", {0.68f, 0.06f, 0.05f}}, {"BLACK", {0.03f, 0.03f, 0.035f}},
-    {"WHITE", {0.82f, 0.82f, 0.80f}}, {"SILVER", {0.55f, 0.57f, 0.60f}},
-    {"BLUE", {0.05f, 0.18f, 0.62f}}, {"YELLOW", {0.85f, 0.65f, 0.04f}},
-    {"ORANGE", {0.85f, 0.30f, 0.03f}}, {"GREEN", {0.08f, 0.45f, 0.12f}},
-    {"PURPLE", {0.30f, 0.06f, 0.45f}}, {"LIME", {0.45f, 0.75f, 0.05f}},
-    {"GUNMETAL", {0.18f, 0.19f, 0.21f}} };
-#define N_PAINTS ((int)(sizeof k_paints / sizeof *k_paints))
-enum { GARAGE_CAR, GARAGE_SHOP, GARAGE_PAINT, GARAGE_NITROUS, GARAGE_TURBO, GARAGE_GEARBOX,
-       GARAGE_CONTROLS, GARAGE_RACE, GARAGE_GO, GARAGE_ROWS };
 #endif
 
 #ifdef __vita__
@@ -18373,7 +18364,6 @@ int main(int argc, char **argv) {
     int running = 1, shotframe = 0, final_status = 0;
     int pending_car = -1, pending_track = -1;
 #ifdef __vita__
-    int garage_row = 0, garage_paint = 0;   /* garage menu (race_state 3) */
     int garage_race = -1;        /* -1 free roam, else index into sprintev[] */
     int race_start_pending = 0;  /* >0: start garage_race once the loader is idle */
     int race_place_pending = 0;  /* teleported; snap to the grid once loaded */
@@ -18381,7 +18371,6 @@ int main(int argc, char **argv) {
     int post_hold = 0;           /* post-race marker outside the loaded area: held there until it streams in */
     float post_hold_pos[4];      /* the marker spot + heading */
     int cc_cycle = 0;            /* D-pad Up while driving: next camera view */
-    const char *garage_status = NULL;
 #endif
     float nitro_fx = 0.0f;                 /* eased visual/boost state, 0..1 */
     float turbo_boost = -0.70f;            /* HUD turbo dial, -1 vacuum .. +1 */
@@ -18584,6 +18573,20 @@ int main(int argc, char **argv) {
         if(g_dbg.traffic_target>N_TRAFFIC_MAX)g_dbg.traffic_target=N_TRAFFIC_MAX;
         traffic_world.traffic_target=g_dbg.traffic_target;
 #ifdef OPENUG2_SIM_PRE_H
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_PAUSEACT=quitrace|quit|wmap -- 15 s into a career race,
+               the pause menu's confirmed action (as pause_key's OK sets it), once */
+            static int pa_done;
+            const char *pa = getenv("OPENUG2_SIM_PAUSEACT");
+            if (pa && !pa_done && g_career_mode && RT_RACE && !g_rt.pfinished && g_rt.start >= 0
+                && g_rt.t - g_rt.start > 15.0f && g_career.engaged_event && g_post.action < 0) {
+                pa_done = 1;
+                const CareerRecord *r = career_record(n2_u32(g_career.engaged_event + 8));
+                g_post.action = !strcmp(pa, "quit") ? PR_QUIT_PAUSE : !strcmp(pa, "wmap") ? PR_WORLDMAP_PAUSE : PR_EXPLORE_ABANDON;
+                printf("sim pause: %s mid-race (record +6 = %d, cash %d)\n", pa, r ? r->flag[CREC_DONE] : -1, (int)g_career.cash);
+            }
+        }
+#endif
         {   /* test aid (simulator): OPENUG2_SIM_AUTO=<n> -- a career autopilot for the C11 run. It presses
                through movies, engage dialogs and the post-race screens (Next Race, else Explore; dialogs on
                OK) as a player would, and in career free roam opens the engage dialog of the first event in
@@ -18898,8 +18901,7 @@ int main(int argc, char **argv) {
                     g_dbg.body_kit_request=kit_ids[(kit_cursor+1)%nkit_ids];
                 }
 #ifdef __vita__
-                /* Start while driving opens the garage: the car stops and the
-                   camera orbits it (the pre-race showroom state). */
+                /* Start during the race intro NIS skips it */
                 else if (k == SDLK_RETURN && !e.key.repeat && race_state == 0 && world2 && g_rt.nis_on) {
                     g_rt.nis_skip = 1;           /* 0x603bc0 message 6: to the countdown */
                 }
@@ -18974,7 +18976,7 @@ int main(int argc, char **argv) {
                 /* the Read SMS binding (joy event 0xc2 -> SetEngagingDialog + RC message
                    0xd): career free roam, not engaging; an empty queue opens an empty mailbox */
                 else if (k == SDLK_KP_3 && !e.key.repeat && race_state == 1 && g_rt.roam && g_rt.w && g_career_mode &&
-                         !post_up() && !g_eng.h && sms_summon(dataroot)) {
+                         !post_up() && !g_eng.h && !g_sc.h && sms_summon(dataroot)) {   /* + IsInPreviewMode */
                     printf("sms: Read SMS\n");
                 }
                 /* the Career Stats binding (joy event 0xc1 -> RC message 0x13, 0x6068c5):
@@ -18987,87 +18989,7 @@ int main(int argc, char **argv) {
                     int sk = fe_key(k);
                     if (sk && (!e.key.repeat || (sk >= SHOP_KEY_UP && sk <= SHOP_KEY_RIGHT))) shop_input(g_shop, sk);
                 }
-                else if (race_state == 3 && world2) {   /* garage navigation */
-                    if (e.key.repeat && k != SDLK_LEFT && k != SDLK_RIGHT) { /* no auto-repeat */ }
-                    else if (k == SDLK_UP)   garage_row = (garage_row + GARAGE_ROWS - 1) % GARAGE_ROWS;
-                    else if (k == SDLK_DOWN) garage_row = (garage_row + 1) % GARAGE_ROWS;
-                    else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && garage_row == GARAGE_CAR &&
-                             pending_car < 0) {
-                        /* next/previous player car that exists in CARS/ */
-                        int step = k == SDLK_RIGHT ? 1 : ncars - 1, pick = selcar;
-                        for (int n = 0; n < ncars; n++) {
-                            pick = (pick + step) % ncars;
-                            if (player_car_index(carlist[pick]) >= 0) break;
-                        }
-                        if (pick != selcar) pending_car = pick;
-                    }
-                    else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && garage_row == GARAGE_RACE &&
-                             nsprint + g_nvenue > 0 && !race_start_pending) {
-                        int n = nsprint + g_nvenue + 1;   /* -1 (free roam) .. venues */
-                        garage_race = (garage_race + 1 + (k == SDLK_RIGHT ? 1 : n - 1)) % n - 1;
-                        garage_status = NULL;
-                    }
-                    else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && garage_row == GARAGE_NITROUS) {
-                        car_toggle_part(g_fit_nos, carname, car_has_nos(carname));
-                        printf("garage: nitrous %s\n", car_has_nos(carname) ? "fitted" : "removed");
-                    }
-                    else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && garage_row == GARAGE_TURBO) {
-                        car_toggle_part(g_fit_turbo, carname, car_has_turbo(carname));
-                        g_turbo_fitted = car_has_turbo(carname);
-                        printf("garage: turbo %s\n", g_turbo_fitted ? "fitted" : "removed");
-                    }
-                    else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && garage_row == GARAGE_GEARBOX) {
-                        g_manual = !g_manual;
-                        g_opt.p[0].manual = (unsigned char)g_manual;   /* the Player option */
-                        printf("garage: gearbox %s\n", g_manual ? "manual" : "automatic");
-                    }
-                    else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && garage_row == GARAGE_CONTROLS) {
-                        vita_ctrl_scheme = !vita_ctrl_scheme;
-                        options_ctl_preset(&g_opt, vita_ctrl_scheme);   /* the controller setup's bindings */
-                        options_save();
-                        printf("garage: controls %s\n", vita_ctrl_scheme ? "R gas / L brake"
-                                                                         : "original pad layout");
-                    }
-                    else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && garage_row == GARAGE_PAINT) {
-                        garage_paint = (garage_paint + (k == SDLK_RIGHT ? 1 : N_PAINTS - 1)) % N_PAINTS;
-                        g_dbg.paint_override = garage_paint > 0;
-                        if (garage_paint > 0) memcpy(g_dbg.paint, k_paints[garage_paint].rgb, sizeof g_dbg.paint);
-                    }
-                    else if ((k == SDLK_KP_ENTER || k == SDLK_RETURN) &&
-                             garage_row == GARAGE_SHOP && !race_start_pending && pending_car < 0) {
-                        world_tiles_trim(1);
-                        g_shop = shop_open(dataroot, carname, &carcfg, modification,
-                                           wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
-                        if (!g_shop) world_tiles_trim(0);
-                        garage_status = g_shop ? NULL : "CAR SHOP UNAVAILABLE";
-                    }
-                    else if (race_start_pending) { /* busy loading the race */ }
-                    else if (k == SDLK_BACKSPACE || k == SDLK_f) {
-                        race_state = 1;   /* back to driving, where the car stands */
-                        g_ride_ready = 0;
-                    }
-                    else if (k == SDLK_RETURN ||
-                             (k == SDLK_KP_ENTER && garage_row == GARAGE_GO)) {
-                        int in_race = world.city.race.active && !world.city.race.finished;
-                        if (garage_race >= nsprint) {            /* the drift venue's event */
-                            garage_status = "LOADING VENUE...";
-                            venue_go(g_venue_track[garage_race - nsprint], g_venue_id[garage_race - nsprint]);
-                        } else if (garage_race < 0 && g_in_venue) {   /* back to the city */
-                            garage_status = "LOADING...";
-                            venue_go(NULL, 0);
-                        } else if (garage_race >= 0 && !(in_race && sprintev[garage_race] == world.city.race.ev)) {
-                            race_start_pending = 1;   /* new race: load and place */
-                            garage_status = "LOADING RACE...";
-                        } else {
-                            if (garage_race < 0 && world.city.race.active) {   /* leave the race */
-                                world_set_mode(&world, MODE_FREEROAM, -1);
-                                world.city.race.active = 0;
-                                resident_args.scenery_event = -1;   /* free-roam scenery again */
-                            }
-                            race_state = 1; g_ride_ready = 0;
-                        }
-                    }
-                }
+                else if (race_state == 3 && world2) { /* a front end is loading: keys wait */ }
 #endif
                 else if (race_state == 3) {   /* pre-race menu navigation */
                     /* Queue car/track changes for the frame-thread transition
@@ -19357,7 +19279,6 @@ int main(int argc, char **argv) {
                     carpos[0] = sp[0]; carpos[1] = sp[1]; carpos[2] = sp[2]; heading = sh;
                     world_set_mode(&world, MODE_FREEROAM, -1);
                     world.city.race.active = 0;
-                    garage_status = "THIS RACE COULD NOT BE STARTED";
                     printf("garage: race %d could not start (the race manager could not be set up)\n",
                            world.city.ev[ev].id);
                 }
@@ -19696,7 +19617,7 @@ int main(int argc, char **argv) {
             venue_list_build(troot, nstem);
             nsd = world_scripted_defs(&world, troot, sdefs, 256);
             /* back to driving; a venue's event starts once the car is down */
-            race_state = 1; garage_row = 0; garage_race = -1; garage_status = NULL;
+            race_state = 1; garage_race = -1;
             race_start_pending = race_place_pending = 0;
             g_boot_ev = next_ev;
             hud_free(&sw_ls);
@@ -19784,18 +19705,27 @@ int main(int argc, char **argv) {
             int q = -1;
             for (int k = 0; k < nsprint; k++) if (sprintev[k] == world.city.race.ev) q = k;
             post_close();
-            if (act == PR_EXPLORE) {
+            if (act == PR_EXPLORE || act == PR_EXPLORE_ABANDON) {
                 /* 0x3411395c: a won event saves to the memory card first (EnterMemcard
                    0x441 -> 0x35e413dd), then QuitRaceToFreeRoamRaceDone 800f30fc:
                    NotifyEnterFreeRoamFromPostRace, its post-race movie or race
                    message 0xb (free roam on the loaded world) */
                 const unsigned char *cev = g_career.engaged_event;
-                int st0 = g_career.stage, won = g_eng.commit && cev && g_eng.won;
+                int won = g_eng.commit && cev && g_eng.won;
+                if (act == PR_EXPLORE_ABANDON) {
+                    /* QuitRaceToFreeRoam 800f30c4: NotifyEnterFreeRoamFromPause 80126674 -- the
+                       tournament left uncommitted (record stays 2), no save, no movie */
+                    g_eng.commit = 0; won = 0;
+                    const CareerRecord *ar = cev ? career_record(n2_u32(cev + 8)) : NULL;
+                    printf("career: race left uncommitted (record +6 = %d, cash %d)\n", ar ? ar->flag[CREC_DONE] : -1, (int)g_career.cash);
+                } else
                 career_mark_event_complete();
+                /* 800f2d3c: only with autosave (0x803c4ab8), and before 0x35e413dd's
+                   NotifyEnterFreeRoamFromPostRace -- the save keeps has_spawn as it is */
+                if (won && g_opt.autosave && profile_named()) printf("career: saved after the win (%s)\n", profile_save() ? "ok" : "FAILED");
                 char mv[64];
-                if (career_post_race_free_roam(cev, st0, mv, sizeof mv))   /* LaunchPostRaceMovie 0x53d7a0 */
+                if (career_post_race_free_roam(act == PR_EXPLORE_ABANDON ? NULL : cev, g_career_from_wmap, mv, sizeof mv))   /* LaunchPostRaceMovie 0x53d7a0 */
                     mv_launch(dataroot, MV_POST_RACE, mv, !strcasecmp(mv, "Scene07") ? "UpperClass" : NULL);
-                if (won && profile_named()) printf("career: saved after the win (%s)\n", profile_save() ? "ok" : "FAILED");
                 rt_end();
                 world_set_mode(&world, MODE_FREEROAM, -1);
                 world.city.race.active = 0;
@@ -19824,7 +19754,7 @@ int main(int argc, char **argv) {
                     snprintf(g_qr.stem, sizeof g_qr.stem, "%.7s", (const char *)rec + 0x40);
                     g_qr.laps = (signed char)tr[3] > 0 ? (signed char)tr[3] : 1;
                     g_qr.reverse = tr[2] & 1;
-                    g_eng.commit = 1;
+                    g_eng.commit = 1; g_eng.won = 0; g_eng.margin = 0.0f;
                     g_rt_keep.on = 1;
                     g_qr_pending = 1;
                     g_restart_ls = loading_screen(dataroot) != NULL;
@@ -19833,16 +19763,22 @@ int main(int argc, char **argv) {
                 } else printf("career: tournament track %d is not in the race table\n", tid);
             } else if (act == PR_RESTART && q >= 0) {      /* message 9 -> 0x603de0: the same race again */
                 printf("post-race: restart event %d\n", world.city.ev[sprintev[q]].id);
-                if (g_career_mode && g_career.engaged_event) g_eng.commit = 1;
+                if (g_career_mode && g_career.engaged_event) {
+                    /* NotifyRestartCurrentRace 80128798: the track state back to 2 (racing) --
+                       the last finish's result does not count any more */
+                    g_eng.commit = 1; g_eng.won = 0; g_eng.margin = 0.0f;
+                    if (tour_on()) g_tourn.done[g_tourn.cur] = g_tourn.fin[g_tourn.cur] = 0;
+                }
                 g_restart_ls = loading_screen(dataroot) != NULL;
                 if (!g_restart_ls) printf("post-race: PC_Loading.fng not loaded\n");
                 g_rt_keep.on = 1;
-                race_state = 3; garage_row = 0;
+                race_state = 3;
                 vel[0] = vel[1] = 0; speed = 0;
                 menuspin = atan2f(cam[1]-carpos[1], cam[0]-carpos[0]);
-                garage_race = q; race_start_pending = 1; garage_status = "LOADING RACE...";
+                garage_race = q; race_start_pending = 1;
             } else {                                /* 0x4a3e80: the main menu; message 0x15 */
                 if (act == PR_RESTART) printf("post-race: restart -- the event is not in this track's list, to the main menu\n");
+                int was_roam = g_rt.active && g_rt.roam;   /* rt_end clears g_rt */
                 rt_end();
                 int to_crib = (act == PR_WORLDMAP || act == PR_WORLDMAP_PAUSE) && g_career_mode;
                 if (to_crib) {
@@ -19850,6 +19786,12 @@ int main(int argc, char **argv) {
                        (MarkCurrentEventComplete) / NotifyEnterCribFromPauseMenu (no commit);
                        the engaged event done with; FEngSetFirstFrontendScreen(UI_CareerCrib) */
                     if (act == PR_WORLDMAP) career_mark_event_complete();
+                    else {
+                        /* NotifyEnterCribFromPauseMenu 801269a4: the car's spot and heading as the
+                           spawn (+0x7e3c = 1), WorldChallengeState::NotifyExitingToFrontend */
+                        career_enter_fe_magazine(carpos, (uint16_t)((int)lrintf(heading * 10430.3779f) - 0x4000));
+                        career_wc_exit_to_frontend();
+                    }
                     g_eng.commit = 0;
                     g_career.engaged_event = NULL;
                     printf("career: Return to World Map -- the crib\n");
@@ -19857,8 +19799,21 @@ int main(int argc, char **argv) {
                 if (g_career_mode && !to_crib) {   /* the career is left: its world layer and ride go */
                     /* QuitGame 800f3590: NotifyEnterCribFromPostRace (MarkCurrentEventComplete,
                        the event done with), NotifyExitToMainMenuFromFreeRoamOrRace */
-                    career_mark_event_complete();
-                    career_post_race_free_roam(NULL, g_career.stage, NULL, 0);
+                    if (act == PR_QUIT_PAUSE) {
+                        /* QuitGame__9PauseMenu 80100a5c: only NotifyExitToMainMenuFromFreeRoamOrRace
+                           80126718 -- no commit (a race quit is neither won nor lost), +0x7e3c = 1,
+                           SaveSpawnPosition 801266dc when not in an event (0x803fca54 == 0) */
+                        g_eng.commit = 0; g_eng.won = 0;
+                        if (was_roam && !g_career.engaged_event)
+                            career_enter_fe_magazine(carpos, (uint16_t)((int)lrintf(heading * 10430.3779f) - 0x4000));
+                    } else {
+                        /* PostRaceMenu::NotificationMessage 800f2d3c, Quit 0x24dd40cf: a won event
+                           saves to the memory card first (NotifyAboutToSaveToMemcardFromPostRace) */
+                        int won = g_eng.commit && g_career.engaged_event && g_eng.won;
+                        career_mark_event_complete();
+                        if (won && g_opt.autosave && profile_named()) printf("career: saved after the win (%s)\n", profile_save() ? "ok" : "FAILED");
+                    }
+                    career_post_race_free_roam(NULL, 0, NULL, 0);
                     career_wc_exit_to_frontend(); g_career_mode = 0; g_career_go = 0; g_career_nis_pending = 0; g_career_spawn_on = 0;
                     g_wg_career_stage = -1; g_wg_career_owns_car = 0;
                     active_scenery_event = job_scenery_event = -1000;   /* the open free-roam scenery again */
@@ -19892,7 +19847,7 @@ int main(int argc, char **argv) {
         /* the front end takes the parked car: the showroom under its menus */
         if (g_fe && !g_fe_in && world2 && race_state == 1 && g_ride_ready) {
             g_fe_in = 1;
-            race_state = 3; garage_row = 0; garage_status = NULL;
+            race_state = 3;
             vel[0] = vel[1] = 0; speed = 0;
             menuspin = atan2f(cam[1]-carpos[1], cam[0]-carpos[0]);
             garage_race = -1;
@@ -20323,20 +20278,19 @@ int main(int argc, char **argv) {
             if (g_qr.type == QR_FREERUN) {
                 g_roam_level = g_qr.traffic; g_roam_diff = g_qr.difficulty;   /* 0x53f580: R+4, R+2 */
                 if (g_rt.roam) rt_end();
-                if (strcmp(stem, "L4RA")) { garage_status = "LOADING..."; venue_go(NULL, 0); }
+                if (strcmp(stem, "L4RA")) { venue_go(NULL, 0); }
                 else { race_state = 1; g_ride_ready = 0; }
             } else if (strcmp(stem, g_qr.stem)) {
                 static char qtrack[16];
                 snprintf(qtrack, sizeof qtrack, "STREAM%s", g_qr.stem);
-                garage_status = "LOADING...";
                 venue_go(qtrack, g_qr.event);
             } else {
                 int q = -1;
                 for (int k = 0; k < nsprint; k++) if (world.city.ev[sprintev[k]].id == g_qr.event) q = k;
                 if (q >= 0) {
-                    race_state = 3; garage_row = 0;
+                    race_state = 3;
                     vel[0] = vel[1] = 0; speed = 0;
-                    garage_race = q; race_start_pending = 1; garage_status = "LOADING RACE...";
+                    garage_race = q; race_start_pending = 1;
                     g_restart_ls = loading_screen(dataroot) != NULL;   /* the game's loading screen until the race */
                 } else {
                     printf("quick race: event %d is not in %s's event list\n", g_qr.event, stem);
@@ -20349,13 +20303,11 @@ int main(int argc, char **argv) {
            the saved respawn (has_spawn) or event 4000's start line */
         if (g_career_go && pending_car < 0 && !race_start_pending) {
             g_career_go = 0;
+            career_reset_engaged();   /* NotifyFreeRoamBegun: ResetEngagedTriggerZone 80126a90 */
             /* NotifyFreeRoamBegun 0x5412d0 runs on every free-roam start (career start, after a
                race, a shop or the crib): MaybeTargetGPSForShopEvent(DDAY_EVENT_B) -- after the
                stage-0 car lot this is what puts the GPS on B's shop */
-            if (g_career.current_event == CAREER_DDAY_A && g_career.s0.state == 9)
-                g_gps.pend = 'A';   /* resumed before visiting the car lot */
-            else
-                g_gps.pend = 'B';
+            g_gps.pend = 'B';       /* 80126b58: bStringHash("DDAY_EVENT_B") only */
             g_roam_level = 3;
             if (g_rt.n || g_rt.active) rt_end();
             float sp[3] = {0, 0, 0}; uint16_t h16 = 0; int ok = 0;
@@ -20384,7 +20336,6 @@ int main(int argc, char **argv) {
                 g_career_heading = career_h16_heading(h16);
             }
             printf("career: LoadTrack STREAML4RA, spawn from %s (%.1f %.1f %.1f)\n", from, sp[0], sp[1], sp[2]);
-            garage_status = "LOADING...";
             venue_go(NULL, 0);
         }
         /* the Test Track: the car down on L4RG -> the dyno (SetupDynoRun: no race;
@@ -20486,7 +20437,7 @@ int main(int argc, char **argv) {
                        + reload of L4RG for a menu) */
                     const unsigned char *sd = g_tt_shop;
                     g_tt_shop = NULL; g_tt_entry = 0; g_tt_ret_shop = NULL;
-                    race_state = 3; garage_row = 0; garage_status = NULL; garage_race = -1;
+                    race_state = 3; garage_race = -1;
                     vel[0] = vel[1] = 0; speed = 0;
                     menuspin = atan2f(cam[1]-carpos[1], cam[0]-carpos[0]);
                     world_tiles_trim(1);
@@ -20533,10 +20484,10 @@ int main(int argc, char **argv) {
             g_boot_ev = 0;
             if (q < 0) resident_args.scenery_event = runtime_scenery_event;   /* free roam after all */
             if (q >= 0) {
-                race_state = 3; garage_row = 0;
+                race_state = 3;
                 vel[0] = vel[1] = 0; speed = 0;
                 menuspin = atan2f(cam[1]-carpos[1], cam[0]-carpos[0]);
-                garage_race = q; race_start_pending = 1; garage_status = "LOADING RACE...";
+                garage_race = q; race_start_pending = 1;
                 g_restart_ls = loading_screen(dataroot) != NULL;   /* the game's loading screen until the race */
             }
         }
@@ -20651,7 +20602,7 @@ int main(int argc, char **argv) {
         if (g_cshop_pending && world2 && race_state == 1 && g_ride_ready) {   /* a city shop: its first screen */
             const unsigned char *sd = g_cshop_pending;
             g_cshop_pending = NULL;
-            race_state = 3; garage_row = 0; garage_status = NULL;
+            race_state = 3;
             vel[0] = vel[1] = 0; speed = 0;
             menuspin = atan2f(cam[1]-carpos[1], cam[0]-carpos[0]);
             garage_race = -1;
@@ -20671,7 +20622,7 @@ int main(int argc, char **argv) {
         }
         if (fe_customize && world2 && race_state == 1 && g_ride_ready) {
             fe_customize = 0;
-            race_state = 3; garage_row = 0; garage_status = NULL;
+            race_state = 3;
             vel[0] = vel[1] = 0; speed = 0;
             menuspin = atan2f(cam[1]-carpos[1], cam[0]-carpos[0]);
             garage_race = -1;
@@ -20709,7 +20660,6 @@ int main(int argc, char **argv) {
                     g_career_spawn_on = 1;
                 } else printf("tuning: event 4706 has no start grid%c", 10);
             }
-            garage_status = "LOADING...";
             venue_go("STREAML4RG", 4706);
             world_tiles_trim(0);
         }
@@ -20734,6 +20684,7 @@ int main(int argc, char **argv) {
                         if (cc) career_car_set_cfg(cc->handle, line);
                         if (cc) career_car_set_stars(cc->handle, shop_rate(g_shop, &sa.cfg, sa.rim_folder, sa.rim_style));
                         career_recalc_dvd_unlocks();   /* NotifyFreeRoamBegun on the way back */
+                        career_reset_engaged();         /* NotifyFreeRoamBegun: ResetEngagedTriggerZone 80126a90 */
                         g_cshop_dirty |= dirty;
                         if (shop_uniques_done(g_shop)) g_cshop_dirty = 1;   /* the challenge's record */
                         if (g_career_preset_on) {   /* the ride the crib / free roam rebuild */
@@ -21803,8 +21754,8 @@ int main(int argc, char **argv) {
         int nitro_active = race_state == 1 &&
                            ks[SDL_SCANCODE_N] && throttle > 0.1f && speed > 0.02f;
 #ifdef __vita__
-        /* the Performance Shop's nitrous package, else the garage row (level 3) */
-        g_n2_nos_level = g_n2_perf_nos > 0 ? g_n2_perf_nos : car_has_nos(carname) ? 3 : 0;
+        /* the Performance Shop's nitrous package */
+        g_n2_nos_level = g_n2_perf_nos > 0 ? g_n2_perf_nos : 0;
 #ifdef OPENUG2_SIM_PRE_H
         if (!g_n2_nos_level && getenv("OPENUG2_FXTEST_NOS")) g_n2_nos_level = 3;   /* test aid (simulator): a bottle */
 #endif
@@ -21847,7 +21798,7 @@ int main(int argc, char **argv) {
            end). Closed throttle pulls vacuum; on throttle the turbo builds
            pressure with rpm and lags behind it (spools up slowly, vents
            fast). Display + audio only: the power curve is unchanged. */
-        g_turbo_fitted = car_has_turbo(carname);
+        g_turbo_fitted = car_stock_turbo(carname);
         {
             float tgt = -0.70f, thr = rp_up() ? g_n2s.throttle : throttle;   /* the replay: the recorded pedal */
             if ((race_state == 1 || rp_up()) && thr > 0.05f) {
@@ -22511,7 +22462,7 @@ int main(int argc, char **argv) {
                 }
                 career_speech_tick(dms, speech_done());   /* HandleTick: UpdateTimerEvents when IsSpeechDone */
                 if (!g_career_nis_on) {
-                    int a = career_stage0_update(g_career_ms, 1);
+                    int a = career_stage0_update(g_career_ms, speech_done());   /* states 3-6: Stage0IsSpeechDone 8018a998 = IsSpeechDone */
                     if (a & CS0_INTRO) hud_event_add(0x14, 2);   /* FEngHud::TriggerStage0Intro(2) */
                     if (a) printf("career: stage 0 actions 0x%x (state %d)%s%s%s\n", a, g_career.s0.state,
                                   a & CS0_INTRO ? " intro (HUD TriggerStage0Intro)" : "",
@@ -22523,7 +22474,11 @@ int main(int argc, char **argv) {
                 {   /* UpdateTick's SMSMessageQueue::Tick: the career time, the timed tips, the
                        autopopup when ConditionsRightToSeeAutopopup (game flow, no shop or
                        engage dialog, career free roam) */
-                    int cond = !g_pause.on && !post_up() && !g_eng.h && !g_shop && !g_fe && !g_sc.h;
+                    /* 8012c1c0 also holds them while the engaged trigger zone (+0x7df0) is a shop's
+                       (+0x7df8): a declined shop keeps it until ResetEngagedTriggerZone (the next
+                       free roam / race) */
+                    const CareerZone *ez = career_engaged();
+                    int cond = !g_pause.on && !post_up() && !g_eng.h && !g_shop && !g_fe && !g_sc.h && !(ez && ez->shop);
                     if (career_sms_tick((float)dms * 0.001f, 1, cond)) sms_autopopup(dataroot);
                 }
                 if (g_rt.w) {   /* NotifyRandomEncounterFinished 80126f84: a free-roam Outrun over */
@@ -22534,9 +22489,7 @@ int main(int argc, char **argv) {
                 }
                 {   unsigned char f = (unsigned char)((g_career.b873e ? 1 : 0) | (g_career.b873f ? 2 : 0));
                     if (f != g_career_s0_flags) {
-                        if ((f & 1) && !(g_career_s0_flags & 1) && g_career.stage == 0 &&
-                            g_career.current_event == CAREER_DDAY_A)
-                            g_gps.pend = 'A';   /* the optional races have closed */
+                        /* (NotifyCSStage0Timeout 8012ae1c targets no GPS) */
                         g_career_s0_flags = f;
                         career_recalc_zones();
                     }
@@ -22682,7 +22635,9 @@ int main(int argc, char **argv) {
                     /* the engaged event's result, committed only when the post-race
                        screens are left (MarkCurrentEventComplete 80126768): a
                        Restart races it again uncommitted */
-                    g_eng.won = g_rt.ent[0].place == 1 && !g_rt.dstatus[0];
+                    /* CalculateIfWon 801285b8, one track: a drift race (+0xf == 5) is
+                       GetLeaderBoardPos(0) == 1 (the score order), else 1st across the line */
+                    g_eng.won = g_rt.drift ? rt_drift_place() == 1 : g_rt.ent[0].place == 1 && !g_rt.dstatus[0];
                     if (tour_on()) {    /* NotifyRaceIsOver 80128764: this track's results */
                         int t = g_tourn.cur;
                         g_tourn.nr = 1 + (g_rt.n < g_rt.nopp ? g_rt.n : g_rt.nopp);
@@ -22696,6 +22651,7 @@ int main(int argc, char **argv) {
                     if (getenv("OPENUG2_SIM_WIN")) g_eng.won = !tour_has_next();   /* test aid (simulator): count the race as won */
 #endif
                     g_eng.margin = !g_eng.won ? 0.0f : tour_on() ? tour_margin() : rt_margin_of_victory();
+                    career_race_finished(g_eng.won);   /* NotifyCurrentRaceFinished 80126cd0 */
                     if (tour_on()) {    /* no UI_PostRaceResults: the tournament's screens */
                         hud_free(&g_results);
                         tour_open_results();
@@ -27535,8 +27491,8 @@ int main(int argc, char **argv) {
 #ifdef __vita__
             /* garage NITROUS / TURBO rows, per car (stock: turbo on the
                factory-turbo cars only); the dial reads simulated pressure */
-            hs.have_nos = (unsigned char)(g_n2_nos_level > 0);   /* shop package or garage row */
-            hs.have_turbo = (unsigned char)car_has_turbo(carname);
+            hs.have_nos = (unsigned char)(g_n2_nos_level > 0);   /* the shop package */
+            hs.have_turbo = (unsigned char)car_stock_turbo(carname);
 #endif
             if (hud_fitted_set) {     /* developer override, display only */
                 hs.have_nos = (unsigned char)hud_fitted_nos;
@@ -27568,6 +27524,14 @@ int main(int argc, char **argv) {
             if (hs.roam && g_career_mode) {   /* SMSMessageManager::Update's queue (event 0x13) */
                 hs.sms_unread = career_sms_unread();
                 hs.sms_stage0 = career_stage0_has_control();
+                if (hs.sms_stage0) {
+                    /* DetermineHudFeatures 802158f8 under Stage0 HasControl: only the phone /
+                       engage bit, the minimap (low |1) once ShowMinimap (state > 5), the
+                       gauges (low |0x60) once ShowGauges (state > 8); no wallet (0x80000) */
+                    if (!career_stage0_show(2)) hs.map_off = 1;
+                    if (!career_stage0_show(4)) hs.no_gauges = 1;
+                    hs.have_money = 0;
+                }
                 for (int i = career_sms_count() - 1; i >= 1; i--) {   /* UpdateSMS: never slot 0 */
                     const CareerSmsSlot *m = career_sms_slot(i);
                     if (m && m->msg && !m->b[0] && m->b[2] != 1) { hs.sms_env = (signed char)m->msg[5]; break; }
@@ -27923,61 +27887,7 @@ int main(int argc, char **argv) {
             } else if (race_state == 3 && world2 && g_shop) {
                 shop_draw(g_shop, &rp, &quad, W, H);
             } else if (race_state == 3 && world2) {
-                char carv[64], paintv[24];
-                snprintf(carv, sizeof carv, "%s", player_car_name(carname));
-                snprintf(paintv, sizeof paintv, "%s", k_paints[garage_paint].name);
-                HudMenu menu; memset(&menu, 0, sizeof menu);
-                menu.title = "GARAGE";
-                menu.label[GARAGE_CAR] = "CAR";     menu.value[GARAGE_CAR] = carv;
-                menu.label[GARAGE_SHOP] = "CAR SHOP";
-                menu.label[GARAGE_PAINT] = "PAINT"; menu.value[GARAGE_PAINT] = paintv;
-                menu.label[GARAGE_NITROUS] = "NITROUS";
-                menu.value[GARAGE_NITROUS] = car_has_nos(carname) ? "FITTED" : "NONE";
-                menu.label[GARAGE_TURBO] = "TURBO";
-                menu.value[GARAGE_TURBO] = car_has_turbo(carname) ? "FITTED" : "NONE";
-                menu.label[GARAGE_GEARBOX] = "GEARBOX";
-                menu.value[GARAGE_GEARBOX] = g_manual ? "MANUAL" : "AUTOMATIC";
-                menu.label[GARAGE_CONTROLS] = "CONTROLS";
-                menu.value[GARAGE_CONTROLS] = vita_ctrl_scheme ? "R GAS  L BRAKE"
-                                                               : "ORIGINAL";
-                char racev[64];
-                int in_race = world.city.race.active && !world.city.race.finished;
-                if (garage_race < 0) snprintf(racev, sizeof racev, "FREE ROAM");
-                else if (garage_race >= nsprint && airace_event_type(g_venue_id[garage_race - nsprint]) == AIRACE_DRAG)
-                    snprintf(racev, sizeof racev, "DRAG %d", g_venue_id[garage_race - nsprint]);
-                else if (garage_race >= nsprint && airace_event_type(g_venue_id[garage_race - nsprint]) == AIRACE_STREETX)
-                    snprintf(racev, sizeof racev, "STREET X %d", g_venue_id[garage_race - nsprint]);
-                else if (garage_race >= nsprint && airace_event_type(g_venue_id[garage_race - nsprint]) == AIRACE_URL)
-                    snprintf(racev, sizeof racev, "URL %d", g_venue_id[garage_race - nsprint]);
-                else if (garage_race >= nsprint)
-                    snprintf(racev, sizeof racev, "DRIFT %d  (%s)", g_venue_id[garage_race - nsprint],
-                             g_venue_id[garage_race - nsprint] >= 4311 ? "STADIUM" : "VACANT LOT");
-                else {
-                    const WEvent *ge = &world.city.ev[sprintev[garage_race]];
-                    /* the race table's type (GLOBALB 0x34a11 +0xf), not the
-                       route's loop flag: the downhill drifts are open routes */
-                    static const char *const tname[] = { "CIRCUIT", "SPRINT", "STREET X", "?",
-                                                         "DRAG", "DRIFT", "URL" };
-                    int rt = airace_event_type(ge->id);
-                    const char *tn = rt >= 0 && rt <= AIRACE_URL ? tname[rt]
-                                   : ge->circuit ? "CIRCUIT" : "SPRINT";
-                    snprintf(racev, sizeof racev, "%s %d  (%d.%d KM)", tn,
-                             ge->id, ge->len100m / 10, ge->len100m % 10);
-                }
-                menu.label[GARAGE_RACE] = "RACE"; menu.value[GARAGE_RACE] = racev;
-                menu.label[GARAGE_GO] =
-                    garage_race < 0 ? (in_race ? "QUIT RACE, FREE ROAM" : "RESUME FREE ROAM")
-                    : garage_race >= nsprint ? "GO TO THE VENUE"
-                    : (in_race && sprintev[garage_race] == world.city.race.ev) ? "RESUME RACE"
-                    : "START RACE";
-                menu.rows = GARAGE_ROWS; menu.sel = garage_row;
-                menu.status = race_start_pending ? "LOADING RACE..."
-                            : pending_car >= 0 ? "LOADING CAR..." : garage_status;
-                if (!menu.status && (garage_row == GARAGE_GEARBOX || garage_row == GARAGE_CONTROLS))
-                    menu.status = !g_manual ? (vita_ctrl_scheme ? "SQUARE HANDBRAKE  X NITROUS" : "R HANDBRAKE  L NITROUS")
-                                : "SHIFT  REAR TOUCH: TOP RIGHT UP  TOP LEFT DOWN";
-                menu.hint = "UP/DOWN SELECT    LEFT/RIGHT CHANGE    X CONFIRM    O BACK";
-                hud_draw_menu(hud, &rp, &quad, &menu, W, H);
+                /* between front-end screens (a race / venue loading): no HUD */
             } else
 #endif
             /* a drift race draws HUD_Drift (its widgets fed from the player's

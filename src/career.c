@@ -206,6 +206,15 @@ static void cstage_won(CareerStage *s, const unsigned char *ev)        /* Notify
     for (int i = 0; i < n; i++)
         if (!a[i] || a[i] == h) { a[i] = h; return; }
 }
+/* NotifyCurrentRaceFinished 80126cd0: a won race counts for its stage at the
+   finish, before the post-race screens (NeedToAskForSponsor reads the count
+   in the cPostRaceScreenManager ctor); CommitWinEvent's own NotifyWonEvent
+   later finds it already there */
+void career_race_finished(int won)
+{
+    const unsigned char *ev = g_career.engaged_event;
+    if (won && ev) cstage_won(&g_career.st[(signed char)ev[0x37] & 7], ev);
+}
 static void stage_cleared(int stage);
 static void cs_stage_started(int stage);
 static void cs_event_begin(const unsigned char *ev);
@@ -363,6 +372,25 @@ static int pile_max_sponsored(int category, int type)
             }
     return n;
 }
+/* DAT_803bbed0 (+0x7e2c, b873d: a career car is owned) && IsSUV(GetCurrentCareerCar())
+   801345c4 (record +0x88a) -- GetMaxNumberOfEventsByType / GetRandomEvent /
+   BuildListOfEvents / MaybeAddWorldChallenge. have_suv_car is a test override. */
+static int career_driving_suv(void)
+{
+    if (g_career.have_suv_car) return 1;
+    const CareerCar *c = g_career.b873d ? career_current_car() : NULL;
+    return c && airace_type_suv(c->type);
+}
+/* DoesPlayerOwnSUV 8012420c: any FEPlayerCarDB career car (filter 4, +0x7f8 set) that IsSUV */
+static int career_owns_suv(void)
+{
+    if (g_career.have_suv_car) return 1;
+    for (int i = 0; i < CAREER_NSLOTS; i++) {
+        const CareerCar *c = career_car_slot(i);
+        if (c && c->has && c->type >= 0 && airace_type_suv(c->type)) return 1;
+    }
+    return 0;
+}
 static int pile_max(int type)                                           /* GetMaxNumberOfEventsByType 80125614 */
 {
     const unsigned char *sd = g_career.st[g_career.stage].stage;
@@ -373,7 +401,7 @@ static int pile_max(int type)                                           /* GetMa
     case 2: return (signed char)sd[0x33];
     case 3: return (signed char)sd[0x34];
     case 4: return (signed char)sd[0x32];
-    case 5: return g_career.have_suv_car ? (signed char)sd[0x37] : 0;
+    case 5: return career_driving_suv() ? (signed char)sd[0x37] : 0;
     case 6: return pile_max_sponsored(1, 6);
     case 7: return pile_max_sponsored(3, 7);
     case 8: return pile_max_sponsored(2, 8);
@@ -393,7 +421,7 @@ static const unsigned char *pile_random(const CareerPile *p, int type)
         if (pile_has(p, ev) || (signed char)ev[0x37] != g_career.stage || ev[0x34] == 2 || ev[0x7f]
             || career_has_completed(rd32(ev + 8)) || rd32(ev + 8) == FINAL_EVENT || !pile_matches(ev, type))
             continue;
-        if (ev[0xd] == 1 && !g_career.have_suv_car) continue;
+        if (ev[0xd] == 1 && !career_driving_suv()) continue;
         if (n < 32) c[n] = ev;
         n++;
     }
@@ -417,7 +445,7 @@ static void pile_maybe_challenge(CareerPile *p, const CareerStage *s, const unsi
     case 2: ok = s->dc >= need; break;
     case 3: ok = cstage_sponsor_done(s) >= need; break;
     }
-    if (g_career.have_suv_car && h == SUV_NO_CHALLENGE) ok = 0;
+    if (career_driving_suv() && h == SUV_NO_CHALLENGE) ok = 0;
     if (ok) pile_add_challenge(p, wc);
 }
 
@@ -445,7 +473,7 @@ void career_build_events(void)                                          /* Build
     }
     for (int i = 0; i < 64; i++) {                       /* keep what is still open */
         const unsigned char *ev = old.event[i];
-        if (ev && (signed char)ev[0x37] == c->stage && (ev[0xd] != 1 || c->have_suv_car)
+        if (ev && (signed char)ev[0x37] == c->stage && (ev[0xd] != 1 || career_driving_suv())
             && !career_has_completed(rd32(ev + 8)))
             pile_add_event(p, ev);
     }
@@ -475,7 +503,7 @@ int career_event_in_pile(const unsigned char *ev) { return ev && pile_has(&g_car
 int career_event_on_radar(const unsigned char *ev)                      /* IsEventVisibleOnRadar */
 {
     if (!ev || ev[0x7f] || !career_event_in_pile(ev)) return 0;
-    return ev[0xd] != 1 || g_career.have_suv_car;     /* DoesPlayerOwnSUV (C6: owned, not driven) */
+    return ev[0xd] != 1 || career_owns_suv();         /* DoesPlayerOwnSUV 8012420c (owned, not driven) */
 }
 const unsigned char *career_random_hidden_event(void)                   /* GetRandomHiddenEvent 80125948 */
 {
@@ -558,23 +586,27 @@ void career_commit_win(uint32_t h, int reward, float margin)
     if (r) r->flag[CREC_DONE] = CDONE_WON;
     CareerStage *s = &g_career.st[(signed char)ev[0x37] & 7];
     if (reward) {
-        if (g_career.current_event) {
+        /* +0x7e1c, the race NotifyEnterEvent engaged (not +0x7e24, the shop
+           event): GetLastPurse + NotifyCommitSponsorPoints (GC 80127050) */
+        if (g_career.engaged_event) {
             g_career.cash += career_event_purse(ev);
             cstage_sponsor_points(s, margin, ev);
         } else
             g_career.cash += (int)rd32(ev + 0x30);
     }
-    cstage_won(s, ev);
+    /* GC 80127050's order: SMS NotifyCompleteEvent, NotifyCommitEvent 80124790
+       (NotifyWonEvent + CheckIfClearedStage -- the stage may advance here),
+       HandleCareerEventEnd, then WorldChallengeState::NotifyCareerEventCompleted
+       8012ceec on the (possibly new) current stage */
     career_sms_complete_event(ev);               /* SMSMessageQueue::NotifyCompleteEvent 8012c6d4 */
+    cstage_won(s, ev);
+    cstage_check_cleared(s);
     cs_event_end(ev, 1);
-    /* WorldChallengeState::NotifyCareerEventCompleted 8012ceec: the stage's
-       world-race challenges reached exactly now -> their SMS */
-    for (int i = 0; i < career_nchallenges(); i++) {
+    for (int i = 0; i < career_nchallenges(); i++) {   /* the stage's world-race challenges reached exactly now -> their SMS */
         const unsigned char *wc = career_challenge(i);
         if (wc[6] == 0 && rd16s(wc + 4) == g_career.stage &&
             cstage_world_done(&g_career.st[g_career.stage & 7]) == (signed char)wc[7]) career_sms_add_wc(wc);
     }
-    cstage_check_cleared(s);
     printf("career: won %s ($%d)\n", career_string(rd16(ev)), g_career.cash);
 }
 void career_commit_lose(uint32_t h)                                     /* CommitLoseEvent 80127178 */
@@ -719,13 +751,9 @@ int career_zone_enterable(const CareerZone *z)                           /* 8012
 int career_zone_data(uint32_t zone, CareerZone *out)                     /* 801240bc */
 {
     memset(out, 0, sizeof *out);
-    if (g_career.wcs.wc) {
-        /* RecalcUnlockedZones publishes only the active challenge's goal. */
-        const CareerZone *goal = career_unlocked_zone(0);
-        if (!goal || goal->zone != zone) return 0;
-        *out = *goal;
-        return 1;
-    }
+    /* no world-challenge case here: during one the pile is empty (no events), a
+       shop zone still reaches NotifyShopDiscovered, and IsEnterable 80123bd0
+       lets only the goal in */
     for (int i = 0; i < career_nevents(); i++)                           /* GetFirstUnlockedEvent 80124040 */
         if (rd32(career_event(i) + 0x28) == zone && career_event_in_pile(career_event(i))) { out->event = career_event(i); break; }
     if (!out->event && !(out->shop = shop_by_zone(zone)) && !(out->showcase = showcase_by_zone(zone)) &&
@@ -804,9 +832,7 @@ int career_player_zones(const uint32_t *zones, int n)                    /* 8021
     CareerZone z = { 0 };
     uint32_t at = 0;
     for (int i = 0; i < n && !at; i++) if (career_zone_data(zones[i], &z)) at = zones[i];
-    if (at == g_cw.in_zone && (!at || (!g_cw.cur.zone && !career_zone_enterable(&z)) ||
-        (z.event == g_cw.cur.event &&
-        z.shop == g_cw.cur.shop && z.showcase == g_cw.cur.showcase && z.wc == g_cw.cur.wc))) return 0;
+    if (at == g_cw.in_zone) return 0;   /* 80218c44: Exit / Enter only when the zone (+0x9a4) changes */
     int r = 0;
     if (g_cw.in_zone) {                                                  /* ExitEventTriggerZone 80218ab4 */
         if (g_cw.cur.zone) {
@@ -855,6 +881,7 @@ int career_can_engage(void)                                              /* 8012
            (z->showcase && showcase_enterable(z->showcase)) || (z->wc && wc_enterable(z->wc));
 }
 void career_engage_requested(void) { g_cw.engaged = g_cw.cur; }
+void career_reset_engaged(void) { memset(&g_cw.engaged, 0, sizeof g_cw.engaged); }   /* ResetEngagedTriggerZone 80126a90 (+0x7df0..+0x7dfc) */
 int  career_engaging_dialog(void) { return g_cw.engaging; }
 void career_set_engaging_dialog(int on) { g_cw.engaging = on != 0; }
 const CareerZone *career_engaged(void) { return g_cw.engaged.zone ? &g_cw.engaged : NULL; }
@@ -1010,19 +1037,21 @@ void career_enter_event(const unsigned char *ev, const float pos[3], uint16_t he
 /* NotifyEnterFreeRoamFromPostRace 80126918, after MarkCurrentEventComplete
    (the caller's commit): CalcShowPostRaceMovie 801267f0 -- the event's own
    post movie (+4) once it is completed; else Scene07 when the win moved the
-   career into stage 2; else the event 0x4cce3e1's Scene16 / Scene15 (the
-   EventInProgressState +0xc check, 0 offline, is taken as 0) -- then the
+   career into stage 2 (the event's stage, +0x37, not the current one after
+   the commit); else the event 0x4cce3e1's Scene16 / Scene15. None for a
+   race started from the crib World Map (EventInProgressState +0xc,
+   StartCareerEventFromWorldMap 8011d380) -- then the
    engaged event is done with (+0x7e1c = 0, NotifyUserIsDoneWithEvent) and
    the next career start uses the spawn (+0x7e3c = 1). 1 = a movie in out. */
-int career_post_race_free_roam(const unsigned char *ev, int stage_before, char *out, int n)
+int career_post_race_free_roam(const unsigned char *ev, int from_wmap, char *out, int n)
 {
     CareerState *c = &g_career;
     int movie = 0;
-    if (ev && out && n > 0) {
+    if (ev && out && n > 0 && !from_wmap) {
         const char *pm = career_string(rd16(ev + 4));
         const char *name = NULL;
         if (pm && pm[0] && career_has_completed(rd32(ev + 8))) name = pm;
-        else if (stage_before != c->stage && c->stage == 2) name = "Scene07";
+        else if ((signed char)ev[0x37] != c->stage && c->stage == 2) name = "Scene07";
         else if (rd32(ev + 8) == 0x4cce3e1u) name = career_has_completed(0x4cce3e1u) ? "Scene15" : "Scene16";
         if (name) { snprintf(out, (size_t)n, "%s", name); movie = 1; }
     }
@@ -1759,12 +1788,16 @@ static const unsigned char *showcase_by_handle(uint32_t h)              /* FindS
 }
 void career_sms_add_wc(const unsigned char *wc)                         /* AddWorldChallengeMessage 8012bd88 */
 {
+    const unsigned char *sc = showcase_by_handle(rd32(wc + 0xc));
+    /* both callers (NotifyCareerEventCompleted 8012ceec, NotifyOutrunRaceFinished
+       8012ce38) follow AddWorldChallengeMessage with CareerSpeech::
+       HandleWorldChallengeUnlock 8018a374: the challenge's kind (+0x14) 3 or 4,
+       whether or not it has an SMS record */
+    if (sc && (wc[0x14] == 3 || wc[0x14] == 4)) career_speech_showcase_unlock(sc);
     const unsigned char *d = career_sms_by_hash(rd32(wc + 8));
     if (!d) return;
     uint32_t body = fmt_hash("SMS_MAG_GENERIC_BODY_%d", g_sms_mag_n % 2 + 1);
     uint32_t subj = fmt_hash("SMS_MAG_GENERIC_SUBJ_%d", g_sms_mag_n % 2 + 1);
-    const unsigned char *sc = showcase_by_handle(rd32(wc + 0xc));
-    if (sc && (sc[0x24] == 3 || sc[0x24] == 4)) career_speech_showcase_unlock(sc);   /* HandleWorldChallengeUnlock */
     if (sc) {                                   /* bStringHash("_TITLE", showcase +0x28) */
         g_sms_mag_n++;
         sms_add_magazine(d, body, subj, hash_cont(rd32(sc + 0x28), "_TITLE"));
@@ -2143,10 +2176,10 @@ int career_help_zone_active(uint32_t zone)
 int career_sms_tick(float dt, int roam, int cond)
 {
     CareerState *c = &g_career;
-    if (roam && !career_stage0_has_control()) c->career_time += dt;
+    if (roam && !career_stage0_has_control()) c->f8764 += dt;   /* +0x7e54 (PC +0x8764): saved, -1 by Default */
     for (int i = 0; i < career_nsms_data(); i++) {
         const unsigned char *d = career_sms_data(i);
-        if (d[2] == 3 && (float)rd32(d + 8) < c->career_time && !sms_queued(d)) career_sms_add(d);
+        if (d[2] == 3 && (float)rd32(d + 8) < c->f8764 && !sms_queued(d)) career_sms_add(d);
     }
     int any = 0;
     for (int i = 0; i < career_sms_count() && !any; i++)

@@ -4576,7 +4576,7 @@ hud_restore:
     glBlendFunc((GLenum)blend_src, (GLenum)blend_dst);
 }
 
-/* ------------------------------------------------------------ garage menu */
+/* ------------------------------------------------------------ banner text */
 
 /* The tallest loaded HUD font (the game's own), or -1. */
 static int hud_menu_font(const Hud *h) {
@@ -4625,75 +4625,6 @@ static void hud_menu_text(Hud *h, const HudDC *dc, int fi, const char *txt,
         x += g->adv * scale;
     }
     hud_batch(h, dc, F->tex, v, nq, rgba);
-}
-
-/* A flat rectangle, FEng centre (fx, fy) and size (w, h). */
-static void hud_menu_rect(const HudDC *dc, float fx, float fy, float w, float h,
-                          float r, float g, float b, float a) {
-    float nx, ny; fe_ndc(dc->asp, 0, fx, fy, &nx, &ny);
-    hud_blit(dc, 0, w / 240.0f, h / 240.0f, nx, ny, 0.0f, r, g, b, a);
-}
-
-void hud_draw_menu(Hud *h, const RProg *rp, GpuMesh *quad, const HudMenu *m,
-                   int width, int height) {
-    if (!h || !rp || !quad || !m || width <= 0 || height <= 0) return;
-    HudDC dc; dc.rp = rp; dc.quad = quad; dc.asp = (float)width / (float)height;
-
-    GLboolean depth_on = glIsEnabled(GL_DEPTH_TEST), blend_on = glIsEnabled(GL_BLEND);
-    GLint blend_src = GL_SRC_ALPHA, blend_dst = GL_ONE_MINUS_SRC_ALPHA;
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &blend_src);
-    glGetIntegerv(GL_BLEND_DST_ALPHA, &blend_dst);
-    GLboolean depth_mask = GL_TRUE; glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
-    GLfloat fog_density = 0.0f; glGetUniformfv(rp->prog, rp->uFogDensity, &fog_density);
-    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUniform1f(rp->uVColor, 0.0f); glUniform1f(rp->uFogDensity, 0.0f);
-    glUniform1f(rp->uDecal, 0.0f); glUniform1f(rp->uAlphaTest, 0.0f);
-    glUniform1f(rp->uTextureAlpha, 1.0f); glUniform1f(rp->uVista, 0.0f);
-    glUniform3f(rp->uEmissive, 0.0f, 0.0f, 0.0f);
-
-    int fi = hud_menu_font(h);
-    static const float white[4] = {0.95f, 0.95f, 0.97f, 1.0f};
-    static const float dim[4]   = {0.60f, 0.64f, 0.72f, 1.0f};
-    static const float gold[4]  = {1.00f, 0.80f, 0.20f, 1.0f};
-    static const float blue[4]  = {0.45f, 0.75f, 1.00f, 1.0f};
-
-    /* title band across the top, rows in the lower third (the car shows above) */
-    hud_menu_rect(&dc, 0.0f, -200.0f, 2000.0f, 56.0f, 0.02f, 0.03f, 0.06f, 0.70f);
-    hud_menu_text(h, &dc, fi, m->title, 0.0f, -200.0f, 1.25f, 1, gold);
-
-    const float row_h = 30.0f, top = 240.0f - 40.0f - row_h * (float)(m->rows + (m->status ? 1 : 0));
-    float panel_h = row_h * (float)(m->rows + (m->status ? 1 : 0)) + 16.0f;
-    hud_menu_rect(&dc, 0.0f, top + 0.5f * panel_h - 0.5f * row_h - 8.0f, 460.0f, panel_h,
-                  0.02f, 0.03f, 0.06f, 0.72f);
-    for (int i = 0; i < m->rows && i < HUD_MENU_ROWS; i++) {
-        float y = top + row_h * (float)i;
-        int s = i == m->sel;
-        if (s) hud_menu_rect(&dc, 0.0f, y, 452.0f, row_h - 4.0f, 0.10f, 0.28f, 0.55f, 0.85f);
-        if (m->value[i]) {
-            hud_menu_text(h, &dc, fi, m->label[i], -210.0f, y, 0.85f, 0, s ? white : dim);
-            char buf[96];
-            snprintf(buf, sizeof buf, s ? "<  %s  >" : "%s", m->value[i]);
-            hud_menu_text(h, &dc, fi, buf, 210.0f, y, 0.85f, 2, s ? gold : white);
-        } else {
-            hud_menu_text(h, &dc, fi, m->label[i], 0.0f, y, 0.95f, 1, s ? gold : white);
-        }
-    }
-    if (m->status)
-        hud_menu_text(h, &dc, fi, m->status, 0.0f, top + row_h * (float)m->rows, 0.7f, 1, blue);
-    if (m->hint) {
-        hud_menu_rect(&dc, 0.0f, 225.0f, 2000.0f, 26.0f, 0.0f, 0.0f, 0.0f, 0.55f);
-        hud_menu_text(h, &dc, fi, m->hint, 0.0f, 225.0f, 0.6f, 1, dim);
-    }
-
-    glUniform1f(rp->uUseTex, 0.0f); glUniform1f(rp->uUnlit, 0.0f);
-    glUniform1f(rp->uEmissiveTex, 0.0f); glUniform1f(rp->uAlpha, 1.0f);
-    glUniform1f(rp->uTextureAlpha, 0.0f); glUniform1f(rp->uFogDensity, fog_density);
-    glUniform3f(rp->uColor, 1.0f, 1.0f, 1.0f);
-    glDepthMask(depth_mask);
-    if (depth_on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (blend_on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-    glBlendFunc((GLenum)blend_src, (GLenum)blend_dst);
 }
 
 /* A movie full screen (IG_PlayMovie): black, the picture letterboxed */

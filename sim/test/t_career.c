@@ -18,6 +18,7 @@ static unsigned char *rd(const char *p, long *n)
 static unsigned u16(const unsigned char *p) { return p[0] | p[1] << 8; }
 static unsigned u32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (unsigned)p[3] << 24; }
 static unsigned bhash(const char *s) { unsigned h = 0xffffffffu; while (*s) h = h * 33 + (unsigned char)*s++; return h; }
+void garage_tt_request(int what, int dir) { (void)what; (void)dir; }   /* main.c stub (shop.o) */
 
 static void show_pile(void)
 {

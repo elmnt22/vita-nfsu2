@@ -449,20 +449,6 @@ int hud_set_trackmap(Hud *h, const char *dataroot, int event,
 void hud_draw(Hud *h, const RProg *rp, GpuMesh *quad,
               const HudState *s, int width, int height);
 
-/* Garage / pause menu: a title, rows of "LABEL   < value >", one selected,
- * and a hint line, in the game's own HUD font over a dark panel. Drawn
- * instead of the driving HUD. Strings are ASCII; the font has capitals. */
-#define HUD_MENU_ROWS 10
-typedef struct {
-    const char *title;
-    const char *label[HUD_MENU_ROWS];
-    const char *value[HUD_MENU_ROWS];   /* NULL: a plain action row */
-    int rows, sel;
-    const char *hint;
-    const char *status;                 /* optional line under the rows */
-} HudMenu;
-void hud_draw_menu(Hud *h, const RProg *rp, GpuMesh *quad, const HudMenu *m,
-                   int width, int height);
 /* a polyline in FEng space (640x480 centred, y down), colour 0xAARRGGBB */
 void hud_fe_lines(const RProg *rp, GpuMesh *quad, int width, int height,
                   const float *xy, int n, uint32_t argb, float thick);

@@ -1394,8 +1394,12 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_S, act_down(b, OPT_ACT_BACK));
     set_key(SDL_SCANCODE_E, act_down(b, OPT_ACT_SHIFT_UP));
     set_key(SDL_SCANCODE_Q, act_down(b, OPT_ACT_SHIFT_DOWN));
+    /* the stick as left / right keys (also the drag lane change's analog
+       events 0xba / 0xbb, handler 0x571d50 table 0x7fe238): retail presses
+       left when the 0..255 axis byte goes below 0x40 (0x7fdd08) and right
+       above 0xbf (0x7fdd09) -- raw < 64 / raw > 191, so lx < -64 / lx > 63 */
     set_key(SDL_SCANCODE_A, act_down(b, OPT_ACT_STEER_L) || lx < -64);
-    set_key(SDL_SCANCODE_D, act_down(b, OPT_ACT_STEER_R) || lx > 64);
+    set_key(SDL_SCANCODE_D, act_down(b, OPT_ACT_STEER_R) || lx > 63);
     set_key(SDL_SCANCODE_SPACE, act_down(b, OPT_ACT_HANDBRAKE));
     set_key(SDL_SCANCODE_N, act_down(b, OPT_ACT_NITROUS) && !(b & SCE_CTRL_SELECT));
     set_key(SDL_SCANCODE_C, act_down(b, OPT_ACT_CAMERA));

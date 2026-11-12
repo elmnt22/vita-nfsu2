@@ -85,7 +85,7 @@ typedef struct {
     uint8_t  has_spawn;               /* +0x8744 SaveSpawnPosition 801266dc / GetRespawnParameters 8012765c */
     float    spawn[4];                /* +0x8750 x, y, z (+ pad) */
     uint16_t spawn_heading;           /* +0x8760 */
-    float    f8764;                   /* -1 */
+    float    f8764;                   /* +0x7e54 the career time (s, free roam w/o Stage0; Default -1; saved) */
     uint8_t  a8768[0x100];
     uint8_t  a8869[0x10];             /* Default: all 1 */
     CareerSmsQueue sms;               /* +0x5d20 */
@@ -99,7 +99,7 @@ typedef struct {
         int read_msg, sms_dismissed;
     } s0;
     uint32_t engaged_preset;          /* the engaged event's preset ride (+0x7e1c -> +0x2c), C3 */
-    int      have_suv_car;            /* 0x803bbed0 && current car IsSUV */
+    int      have_suv_car;            /* test override only: the game computes career_driving_suv / career_owns_suv */
     int      has_car;
     const unsigned char *shop;        /* +0x7e20 the shop we are in (NotifyEnterShopFromFreeRoam;
                                          GetShopWeAreCurrentlyIn), not saved */
@@ -111,7 +111,7 @@ typedef struct {
         uint16_t heading;             /* +0x118 the car's at the start (the retry's) */
         int state;                    /* +0x11c CWC_* */
     } wcs;
-    float career_time;                /* +0x7e54 the career time (s, free roam; not saved) */
+    /* (the career time is f8764: GC +0x7e54 / PC +0x8764, saved) */
 } CareerState;
 /* WorldChallengeState +0x11c */
 enum { CWC_NONE, CWC_RUNNING, CWC_AT_SHOP, CWC_AT_SHOWCASE, CWC_IN_SHOP, CWC_DONE, CWC_FAILED,
@@ -149,6 +149,7 @@ const unsigned char *career_random_hidden_event(void);
 /* results: margin = the margin of victory (EventInProgressState, C4); won
    with the reward still claimable. CommitWinEvent 0x541420 / CommitLoseEvent */
 void career_commit_win(uint32_t h, int reward, float margin);
+void career_race_finished(int won);
 void career_commit_lose(uint32_t h);
 void career_choose_sponsor(const unsigned char *sponsor);     /* NotifyChooseSponsor */
 float career_rep_for_margin(float margin, const unsigned char *ev);   /* 0x512b50 */
@@ -255,6 +256,7 @@ int  career_player_zones(const uint32_t *zones, int n);
 const CareerZone *career_current_zone(void);                  /* +0x7dec.. (NotifyEnterTriggerZone) */
 int  career_can_engage(void);                                 /* CanWeEngage 801244d4 */
 void career_engage_requested(void);                           /* NotifyEngageMechanicRequested 8012660c */
+void career_reset_engaged(void);                              /* ResetEngagedTriggerZone 80126a90: NotifyFreeRoamBegun / NotifyBeginNewRace */
 int  career_engaging_dialog(void);                            /* IsEngagingDialog (+0x6820) */
 void career_set_engaging_dialog(int on);                      /* SetEngagingDialog */
 const CareerZone *career_engaged(void);                       /* +0x7df0.. the engaged zone; NULL none */
@@ -277,7 +279,7 @@ uint32_t career_shop_accept(const unsigned char *shop);        /* EngageShopDial
 /* NotifyEnterEvent 80126318 (RaceEngageDialog accept, LaunchEngagedRace):
    pos / heading the car's (kept, has_spawn 0); NULL keeps the spawn */
 void career_enter_event(const unsigned char *ev, const float pos[3], uint16_t heading);
-int  career_post_race_free_roam(const unsigned char *ev, int stage_before, char *out, int n);   /* NotifyEnterFreeRoamFromPostRace 80126918 */
+int  career_post_race_free_roam(const unsigned char *ev, int from_wmap, char *out, int n);   /* NotifyEnterFreeRoamFromPostRace 80126918 */
 void career_decline_event(const unsigned char *ev);           /* NotifyDeclineEvent 801265e0 */
 void career_decline_shop(const unsigned char *shop);          /* NotifyDeclineEnterShopFromFreeRoam 80126f48 (empty) */
 /* NotifyInBankTriggerZone 801262b8 (a type 19 zone holding the car, 0 none):
