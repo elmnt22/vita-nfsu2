@@ -25,7 +25,7 @@ engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
 - [What's in the port](#whats-in-the-port)
 - [What you need](#what-you-need)
 - [Installation](#installation)
-- [UG2Converter (PC tool)](#ug2converter-pc-tool)
+- [NFSU2 Vita Prep Tool (PC)](#nfsu2-vita-prep-tool-pc)
 - [Bringing over a PC save](#bringing-over-a-pc-save)
 - [Settings](#settings)
 - [Reporting problems](#reporting-problems)
@@ -76,8 +76,9 @@ engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
 - **Need for Speed Underground 2 for PC, patched to v1.2.** The port only
   reads the data folders, but it is built and tested against v1.2
   (`SPEED2.EXE` dated Feb 9 2005).
-- A Windows 10/11 PC for **UG2Converter** (optional, but it saves 15–20
-  minutes on the first boot).
+- A Windows 10/11 PC for the **NFSU2 Vita Prep Tool** (optional, but
+  recommended: it checks your game files, puts them on the Vita, and saves
+  15–20+ minutes on the first boot).
 
 ### On the Vita side
 
@@ -101,7 +102,12 @@ page to your Vita and install it with VitaShell. It shows up as
 
 ### 2. Copy the game data
 
-Copy these folders from your PC install (usually
+The easiest way is the **[NFSU2 Vita Prep Tool](#nfsu2-vita-prep-tool-pc)**:
+it checks your game files, then sends only the ones the Vita needs over
+Wi-Fi or copies them over USB, along with the converted world data (step 3).
+Files already on the Vita are skipped, so sending again later is quick.
+
+To copy by hand instead, copy these folders from your PC install (usually
 `C:\Program Files (x86)\EA GAMES\Need for Speed Underground 2`) to
 **`ux0:data/NFSU2/`** on the Vita:
 
@@ -131,7 +137,7 @@ The layout on the memory card:
 ux0:data/NFSU2/
 ├── CARS/  CREDITS/  FRONTEND/  GLOBAL/  LANGUAGES/  MOVIES/
 ├── NIS/   SDATA/    SOUND/     SUBTITLES/  TRACKS/  memcard/   <- copied from the PC game
-├── cache/      <- converted world data, shaders, shop lists (made by the game or UG2Converter)
+├── cache/      <- converted world data, shaders, shop lists (made by the game or the Prep Tool)
 ├── profiles/   <- your saves
 └── log.txt, log_prev.txt, boot.txt, crumbs.txt               <- logs
 ```
@@ -140,9 +146,9 @@ ux0:data/NFSU2/
 
 On its first boot the game converts the world data into a format the Vita
 can stream quickly. This is the **"OPTIMIZING WORLD DATA"** screen, and on
-the console it takes **15–20+ minutes**. **UG2Converter** does the same job
-on your PC in about **1½ minutes** and can send the result straight to the
-Vita over Wi-Fi. See [UG2Converter](#ug2converter-pc-tool) below.
+the console it takes **15–20+ minutes**. The **NFSU2 Vita Prep Tool** does
+the same job on your PC in about **1½ minutes** and puts the result on the
+Vita with the game files. See [NFSU2 Vita Prep Tool](#nfsu2-vita-prep-tool-pc) below.
 
 You can skip this step. The Vita then converts the data itself on the first
 boot.
@@ -153,48 +159,60 @@ Start **NFS Underground 2** from the LiveArea.
 
 ---
 
-## UG2Converter (PC tool)
+## NFSU2 Vita Prep Tool (PC)
 
-`UG2Converter.exe` is a single Windows file with nothing to install. It's on
-the [Releases](https://github.com/elmnt22/vita-nfsu2/releases) page. It runs
-the port's own conversion code on your PC, so its output is identical to
-what the Vita would make. Use the converter from the **same release** as
-your VPK. If the data format changes, the Vita ignores cache files from an
-older converter and converts the data itself.
+`NFSU2VitaPrep.exe` is a single Windows file with nothing to install. It's
+on the [Releases](https://github.com/elmnt22/vita-nfsu2/releases) page. It
+gets your PC copy of the game ready for the Vita:
+
+- **Checks your game files.** Every file the Vita needs is compared with the
+  original game (size and checksum), so a missing, damaged or modded file
+  shows up on the PC instead of as a crash on the Vita.
+- **Converts the world data** with the port's own code, so the result is
+  identical to what the Vita would make. It also prebuilds the cars' parts
+  lists and the shop screens.
+- **Puts it on the Vita** over Wi-Fi (FTP) or USB. Only the files the Vita
+  needs go over (no `Support`, `Uninstall` or other unused files), and game
+  files already there are skipped.
+- **Imports a PC save** (see [below](#bringing-over-a-pc-save)).
+
+Use the Prep Tool from the **same release** as your VPK. If the data format
+changes, the Vita ignores cache files from an older tool and converts the
+data itself.
 
 **Quick start:**
 
-1. Run **UG2Converter.exe**. It finds your NFSU2 install from the registry.
-   If it doesn't, click **Browse...** and pick the game folder (the one with
-   `TRACKS` in it).
-2. Click **Convert**. It converts all six track sets (the City, both Drag
-   Strips, Drift, Street X and URL) and prebuilds the cars' parts lists and
-   the shop screens. The result is about 330 MB and goes to a folder called
-   `NFSU2 Vita cache`.
-3. On the Vita, start an FTP server on port **1337**: in VitaShell, press
-   **SELECT**, or use vitacompanion.
-4. In the converter, type the IP address the Vita shows and click
-   **Send to Vita**. The files go to `ux0:data/NFSU2/cache`.
-
-   To copy the files by hand instead, copy the `cache` folder from the
-   output folder into `ux0:data/NFSU2/`.
+1. Run **NFSU2VitaPrep.exe**. It finds your NFSU2 install from the
+   registry. If it doesn't, click **Browse...** and pick the game folder
+   (the one with `TRACKS` in it).
+2. Click **Convert**. It checks your game files first, then converts all
+   six track sets (the City, both Drag Strips, Drift, Street X and URL).
+   The result is about 330 MB and goes to a folder called `NFSU2 Vita Prep`.
+3. Put it on the Vita. Leave **Game files too** ticked the first time
+   (about 1.7 GB), then either:
+   - **Over Wi-Fi:** start an FTP server on the Vita on port **1337** (in
+     VitaShell press **SELECT**, or use vitacompanion), type the IP address
+     the Vita shows and click **Send to Vita**.
+   - **Over USB (faster):** in VitaShell press **START**, pick **USB**
+     and connect the Vita. Click **Copy to memory card...** and pick the
+     memory card's drive.
 
 If it worked, the game goes straight to the title screen without the
 "OPTIMIZING WORLD DATA" screen.
 
 The full guide, with the command line options and troubleshooting, is in
-**[docs/CONVERTER.md](docs/CONVERTER.md)**.
+**[docs/PREP_TOOL.md](docs/PREP_TOOL.md)**.
 
 ---
 
 ## Bringing over a PC save
 
-UG2Converter can import a career save from the PC game with
+The Prep Tool can import a career save from the PC game with
 **Import PC save...**. The PC game keeps saves in
 `%LOCALAPPDATA%\NFS Underground 2\<name>\<name>`. The imported profile is
-sent to `ux0:data/NFSU2/profiles` with the rest. Load it from the
+sent or copied to `ux0:data/NFSU2/profiles` with the rest. Load it from the
 **Profile Manager** in the game. See
-[docs/CONVERTER.md](docs/CONVERTER.md#importing-a-pc-save).
+[docs/PREP_TOOL.md](docs/PREP_TOOL.md#importing-a-pc-save).
 
 ---
 
@@ -207,7 +225,7 @@ game starts. A small menu opens before the game loads:
 |---|---|
 | **Logs** | On by default. Off stops `log.txt` and `perf.csv` from being written. `boot.txt` and `crumbs.txt` are always kept. |
 | **Frame rate** | **30 FPS** (default, locked and even) or **Unlocked** (up to 60, varies; experimental). |
-| **Reset caches** | Deletes `ux0:data/NFSU2/cache`: the converted world data, shaders and shop lists. Your profiles and options are kept. On the next boot the game converts the world again, or you can send it again from UG2Converter. |
+| **Reset caches** | Deletes `ux0:data/NFSU2/cache`: the converted world data, shaders and shop lists. Your profiles and options are kept. On the next boot the game converts the world again, or you can send it again from the Prep Tool. |
 
 **Start Game** (or START) saves the settings and restarts the game.
 
@@ -227,8 +245,8 @@ writes its logs to `ux0:data/NFSU2/`:
 - `boot.txt`, `crumbs.txt`: startup and the last steps before a crash
 
 Attach them to the issue, plus a screenshot for a visual problem. For a
-converter problem, attach `convert_log.txt` from the converter's output
-folder.
+Prep Tool problem, attach `convert_log.txt` from its output folder
+(`NFSU2 Vita Prep`).
 
 ---
 
@@ -238,14 +256,14 @@ You only need this to build the port yourself. Players can use the
 release files.
 
 **Requirements:** a native-Windows [VitaSDK](https://vitasdk.org/) and a
-bash shell (Git Bash works). The simulator and the converter also need
+bash shell (Git Bash works). The simulator and the Prep Tool also need
 [zig](https://ziglang.org/) (`zig cc`) and SDL2. The patched vitaGL is
 included in `vita/lib/`.
 
 ```sh
 VITASDK=E:/vitasdk ./vita/build_vita.sh   # -> vita/build/NFSU2Vita.vpk (+ eboot.bin)
 ./sim/build_sim.sh                        # Windows simulator of the Vita build
-./converter/build_converter.sh            # -> converter/build/UG2Converter.exe
+./converter/build_converter.sh            # -> converter/build/NFSU2VitaPrep.exe
 ```
 
 - The **simulator** (`sim/`) runs the Vita build on Windows at the Vita's
@@ -253,7 +271,7 @@ VITASDK=E:/vitasdk ./vita/build_vita.sh   # -> vita/build/NFSU2Vita.vpk (+ eboot
   See [sim/README.md](sim/README.md).
 - [vita/PORTING_NOTES.md](vita/PORTING_NOTES.md) covers the Vita specifics:
   memory, streaming, the renderer, shaders and logs.
-- [converter/README.md](converter/README.md) has the converter's developer
+- [converter/README.md](converter/README.md) has the Prep Tool's developer
   notes, including what it writes and when it needs a rebuild.
 - [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) and
   [docs/FORMATS.md](docs/FORMATS.md) cover the engine and the game's file
@@ -271,9 +289,9 @@ supported targets are the three scripts above.
 | `src/` | Game code: engine, world streaming, rendering, physics (`n2sim`), AI, career, front end (FEng), HUD, shops, audio, speech, movies, profiles |
 | `vita/` | Vita platform layer (an SDL subset on vitaGL / SceCtrl / SceAudio), boot settings menu, build script, LiveArea assets, vendored vitaGL |
 | `sim/` | Windows simulator of the Vita build, plus self-tests in `sim/test/` |
-| `converter/` | UG2Converter: PC-side world conversion, cache builders, PC save import, FTP send |
+| `converter/` | NFSU2 Vita Prep Tool: game file check, PC-side world conversion, cache builders, PC save import, FTP / USB send |
 | `tools/` | Asset dump/audit tools, LiveArea and loading-screen art helpers |
-| `docs/` | Player guide for the converter, file format notes, developer guide |
+| `docs/` | Player guide for the Prep Tool, file format notes, developer guide |
 | `third_party/` | Dear ImGui (desktop debug UI) |
 
 ---

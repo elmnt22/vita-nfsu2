@@ -44,3 +44,12 @@ long long g_career[4096];   /* options.c, perfparts.c, vinyl.c and pcsave.c link
  * lights load (carfx.c); no cars here, so nothing to tell (11-09: the old
  * aborting stub stopped the conversion) */
 void carfx_lights_changed(void) { }
+
+/* 11-12: carfx.c's light-list generation (world.c stamps a region's lights
+ * with it); no car lighting here, a counter is enough */
+#include <stdint.h>
+uint32_t carfx_new_light_revision(void) { static uint32_t r; return ++r; }
+
+/* 11-12: nfsu2.h n2_lang() asks the Vita's system language (built __vita__
+ * like the simulator); -1 = unknown -> English, OPENUG2_LANG still overrides */
+int vita_system_lang(void) { return -1; }

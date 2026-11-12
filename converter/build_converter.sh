@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# OpenUG2 World Data Converter -- Windows tool that runs the Vita's one-time
+# NFSU2 Vita Prep Tool (was UG2Converter) -- Windows tool: checks the game files,
+# runs the Vita's one-time
 # world tile conversion on a PC (converter/ug2conv.c).
 #
-#   ./converter/build_converter.sh   -> converter/build/UG2Converter.exe
+#   ./converter/build_converter.sh   -> converter/build/NFSU2VitaPrep.exe
 #
 # The game's world sources are compiled exactly as for the simulator (32-bit
 # ILP32 like the Vita, __vita__ + N2_GLES, sim/include/sim_pre.h), so the
@@ -47,9 +48,9 @@ fail=0
 for p in "${pids[@]}"; do wait "$p" || fail=1; done
 [ $fail = 0 ] || { echo "compile failed"; exit 1; }
 
-echo "LD UG2Converter.exe"
+echo "LD NFSU2VitaPrep.exe"
 "${CC[@]}" -g "${OBJS[@]}" "$ROOT/converter/ug2conv.rc" "$SDL2_DIR/lib/libSDL2.a" \
     -lwininet -lcomctl32 -lcomdlg32 -lshell32 -lole32 -loleaut32 -luuid -ladvapi32 -lgdi32 -luser32 \
     -lwinmm -limm32 -lsetupapi -lversion -lcfgmgr32 \
-    -Wl,--subsystem,windows -Wl,--stack,8388608 -o "$OUT/UG2Converter.exe"
-echo "built $OUT/UG2Converter.exe"
+    -Wl,--subsystem,windows -Wl,--stack,8388608 -o "$OUT/NFSU2VitaPrep.exe"
+echo "built $OUT/NFSU2VitaPrep.exe"

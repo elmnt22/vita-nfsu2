@@ -1,22 +1,29 @@
-/* ug2conv.c -- OpenUG2 World Data Converter (Windows).
+/* ug2conv.c -- NFSU2 Vita Prep Tool (Windows; was "UG2Converter").
  *
- * The Vita build converts every track's world into prebuilt tiles once, on
- * the first boot ("OPTIMIZING WORLD DATA", 15-20+ minutes on the console).
- * This tool runs that same conversion -- the game's own world_tiles.c and
- * resource.c, built 32-bit like the Vita -- on a PC from the player's NFSU2
- * folder, then copies the result to the Vita over FTP (VitaShell or
- * vitacompanion, port 1337) or leaves it in a folder to copy by hand. The
- * Vita finds the tile sets and compact bundles in ux0:data/NFSU2/cache and
- * skips its own conversion.
+ * Gets a player's NFSU2 PC install ready for the Vita:
+ *  - checks the game files against the v1.2 data the port is tested with
+ *    (game_manifest.inc: names, sizes, CRC32s -- tools/gen_prep_manifest.py)
+ *  - converts every track's world into prebuilt tiles: the Vita's one-time
+ *    first boot step ("OPTIMIZING WORLD DATA", 15-20+ minutes on the console),
+ *    run here with the game's own world_tiles.c and resource.c, built 32-bit
+ *    like the Vita, plus the other first-use caches (conv_extras.c)
+ *  - sends the game files the Vita needs (only those: the manifest leaves out
+ *    Support / Uninstall / #JIMBO and files the port never opens) and the
+ *    cache to the Vita over FTP (VitaShell or vitacompanion, port 1337), or
+ *    copies them to a folder (the memory card over VitaShell's USB mode).
+ *    Game files already there at the same size are skipped.
  *
- *   UG2Converter.exe                      the window
- *   UG2Converter.exe --cli GAME OUT       convert without the window
- *   UG2Converter.exe --send IP OUT        send OUT's converted tracks to the Vita
- *   UG2Converter.exe --import-save SAVE GAME OUT
+ *   NFSU2VitaPrep.exe                          the window
+ *   NFSU2VitaPrep.exe --check GAME             check the game files (report on stderr)
+ *   NFSU2VitaPrep.exe --cli GAME OUT           check + convert without the window
+ *   NFSU2VitaPrep.exe --send IP OUT [GAME]     send OUT's cache (+ GAME's files) to the Vita
+ *   NFSU2VitaPrep.exe --copy DEST OUT [GAME]   the same into DEST (ux0's root, or any folder)
+ *   NFSU2VitaPrep.exe --import-save SAVE GAME OUT
  *                                         a PC save (%LOCALAPPDATA%\NFS Underground 2\
  *                                         <NAME>\<NAME>) into OUT\profiles\<NAME>\<NAME>
  *                                         (pcsave.c), sent with the rest
  */
+#define TOOL_NAME "NFSU2 Vita Prep Tool"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
@@ -87,7 +94,12 @@ static int game_dir_detect(char *out, size_t cap) {
     for (int i = 0; i < 2; i++) {
         DWORD n = (DWORD)cap;
         if (RegGetValueA(HKEY_LOCAL_MACHINE, keys[i], "Install Dir", RRF_RT_REG_SZ, NULL, out, &n) == ERROR_SUCCESS &&
-            game_dir_fix(out, cap)) return 1;
+            game_dir_fix(out, cap)) {
+            char l[MAX_PATH];   /* the installer may store a short 8.3 name */
+            DWORD k = GetLongPathNameA(out, l, sizeof l);
+            if (k && k < sizeof l) snprintf(out, cap, "%s", l);
+            return 1;
+        }
     }
     GetModuleFileNameA(NULL, out, (DWORD)cap);   /* the tool dropped into the game folder */
     char *s = strrchr(out, '\\'); if (s) *s = 0;
@@ -96,13 +108,124 @@ static int game_dir_detect(char *out, size_t cap) {
     return 0;
 }
 
-/* Output: "NFSU2 Vita cache" next to the tool; Documents if that is read-only. */
+/* ---- the game files the Vita needs, and the check against v1.2 ----------- */
+typedef struct { const char *rel; long long size; unsigned crc; } GameFile;
+static const GameFile k_game[] = {
+#include "game_manifest.inc"
+};
+#define NGAME ((int)(sizeof k_game / sizeof *k_game))
+#define V12_EXE_SIZE 4800512LL   /* SPEED2.EXE v1.2 (Feb 9 2005); the data files are v1.0's, unchanged */
+
+static unsigned g_crctab[256];
+static unsigned crc32_add(unsigned c, const unsigned char *p, DWORD n) {   /* zlib's crc32 */
+    if (!g_crctab[1])
+        for (unsigned i = 0; i < 256; i++) {
+            unsigned k = i;
+            for (int j = 0; j < 8; j++) k = k & 1 ? 0xEDB88320u ^ (k >> 1) : k >> 1;
+            g_crctab[i] = k;
+        }
+    c = ~c;
+    while (n--) c = g_crctab[(c ^ *p++) & 0xff] ^ (c >> 8);
+    return ~c;
+}
+static void game_path(char *out, size_t cap, const char *game, const char *rel) {
+    snprintf(out, cap, "%s\\%s", game, rel);
+    for (char *s = out; *s; s++) if (*s == '/') *s = '\\';
+}
+static long long game_total(void) {
+    long long t = 0;
+    for (int i = 0; i < NGAME; i++) t += k_game[i].size;
+    return t;
+}
+
+static struct {
+    volatile int busy, done, ok;   /* ok: every file there and matching */
+    volatile long long bytes, total;
+    int missing, bad;
+    char msg[2048];
+} g_chk;
+
+/* A fingerprint of the install as the file system sees it (sizes + write
+   times): a later check of an unchanged folder that passed skips the CRCs. */
+static unsigned game_fingerprint(const char *game) {
+    unsigned c = crc32_add(0, (const unsigned char *)game, (DWORD)strlen(game));
+    char p[MAX_PATH + 160];
+    for (int i = 0; i < NGAME; i++) {
+        game_path(p, sizeof p, game, k_game[i].rel);
+        WIN32_FILE_ATTRIBUTE_DATA d;
+        if (!GetFileAttributesExA(p, GetFileExInfoStandard, &d)) memset(&d, 0, sizeof d);
+        c = crc32_add(c, (const unsigned char *)&d.nFileSizeLow, 4);
+        c = crc32_add(c, (const unsigned char *)&d.ftLastWriteTime, sizeof d.ftLastWriteTime);
+    }
+    return c;
+}
+static void setting_get(const char *name, char *out, DWORD cap);
+static void setting_put(const char *name, const char *v);
+
+/* Checks GAME against the manifest. Returns 1 when everything matches; the
+   report is in g_chk.msg either way. */
+static int check_game(const char *game) {
+    static unsigned char buf[1 << 20];
+    char p[MAX_PATH + 160], list[1200] = "";
+    int nlist = 0;
+    g_chk.missing = g_chk.bad = 0; g_chk.bytes = 0; g_chk.total = game_total();
+    char fp[32], prev[32];
+    snprintf(fp, sizeof fp, "%08x", game_fingerprint(game));
+    setting_get("CheckedOK", prev, sizeof prev);
+    int quick = !strcmp(fp, prev);   /* passed before and nothing changed: sizes only */
+    for (int i = 0; i < NGAME; i++) {
+        const GameFile *g = &k_game[i];
+        game_path(p, sizeof p, game, g->rel);
+        long long sz = file_size(p);
+        const char *why = NULL;
+        if (sz < 0) { why = "missing"; g_chk.missing++; }
+        else if (sz != g->size) { why = "different size"; g_chk.bad++; }
+        else if (!quick) {
+            HANDLE h = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+            unsigned c = 0; DWORD got; int rd = h != INVALID_HANDLE_VALUE;
+            while (rd && ReadFile(h, buf, sizeof buf, &got, NULL) && got) { c = crc32_add(c, buf, got); g_chk.bytes += got; }
+            if (rd) CloseHandle(h);
+            if (!rd) { why = "can't be read"; g_chk.bad++; }
+            else if (c != g->crc) { why = "different contents"; g_chk.bad++; }
+            g_chk.bytes -= sz;   /* counted below */
+        }
+        g_chk.bytes += g->size;
+        if (why && nlist < 12) {
+            size_t n = strlen(list);
+            snprintf(list + n, sizeof list - n, "   %s (%s)\n", g->rel, why);
+            nlist++;
+        }
+    }
+    int problems = g_chk.missing + g_chk.bad;
+    if (!problems) setting_put("CheckedOK", fp);
+    char exe[MAX_PATH + 32], exe_note[200] = "";
+    snprintf(exe, sizeof exe, "%s\\SPEED2.EXE", game);
+    long long esz = file_size(exe);
+    if (esz == V12_EXE_SIZE) snprintf(exe_note, sizeof exe_note, "\nSPEED2.EXE is v1.2.");
+    else if (esz > 0) snprintf(exe_note, sizeof exe_note, "\nSPEED2.EXE is not v1.2. That's fine: the Vita "
+                               "only uses the data files, and the v1.2 patch didn't change them.");
+    if (!problems)
+        snprintf(g_chk.msg, sizeof g_chk.msg, "All %d game files the Vita needs are there and match the "
+                 "original game.%s", NGAME, exe_note);
+    else
+        snprintf(g_chk.msg, sizeof g_chk.msg, "%d of the %d game files the Vita needs %s missing and %d %s "
+                 "different from the original game:\n\n%s%s\nMissing files can crash the game on the Vita. "
+                 "Changed files (mods, a different release, damaged copies) may crash or look wrong. "
+                 "Reinstalling the game, or copying it again, usually fixes this.%s",
+                 g_chk.missing, NGAME, g_chk.missing == 1 ? "is" : "are", g_chk.bad, g_chk.bad == 1 ? "is" : "are",
+                 list, problems > nlist ? "   ...\n" : "", exe_note);
+    printf("prep: game check (%s): %d missing, %d different\n", quick ? "sizes" : "full", g_chk.missing, g_chk.bad);
+    g_chk.ok = !problems;
+    return !problems;
+}
+
+/* Output: "NFSU2 Vita Prep" next to the tool; Documents if that is read-only. */
 static char g_out[MAX_PATH];
 static void out_dir_init(void) {
     GetModuleFileNameA(NULL, g_out, sizeof g_out);
     char *s = strrchr(g_out, '\\'); if (s) *s = 0;
     char probe[MAX_PATH + 32];
-    snprintf(probe, sizeof probe, "%s\\NFSU2 Vita cache", g_out);
+    snprintf(probe, sizeof probe, "%s\\NFSU2 Vita Prep", g_out);
     CreateDirectoryA(probe, NULL);
     DWORD a = GetFileAttributesA(probe);
     char test[MAX_PATH + 48]; snprintf(test, sizeof test, "%s\\.write_test", probe);
@@ -111,7 +234,7 @@ static void out_dir_init(void) {
     if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); snprintf(g_out, sizeof g_out, "%s", probe); return; }
     char docs[MAX_PATH];
     if (SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, docs) != S_OK) snprintf(docs, sizeof docs, ".");
-    snprintf(g_out, sizeof g_out, "%s\\NFSU2 Vita cache", docs);
+    snprintf(g_out, sizeof g_out, "%s\\NFSU2 Vita Prep", docs);
     CreateDirectoryA(g_out, NULL);
 }
 
@@ -136,14 +259,17 @@ static struct {
     char game[MAX_PATH];
     char msg[512];
     char extra[128];   /* the first-use cache being made after the tracks */
+    int gui;           /* the window: ask before converting a folder that failed the check */
+    volatile int checking;
 } g_job;
+static HWND g_wnd;
 
 void conv_fatal(const char *what) {
     printf("converter: unexpected call to %s -- stopping\n", what);
     fflush(stdout);
     char m[256]; snprintf(m, sizeof m, "The conversion reached code it does not support (%s).\n"
                           "Please report this. Nothing was copied to your Vita.", what);
-    MessageBoxA(NULL, m, "NFSU2 Vita Converter", MB_ICONERROR);
+    MessageBoxA(NULL, m, TOOL_NAME, MB_ICONERROR);
     ExitProcess(3);
 }
 
@@ -154,7 +280,23 @@ static void convert_all(void) {
     snprintf(p, sizeof p, "%s\\convert_log.txt", g_out);
     freopen(p, "w", stdout);
     setvbuf(stdout, NULL, _IOLBF, 4096);
-    printf("NFSU2 Vita converter: game folder %s, output %s\n", g_job.game, g_out);
+    printf(TOOL_NAME ": game folder %s, output %s\n", g_job.game, g_out);
+    /* the game files first: a broken or modded copy is better caught here
+       than as a crash on the Vita */
+    g_job.checking = 1;
+    int good = check_game(g_job.game);
+    g_job.checking = 0;
+    printf("%s\n", g_chk.msg);
+    if (!good && g_job.gui) {
+        char q[2200];
+        snprintf(q, sizeof q, "%s\n\nConvert anyway?", g_chk.msg);
+        if (MessageBoxA(g_wnd, q, TOOL_NAME, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+            snprintf(g_job.msg, sizeof g_job.msg, "Stopped: some game files are missing or changed (see Check game files).");
+            printf("converter: %s\n", g_job.msg); fflush(stdout);
+            g_job.ok = 0; g_job.done = 1; g_job.busy = 0;
+            return;
+        }
+    }
     int todo[NTRACKS], n = 0, missing = 0;
     for (int t = 0; t < NTRACKS; t++) {
         if (!track_present(g_job.game, t)) { printf("%s: no %s.BUN, skipped\n", k_tracks[t].name, k_tracks[t].bun); missing++; continue; }
@@ -222,16 +364,19 @@ static void convert_all(void) {
 static DWORD WINAPI convert_thread(LPVOID a) { (void)a; convert_all(); return 0; }
 
 /* ---- sending to the Vita over FTP (worker thread) ------------------------- */
-typedef struct { char local[MAX_PATH + 96], remote[256]; long long size; } SendFile;
+typedef struct { char local[MAX_PATH + 160], remote[256]; long long size; int game; } SendFile;
 static struct {
     volatile int busy, done, ok;
     volatile long long sent, total;
-    volatile int file, nfiles;
+    volatile int file, nfiles, skipped;
     char ip[64];
+    char dest[MAX_PATH];   /* set: copy into this folder (the memory card's root) instead of FTP */
+    char game[MAX_PATH];   /* set: the game files go too */
     char msg[512];
 } g_send;
 
-#define SEND_CAP (5 * NTRACKS + 64 + 16)
+#define SEND_CAP (NGAME + 5 * NTRACKS + 64 + 16)
+#define VITA_DATA "ux0:/data/NFSU2"
 #define VITA_PROFILES "ux0:/data/NFSU2/profiles"
 /* the imported PC saves: OUT\profiles\<NAME>\<NAME> */
 static int send_profiles(SendFile *f, int n, int cap) {
@@ -274,12 +419,21 @@ static int send_add(SendFile *f, int n, const char *name) {   /* a cache file, i
     snprintf(f[n].remote, sizeof f[n].remote, VITA_CACHE "/%s", name);
     return file_exists(f[n].local) ? n + 1 : n;
 }
-static int send_list(SendFile *f, int cap) {
+static int send_list(SendFile *f, int cap, const char *game) {
     int n = 0;
     char name[128];
+    /* the game files first (only the ones the Vita needs), so the cache --
+       whose indexes say "converted" -- only lands next to a whole install */
+    for (int i = 0; game && game[0] && i < NGAME && n < cap; i++) {
+        game_path(f[n].local, sizeof f[n].local, game, k_game[i].rel);
+        snprintf(f[n].remote, sizeof f[n].remote, VITA_DATA "/%s", k_game[i].rel);
+        f[n].game = 1;
+        if (file_exists(f[n].local)) n++;
+    }
     /* per track: the compact bundle, its stripped copy and start, the tile
        pack, then the index -- its presence tells the game the set is whole,
        so it goes last */
+    for (int i = n; i < cap; i++) f[i].game = 0;
     for (int t = 0; t < NTRACKS && n + 5 <= cap; t++) {
         if (!track_done(t)) continue;
         compact_path(f[n].local, sizeof f[n].local, t);
@@ -300,65 +454,131 @@ static int send_list(SendFile *f, int cap) {
     return n;
 }
 
-static int ftp_put(HINTERNET c, const SendFile *f, char *buf, DWORD bufsz) {
-    HANDLE h = CreateFileA(f->local, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+/* Two ways onto the Vita: FTP (c set), or a folder (g_send.dest: the memory
+   card's root as VitaShell's USB mode shows it, or anywhere to copy later). */
+static void dest_path(char *out, size_t cap, const char *remote) {   /* "ux0:/x/y" -> DEST\x\y */
+    const char *r = !strncmp(remote, "ux0:/", 5) ? remote + 5 : remote;
+    snprintf(out, cap, "%s\\%s", g_send.dest, r);
+    for (char *s = out; *s; s++) if (*s == '/') *s = '\\';
+}
+
+/* the remote folder's file sizes, to skip game files already there */
+typedef struct { char name[96]; long long size; } RemoteEnt;
+static RemoteEnt g_rent[512]; static int g_nrent; static char g_rdir[256];
+static void remote_list(HINTERNET c, const char *dir) {
+    if (!strcmp(dir, g_rdir)) return;
+    snprintf(g_rdir, sizeof g_rdir, "%s", dir);
+    g_nrent = 0;
+    if (c) {
+        if (!FtpSetCurrentDirectoryA(c, dir)) return;
+        WIN32_FIND_DATAA d;
+        HINTERNET f = FtpFindFirstFileA(c, NULL, &d, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+        if (!f) return;
+        do {
+            if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY || g_nrent >= 512) continue;
+            snprintf(g_rent[g_nrent].name, sizeof g_rent[0].name, "%s", d.cFileName);
+            g_rent[g_nrent++].size = ((long long)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+        } while (InternetFindNextFileA(f, &d));
+        InternetCloseHandle(f);
+    }
+}
+static int already_there(HINTERNET c, const SendFile *f) {
+    if (!f->game) return 0;   /* the cache always goes: same size does not mean the same tiles */
+    if (!c) { char p[MAX_PATH + 300]; dest_path(p, sizeof p, f->remote); return file_size(p) == f->size; }
+    char dir[256]; snprintf(dir, sizeof dir, "%s", f->remote);
+    char *s = strrchr(dir, '/'); if (!s) return 0;
+    *s = 0;
+    remote_list(c, dir);
+    for (int i = 0; i < g_nrent; i++)
+        if (!_stricmp(g_rent[i].name, s + 1)) return g_rent[i].size == f->size;
+    return 0;
+}
+
+/* every folder on the way to the file (made once each) */
+static void make_dirs(HINTERNET c, const char *remote) {
+    static char made[256];
+    char dir[256]; snprintf(dir, sizeof dir, "%s", remote);
+    char *s = strrchr(dir, '/'); if (!s) return;
+    *s = 0;
+    if (!strcmp(dir, made)) return;
+    snprintf(made, sizeof made, "%s", dir);
+    if (!c) { char p[MAX_PATH + 300]; dest_path(p, sizeof p, dir); SHCreateDirectoryExA(NULL, p, NULL); return; }
+    for (char *q = dir + 5; (q = strchr(q, '/')) != NULL; q++) {   /* past "ux0:/" */
+        *q = 0; FtpCreateDirectoryA(c, dir); *q = '/';   /* already there is fine */
+    }
+    FtpCreateDirectoryA(c, dir);
+}
+
+static int put_file(HINTERNET c, const SendFile *f, char *buf, DWORD bufsz) {
+    HANDLE h = CreateFileA(f->local, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    HINTERNET r = FtpOpenFileA(c, f->remote, GENERIC_WRITE, FTP_TRANSFER_TYPE_BINARY, 0);
-    int ok = r != NULL;
+    HINTERNET r = NULL; HANDLE o = INVALID_HANDLE_VALUE;
+    if (c) r = FtpOpenFileA(c, f->remote, GENERIC_WRITE, FTP_TRANSFER_TYPE_BINARY, 0);
+    else { char p[MAX_PATH + 300]; dest_path(p, sizeof p, f->remote);
+           o = CreateFileA(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL); }
+    int ok = c ? r != NULL : o != INVALID_HANDLE_VALUE;
     DWORD got;
     while (ok && ReadFile(h, buf, bufsz, &got, NULL) && got) {
         for (DWORD off = 0; ok && off < got; ) {
             DWORD w = 0;
-            ok = InternetWriteFile(r, buf + off, got - off, &w) && w;
+            ok = (c ? InternetWriteFile(r, buf + off, got - off, &w) : WriteFile(o, buf + off, got - off, &w, NULL)) && w;
             off += w; g_send.sent += w;
         }
     }
     CloseHandle(h);
     if (r && !InternetCloseHandle(r)) ok = 0;
+    if (o != INVALID_HANDLE_VALUE && !CloseHandle(o)) ok = 0;
     return ok;
 }
 
 static void send_all(void) {
     static SendFile files[SEND_CAP];
-    int n = send_list(files, SEND_CAP);
+    int to_dir = g_send.dest[0] != 0;
+    int n = send_list(files, SEND_CAP, g_send.game);
     long long total = 0;
     for (int i = 0; i < n; i++) total += files[i].size;
-    g_send.total = total; g_send.sent = 0; g_send.nfiles = n;
+    g_send.total = total; g_send.sent = 0; g_send.nfiles = n; g_send.skipped = 0;
     int ok = n > 0;
-    HINTERNET net = InternetOpenA("NFSU2 Vita Converter", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-    HINTERNET c = net ? InternetConnectA(net, g_send.ip, FTP_PORT, NULL, NULL, INTERNET_SERVICE_FTP,
-                                         INTERNET_FLAG_PASSIVE, 0) : NULL;
-    if (!c) {
+    long long moved = 0;
+    HINTERNET net = NULL, c = NULL;
+    if (!to_dir) {
+        net = InternetOpenA(TOOL_NAME, INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+        c = net ? InternetConnectA(net, g_send.ip, FTP_PORT, NULL, NULL, INTERNET_SERVICE_FTP,
+                                   INTERNET_FLAG_PASSIVE, 0) : NULL;
+    }
+    g_rdir[0] = 0;
+    if (!to_dir && !c) {
         ok = 0;
         snprintf(g_send.msg, sizeof g_send.msg, "Could not reach the Vita at %s. Is its FTP server on "
                  "(VitaShell: press SELECT) and the IP right?", g_send.ip);
     } else if (ok) {
-        FtpCreateDirectoryA(c, "ux0:/data");   /* already there is fine */
-        FtpCreateDirectoryA(c, "ux0:/data/NFSU2");
-        FtpCreateDirectoryA(c, VITA_CACHE);
-        FtpCreateDirectoryA(c, VITA_CACHE "/tiles");
-        for (int i = 0; i < n; i++)
-            if (!strncmp(files[i].remote, VITA_PROFILES "/", sizeof VITA_PROFILES)) {
-                char dir[256];
-                snprintf(dir, sizeof dir, "%s", files[i].remote);
-                *strrchr(dir, '/') = 0;
-                FtpCreateDirectoryA(c, VITA_PROFILES);
-                FtpCreateDirectoryA(c, dir);
-            }
         /* the old indexes go first: a set cut off half way reads as missing
            (and the Vita converts it) instead of as whole */
         for (int i = 0; i < n; i++)
-            if (strstr(files[i].remote, ".idx")) FtpDeleteFileA(c, files[i].remote);
+            if (strstr(files[i].remote, ".idx")) {
+                if (c) FtpDeleteFileA(c, files[i].remote);
+                else { char p[MAX_PATH + 300]; dest_path(p, sizeof p, files[i].remote); DeleteFileA(p); }
+            }
         static char buf[256 << 10];
         for (int i = 0; i < n && ok; i++) {
             g_send.file = i;
-            ok = ftp_put(c, &files[i], buf, sizeof buf);
-            if (!ok) snprintf(g_send.msg, sizeof g_send.msg, "Sending %s failed. Check the Wi-Fi and try again.",
-                              strrchr(files[i].remote, '/') + 1);
+            if (already_there(c, &files[i])) { g_send.sent += files[i].size; g_send.skipped++; continue; }
+            make_dirs(c, files[i].remote);
+            ok = put_file(c, &files[i], buf, sizeof buf);
+            if (ok) moved += files[i].size;
+            if (!ok) snprintf(g_send.msg, sizeof g_send.msg, to_dir
+                              ? "Copying %s failed. Is the memory card still connected, with enough free space?"
+                              : "Sending %s failed. Check the Wi-Fi and the free space on the memory card, and try again "
+                                "(files already sent are skipped).", files[i].remote + 5);
         }
-        if (ok) snprintf(g_send.msg, sizeof g_send.msg, "Sent %.0f MB to the Vita. Start NFS Underground 2 -- it skips "
-                         "\"Optimizing world data\".", total / 1048576.0);
-    } else snprintf(g_send.msg, sizeof g_send.msg, "Nothing to send yet: convert first.");
+        char skip[96] = "";
+        if (g_send.skipped) snprintf(skip, sizeof skip, " (%d game file%s already there, skipped)", g_send.skipped,
+                                     g_send.skipped == 1 ? "" : "s");
+        if (ok) snprintf(g_send.msg, sizeof g_send.msg, "%s %.0f MB%s%s. Start NFS Underground 2%s.",
+                         to_dir ? "Copied" : "Sent", moved / 1048576.0,
+                         to_dir ? "" : " to the Vita", skip,
+                         track_done(0) ? " -- it skips \"Optimizing world data\"" : "");
+    } else snprintf(g_send.msg, sizeof g_send.msg, "Nothing to send yet: convert first, or tick \"Game files too\".");
     if (c) InternetCloseHandle(c);
     if (net) InternetCloseHandle(net);
     g_send.ok = ok;
@@ -368,7 +588,7 @@ static void send_all(void) {
 static DWORD WINAPI send_thread(LPVOID a) { (void)a; send_all(); return 0; }
 
 /* ---- settings ------------------------------------------------------------- */
-#define REG_KEY "Software\\NFSU2Vita\\Converter"
+#define REG_KEY "Software\\NFSU2Vita\\PrepTool"
 static void setting_get(const char *name, char *out, DWORD cap) {
     if (RegGetValueA(HKEY_CURRENT_USER, REG_KEY, name, RRF_RT_REG_SZ, NULL, out, &cap) != ERROR_SUCCESS) out[0] = 0;
 }
@@ -380,8 +600,10 @@ static void setting_put(const char *name, const char *v) {
 }
 
 /* ---- the window ----------------------------------------------------------- */
-enum { ID_GAME = 100, ID_BROWSE, ID_CONVERT, ID_PROGRESS, ID_STATUS, ID_IP, ID_SEND, ID_OPEN, ID_TIMER, ID_IMPORT };
-static HWND g_wnd, g_game_ed, g_browse, g_convert, g_bar, g_status, g_ip_ed, g_send_btn, g_open, g_import;
+enum { ID_GAME = 100, ID_BROWSE, ID_CONVERT, ID_PROGRESS, ID_STATUS, ID_IP, ID_SEND, ID_OPEN, ID_TIMER, ID_IMPORT,
+       ID_CHECK, ID_GAMEFILES, ID_COPY };
+static HWND g_game_ed, g_browse, g_convert, g_bar, g_status, g_ip_ed, g_send_btn, g_open, g_import,
+            g_check, g_gamefiles, g_copy;
 static HFONT g_font, g_bold, g_title;
 static int g_dpi = 96;
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
@@ -395,9 +617,11 @@ static HWND mk(const char *cls, const char *text, DWORD style, int x, int y, int
 }
 static void set_status(const char *s) { SetWindowTextA(g_status, s); }
 static void ui_idle(void) {
-    int busy = g_job.busy || g_send.busy;
+    int busy = g_job.busy || g_send.busy || g_chk.busy;
     EnableWindow(g_convert, !busy); EnableWindow(g_browse, !busy); EnableWindow(g_game_ed, !busy);
-    EnableWindow(g_send_btn, !busy && (track_done(0) || profiles_present())); EnableWindow(g_ip_ed, !busy);
+    EnableWindow(g_check, !busy);
+    EnableWindow(g_send_btn, !busy); EnableWindow(g_copy, !busy); EnableWindow(g_ip_ed, !busy);
+    EnableWindow(g_gamefiles, !busy);
     EnableWindow(g_import, !busy);
 }
 static void ui_initial_status(void) {
@@ -409,7 +633,7 @@ static void ui_initial_status(void) {
         set_status(m);
         SendMessageA(g_bar, PBM_SETPOS, n == NTRACKS ? 1000 : 0, 0);
     } else if (!game[0]) set_status("Pick your Need for Speed Underground 2 folder, then press Convert.");
-    else set_status("Ready. Press Convert -- it takes about 2 minutes.");
+    else set_status("Ready. Press Convert -- it checks your game files, then converts (about 2 minutes).");
 }
 
 static void on_browse(void) {
@@ -423,7 +647,7 @@ static void on_browse(void) {
     if (SHGetPathFromIDListA(id, p)) {
         if (!game_dir_fix(p, sizeof p))
             MessageBoxA(g_wnd, "That folder has no TRACKS\\STREAML4RA.BUN.\n\nPick the folder NFS Underground 2 is "
-                        "installed in (or the folder you copied the game data from).", "NFSU2 Vita Converter", MB_ICONWARNING);
+                        "installed in (or the folder you copied the game data from).", TOOL_NAME, MB_ICONWARNING);
         else SetWindowTextA(g_game_ed, p);
     }
     CoTaskMemFree(id);
@@ -433,13 +657,14 @@ static void on_convert(void) {
     char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
     if (!game_dir_fix(game, sizeof game)) {
         MessageBoxA(g_wnd, "Pick your Need for Speed Underground 2 folder first (it has a TRACKS folder in it).",
-                    "NFSU2 Vita Converter", MB_ICONWARNING);
+                    TOOL_NAME, MB_ICONWARNING);
         return;
     }
     SetWindowTextA(g_game_ed, game);
     setting_put("GameDir", game);
     memset(&g_job, 0, sizeof g_job);
     snprintf(g_job.game, sizeof g_job.game, "%s", game);
+    g_job.gui = 1;
     g_job.busy = 1;
     SendMessageA(g_bar, PBM_SETPOS, 0, 0);
     set_status("Starting...");
@@ -447,21 +672,82 @@ static void on_convert(void) {
     HANDLE h = CreateThread(NULL, 16 << 20, convert_thread, NULL, 0, NULL);
     if (h) CloseHandle(h); else { g_job.busy = 0; set_status("Could not start the conversion."); ui_idle(); }
 }
+/* Send to Vita (FTP) and Copy to memory card (a folder) start the same job */
+static void start_send(const char *ip, const char *dest) {
+    int with_game = SendMessageA(g_gamefiles, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    setting_put("GameFiles", with_game ? "1" : "0");
+    char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
+    if (with_game && !game_dir_fix(game, sizeof game)) {
+        MessageBoxA(g_wnd, "Pick your Need for Speed Underground 2 folder first (step 1), or untick "
+                    "\"Game files too\" to send only the converted data.", TOOL_NAME, MB_ICONWARNING);
+        return;
+    }
+    memset(&g_send, 0, sizeof g_send);
+    if (ip) snprintf(g_send.ip, sizeof g_send.ip, "%s", ip);
+    if (dest) snprintf(g_send.dest, sizeof g_send.dest, "%s", dest);
+    if (with_game) snprintf(g_send.game, sizeof g_send.game, "%s", game);
+    g_send.busy = 1;
+    SendMessageA(g_bar, PBM_SETPOS, 0, 0);
+    set_status(dest ? "Copying..." : "Connecting to the Vita...");
+    ui_idle();
+    HANDLE h = CreateThread(NULL, 0, send_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h); else { g_send.busy = 0; ui_idle(); }
+}
 static void on_send(void) {
     char ip[64]; GetWindowTextA(g_ip_ed, ip, sizeof ip);
     char *s = ip; while (*s == ' ') s++;
     char *e = s + strlen(s); while (e > s && e[-1] == ' ') *--e = 0;
     if (!*s) { MessageBoxA(g_wnd, "Type your Vita's IP address (VitaShell shows it when you press SELECT).",
-                           "NFSU2 Vita Converter", MB_ICONINFORMATION); return; }
+                           TOOL_NAME, MB_ICONINFORMATION); return; }
     setting_put("VitaIP", s);
-    memset(&g_send, 0, sizeof g_send);
-    snprintf(g_send.ip, sizeof g_send.ip, "%s", s);
-    g_send.busy = 1;
+    start_send(s, NULL);
+}
+/* dest folder -> the memory card's root: a pick of its data or data\NFSU2
+   folder means the same card */
+static void dest_fix(char *p) {
+    for (char *s = p; *s; s++) if (*s == '/') *s = '\\';
+    size_t n = strlen(p);
+    while (n > 0 && p[n - 1] == '\\') p[--n] = 0;   /* "E:\" -> "E:" */
+    if (n >= 11 && !_stricmp(p + n - 11, "\\data\\NFSU2")) p[n -= 11] = 0;
+    if (n >= 5 && !_stricmp(p + n - 5, "\\data")) p[n -= 5] = 0;
+}
+/* the memory card over USB (VitaShell: START > USB) shows up as a drive */
+static void on_copy(void) {
+    BROWSEINFOA bi = {0};
+    bi.hwndOwner = g_wnd;
+    bi.lpszTitle = "Pick the Vita's memory card (ux0) as it shows up over USB, or any folder to copy it to later";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST id = SHBrowseForFolderA(&bi);
+    if (!id) return;
+    char p[MAX_PATH];
+    int got = SHGetPathFromIDListA(id, p);
+    CoTaskMemFree(id);
+    if (!got) return;
+    dest_fix(p);
+    start_send(NULL, p);
+}
+/* Check game files: the same check Convert runs first, on its own */
+static DWORD WINAPI check_thread(LPVOID a) {
+    check_game((const char *)a);
+    g_chk.done = 1; g_chk.busy = 0;
+    return 0;
+}
+static void on_check(void) {
+    static char game[MAX_PATH];
+    GetWindowTextA(g_game_ed, game, sizeof game);
+    if (!game_dir_fix(game, sizeof game)) {
+        MessageBoxA(g_wnd, "Pick your Need for Speed Underground 2 folder first (it has a TRACKS folder in it).",
+                    TOOL_NAME, MB_ICONWARNING);
+        return;
+    }
+    SetWindowTextA(g_game_ed, game);
+    setting_put("GameDir", game);
+    g_chk.done = 0; g_chk.busy = 1;
     SendMessageA(g_bar, PBM_SETPOS, 0, 0);
-    set_status("Connecting to the Vita...");
+    set_status("Checking your game files...");
     ui_idle();
-    HANDLE h = CreateThread(NULL, 0, send_thread, NULL, 0, NULL);
-    if (h) CloseHandle(h); else { g_send.busy = 0; ui_idle(); }
+    HANDLE h = CreateThread(NULL, 0, check_thread, game, 0, NULL);
+    if (h) CloseHandle(h); else { g_chk.busy = 0; ui_idle(); }
 }
 /* "Import PC save...": the PC game's profile file (its folder in
    %LOCALAPPDATA%\NFS Underground 2), into the output's profiles folder */
@@ -469,7 +755,7 @@ static void on_import(void) {
     char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
     if (!game_dir_fix(game, sizeof game)) {
         MessageBoxA(g_wnd, "Pick your Need for Speed Underground 2 folder first (it has a TRACKS folder in it): "
-                    "the import reads the game's car data.", "NFSU2 Vita Converter", MB_ICONWARNING);
+                    "the import reads the game's car data.", TOOL_NAME, MB_ICONWARNING);
         return;
     }
     char dir[MAX_PATH] = "", file[MAX_PATH] = "";
@@ -490,11 +776,22 @@ static void on_import(void) {
     int ok = import_save(file, game, m, sizeof m);
     set_status(ok ? "Save imported. Send to Vita copies it." : "The save could not be imported.");
     ui_idle();
-    MessageBoxA(g_wnd, m, "NFSU2 Vita Converter", ok ? MB_ICONINFORMATION : MB_ICONERROR);
+    MessageBoxA(g_wnd, m, TOOL_NAME, ok ? MB_ICONINFORMATION : MB_ICONERROR);
 }
 static void on_timer(void) {
     char m[256];
-    if (g_job.busy && g_job.todo && !g_job.extra[0]) {
+    if (g_chk.busy || (g_job.busy && g_job.checking)) {
+        long long t = g_chk.total > 0 ? g_chk.total : 1;
+        SendMessageA(g_bar, PBM_SETPOS, (WPARAM)(g_chk.bytes * 1000 / t), 0);
+        snprintf(m, sizeof m, "Checking your game files: %d%%", (int)(g_chk.bytes * 100 / t));
+        set_status(m);
+    } else if (g_chk.done) {
+        g_chk.done = 0;
+        SendMessageA(g_bar, PBM_SETPOS, 1000, 0);
+        set_status(g_chk.ok ? "Game files OK." : "Some game files are missing or changed.");
+        ui_idle();
+        MessageBoxA(g_wnd, g_chk.msg, TOOL_NAME, g_chk.ok ? MB_ICONINFORMATION : MB_ICONWARNING);
+    } else if (g_job.busy && g_job.todo && !g_job.extra[0]) {
         const WTileProgress *p = &g_job.prog;
         float f = p->cells_total > 0 ? (float)p->cells_done / (float)p->cells_total : 0.0f;
         if (f > 1.0f) f = 1.0f;
@@ -511,30 +808,33 @@ static void on_timer(void) {
         if (g_job.ok) SendMessageA(g_bar, PBM_SETPOS, 1000, 0);
         set_status(g_job.msg);
         ui_idle();
-        if (!g_job.ok) MessageBoxA(g_wnd, g_job.msg, "NFSU2 Vita Converter", MB_ICONERROR);
+        if (!g_job.ok) MessageBoxA(g_wnd, g_job.msg, TOOL_NAME, MB_ICONERROR);
     }
     if (g_send.busy && g_send.total > 0) {
         SendMessageA(g_bar, PBM_SETPOS, (WPARAM)(g_send.sent * 1000 / g_send.total), 0);
-        snprintf(m, sizeof m, "Sending to the Vita: %.0f of %.0f MB (file %d of %d)", g_send.sent / 1048576.0,
-                 g_send.total / 1048576.0, g_send.file + 1, g_send.nfiles);
+        snprintf(m, sizeof m, "%s: %.0f of %.0f MB (file %d of %d)", g_send.dest[0] ? "Copying" : "Sending to the Vita",
+                 g_send.sent / 1048576.0, g_send.total / 1048576.0, g_send.file + 1, g_send.nfiles);
         set_status(m);
     } else if (g_send.done) {
         g_send.done = 0;
         set_status(g_send.msg);
         ui_idle();
-        MessageBoxA(g_wnd, g_send.msg, "NFSU2 Vita Converter", g_send.ok ? MB_ICONINFORMATION : MB_ICONERROR);
+        MessageBoxA(g_wnd, g_send.msg, TOOL_NAME, g_send.ok ? MB_ICONINFORMATION : MB_ICONERROR);
     }
 }
 
 static void build_ui(void) {
     int y = 14;
-    mk("STATIC", "NFSU2 Vita World Data Converter", 0, 20, y, 500, 28, 0, g_title); y += 32;
-    mk("STATIC", "Does the Vita's one-time \"Optimizing world data\" step on this PC instead, so the game "
-       "is ready to play the first time you start it.", 0, 20, y, 500, 34, 0, g_font); y += 46;
+    mk("STATIC", TOOL_NAME, 0, 20, y, 500, 28, 0, g_title); y += 32;
+    mk("STATIC", "Gets your NFSU2 PC files ready for the Vita: checks them, does the Vita's one-time "
+       "\"Optimizing world data\" step here, and puts everything on the Vita.", 0, 20, y, 500, 34, 0, g_font); y += 46;
 
     mk("STATIC", "1.  Your Need for Speed Underground 2 folder", 0, 20, y, 500, 18, 0, g_bold); y += 22;
     g_game_ed = mk("EDIT", "", ES_AUTOHSCROLL, 20, y, 400, 24, ID_GAME, g_font);
-    g_browse = mk("BUTTON", "Browse...", BS_PUSHBUTTON, 428, y, 92, 24, ID_BROWSE, g_font); y += 40;
+    g_browse = mk("BUTTON", "Browse...", BS_PUSHBUTTON, 428, y, 92, 24, ID_BROWSE, g_font); y += 30;
+    g_check = mk("BUTTON", "Check game files", BS_PUSHBUTTON, 20, y, 140, 24, ID_CHECK, g_font);
+    mk("STATIC", "Makes sure your copy is complete and unmodified.", 0, 170, y + 4, 350, 18,
+       0, g_font); y += 38;
 
     mk("STATIC", "2.  Convert", 0, 20, y, 500, 18, 0, g_bold); y += 22;
     g_convert = mk("BUTTON", "Convert", BS_DEFPUSHBUTTON, 20, y, 140, 30, ID_CONVERT, g_bold);
@@ -544,19 +844,23 @@ static void build_ui(void) {
     g_status = mk("STATIC", "", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 20, y, 500, 18, ID_STATUS, g_font); y += 36;
 
     mk("STATIC", "3.  Put it on your Vita", 0, 20, y, 500, 18, 0, g_bold); y += 24;
+    g_gamefiles = mk("BUTTON", "Game files too (about 1.7 GB the first time; files already there are skipped)",
+                     BS_AUTOCHECKBOX, 20, y, 500, 20, ID_GAMEFILES, g_font); y += 28;
     mk("STATIC", "Vita IP address:", 0, 20, y + 4, 104, 18, 0, g_font);
     g_ip_ed = mk("EDIT", "", ES_AUTOHSCROLL, 126, y, 150, 24, ID_IP, g_font);
     g_send_btn = mk("BUTTON", "Send to Vita", BS_PUSHBUTTON, 284, y, 120, 24, ID_SEND, g_font); y += 30;
     mk("STATIC", "Open VitaShell on the Vita and press SELECT to see its IP (vitacompanion works too). "
        "Close NFS Underground 2 on the Vita first.", 0, 20, y, 500, 34, 0, g_font); y += 42;
+    g_copy = mk("BUTTON", "Copy to memory card...", BS_PUSHBUTTON, 20, y, 140, 24, ID_COPY, g_font);
+    mk("STATIC", "Faster than Wi-Fi: in VitaShell press START, pick USB, then pick the memory card's "
+       "drive here.", 0, 170, y - 2, 350, 34, 0, g_font); y += 36;
     g_open = mk("BUTTON", "Open output folder", BS_PUSHBUTTON, 20, y, 140, 24, ID_OPEN, g_font);
-    mk("STATIC", "No Wi-Fi? Copy the \"cache\" folder from there into ux0:data/NFSU2/ on the Vita "
-       "(USB or SD card).", 0, 170, y - 2, 350, 34, 0, g_font); y += 44;
+    mk("STATIC", "The converted data and the logs.", 0, 170, y + 4, 350, 18, 0, g_font); y += 44;
 
     mk("STATIC", "Optional:  bring your PC career", 0, 20, y, 500, 18, 0, g_bold); y += 24;
     g_import = mk("BUTTON", "Import PC save...", BS_PUSHBUTTON, 20, y, 140, 24, ID_IMPORT, g_font);
     mk("STATIC", "Turns a profile of the PC game into a Vita profile (career, cars, options, "
-       "high scores). Send to Vita copies it too.", 0, 170, y - 2, 350, 34, 0, g_font);
+       "high scores). Sending or copying takes it along.", 0, 170, y - 2, 350, 34, 0, g_font);
 }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -566,6 +870,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_BROWSE: on_browse(); return 0;
         case ID_CONVERT: on_convert(); return 0;
         case ID_SEND: on_send(); return 0;
+        case ID_COPY: on_copy(); return 0;
+        case ID_CHECK: on_check(); return 0;
         case ID_IMPORT: on_import(); return 0;
         case ID_OPEN: ShellExecuteA(h, "open", g_out, NULL, NULL, SW_SHOWNORMAL); return 0;
         }
@@ -576,11 +882,13 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
     case WM_CLOSE:
-        if ((g_job.busy || g_send.busy) &&
+        if ((g_job.busy || g_send.busy || g_chk.busy) &&
             MessageBoxA(h, g_job.busy ? "The conversion is still running. Quit anyway? (The track in progress "
                                         "starts over next time.)"
-                                      : "Still sending to the Vita. Quit anyway? (Send again later.)",
-                        "NFSU2 Vita Converter", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+                                      : g_chk.busy ? "Still checking the game files. Quit anyway?"
+                                      : "Still sending to the Vita. Quit anyway? (Send again later: files already "
+                                        "there are skipped.)",
+                        TOOL_NAME, MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
         DestroyWindow(h); return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
@@ -611,9 +919,22 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
         fprintf(stderr, "%s\n", m);
         return ok ? 0 : 1;
     }
-    if (__argc >= 4 && !strcmp(__argv[1], "--send")) {
-        snprintf(g_send.ip, sizeof g_send.ip, "%s", __argv[2]);
+    if (__argc >= 3 && !strcmp(__argv[1], "--check")) {   /* GAME: 0 = all match, 1 = problems */
+        char game[MAX_PATH];
+        snprintf(game, sizeof game, "%s", __argv[2]);
+        if (!game_dir_fix(game, sizeof game)) { fprintf(stderr, "no NFSU2 game folder at %s\n", __argv[2]); return 2; }
+        int ok = check_game(game);
+        fprintf(stderr, "%s\n", g_chk.msg);
+        return ok ? 0 : 1;
+    }
+    if (__argc >= 4 && (!strcmp(__argv[1], "--send") || !strcmp(__argv[1], "--copy"))) {   /* IP|DEST OUT [GAME] */
+        if (!strcmp(__argv[1], "--send")) snprintf(g_send.ip, sizeof g_send.ip, "%s", __argv[2]);
+        else { snprintf(g_send.dest, sizeof g_send.dest, "%s", __argv[2]); dest_fix(g_send.dest); }
         snprintf(g_out, sizeof g_out, "%s", __argv[3]);
+        if (__argc >= 5) {
+            snprintf(g_send.game, sizeof g_send.game, "%s", __argv[4]);
+            if (!game_dir_fix(g_send.game, sizeof g_send.game)) { fprintf(stderr, "no NFSU2 game folder at %s\n", __argv[4]); return 2; }
+        }
         conv_set_folders("", g_out);
         send_all();
         fprintf(stderr, "%s\n", g_send.msg);
@@ -628,14 +949,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     g_font = font(9, FW_NORMAL); g_bold = font(9, FW_SEMIBOLD); g_title = font(14, FW_SEMIBOLD);
 
     WNDCLASSA wc = {0};
-    wc.lpfnWndProc = wndproc; wc.hInstance = inst; wc.lpszClassName = "NFSU2VitaConverter";
+    wc.lpfnWndProc = wndproc; wc.hInstance = inst; wc.lpszClassName = "NFSU2VitaPrep";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(1));
     RegisterClassA(&wc);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r = { 0, 0, S(540), S(530) };
+    RECT r = { 0, 0, S(540), S(640) };
     AdjustWindowRect(&r, style, FALSE);
-    g_wnd = CreateWindowA("NFSU2VitaConverter", "NFSU2 Vita Converter", style, CW_USEDEFAULT, CW_USEDEFAULT,
+    g_wnd = CreateWindowA("NFSU2VitaPrep", TOOL_NAME, style, CW_USEDEFAULT, CW_USEDEFAULT,
                           r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     build_ui();
 
@@ -645,6 +966,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     SetWindowTextA(g_game_ed, v);
     setting_get("VitaIP", v, sizeof v);
     SetWindowTextA(g_ip_ed, v);
+    setting_get("GameFiles", v, sizeof v);
+    SendMessageA(g_gamefiles, BM_SETCHECK, strcmp(v, "0") ? BST_CHECKED : BST_UNCHECKED, 0);
     conv_set_folders("", g_out);   /* track_done reads the output's cache */
     ui_initial_status();
     ui_idle();

@@ -1,7 +1,30 @@
-# UG2Converter (developer notes) (Windows)
+# NFSU2 Vita Prep Tool (developer notes) (Windows)
 
-Does the Vita's one-time "OPTIMIZING WORLD DATA" boot step on a PC: about
-2 minutes for all six tracks instead of 15-20+ on the console.
+Was UG2Converter (renamed 2026-11-12). Checks the player's game files,
+does the Vita's one-time "OPTIMIZING WORLD DATA" boot step on a PC (about
+2 minutes for all six tracks instead of 15-20+ on the console), and puts
+the game files + cache on the Vita over FTP or into a folder (USB).
+
+## Game files: the check and what is sent
+
+`converter/game_manifest.inc` lists every file the Vita needs with its size
+and CRC32 (names and numbers only, no game data). Regenerate it with
+
+    python tools/gen_prep_manifest.py <NFSU2 v1.2 game folder>
+
+It takes the 12 folders the README lists and leaves out the files the port
+never opens: `SOUND/ENGINE/CAR_nn_ENG_MB_EE.ABK` (audio.c loads the `_SPU`
+banks). Add a rule there when another file is proven unused (the original
+track bundles must stay: the game reads texture pixels from them on demand
+even with the compact copies). The data files are all dated 2004, so v1.0
+and v1.2 installs carry the same data; only SPEED2.EXE differs (4,800,512
+bytes = v1.2), and the port does not use it.
+
+A passing check is remembered (HKCU `Software\NFSU2Vita\PrepTool`,
+`CheckedOK` = fingerprint of path + sizes + write times); the next check of
+an unchanged folder compares sizes only. Sending lists each remote folder
+once (FTP LIST) and skips game files already there at the same size; cache
+files always go.
 
 It runs the game's own conversion (`src/world_tiles.c`, `src/resource.c`,
 built 32-bit like the Vita, same as the simulator) on the player's NFSU2
@@ -26,15 +49,15 @@ World detail is set to low, as the Vita's default.
 
 ## Use
 
-1. Run `UG2Converter.exe` (one file, nothing to install). It finds the NFSU2
+1. Run `NFSU2VitaPrep.exe` (one file, nothing to install). It finds the NFSU2
    install from the registry; otherwise Browse to the folder with `TRACKS`.
 2. Convert.
 3. Send to Vita: the Vita's FTP server on port 1337 (VitaShell: SELECT, or
    vitacompanion). Or copy the `cache` folder from "Open output folder" into
    `ux0:data/NFSU2/` by hand.
 
-Command line: `UG2Converter.exe --cli GAME OUT` (convert, log in
-`OUT/convert_log.txt`), `UG2Converter.exe --send IP OUT`.
+Command line: `--check GAME`, `--cli GAME OUT` (check + convert, log in
+`OUT/convert_log.txt`), `--send IP OUT [GAME]`, `--copy DEST OUT [GAME]`.
 
 When sending, the Vita's old `.idx` files are deleted first and each track's
 index goes up last, so a cut-off transfer reads as "not converted" (the Vita
@@ -49,7 +72,7 @@ the tool with the name if ever reached.
 
 ## Build
 
-    ./converter/build_converter.sh   # -> converter/build/UG2Converter.exe
+    ./converter/build_converter.sh   # -> converter/build/NFSU2VitaPrep.exe
 
 zig cc, SDL2 linked statically (`SDL2_DIR`, default the simulator's). A
 `WTILE_VERSION` bump, a `SHOP_CACHE` version bump (shop.c) or a change to the

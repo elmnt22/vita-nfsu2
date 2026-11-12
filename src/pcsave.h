@@ -7,7 +7,7 @@
  * writes the port's own profile (profile.c's tagged blocks) for the same
  * name: options, the garage (the tuned cars, the current car), the career
  * cars (parts, paint, vinyls, inventory, tunings), the career and the high
- * scores. Used by UG2Converter (--import-save, the window) and in game by
+ * scores. Used by the NFSU2 Vita Prep Tool (--import-save, the window) and in game by
  * the Profile Manager (a save copied to ux0:data/NFSU2/pcsave/).
  */
 #ifndef OPENUG2_PCSAVE_H
