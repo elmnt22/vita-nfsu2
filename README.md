@@ -18,6 +18,8 @@ engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
 > code. You need your own legally owned copy of the PC game. This project is
 > not affiliated with, authorized or endorsed by Electronic Arts.
 
+Disclosure: Whilst I know a bit of programming and coding, I used AI to help accelerate areas of this port that otherwise would have taken me forever. AI used was Claude Opus.
+
 ---
 
 ## Contents
