@@ -1430,6 +1430,9 @@ static int btex_cmp(const void *a, const void *b) {   /* final texture order */
 }
 
 #define BATCH_CELL     256.0f   /* grid cell edge, metres */
+#ifndef WORLD_BATCH_CELL_M
+#define WORLD_BATCH_CELL_M 128.0f   /* Vita world batch cell edge (fixed grid), metres */
+#endif
 #define BATCH_MAXVERTS 65535    /* u16 indices (GLES2: no u32 without ext) */
 
 #ifdef __vita__
@@ -1900,8 +1903,8 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
         ent[m].cell_x = ent[m].cell_y = 0;
 #ifdef __vita__
         /* Fixed world tiles; resident bounds must not shift batch membership. */
-        ent[m].cell_x = (int)floorf(cx / 128.0f);
-        ent[m].cell_y = (int)floorf(cy / 128.0f);
+        ent[m].cell_x = (int)floorf(cx / WORLD_BATCH_CELL_M);
+        ent[m].cell_y = (int)floorf(cy / WORLD_BATCH_CELL_M);
         ent[m].key = tex;
 #endif
         ent[m].group = batch_group(mesh, mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE);
@@ -1909,6 +1912,26 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
     }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
     j->meshes = m;
+#ifdef __vita__
+    {   static int cellstat = -1;   /* test aid: OPENUG2_CELLSTAT prints the batch count at 128/256/512 m cells */
+        if (cellstat < 0) cellstat = getenv("OPENUG2_CELLSTAT") != NULL;
+        if (cellstat && m) {
+            int cnt[3] = {0};
+            for (int sh = 0; sh < 3; sh++) {
+                typedef struct { int x, y, g; GLuint t; } K;
+                K *kk = (K *)malloc((size_t)m * sizeof *kk); if (!kk) break;
+                for (int i = 0; i < m; i++) { kk[i].x = ent[i].cell_x >> sh; kk[i].y = ent[i].cell_y >> sh;
+                    kk[i].g = ent[i].group; kk[i].t = (GLuint)ent[i].key; }
+                for (int i = 0; i < m; i++) { int dup = 0;
+                    for (int q = i - 1; q >= 0 && q >= i - 4000 && !dup; q--)
+                        dup = kk[q].x == kk[i].x && kk[q].y == kk[i].y && kk[q].g == kk[i].g && kk[q].t == kk[i].t;
+                    cnt[sh] += !dup; }
+                free(kk);
+            }
+            printf("cellstat: %d meshes -> batches 128m %d, 256m %d, 512m %d (ignoring the vertex cap)\n", m, cnt[0], cnt[1], cnt[2]);
+        }
+    }
+#endif
     return j;
 }
 

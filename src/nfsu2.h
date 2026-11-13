@@ -106,6 +106,12 @@ typedef struct {
        keep/drop one whole tier's slice set atomically instead of resolving
        each split slice independently. 0 = not a car mesh / not tier-tracked. */
     uint32_t tierid;
+    unsigned char lodtag;  /* car meshes: the part name's LOD letter, 1..4 = _A.._D; 0 = none (truncated name) */
+    unsigned char lodhide; /* car meshes: a hidden-detail part (engine, exhaust, *_UNDER, trunk audio, door
+                              sill/panel, brakes) that may drop out where it has no lower tier */
+    unsigned char lodbits; /* car meshes after n2_car_dedupe_lod: bit L = the part has a
+                              model at CARPART_LOD L (CarRenderInfo::Render 0x620ae0 skips a
+                              part whose slot[lod] is empty); 0 = drawn at every LOD */
     uint32_t car_material; /* trusted 0x134013 hash; 0 for absent/mixed/invalid data */
     long car_source; /* payload offset of the owning car object, for its attachments */
     unsigned char car_mount; /* N2_MOUNT_*; shared by every slice of a car part */
@@ -1912,6 +1918,12 @@ static uint32_t n2_car_name_key(const unsigned char *d, long beg, long end) {
     for(size_t q=0;q<L;q++){h^=(unsigned char)name[q];h*=16777619u;}
     return h?h:1u;
 }
+/* The LOD letter itself: 1..4 for a trailing _A.._D, 0 when the name has none. */
+static unsigned char n2_car_name_lod(const unsigned char *d, long beg, long end) {
+    char name[64]; n2_car_mesh_name(d,beg,end,name);
+    size_t L=strlen(name);
+    return (L>=2 && name[L-2]=='_' && name[L-1]>='A' && name[L-1]<='D') ? (unsigned char)(name[L-1]-'A'+1) : 0;
+}
 
 static void n2_mesh_bbox(const N2Mesh *m, float *bb) {
     bb[0]=bb[2]=bb[4] = 1e30f; bb[1]=bb[3]=bb[5] = -1e30f;
@@ -2015,10 +2027,14 @@ static void n2_car_dedupe_lod(N2Scene *s) {
         tiers[t].score += s->meshes[i].nidx;
     }
     char *tdrop = (char *)calloc((size_t)nt, 1);
-    if (!tdrop) { free(bb); free(drop); free(tiers); return; }   /* OOM: keep everything */
+    int *grp = (int *)malloc((size_t)nt * sizeof *grp);   /* the family anchor of each tier, -1 = none */
+    if (!tdrop || !grp) { free(bb); free(drop); free(tiers); free(tdrop); free(grp); return; }   /* OOM: keep everything */
+    for (int t = 0; t < nt; t++) grp[t] = -1;
     for (int a = 0; a < nt; a++) {
         if (tdrop[a] || !s->meshes[tiers[a].rep].namekey) continue;
         int best = a;
+        int g = grp[a] >= 0 ? grp[a] : a;   /* a kept tier that anchors again stays in its family */
+        grp[a] = g;
         /* Family membership (M135-R hardening) is decided against tier `a`'s
            OWN namekey/bbox, fixed for this whole group -- never against
            whichever tier currently holds `best`. `best` only tracks the
@@ -2034,10 +2050,86 @@ static void n2_car_dedupe_lod(N2Scene *s) {
             if (tdrop[c]) continue;
             if (s->meshes[tiers[c].rep].namekey != s->meshes[tiers[a].rep].namekey) continue;
             if (n2_bbox_overlap(tiers[a].bb, tiers[c].bb) < N2_LOD_OVERLAP) continue;
+            if (grp[c] < 0) grp[c] = g;
             if (tiers[c].score > tiers[best].score) { tdrop[best] = 1; best = c; }
             else tdrop[c] = 1;
         }
     }
+    /* CARPART_LOD per kept slice (CarRenderInfo::Render 0x620ae0 draws
+       slot[part*4 + lod] and skips the part when that model is absent).
+       The kept tier stays the LOD 0 model; each other tier of its family
+       is the model of the LOD its letter names (A..D = 0..3). A family
+       whose letters are missing or repeated (names truncated before the
+       suffix) ranks its other tiers by detail: 1, 2, 3. A kept slice is in
+       LOD L when the L tier has a slice of the same material -- the tiers
+       split by material, so a missing material is a missing piece (CIVIC
+       FRONT_WHEEL_B has no fd102a92 slice). A lettered part with no other
+       tier exists at LOD 0 and its own letter only (CIVIC HOOD_UNDER_A). */
+    for (int w = 0; w < nt; w++) {
+        if (tdrop[w] || grp[w] < 0) continue;
+        int a = grp[w], mem[16], nm = 0, lettered = 1;
+        unsigned seen = 0;
+        for (int t = 0; t < nt && nm < 16; t++) {
+            if (grp[t] != a) continue;
+            mem[nm++] = t;
+            unsigned char lt = s->meshes[tiers[t].rep].lodtag;
+            if (!lt || (seen & (1u << lt))) lettered = 0;
+            seen |= lt ? 1u << lt : 0;
+        }
+        int level[16];
+        if (lettered) {
+            int wl = s->meshes[tiers[w].rep].lodtag - 1;
+            for (int q = 0; q < nm; q++) {
+                int l = s->meshes[tiers[mem[q]].rep].lodtag - 1;
+                level[q] = mem[q] == w ? 0 : l == 0 ? wl : l;   /* a richer B..D kept as LOD 0 swaps with A */
+            }
+        } else {
+            for (int q = 0; q < nm; q++) level[q] = mem[q] == w ? 0 : -1;
+            for (int r = 1; r < 4; r++) {   /* next most detailed */
+                int pick = -1;
+                for (int q = 0; q < nm; q++)
+                    if (level[q] < 0 && (pick < 0 || tiers[mem[q]].score > tiers[mem[pick]].score)) pick = q;
+                if (pick < 0) break;
+                level[pick] = r;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            if (s->meshes[i].tierid != tiers[w].tierid) continue;
+            unsigned bits = 1;
+            /* only a wheel or brake is self-contained per slice; a body part's
+               lower tier can hand a surface to another part (CIVIC DOOR_LEFT_B
+               has no paint slice: BODY_B carries it), so there the whole part
+               is present at L or not */
+            int per_slice = s->meshes[i].car_mount == N2_MOUNT_WHEEL ||
+                            s->meshes[i].car_mount == N2_MOUNT_FRONT_BRAKE ||
+                            s->meshes[i].car_mount == N2_MOUNT_REAR_BRAKE;
+            for (int q = 0; q < nm; q++) {
+                int L = level[q];
+                if (mem[q] == w || L < 1 || L > 3) continue;
+                if (!per_slice) { bits |= 1u << L; continue; }
+                for (int j = 0; j < n; j++)
+                    if (s->meshes[j].tierid == tiers[mem[q]].tierid &&
+                        s->meshes[j].car_material == s->meshes[i].car_material &&
+                        (s->meshes[i].car_material || s->meshes[j].texkey == s->meshes[i].texkey)) { bits |= 1u << L; break; }
+            }
+            /* No model at L: a part's geometry moves into that tier's body
+               shell (traffic PICKUP_TIRE_FRONT has A/B only, BODY_C carries
+               the tyres; BUS_BODY, ECLIPSE doors, SX roof have no C). We draw
+               the kept LOD 0 shell, so only hidden details drop out there;
+               every other part stays. */
+            if (!s->meshes[i].lodhide) {
+                unsigned have = 1;
+                for (int q = 0; q < nm; q++) if (level[q] >= 1 && level[q] <= 3) have |= 1u << level[q];
+                bits |= 0xeu & ~have;
+            } else if (nm == 1) {   /* a hidden detail with no other tier: LOD 0 and its own letter */
+                unsigned char lt = s->meshes[i].lodtag;
+                bits = lt ? 1u | (1u << (lt - 1)) : 0;
+            }
+            if (bits == 0xfu) bits = 0;
+            s->meshes[i].lodbits = (unsigned char)bits;
+        }
+    }
+    free(grp);
     for (int i = 0; i < n; i++) {
         uint32_t tid = s->meshes[i].tierid;
         for (int t = 0; t < nt; t++)
@@ -2604,6 +2696,10 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
             cat = N2_CAR_MECH;
         int trim = cat == N2_CAR_BODY && n2_car_is_trim(d, ds, ds + s);
                     uint32_t nk2 = n2_car_name_key(d, ds, ds + s);   /* LOD family, resolved after the walk */
+                    unsigned char lodtag = n2_car_name_lod(d, ds, ds + s);
+                    unsigned char lodhide = strstr(part, "_ENGINE") || strstr(part, "_EXHAUST") ||
+                        strstr(part, "_UNDER") || strstr(part, "_AUDIO") || strstr(part, "_DOOR_SILL") ||
+                        strstr(part, "_DOOR_PANEL") || brake;
         uint32_t tk = n2_mesh_texkey(d, ds, ds + s, keys, nkeys);
         N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
         n2_find_leaves(d, ds, ds + s, 0x00134B01u, vtx, &nv, 64);
@@ -2721,6 +2817,7 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                        the cross-tier family grouping. */
                     scene->meshes[before].namekey =
                         k == big ? nk2 : nk2 ^ (0x9e3779b9u * (sub[k].mat + 1));
+                    scene->meshes[before].lodtag = lodtag; scene->meshes[before].lodhide = lodhide;
                     scene->meshes[before].vkind = vkind;
                     scene->meshes[before].vnum = vnum;
                     scene->meshes[before].famkey = vfam;
@@ -2752,6 +2849,7 @@ static int n2_car_chunk(const unsigned char *d,uint32_t tag,long ds,long end,voi
                         strstr(part,"_SKIRT") || strstr(part,"_BODY") ||
                         strstr(part,"_DOOR_LEFT") || strstr(part,"_DOOR_RIGHT")?2:0);
                     scene->meshes[before].namekey = nk2;
+                    scene->meshes[before].lodtag = lodtag; scene->meshes[before].lodhide = lodhide;
                     scene->meshes[before].vkind = vkind;
                     scene->meshes[before].vnum = vnum;
                     scene->meshes[before].famkey = vfam;

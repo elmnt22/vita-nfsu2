@@ -8,6 +8,7 @@
 #define OPENUG2_NISDRAW_H
 
 #include "nis.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,7 +27,7 @@ void nisdraw_free(NisDraw *d);
    program unbound; the caller binds its own program again. Returns the
    characters drawn. */
 int nisdraw_draw(NisDraw *d, const Nis *n, const float V[16], const float PV[16],
-                 const void *lights, int nlights, int stride);
+                 const void *lights, int nlights, int stride, uint32_t light_revision);
 
 #ifdef __cplusplus
 }

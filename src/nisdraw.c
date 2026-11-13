@@ -279,7 +279,7 @@ static void stream_at(int first)
 }
 
 int nisdraw_draw(NisDraw *d, const Nis *n, const float V[16], const float PV[16],
-                 const void *lights, int nlights, int stride)
+                 const void *lights, int nlights, int stride, uint32_t light_revision)
 {
     if (!d || !n) return 0;
     /* the eye and the look direction from the view (column-major) */
@@ -318,7 +318,9 @@ int nisdraw_draw(NisDraw *d, const Nis *n, const float V[16], const float PV[16]
         vis[i] = 1;
         /* the light rig at the pelvis (0x61d150: bone 1's translation) */
         float sh[10][4];
-        carfx_sh(sh, c.pelvis, fwd, lights, nlights, stride);
+        /* the cars' light-list revision: the same key keeps the one cached
+           light grid (carfx.c) instead of a rebuild per caller per frame */
+        carfx_sh_revision(sh, c.pelvis, fwd, lights, nlights, stride, light_revision);
         for (int k = 0; k < 10; k++) glUniform4fv(d->uSH[k], 1, sh[k]);
         /* BlendMatrices x the world object: model -> world per bone */
         for (int k = 0; k < c.nbones; k++) m4mul(c.skin + 16 * k, c.W, bw + 16 * k);

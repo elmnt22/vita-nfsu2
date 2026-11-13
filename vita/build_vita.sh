@@ -32,7 +32,17 @@ fi
 
 CFLAGS=(-O2 -g -std=gnu99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable
         -Wno-misleading-indentation -mcpu=cortex-a9 -mfpu=neon -ftree-vectorize -fno-strict-aliasing
-        -DN2_GLES "-I$ROOT/vita/include" "-I$ROOT/src")
+        -fno-math-errno -DN2_GLES "-I$ROOT/vita/include" "-I$ROOT/src")
+# -fno-math-errno: sqrtf etc. become a bare vsqrt (no errno call path); results are identical,
+# so physics stays bit-exact. Draw-side files (no sim/AI state) also get -O3; physics, AI and
+# collision (n2sim, carcoll, airacer, main) keep -O2.
+O3_FILES=" src/render.c src/world_instance.c src/world_tiles.c src/world_mesh.c src/acid.c src/aciddraw.c src/carfx.c src/nisdraw.c src/hud.c "
+# rebuild everything when the flags change
+FLAGSTAMP="$OUT/obj/.flags"
+FLAGSTR="${CFLAGS[*]} | O3:$O3_FILES"
+if [ ! -f "$FLAGSTAMP" ] || [ "$(cat "$FLAGSTAMP")" != "$FLAGSTR" ]; then
+    echo "compiler flags changed: full rebuild"; rm -f "$OUT"/obj/*.o; printf '%s' "$FLAGSTR" > "$FLAGSTAMP"
+fi
 
 SRC="src/main.c src/render.c src/physics.c src/n2sim.c src/wcoll.c src/carcoll.c src/airacer.c src/perfparts.c src/airace.c src/racepath.c src/style.c src/ai.c src/audio.c src/resource.c src/world.c
      src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/jumpcam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/profile.c src/pcsave.c src/garage_line.c src/vinyl.c src/partanim.c src/smokeable.c src/worldanim.c src/career.c src/movie.c src/mplay.c src/speech.c src/tuning.c src/replay.c src/rain.c src/reverb.c vita/sdl_vita.c"
@@ -51,7 +61,8 @@ for s in $SRC; do
         [ -n "$(find "$ROOT/src" "$ROOT/vita/include" -name '*.h' -newer "$o" -print -quit)" ]; then
         echo "CC $s"
         throttle
-        "$CC" "${CFLAGS[@]}" -c "$ROOT/$s" -o "$o" || touch "$FAILMARK" &
+        XF=(); case "$O3_FILES" in *" $s "*) XF=(-O3);; esac
+        "$CC" "${CFLAGS[@]}" "${XF[@]}" -c "$ROOT/$s" -o "$o" || touch "$FAILMARK" &
         pids+=($!)
     fi
 done

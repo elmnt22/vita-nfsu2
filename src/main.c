@@ -2604,6 +2604,34 @@ static int prepare_car_switch(CarSwitchCandidate *candidate,
     memcpy(g_skin_key, sk, sizeof sk); memcpy(n2_own_slot_keys, ok, sizeof ok);
     return r;
 }
+/* CARPART_LOD of a car seen from the camera: CarRenderInfo::Render 0x620ae0
+ * (racers, table 0x7a66dc {40,30,20,0}) / RenderFast 0x6162e0 (traffic,
+ * 0x7a66ec {40,20,10,0}) step up while the car's pixel size is under the
+ * table entry; the size is eView::GetPixelSize 0x48acb0 at r = 3 m: 0 when
+ * the car is more than r behind the camera plane, else view+0xc * r /
+ * (dist - r) (x2 inside r/2), view+0xc = 256 / tan(fov / 2)
+ * (CalculateViewMatricies 0x5c7ec0, fov = the 4:3 horizontal fov). Under 4
+ * pixels the car is not drawn: -1. Capped at 2 here, not retail's 3: the D
+ * tier is a single shell (BODY_D) standing in for every part, and we draw the
+ * kept LOD 0 slices, so a D pass would leave the car with holes. */
+static int ai_car_lod(const float pos[3], const float eye[3], const float fwd[3], float hfov43, int traffic) {
+    static const float racer_t[4] = { 40, 30, 20, 0 }, traffic_t[4] = { 40, 20, 10, 0 };
+    const float *t = traffic ? traffic_t : racer_t;
+    float d[3] = { pos[0] - eye[0], pos[1] - eye[1], pos[2] - eye[2] };
+    float fl = sqrtf(fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2]);
+    const float r = 3.0f;
+    if (fl > 1e-6f && (d[0]*fwd[0] + d[1]*fwd[1] + d[2]*fwd[2]) / fl < -r) return -1;
+    float th = tanf(hfov43 * 0.5f), scale = th != 0.0f ? 256.0f / th : 10.0f;
+    float dist = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) - r;
+    int pix = (int)(r * 0.5f < dist ? scale * r / dist : scale * 2.0f);
+    if (pix < 4) return -1;
+    int lod = 0;
+    while (lod < 3 && (float)pix < t[lod]) lod++;
+    return lod > 2 ? 2 : lod;
+}
+/* the slice has a model at that LOD (n2_car_dedupe_lod's lodbits; 0 = all) */
+#define AI_LOD_HAS(m, lod) (!(m)->lodbits || ((m)->lodbits >> (lod)) & 1)
+
 static int prepare_car_switch_(CarSwitchCandidate *candidate,
                                const char *dataroot, const char *name) {
     memset(candidate, 0, sizeof *candidate);
@@ -26038,7 +26066,7 @@ int main(int argc, char **argv) {
             /* AI draw split: per car kind (0 free-roam traffic, 1 racer,
                2 race traffic) ms in setup / lighting / body / wheels / glass,
                logged every 300 frames */
-            static double ads_ms[3][5]; static long ads_cars[3], ads_draws[3], ads_reduced;
+            static double ads_ms[3][5]; static long ads_cars[3], ads_draws[3], ads_reduced, ads_lod[3][3];
             static int ads_frames;
             double ads_f = 1000.0 / (double)SDL_GetPerformanceFrequency();
             for (int ki = 0; ki < AI_N_ALL && VITA_PROBE(6); ki++) {
@@ -26081,6 +26109,22 @@ int main(int argc, char **argv) {
                 }
                 if(!ais[k].render_visible)continue;   /* wheel spin kept current above */
                 int ads_kind = k >= RT_T0 ? 2 : k >= RT_K0 ? 1 : 0, ads_d0 = g_dbg.drawn;
+                /* OPENUG2_AI_LOD: unset = retail pick, "off" = always LOD 0, 0..2 = forced */
+                static int ai_lod_mode = -2;
+                if (ai_lod_mode == -2) {
+                    const char *e = getenv("OPENUG2_AI_LOD");
+                    ai_lod_mode = !e ? -1 : !strcmp(e, "off") ? 0 : (e[0] >= '0' && e[0] <= '2') ? e[0] - '0' : -1;
+                }
+                int alod = ai_lod_mode >= 0 ? ai_lod_mode : ai_car_lod(ais[k].pos, cam, look, cam_hfov, ads_kind != 1);
+                static int ai_lod_log = -1;
+                if (ai_lod_log < 0) ai_lod_log = getenv("OPENUG2_AI_LOD_LOG") != NULL;
+                if (ai_lod_log && (g_rframe % 150) == 0) {
+                    float dd[3] = { ais[k].pos[0]-cam[0], ais[k].pos[1]-cam[1], ais[k].pos[2]-cam[2] };
+                    printf("ai lod: k %d kind %d dist %.1f hfov %.3f lod %d\n", k, ads_kind,
+                           sqrtf(dd[0]*dd[0]+dd[1]*dd[1]+dd[2]*dd[2]), cam_hfov, alod);
+                }
+                if (alod < 0) continue;   /* under 4 pixels (0x620ae0 returns) */
+                ads_lod[ads_kind][alod]++;
                 Uint64 ads_t[6]; ads_t[0] = SDL_GetPerformanceCounter();
                 float steer=ais[k].steer*.5f;
                 ai_wheel_matrices(&draw_wheel,oscale,ais[k].wheel_angle,steer,
@@ -26165,6 +26209,8 @@ int main(int argc, char **argv) {
 #endif
                 for (int i = 0; i < draw_nmesh; i++) {
                     if (mlead && mlead[i] == -1) continue;   /* drawn with its group */
+                    /* a merged body batch stays whole: it is one draw at any LOD */
+                    if (!(mlead && mlead[i] >= 0) && !AI_LOD_HAS(&draw_scene->meshes[i], alod)) continue;
                     int c=draw_gpu[i].cat;
                     int mount=draw_scene->meshes[i].car_mount;
                     int islight=c==N2_CAR_LIGHT||c==N2_CAR_BRAKELIGHT;
@@ -26270,6 +26316,7 @@ int main(int argc, char **argv) {
                     for(int i=0;authored&&i<draw_nmesh;i++){
                         if(draw_scene->meshes[i].car_mount!=N2_MOUNT_WHEEL||
                            draw_scene->meshes[i].tierid!=draw_scene->meshes[draw_stock_wheel].tierid)continue;
+                        if(!AI_LOD_HAS(&draw_scene->meshes[i],alod))continue;
                         /* a library rim is a whole assembly; an incomplete one keeps the model's tyre */
                         if(orims&&((olib_tire&&olib_inner)||(draw_gpu[i].cat!=N2_CAR_TIRE&&draw_gpu[i].cat!=N2_CAR_INTERIOR)))continue;
                         if(orims&&orubber&&draw_gpu[i].cat==N2_CAR_TIRE&&draw_gpu[i].car_material!=N2_MAT_RUBBER)continue;
@@ -26307,6 +26354,7 @@ int main(int argc, char **argv) {
                         if(olk->rtex&&olk->rmode==N2_DRAW_BLEND&&nr==olk->nr){   /* painter order across the 4 wheels */
                             for(int q=0;q<4*nr;q++){
                                 int w=order[q]/nr,li=order[q]%nr;
+                                if(li<olk->rl.count&&!AI_LOD_HAS(&olk->rl.meshes[li],alod))continue;
                                 int sp=olk->sptex&&li<olk->rl.count&&olk->rl.meshes[li].car_anim==N2_WHEEL_SPIN;
                                 glUniformMatrix4fv(uMVP,1,GL_FALSE,sp?smvp[w]:wmvp[w]);render_model(&rp,sp?sworld[w]:aiWheelWorld[w]);
                                 if(sp)glUniform1f(rp.uRimTint,0.0f);   /* the spinner wears its own paint */
@@ -26314,6 +26362,7 @@ int main(int argc, char **argv) {
                                 if(sp)glUniform1f(rp.uRimTint,rtint);
                             }
                         }else for(int li=0;li<nr;li++){   /* one state setup per mesh, then its 4 wheels */
+                            if(li<olk->rl.count&&!AI_LOD_HAS(&olk->rl.meshes[li],alod))continue;
                             int sp=olk->sptex&&li<olk->rl.count&&olk->rl.meshes[li].car_anim==N2_WHEEL_SPIN;
                             if(sp)glUniform1f(rp.uRimTint,0.0f);
                             render_wheel_mesh_n(&rp,&olk->rgm[li],sp?olk->sptex:ortex,sp?olk->spmode:olk->rmode,4,
@@ -26344,6 +26393,7 @@ int main(int argc, char **argv) {
                     for(int q=0;q<count;q++){
                         int i=order[q],window=draw_gpu[i].cat==N2_CAR_GLASS;
                         if(window?!g_dbg.show_glass:!g_dbg.show_lights)continue;
+                        if(!AI_LOD_HAS(&draw_scene->meshes[i],alod))continue;
                         glUniform1f(uSpec,window?.85f*qglass[vq]:.70f);
                         glUniform1f(rp.uEnv,window?.95f*qglass[vq]:.65f);
                         glUniform1f(uAlpha,window?.46f:g_dbg.headlight_lens_alpha);
@@ -26373,12 +26423,16 @@ int main(int argc, char **argv) {
                         kn[q], ads_ms[q][4] / ads_frames, (double)ads_cars[q] / ads_frames,
                         ads_draws[q] / ads_cars[q], ads_ms[q][0] / ads_frames, ads_ms[q][1] / ads_frames,
                         ads_ms[q][2] / ads_frames, ads_ms[q][3] / ads_frames);
+                for (int q = 0; q < 3; q++) if (ads_cars[q] && len > 0 && (size_t)len < sizeof line)
+                    len += snprintf(line + len, sizeof line - (size_t)len, " | %s lod %ld/%ld/%ld",
+                        kn[q], ads_lod[q][0], ads_lod[q][1], ads_lod[q][2]);
                 if (ads_reduced && len > 0 && (size_t)len < sizeof line)
                     snprintf(line + len, sizeof line - (size_t)len,
                              " | reduced-detail rivals %.1f/frame", (double)ads_reduced / ads_frames);
                 if (len > 0 && (ads_cars[0] || ads_cars[1] || ads_cars[2])) printf("%s\n", line);
                 memset(ads_ms, 0, sizeof ads_ms); memset(ads_cars, 0, sizeof ads_cars);
-                memset(ads_draws, 0, sizeof ads_draws); ads_frames = 0; ads_reduced = 0;
+                memset(ads_draws, 0, sizeof ads_draws); memset(ads_lod, 0, sizeof ads_lod);
+                ads_frames = 0; ads_reduced = 0;
             }
             pf_mark(PF_AI_DRAW); pf_gpu(pf_frame,2);
             /* Player::RenderGetAwayArrow 0x5f3ae0 (from RenderCars 0x6316d0):
@@ -26404,7 +26458,8 @@ int main(int argc, char **argv) {
                 static int nis_log; static double nis_ms;
                 Uint64 t0 = SDL_GetPerformanceCounter();
                 int nd = nisdraw_draw(g_rt.nisd, g_rt.nis, V, MVP, world.neighborhood.lights,
-                                      world.neighborhood.nlights, (int)sizeof(N2LightSrc));
+                                      world.neighborhood.nlights, (int)sizeof(N2LightSrc),
+                                      world.neighborhood.lights_revision);
                 /* the flag girl's hand flares, each frame she is drawn (0x436377 -> 0x4335c0) */
                 if (g_acid_ok)
                     for (int ci = 0; ci < nis_nchars(g_rt.nis); ci++) {
