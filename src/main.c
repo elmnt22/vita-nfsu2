@@ -40,6 +40,7 @@
 #include "smokeable.h"
 #include "worldanim.h"
 #include "career.h"
+#include "trophy.h"
 #include "speech.h"
 #include "mplay.h"
 #include "airacer.h"
@@ -2355,6 +2356,7 @@ typedef struct {
     AcidMarker mk[64]; int nmk;   /* 0x13401a model markers (car effects, acid.c) */
     /* AI draw: same-state body meshes merged (built on first AI draw) */
     GpuMesh *mgpu; short *mlead; int nmgpu, mtried, cabin_mesh;
+    GLuint shadow;   /* <CAR>_SHADOWIG, the ground shadow (car_shadow_load) */
 } CarSwitchCandidate;
 
 /* Every model marker (chunk 0x13401a: bStringHash name, 4x4, row 3 the
@@ -2464,6 +2466,7 @@ static void car_switch_release(CarSwitchCandidate *candidate) {
     n2_free_scene(&candidate->scene);
     for (int i = 0; i < candidate->ntextures; i++)
         if (candidate->textures[i]) glDeleteTextures(1, &candidate->textures[i]);
+    if (candidate->shadow) glDeleteTextures(1, &candidate->shadow);
     free(candidate->data); free(candidate->texdata);
     car_candidate_global_off(candidate);
     memset(candidate, 0, sizeof *candidate);
@@ -2493,6 +2496,7 @@ typedef struct {
     float bb[6];                          /* its body box (the ground shadow) */
     float nseg[24][6]; int nnseg;         /* its neon tubes (car-local FRONT/SIDE/REAR_NEON markers) */
     GLuint neon_ut;                       /* its <CAR>_NEON underglow texture */
+    GLuint shadow;                        /* its <CAR>_SHADOWFE ground shadow */
 } TtCar;
 /* the player car's neon tubes, cached per car (g_car_gen) */
 static struct { int gen, n; float p[24][6]; } g_neon_seg = { -1, 0 };
@@ -2508,6 +2512,7 @@ static void tt_old_free(void) {
     if (g_tt_old.rptex) glDeleteTextures(1, &g_tt_old.rptex);
     if (g_tt_old.sptex) glDeleteTextures(1, &g_tt_old.sptex);
     if (g_tt_old.neon_ut) glDeleteTextures(1, &g_tt_old.neon_ut);
+    if (g_tt_old.shadow) glDeleteTextures(1, &g_tt_old.shadow);
     memset(&g_tt_old, 0, sizeof g_tt_old);
 }
 static void tt_old_show(int slot) { g_tt_old.on = 1; g_tt_old.slot = slot; }
@@ -2559,6 +2564,52 @@ static void mod_catalog_cached(const char *dataroot, const char *car, const unsi
     fclose(f);
     if (ok) { remove(fp); ok = rename(tmp, fp) == 0; }
     if (!ok) remove(tmp);
+}
+
+/* The car's own ground shadow (CarRenderInfo::CarRenderInfo 0x638190):
+   <CAR>_SHADOWFE in the front end (state 3), else <CAR>_SHADOWIG, into
+   +0x33c; every racer's pack has both (128x64 DXT3, black + a soft alpha
+   outline darkest at the wheels), traffic models none (they keep the
+   procedural blob). Kept DXT3 on the GPU (~11 KB with mips). */
+static uint32_t car_shadow_key(const char *car, int fe) {
+    return n2_bstr(fe ? "_SHADOWFE" : "_SHADOWIG", n2_bstr(car, 0xffffffffu));
+}
+static GLuint car_shadow_load(const unsigned char *ctdata, long ctlen, uint32_t key) {
+    if (!ctdata || ctlen <= 0) return 0;
+    N2Tex t; memset(&t, 0, sizeof t);
+    GLuint id = 0;
+    if (n2_load_car_tex_by_key(ctdata, ctlen, key, &t) && t.w > 0 && t.h > 0) {
+        id = upload_tpk_texture_to_gpu(&t);
+        if (id) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+    }
+    free(t.rgb); free(t.alpha); free(t.dxt);
+    return id;
+}
+/* the player car's shadow, one texture cached by key (FE / IG swap when the
+   front end and the game swap) */
+static uint32_t g_shadow_key; static GLuint g_shadow_id;
+static GLuint player_shadow_tex(const char *car, int fe, const unsigned char *ctdata, long ctlen) {
+    uint32_t k = car_shadow_key(car, fe);
+    if (k == g_shadow_key) return g_shadow_id;
+    if (g_shadow_id) glDeleteTextures(1, &g_shadow_id);
+    g_shadow_key = k; g_shadow_id = car_shadow_load(ctdata, ctlen, k);
+    printf("shadow: %s_SHADOW%s %s\n", car, fe ? "FE" : "IG", g_shadow_id ? "ok" : "not found");
+    return g_shadow_id;
+}
+/* hand the cached texture over: to the outgoing turntable car, or from a
+   committed candidate (its IG one) */
+static GLuint player_shadow_take(const char *car) {
+    if (g_shadow_key != car_shadow_key(car, 1) && g_shadow_key != car_shadow_key(car, 0)) return 0;
+    GLuint id = g_shadow_id; g_shadow_id = 0; g_shadow_key = 0;
+    return id;
+}
+static void player_shadow_give(const char *car, GLuint id) {
+    if (!id) return;
+    if (g_shadow_id) glDeleteTextures(1, &g_shadow_id);
+    g_shadow_key = car_shadow_key(car, 0); g_shadow_id = id;
 }
 
 static int prepare_car_switch_(CarSwitchCandidate *candidate,
@@ -2748,6 +2799,7 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
     if (shared != g_shared_cartex) free(shared);
+    if (own_pack) candidate->shadow = car_shadow_load(candidate->texdata, candidate->texlen, car_shadow_key(name, 0));
     hitch_mark("car.textures");
     return 1;
 }
@@ -6463,6 +6515,7 @@ static int rt_start_ai(const char *routes_path, const char *paths_path, const ch
         c->lap = 0; c->prevrel = 0;
     }
     g_rt.active = 1; g_rt.t = 0; g_rt.start = -1; g_rt.was_racing = 0;
+    trophy_race_start();
     jumpcam_reset();
     g_rt.hud_reset = 1;
     for (int k = 0; k <= AIRACE_MAX; k++) g_rt.st_gear[k] = 1;      /* 0x5f73d0: the last gear N */
@@ -7663,6 +7716,7 @@ static void rt_drift_tick(int racing, int player_n2, const CarCollHit *h, int nh
         sc.race_dist = g_rt.ent[k].dist;
         sc.human = k == 0;
         StyleMoment *shown[STYLE_NMOM];
+        float banked0 = k == 0 && g_rt.acc[0].m[0] ? g_rt.acc[0].m[0]->banked : 0.0f;   /* trophies: one drift's bank */
         int nshown = style_accum_tick(&g_rt.acc[k], dt, shown, STYLE_NMOM);
         if (k == 0) {                                    /* 0x4c88e0 reads the shown list */
             const StyleMoment *m0 = g_rt.acc[0].m[0];
@@ -7680,6 +7734,7 @@ static void rt_drift_tick(int racing, int player_n2, const CarCollHit *h, int nh
         g_rt.prevmax[k] = g_rt.ent[k].maxlap;
         if (0 < g_rt.cps.laps && g_rt.ent[k].maxlap == g_rt.cps.laps) style_accum_finish(&g_rt.acc[k]);   /* 0x56d710 */
         drift_laps_tick(&g_rt.dl[k], drift_score(&g_rt.acc[k]), g_rt.ent[k].maxlap, g_rt.cps.laps, lap_done);
+        if (k == 0 && g_rt.acc[0].m[0]) trophy_drift_bank(g_rt.acc[0].m[0]->banked - banked0);
     }
     if ((int)(g_rt.t * 60.0f + 0.5f) % 300 == 0) {
         printf("drift t %.0f s: player %.0f (chain %.0f x%d)", g_rt.t, drift_score(&g_rt.acc[0]),
@@ -9679,6 +9734,25 @@ static struct {
     int dlg_kind, dsel;                 /* 1 engage (two buttons), 2 deactivate (one) */
     int fresh;                          /* the frame it opened: the World Map press's own d-pad Left */
 } g_wm;
+/* Fast travel (LiveArea Settings, fasttravel.txt; the NFSU2FastTravel PC mod,
+   github.com/CrabJournal/NFSU2FastTravel): the World Map's two-button GPS
+   dialog's "No" puts the car on the selected entry instead (the mod hooks
+   GameWorldMapScreen::NotificationMessage, vt 0x797f28, with 0x4b113e's No
+   hash redefined): the zone's +4 x/y, a showcase 8 m off on both axes (its
+   photo spot), velocity zeroed, the map closed. The port also takes the
+   zone's +0x14 height and holds the car there until the area streams in. */
+static int fast_travel_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        FILE *f = fopen("ux0:data/NFSU2/fasttravel.txt", "rb");
+        on = f != NULL;
+        if (f) fclose(f);
+        printf("fast travel: %s\n", on ? "on (fasttravel.txt)" : "off");
+    }
+    return on;
+}
+static struct { int go; float p[3]; } g_ft;
 static void wm_free(void)
 {
     hud_free(&g_wm.dlg); hud_free(&g_wm.h);
@@ -9971,6 +10045,21 @@ static void wm_key(const char *dataroot, int k, int repeat)
             const WmEl *e = &g_wm.el[g_wm.zone_el[g_wm.gps]];
             gps_start(z, e->wx, e->wy);
             wm_close();                                          /* +0x60: the map closes */
+        } else if (k == SDLK_KP_ENTER && g_wm.dlg_kind == 1 && g_wm.dsel == 1 && fast_travel_on()) {   /* the mod's No */
+            const CareerZone *z = &g_wm.zone[g_wm.gps];
+            const unsigned char *r = gps_zone_rec(z->zone);
+            audio_fe_play(FE_SND_SELECT);
+            if (r) {
+                memcpy(g_ft.p, r + 4, 8); memcpy(&g_ft.p[2], r + 0x14, 4);
+                if (z->showcase) { g_ft.p[0] += 8.0f; g_ft.p[1] += 8.0f; }
+                g_ft.go = 1;
+                printf("fast travel: to zone %08x (%.0f %.0f %.1f)\n", (unsigned)z->zone,
+                       (double)g_ft.p[0], (double)g_ft.p[1], (double)g_ft.p[2]);
+                wm_close();
+            } else {
+                printf("fast travel: zone %08x not in the track's zones\n", (unsigned)z->zone);
+                hud_free(&g_wm.dlg); wm_prompts();
+            }
         } else if (k == SDLK_KP_ENTER && g_wm.dlg_kind == 2) {   /* 0x34dc1bec */
             audio_fe_play(FE_SND_SELECT);
             gps_stop();
@@ -15843,6 +15932,7 @@ int main(int argc, char **argv) {
     audio_load_traffic_clip(dataroot);
     options_load();
     profile_init();
+    trophy_init();                       /* LiveArea Settings: notrophy.txt switches them off */
     g_manual = g_opt.p[0].manual;
     g_cc_setting = g_opt.p[0].camera;
     SDL_AudioDeviceID adev = audio_init();
@@ -18407,6 +18497,7 @@ int main(int argc, char **argv) {
     int race_place_pending = 0;  /* teleported; snap to the grid once loaded */
     int cam_snap = 0;            /* jump the chase camera (after a teleport) */
     int post_hold = 0;           /* post-race marker outside the loaded area: held there until it streams in */
+    int ft_hold = 0;             /* ... a fast travel's hold (the World Map), not a race's */
     float post_hold_pos[4];      /* the marker spot + heading */
     int cc_cycle = 0;            /* D-pad Up while driving: next camera view */
 #endif
@@ -19164,10 +19255,12 @@ int main(int argc, char **argv) {
                                 memcpy(g_tt_old.nseg, g_neon_seg.p, sizeof g_tt_old.nseg);
                             }
                             g_tt_old.neon_ut = neon_under_take(carname);
+                            g_tt_old.shadow = player_shadow_take(carname);
                         } else if (cgm != opponent_cgm) {
                             free_scene_gpu(cgm, ncar); n2_free_scene(&car);
                         }
                         car = candidate.scene; cgm = candidate.gpu; ncar = candidate.nmesh; g_car_gen++;
+                        player_shadow_give(next_car, candidate.shadow); candidate.shadow = 0;
                         stock_wheel = candidate.stock_wheel;
                         candidate.gpu = NULL; memset(&candidate.scene, 0, sizeof candidate.scene);
                         free(cdata); free(ctdata);
@@ -22704,6 +22797,13 @@ int main(int argc, char **argv) {
                            career_string((uint16_t)(g_career.engaged_event[0] | g_career.engaged_event[1] << 8)),
                            g_rt.ent[0].place, g_eng.won ? "won" : "lost");
                 }
+                {   /* trophies (trophy.c, the port's own): a won race with underglow, a career drift */
+                    int career_ev = g_career_mode && g_eng.commit && g_career.engaged_event;
+                    int won = career_ev ? g_eng.won
+                            : g_rt.drift ? rt_drift_place() == 1 : g_rt.ent[0].place == 1 && !g_rt.dstatus[0];
+                    trophy_race_end(won, carcfg.neon[0][0] || carcfg.neon[0][1],
+                                    career_ev ? g_career.engaged_event : NULL);
+                }
                 for (int i = 0; i < g_nstat; i++) {   /* the player's time / score to the high scores */
                     const RtStat *r = &g_stat[i];
                     if (r->k != 0 || !g_rt.ent[0].place || g_rt.dstatus[0]) continue;
@@ -22747,8 +22847,60 @@ int main(int argc, char **argv) {
         }
 #ifdef __vita__
         hitch_mark("sim.race_tick");
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_MESHDUMP="x y r [texkey]" lists the active
+               resident's meshes in that box once, 20 s in (texkey 0 = all) */
+            static int md_done, md_tick;
+            const char *mdv = getenv("OPENUG2_SIM_MESHDUMP");
+            if (mdv && !md_done && active_resident && race_state == 1 && g_rt.roam && ++md_tick > 600) {
+                float mx = 0, my = 0, mr = 20; unsigned mk = 0;
+                sscanf(mdv, "%f %f %f %x", &mx, &my, &mr, &mk);
+                md_done = 1;
+                const N2Scene *hs = &active_resident->world.scene;
+                printf("meshdump: box (%.0f %.0f) r %.0f key %08x, %d meshes%c", mx, my, mr, mk, hs->count, 10);
+                for (int mi = 0; mi < hs->count; mi++) {
+                    const float *bb = active_resident->world.mbb[mi];
+                    if (bb[2] < mx - mr || bb[0] > mx + mr || bb[3] < my - mr || bb[1] > my + mr) continue;
+                    const N2Mesh *m = &hs->meshes[mi];
+                    if (mk && m->texkey != mk) continue;
+                    double cs[4] = {0, 0, 0, 0}; int cmin[4] = {255, 255, 255, 255}, cmax[4] = {0, 0, 0, 0};
+                    for (int v = 0; m->vcol && v < m->nverts; v++)
+                        for (int c = 0; c < 4; c++) {
+                            int x = m->vcol[v * 4 + c]; cs[c] += x;
+                            if (x < cmin[c]) cmin[c] = x;
+                            if (x > cmax[c]) cmax[c] = x;
+                        }
+                    int nv = m->nverts > 0 ? m->nverts : 1;
+                    printf("meshdump: [%d] %s aname=%s cat=%d texkey=%08x exact=%d verts=%d xy=[%.1f..%.1f][%.1f..%.1f]"
+                           " vcol avg %.0f %.0f %.0f %.0f min %d %d %d %d max %d %d %d %d%c",
+                           mi, m->sname[0] ? m->sname : "(unnamed)", m->aname[0] ? m->aname : "-", m->cat,
+                           m->texkey, m->mat_exact, m->nverts, bb[0], bb[2], bb[1], bb[3],
+                           cs[0] / nv, cs[1] / nv, cs[2] / nv, cs[3] / nv, cmin[0], cmin[1], cmin[2], cmin[3],
+                           cmax[0], cmax[1], cmax[2], cmax[3], 10);
+                    if (getenv("OPENUG2_SIM_MESHDUMP_V"))
+                        for (int v = 0; v < m->nverts; v++) {
+                            const float *q = m->verts + v * 5;
+                            const unsigned char *c = m->vcol ? m->vcol + v * 4 : (const unsigned char *)"\0\0\0\0";
+                            printf("meshdump:   v%d %.1f %.1f %.2f uv %.3f %.3f col %d %d %d %d%c", v, q[0], q[1], q[2],
+                                   q[3], q[4], c[0], c[1], c[2], c[3], 10);
+                        }
+                }
+            }
+        }
+#endif
+        if (g_ft.go) {   /* fast travel (the World Map): held on the zone like a post-race marker */
+            g_ft.go = 0;
+            if (race_state == 1 && g_rt.roam) {
+                memcpy(post_hold_pos, g_ft.p, sizeof g_ft.p); post_hold_pos[3] = heading;
+                memcpy(carpos, g_ft.p, sizeof g_ft.p);
+                vel[0] = vel[1] = 0; speed = 0;
+                g_n2_live = 0; cam_snap = 1;
+                post_hold = 1; ft_hold = 1;
+            }
+        }
         if (post_hold) {   /* the post-race marker: stood there once the resident covers it */
-            if (!g_rt.active || !g_rt.post_done) post_hold = 0;
+            if (ft_hold && !(race_state == 1 && g_rt.roam)) post_hold = ft_hold = 0;
+            else if (!ft_hold && (!g_rt.active || !g_rt.post_done)) post_hold = 0;
             else if (active_resident && hypotf(post_hold_pos[0] - active_resident->center[0],
                                                post_hold_pos[1] - active_resident->center[1]) <
                                             active_resident->radius - 50.0f) {
@@ -22764,8 +22916,9 @@ int main(int argc, char **argv) {
                 carpos[0] = post_hold_pos[0]; carpos[1] = post_hold_pos[1]; carpos[2] = z;
                 heading = post_hold_pos[3]; vel[0] = vel[1] = 0; speed = 0;
                 g_n2_live = 0; g_rt.put_down = 1; g_ride_ready = 0; cam_snap = 1;
-                printf("race: post-race marker area in (gen %lu), the car put down at (%.0f %.0f z %.2f)\n",
-                       active_resident->generation, carpos[0], carpos[1], z);
+                printf("race: %s area in (gen %lu), the car put down at (%.0f %.0f z %.2f)\n",
+                       ft_hold ? "fast travel" : "post-race marker", active_resident->generation, carpos[0], carpos[1], z);
+                ft_hold = 0;
             } else {
                 memcpy(carpos, post_hold_pos, 3 * sizeof(float)); heading = post_hold_pos[3];
                 vel[0] = vel[1] = 0; speed = 0;
@@ -25354,14 +25507,21 @@ int main(int argc, char **argv) {
         }
         #endif
         pf_mark(PF_WORLD_DRAW);
-        /* car shadows: a soft dark blob on the ground under each car, so they
-           sit on the road instead of floating (darkens, so it reads on any
-           surface unlike the additive glows). */
+        /* car shadows. A racer wears its own <CAR>_SHADOWIG / _SHADOWFE
+           (CarRenderInfo::Render 0x620ae0, the g_CarShadowEnable block):
+           the body box (+0x10..+0x24) x 1.05 in game (FE: 1.2 long x 1.14
+           wide), grown by (1 + 0.75 t) where t = clamp(origin height over
+           the ground / 3, 0, 1), 0.04 over the ground, vertex colour
+           0x808080 with alpha 0x72 (FE 0x80) x up.z x (1 - t), 0x80 = 1.
+           The original lays a 4x4 grid on the ground (16 elevation probes,
+           the inner four +0.08 in game); this is one ground-aligned quad.
+           Cars without one (traffic) keep the procedural soft blob. */
         if (ncar && VITA_PROBE(7)) {
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
-            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,2.0f);
-            glUniform3f(uColor, 0.0f, 0.0f, 0.0f); glUniform1f(uAlpha, 0.5f);
+            glUniform3f(uColor, 0.0f, 0.0f, 0.0f);
+            int sh_mode = -1;   /* 0 blob, 1 texture: switch uniforms only on change */
+            glActiveTexture(GL_TEXTURE0);
             for (int ci=0; ci<=AI_N_ALL; ci++) {
                 int c = ci == 0 ? 0 : AI_K(ci - 1) + 1;
                 if((c==0 && (follow_roam_ai || g_cc_hide_car)) ||
@@ -25388,9 +25548,32 @@ int main(int argc, char **argv) {
                         bb=opponent_bb;
                     }
                 }
+                GLuint stex = c == 0 ? player_shadow_tex(carname, g_showroom, ctdata, ctlen)
+                                     : AI_VIS(c-1) ? AI_VIS(c-1)->shadow : 0;
                 float gp[3]={cp[0],cp[1],ground.z},M[16];
-                mat_car_footprint(gp,c==0?heading:ais[c-1].head,ground.normal,
-                                  bb,1.10f,1.35f,.03f,M);
+                if (stex) {
+                    float t = (cp[2] - ground.z) / 3.0f; t = t < 0 ? 0 : t > 1 ? 1 : t;
+                    float g = 1.0f + 0.75f * t, upz = c == 0 ? car_up[2] : 1.0f;
+                    int fe = c == 0 && g_showroom;
+                    mat_car_footprint(gp,c==0?heading:ais[c-1].head,ground.normal,
+                                      bb,(fe?1.2f:1.05f)*g,(fe?1.14f:1.05f)*g,.04f,M);
+                    if (sh_mode != 1) {
+                        sh_mode = 1;
+                        glUniform1f(uUnlit,0.0f); glUniform1f(uSoft,0.0f);
+                        glUniform1f(rp.uEmissiveTex,1.0f); glUniform1f(uUseTex,1.0f);
+                    }
+                    glBindTexture(GL_TEXTURE_2D, stex);
+                    glUniform1f(uAlpha, (fe ? 1.0f : 114.0f/128.0f) * fmaxf(upz, 0.0f) * (1.0f - t));
+                } else {
+                    mat_car_footprint(gp,c==0?heading:ais[c-1].head,ground.normal,
+                                      bb,1.10f,1.35f,.03f,M);
+                    if (sh_mode != 0) {
+                        sh_mode = 0;
+                        glUniform1f(rp.uEmissiveTex,0.0f);
+                        glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,2.0f);
+                        glUniform1f(uAlpha, 0.5f);
+                    }
+                }
                 float MV[16]; mat_mul(MVP,M,MV);
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MV); draw_gpumesh(&quad);
                 g_dbg.drawn++;
@@ -25401,12 +25584,31 @@ int main(int argc, char **argv) {
                 WGroundHit ground;
                 if (world_ground_hit(&scene, tp[0], tp[1], tp[2], &ground) != WSURF_NONE) {
                     float gp[3] = { tp[0], tp[1], ground.z }, M[16], MV[16];
-                    mat_car_footprint(gp, heading, ground.normal, g_tt_old.bb, 1.10f, 1.35f, .03f, M);
+                    if (g_tt_old.shadow) {
+                        mat_car_footprint(gp, heading, ground.normal, g_tt_old.bb, 1.2f, 1.14f, .04f, M);
+                        if (sh_mode != 1) {
+                            sh_mode = 1;
+                            glUniform1f(uUnlit,0.0f); glUniform1f(uSoft,0.0f);
+                            glUniform1f(rp.uEmissiveTex,1.0f); glUniform1f(uUseTex,1.0f);
+                        }
+                        glBindTexture(GL_TEXTURE_2D, g_tt_old.shadow);
+                        glUniform1f(uAlpha, 1.0f);
+                    } else {
+                        mat_car_footprint(gp, heading, ground.normal, g_tt_old.bb, 1.10f, 1.35f, .03f, M);
+                        if (sh_mode != 0) {
+                            sh_mode = 0;
+                            glUniform1f(rp.uEmissiveTex,0.0f);
+                            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,2.0f);
+                            glUniform1f(uAlpha, 0.5f);
+                        }
+                    }
                     mat_mul(MVP, M, MV);
                     glUniformMatrix4fv(uMVP, 1, GL_FALSE, MV); draw_gpumesh(&quad);
                     g_dbg.drawn++;
                 }
             }
+            glUniform1f(rp.uEmissiveTex,0.0f);
+            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f);   /* the state the blob pass always left */
             glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f);
             glDepthMask(GL_TRUE); glDisable(GL_BLEND);
 

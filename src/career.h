@@ -31,6 +31,9 @@ const unsigned char *career_sms_by_hash(uint32_t h);         /* 0x501310 */
 int  career_nshowcases(void);
 const unsigned char *career_showcase(int i);
 int  career_nchallenges(void);
+int  career_nshops(void);
+const unsigned char *career_shop(int i);                     /* ShopDataDesc i */
+uint32_t career_hash(const char *s);                          /* bStringHash 0x43db50 */
 const unsigned char *career_challenge(int i);
 
 /* ---- RuntimeCareerStageInfo (0x104, 8 at PlayerCareerState +0x72d8) ------- */

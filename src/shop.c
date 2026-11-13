@@ -2097,7 +2097,8 @@ static int load_cache_loading(Shop *s) {
                 o += 12 + px;
                 int want = 0;
                 for (int r = 0; r < pk->nres && !want; r++)
-                    want = pk->res[r].type == 1 && feng_tex_key(pk->res[r].name) == key;
+                    want = pk->res[r].type == 1 && feng_tex_key(pk->res[r].name) == key &&
+                           !(hud_is_wide_loading_res(pk->res[r].name) && hud_wide_loading_tex());   /* drawn wide instead */
                 for (int r = 0; pk2 && r < pk2->nres && !want; r++)
                     want = pk2->res[r].type == 1 && feng_tex_key(pk2->res[r].name) == key && key != LS_CTL_PIC_KEY;
                 if (!want || s->ntex >= pk->nres + LS_CTL_NRES) continue;
@@ -10724,7 +10725,7 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
         /* PC_Loading: "LOADING" (group x -125), its gradient (-113) and the
            circles (-44) are one strip; the per-group pin split them on a wide
            screen (text on the left edge, circles centred) */
-        if (p == PK_LOADING) odc.pin = -1.0f;
+        if (p == PK_LOADING) odc.pin = hud_wide_loading_tex() ? hud_wide_loading_pin(dc->asp) : -1.0f;
         /* Loading_Controller is one framed 4:3 layout: "LOADING" and its
            circles / box share a corner, the labels the picture */
         if (p == PK_LOADING_CTL) odc.pin = 0.0f;
@@ -10734,6 +10735,18 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
         odc.cover = o->type != FENG_STRING && fabsf(o->size[0]) >= 600.0f && fabsf(o->size[1]) >= 440.0f;
         dc = &odc;
         const float *c = s->rgba[p][i];
+        /* the loading backdrop PC_load.tga: the widescreen art over the
+           whole screen (hud_wide_loading_tex) */
+        if (o->type != FENG_STRING && o->res >= 0 && o->res < pk->nres && odc.cover &&
+            hud_is_wide_loading_res(pk->res[o->res].name) && hud_wide_loading_tex()) {
+            float v[20];
+            put_vert(v,      -1.0f,  1.0f, 0.0f, 0.0f);
+            put_vert(v + 5,   1.0f,  1.0f, 1.0f, 0.0f);
+            put_vert(v + 10,  1.0f, -1.0f, 1.0f, 1.0f);
+            put_vert(v + 15, -1.0f, -1.0f, 0.0f, 1.0f);
+            draw_quads(dc, hud_wide_loading_tex(), v, 1, c, 0);
+            continue;
+        }
         if (p == PK_LOADING || p == PK_LOADING_CTL) {   /* PC_Loading: animated by script in the game */
             uint32_t c0 = p == PK_LOADING ? 0x50d98304u : 0x50d98305u;   /* Loading_Controller's run 05..09 */
             if (o->hash == 0x5b9d84dbu) continue;                    /* "EVENT HANDLER" debug text */
@@ -10766,7 +10779,23 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
         if (o->hash == O_PRESS_START) {   /* the script's fade, as a slow pulse */
             if (s->mc_view != MCV_OFF) continue;   /* the boot load (MC_Background): the splash has gone on */
             float b[4] = { c[0], c[1], c[2], 0.55f + 0.45f * cosf(s->blink * 3.0f) };
-            text(s, dc, p, i, o->text, b);
+            /* user 11-13: "Press START button" (not the PC's "Please press
+               START to begin"), centred under the logo of the widescreen
+               art (hud_wide_loading_tex: the logo's centre at 37.5% of the
+               width, its bottom at 35% of the height) */
+            static const char k_press[] = "Press START button";
+            int fi = o->res >= 0 && o->res < pk->nres ? s->font_of[p][o->res] : -1;
+            if (p == PK_SPLASH && hud_wide_loading_tex() && fi >= 0 && s->font[fi].ok) {
+                const FengFont *f = &s->font[fi].f;
+                float sc = o->size[0], tw = feng_text_width(f, k_press) * sc;
+                float lh = ((float)o->lead + (float)f->line) * sc;
+                float cx = (0.375f - 0.5f) * 480.0f * dc->asp, cy = (0.405f - 0.5f) * 480.0f;
+                float tx = cx - 0.5f * tw, ty = cy - 0.5f * lh;
+                if (o->just & FENG_JUST_HCENTER) tx += 0.5f * tw; else if (o->just & FENG_JUST_RIGHT) tx += tw;
+                if (o->just & FENG_JUST_VCENTER) ty += 0.5f * lh; else if (o->just & FENG_JUST_BOTTOM) ty += lh;
+                DC pdc = *dc; pdc.pin = 0.0f; pdc.cover = 0;
+                text_at(s, &pdc, p, i, k_press, tx, ty, sc, b);
+            } else text(s, dc, p, i, k_press, b);
             continue;
         }
         const ObjOv *ov_img = NULL;

@@ -589,6 +589,7 @@ static void save_shot(const char *name) {
 /* "probe X Y" (screenshot pixel coords): for the next frame, log every draw
    that changes that pixel -- which program/texture/count painted it. */
 int g_sim_probe; static int g_probe_x, g_probe_y, g_probe_arm, g_probe_n;
+uint32_t g_sim_probe_tag;   /* the world batch being drawn (render.c draw_batch: its texkey) */
 static unsigned char g_probe_last[4];
 void sim_probe_draw(int count) {
     unsigned char px[4]; GLint prog = 0, tex = 0, unit = 0;
@@ -598,7 +599,8 @@ void sim_probe_draw(int count) {
         glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
         glGetIntegerv(GL_ACTIVE_TEXTURE, &unit); glActiveTexture(GL_TEXTURE0);
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex); glActiveTexture((GLenum)unit);
-        printf("probe: draw %d count %d prog %d tex %d -> %d %d %d %d\n", g_probe_n, count, prog, tex, px[0], px[1], px[2], px[3]);
+        printf("probe: draw %d count %d prog %d tex %d texkey %08x -> %d %d %d %d\n", g_probe_n, count, prog, tex, (unsigned)g_sim_probe_tag, px[0], px[1], px[2], px[3]);
+        g_sim_probe_tag = 0;
         memcpy(g_probe_last, px, 4);
         static const char *names[] = { "uVColor", "uUseTex", "uDecal", "uColor", "uAlpha", "uCDiffMin",
             "uCDiffRange", "uCPow", "uSH0", "uFlipN", "uRimTint", "uSpec", "uAmbient", "uDiffuse", "uEmissive" };

@@ -880,6 +880,91 @@ SDL_Window *SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint
 }
 void SDL_DestroyWindow(SDL_Window *w) { (void)w; }
 
+/* ---- Trophies (src/trophy.c decides, this reports) ----------------------
+   The homebrew route (Rinnegatamante's NoTrpDrm + an unsigned trophy pack,
+   as in his ports): sce_sys/trophy/NFSU20001_00/TROPHY.TRP built by
+   tools/trophy_trp.py, communication id = the title id, signature checks
+   switched off by the NoTrpDrm plugin. Without the plugin the context is
+   refused and trophies stay log-only. Unlocks block, so a thread does them
+   from a small queue. Trophy pack ids: 0 = platinum, our i = i + 1. */
+#include <psp2/common_dialog.h>
+#include <psp2/sysmodule.h>
+#include "../src/trophy.h"
+typedef struct { int sdkVersion; SceCommonDialogParam commonParam; int context; int options; uint8_t reserved[128]; } VtSetupParam;
+typedef struct { uint32_t bit[4]; } VtUnlockState;
+int sceNpTrophyInit(void *unk);
+int sceNpTrophyCreateContext(int *context, char *commId, char *commSign, uint64_t options);
+int sceNpTrophyCreateHandle(int *handle);
+int sceNpTrophyDestroyHandle(int handle);
+int sceNpTrophyUnlockTrophy(int ctx, int handle, int id, int *plat_id);
+int sceNpTrophyGetTrophyUnlockState(int ctx, int handle, VtUnlockState *state, uint32_t *count);
+int sceNpTrophySetupDialogInit(VtSetupParam *param);
+SceCommonDialogStatus sceNpTrophySetupDialogGetStatus(void);
+int sceNpTrophySetupDialogTerm(void);
+static int vt_ctx;
+static int vt_skip;                   /* the Settings screen's own context: no trophies there */
+static VtUnlockState vt_state;          /* what the system has; main thread marks queued ones */
+static SceUID vt_sema = -1, vt_lock = -1;
+static int vt_q[128];
+static unsigned vt_qh, vt_qt;          /* head (thread) / tail (main) */
+static int vt_thread(SceSize a, void *p) {
+    (void)a; (void)p;
+    for (;;) {
+        sceKernelWaitSema(vt_sema, 1, NULL);
+        sceKernelLockMutex(vt_lock, 1, NULL);
+        int id = vt_q[vt_qh++ & 127];
+        sceKernelUnlockMutex(vt_lock, 1);
+        int h = -1, plat = -1;
+        int r = sceNpTrophyCreateHandle(&h);
+        if (r >= 0) { r = sceNpTrophyUnlockTrophy(vt_ctx, h, id, &plat); sceNpTrophyDestroyHandle(h); }
+        printf("trophy: system unlock %d -> 0x%08X%s\n", id, (unsigned)r, plat >= 0 ? " (platinum)" : "");
+    }
+    return 0;
+}
+static void vt_unlock(int i) {
+    int id = i + 1;
+    if (id <= 0 || id >= 128 || (vt_state.bit[id >> 5] >> (id & 31) & 1)) return;   /* already on the system */
+    vt_state.bit[id >> 5] |= 1u << (id & 31);
+    sceKernelLockMutex(vt_lock, 1, NULL);
+    if (vt_qt - vt_qh < 128) { vt_q[vt_qt++ & 127] = id; sceKernelUnlockMutex(vt_lock, 1); sceKernelSignalSema(vt_sema, 1); }
+    else sceKernelUnlockMutex(vt_lock, 1);
+}
+/* after vglInit: the setup dialog (installs the pack the first time) needs swaps */
+static void vita_trophy_setup(void) {
+    if (vt_skip) return;
+    SceUID fd = sceIoOpen(TROPHY_OFF_FILE, SCE_O_RDONLY, 0);
+    if (fd >= 0) { sceIoClose(fd); printf("trophy: system off (notrophy.txt)\n"); return; }
+    char comm_id[12] = {0};
+    static char sign[160] = {0xb9, 0xdd, 0xe1, 0x3b, 0x01, 0x00};
+    sceAppMgrAppParamGetString(0, 12, comm_id, sizeof comm_id);   /* the title id */
+    int r = sceSysmoduleLoadModule(SCE_SYSMODULE_NP_TROPHY);
+    if (r >= 0) r = sceNpTrophyInit(NULL);
+    if (r >= 0) r = sceNpTrophyCreateContext(&vt_ctx, comm_id, sign, 0);
+    if (r < 0) { printf("trophy: system unavailable (0x%08X; is NoTrpDrm in ux0:tai/config.txt?), log only\n", (unsigned)r); return; }
+    VtSetupParam sp;
+    memset(&sp, 0, sizeof sp);
+    _sceCommonDialogSetMagicNumber(&sp.commonParam);
+    sp.sdkVersion = PSP2_SDK_VERSION;
+    sp.context = vt_ctx;
+    r = sceNpTrophySetupDialogInit(&sp);
+    if (r >= 0) {
+        while (sceNpTrophySetupDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_RUNNING) {
+            glClear(GL_COLOR_BUFFER_BIT);
+            vglSwapBuffers(GL_TRUE);
+        }
+        sceNpTrophySetupDialogTerm();
+    }
+    int h = -1; uint32_t cnt = 0;
+    if (sceNpTrophyCreateHandle(&h) >= 0) { sceNpTrophyGetTrophyUnlockState(vt_ctx, h, &vt_state, &cnt); sceNpTrophyDestroyHandle(h); }
+    vt_sema = sceKernelCreateSema("trophy_q", 0, 0, 128, NULL);
+    vt_lock = sceKernelCreateMutex("trophy_m", 0, 0, NULL);
+    SceUID th = sceKernelCreateThread("trophy_unlock", vt_thread, 0x10000100, 0x4000, 0, 0, NULL);
+    if (vt_sema < 0 || vt_lock < 0 || th < 0) { printf("trophy: thread setup failed, log only\n"); return; }
+    sceKernelStartThread(th, 0, NULL);
+    trophy_backend = vt_unlock;
+    printf("trophy: system ready (%s, setup 0x%08X, %u on the system)\n", comm_id, (unsigned)r, (unsigned)cnt);
+}
+
 SDL_GLContext SDL_GL_CreateContext(SDL_Window *w) {
     (void)w;
     if (!g_gl_ready) {
@@ -915,6 +1000,7 @@ SDL_GLContext SDL_GL_CreateContext(SDL_Window *w) {
         shark_install_log_cb(shark_cb);
         shark_set_warnings_level(SHARK_WARN_HIGH);
         g_gl_ready = 1;
+        vita_trophy_setup();
         printf("vitaGL: ram %u KB free, cdram %u KB free\n",
                (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024), (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024));
     }
@@ -1973,6 +2059,7 @@ void vita_settings_boot(void) {
     }
     if (!want) return;
     sceIoMkdir(VITA_DATA, 0777);
+    vt_skip = 1;
     SDL_GL_CreateContext(&g_window);
     boot_settings_run();
     vita_relaunch();

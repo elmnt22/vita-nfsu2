@@ -2,6 +2,7 @@
 #include "profile.h"
 #include "options.h"
 #include "career.h"
+#include "trophy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -131,13 +132,16 @@ static unsigned char *serialize(long *len) {
     {   long cl = career_save(NULL, 0);             /* PlayerCareerState 0x514530 */
         unsigned char *cb = (unsigned char *)malloc((size_t)cl);
         if (cb) { career_save(cb, cl); put_block(&b, "CARR", cb, cl); free(cb); } }
+    {   unsigned char tb[64];                        /* the port's trophies (trophy.c), not the original's */
+        long tl = trophy_save(tb, sizeof tb);
+        if (tl > 0) put_block(&b, "TRPH", tb, tl); }
     *len = b.n;
     return b.p;
 }
 /* the blocks back into the working files; 1 ok */
 static int apply(const unsigned char *p, long n) {
-    const unsigned char *opt = NULL, *gar = NULL, *hs = NULL, *car = NULL, *cc = NULL;
-    long optn = 0, garn = 0, hsn = 0, carn = 0, ccn = 0;
+    const unsigned char *opt = NULL, *gar = NULL, *hs = NULL, *car = NULL, *cc = NULL, *tr = NULL;
+    long optn = 0, garn = 0, hsn = 0, carn = 0, ccn = 0, trn = 0;
     for (long i = 0; i + 8 <= n; ) {
         uint32_t l; memcpy(&l, p + i + 4, 4);
         if (i + 8 + (long)l > n) return 0;
@@ -147,6 +151,7 @@ static int apply(const unsigned char *p, long n) {
         else if (!memcmp(p + i, "HSCR", 4)) { hs = d; hsn = l; }
         else if (!memcmp(p + i, "CARR", 4)) { car = d; carn = l; }
         else if (!memcmp(p + i, "CCAR", 4)) { cc = d; ccn = l; }
+        else if (!memcmp(p + i, "TRPH", 4)) { tr = d; trn = l; }
         i += 8 + l;
     }
     uint32_t sz = 0;
@@ -164,6 +169,9 @@ static int apply(const unsigned char *p, long n) {
        first, then the cars go over it */
     if (!car || !career_load(car, carn)) career_default();
     if (cc && !career_cars_load(cc, ccn)) printf("profile: career cars from another build, defaulted\n");
+    trophy_load(tr, trn);                        /* none (an older save): none unlocked yet */
+    trophy_report_all();                         /* switched on since: tell the system what is earned */
+    trophy_check();                              /* catch up with the career as saved */
     return 1;
 }
 
@@ -280,6 +288,7 @@ void profile_default(void) {
     memset(g_hs, 0, sizeof g_hs);
     scores_save();
     career_default();
+    trophy_default();
     profile_set_name("");
     options_save();
 }

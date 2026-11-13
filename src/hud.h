@@ -334,6 +334,16 @@ void hud_screen_hide_h(Hud *h, uint32_t obj, int hide);
 /* the screen's strings wrap at their Sw width (0x51c110, the FEng string layout); off by
    default: the screens ported before it keep their layout until checked */
 void hud_screen_wrap(Hud *h, int on);
+/* The loading screens' PC_load.tga backdrop in the widescreen mod's art
+   (app0:assets/pc_load_wide.dxt), drawn over the whole screen; 0 when the
+   asset is missing. hud_is_wide_loading_res: a resource name is PC_load. */
+GLuint hud_wide_loading_tex(void);
+int hud_is_wide_loading_res(const char *name);
+/* PC_Loading's "LOADING" + circles strip (authored on the left edge, centre
+   x -82 of 640) moved to sit centred under the widescreen art's logo (37.5%
+   of the width, where the title's "Press START button" sits): the edge pin
+   (-1 left .. 0 centre) that puts it there at aspect `asp`. */
+float hud_wide_loading_pin(float asp);
 int  hud_screen_break(Hud *h, const char *name, float width, const char *txt, char (*out)[160], int max);   /* CTextScroller lines */
 const char *hud_screen_string(const Hud *h, uint32_t label);      /* English.bin */
 void hud_screen_script(Hud *h, const char *name, const char *script);

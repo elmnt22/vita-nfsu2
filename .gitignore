@@ -79,3 +79,11 @@ sim/build_*/
 # --- Local rename backups / build error dumps ---
 _bak_rename_1109/
 *.err
+
+# --- Third-party mod art (nfsmods.xyz/mod/3786): shipped in the VPK only, not published here ---
+vita/assets/pc_load_wide.dxt
+tools/pcload_wide.py
+
+# --- Local backups ---
+*.pre_*
+vita/lib/libvitaGL_1008_backup.a

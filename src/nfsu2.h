@@ -54,6 +54,30 @@ typedef struct {
     N2GeomBlock *block;   /* non-NULL: verts/idx/vcol and this record live in it */
 } N2SharedGeometry;
 static void n2_block_free(N2GeomBlock *b) { free(b->data); free(b->geoms); free(b); }
+/* Port fix (not in the original): a few L4RA curb faces were missed by the
+   retail prelight bake and keep one flat bright cyan, D3DCOLOR 0x82b5d5c7
+   (R 181 G 213 B 199 A 130: 263 vertices in STREAML4RA.BUN, e.g. the curbs
+   of TRN_CN_ROADA_CHOP_F7_R0 under the overpass at -898,-105), glowing
+   while the curb pieces beside them are lit like the road. Each such vertex
+   takes the colour of the nearest normally lit vertex of the same mesh.
+   Idempotent, so parsed meshes and cached tiles can both run it. */
+static void n2_fix_flat_prelight(const float *v, unsigned char *col, int n)
+{
+    if (!v || !col || n <= 0) return;
+    for (int i = 0; i < n; i++) {
+        unsigned char *c = col + i * 4;
+        if (c[0] != 181 || c[1] != 213 || c[2] != 199 || c[3] != 130) continue;
+        int best = -1; float bd = 0;
+        for (int j = 0; j < n; j++) {
+            const unsigned char *o = col + j * 4;
+            if (o[0] == 181 && o[1] == 213 && o[2] == 199 && o[3] == 130) continue;
+            float dx = v[j*5] - v[i*5], dy = v[j*5+1] - v[i*5+1], dz = v[j*5+2] - v[i*5+2];
+            float dd = dx*dx + dy*dy + dz*dz;
+            if (best < 0 || dd < bd) { best = j; bd = dd; }
+        }
+        if (best >= 0) memcpy(c, col + best * 4, 4);
+    }
+}
 
 typedef struct {
     N2SharedGeometry *shared_geometry; /* immutable scenery; atomic resident/cache ownership */
@@ -714,6 +738,7 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
             m.vcol[i*4+2] = pc[0]; m.vcol[i*4+3] = pc[3];
         }
     }
+    n2_fix_flat_prelight(m.verts, m.vcol, n);
     /* the index leaf carries the same 0x11 filler prefix as the vertex leaf
        (as whole 0x1111 u16 words). Skipping it is essential: when the filler is
        not a multiple of 6 bytes (e.g. 4 or 8), leaving it in shifts the triangle

@@ -1,0 +1,537 @@
+{
+ "source": "RetroAchievements PS2 set for Need for Speed Underground 2 (game 5613) by BigWeedSmokerMan; titles and descriptions from the RA web API 2026-11-13. Order = src/trophy.c k_info.",
+ "trophies": [
+  {
+   "ra": 261034,
+   "points": 1,
+   "type": "progression",
+   "title": "Welcome to Bayview",
+   "desc": "Complete the Tutorial"
+  },
+  {
+   "ra": 261033,
+   "points": 2,
+   "type": "missable",
+   "title": "Yo Noobie",
+   "desc": "Win an Outrun during the Tutorial"
+  },
+  {
+   "ra": 261028,
+   "points": 2,
+   "type": "missable",
+   "title": "Bring My Car Back... Now!",
+   "desc": "Complete all three races available before going to Rachel's place"
+  },
+  {
+   "ra": 261035,
+   "points": 5,
+   "type": "missable",
+   "title": "City Core Shopper",
+   "desc": "Discover and enter all 8 available locations including Megalow Parts before proceeding to Stage 2"
+  },
+  {
+   "ra": 261040,
+   "points": 5,
+   "type": "progression",
+   "title": "Making a Name",
+   "desc": "Complete Stage 1"
+  },
+  {
+   "ra": 261036,
+   "points": 5,
+   "type": "missable",
+   "title": "Beacon Hill Shopper",
+   "desc": "Discover and enter all 13 available locations including the new car lot before proceeding to Stage 3"
+  },
+  {
+   "ra": 261057,
+   "points": 5,
+   "type": "missable",
+   "title": "I'm so Hood",
+   "desc": "Win 4 Outrun events in Stage 2 and complete the special event to earn unique hoods"
+  },
+  {
+   "ra": 261070,
+   "points": 5,
+   "type": "",
+   "title": "Turbo & High-Tech Performance Magazine",
+   "desc": "Appear on the cover of Turbo & High-Tech Performance Magazine in Stage 2"
+  },
+  {
+   "ra": 261071,
+   "points": 5,
+   "type": "",
+   "title": "Sports Compact Car Magazine",
+   "desc": "Appear on the cover of Sports Compact Car Magazine in Stage 2"
+  },
+  {
+   "ra": 261090,
+   "points": 5,
+   "type": "",
+   "title": "Bayview's Best DVD",
+   "desc": "Reach a 1 Star visual rating and appear on the cover of the Bayview's Best DVD in Stage 2"
+  },
+  {
+   "ra": 261045,
+   "points": 5,
+   "type": "progression",
+   "title": "Sponsor 1 - Sponsor Events",
+   "desc": "Complete the Sponsor Events Required for your 1st Sponsor"
+  },
+  {
+   "ra": 261041,
+   "points": 5,
+   "type": "progression",
+   "title": "Sponsor 1 - World Events",
+   "desc": "Complete the World Events Required for your 1st Sponsor"
+  },
+  {
+   "ra": 261049,
+   "points": 5,
+   "type": "missable",
+   "title": "Pimped Out Escalade",
+   "desc": "Complete the SUV Events before proceeding to Stage 3"
+  },
+  {
+   "ra": 261029,
+   "points": 10,
+   "type": "missable",
+   "title": "Stage 2 - Full Clear",
+   "desc": "Complete all non SUV races before finishing Stage 2"
+  },
+  {
+   "ra": 261053,
+   "points": 10,
+   "type": "missable",
+   "title": "Stage 2 - Hard Finish",
+   "desc": "Complete the final URL Race of Stage 2 with Career Difficulty set to Hard"
+  },
+  {
+   "ra": 261058,
+   "points": 5,
+   "type": "progression",
+   "title": "On the Come Up",
+   "desc": "Complete Stage 2"
+  },
+  {
+   "ra": 261037,
+   "points": 5,
+   "type": "missable",
+   "title": "Jackson Heights Shopper",
+   "desc": "Discover and enter all 15 available locations before proceeding to Stage 4"
+  },
+  {
+   "ra": 261059,
+   "points": 5,
+   "type": "missable",
+   "title": "The Upper Hand",
+   "desc": "Win 3 Outrun events in Stage 3 and complete the special event to earn a unique performance part"
+  },
+  {
+   "ra": 261062,
+   "points": 5,
+   "type": "missable",
+   "title": "Rims Real Big",
+   "desc": "Win 6 Outrun events in Stage 3 and complete the special event to earn unique rims"
+  },
+  {
+   "ra": 261072,
+   "points": 5,
+   "type": "",
+   "title": "Street Car Magazine",
+   "desc": "Appear on the cover of Street Car Magazine in Stage 3"
+  },
+  {
+   "ra": 261073,
+   "points": 5,
+   "type": "",
+   "title": "Car Audio and Electronics Magazine",
+   "desc": "Appear on the cover of Car Audio and Electronics Magazine in Stage 3"
+  },
+  {
+   "ra": 261074,
+   "points": 5,
+   "type": "",
+   "title": "GTI Magazine",
+   "desc": "Appear on the cover of GTI Magazine in Stage 3"
+  },
+  {
+   "ra": 261075,
+   "points": 5,
+   "type": "",
+   "title": "Hot 4's Magazine",
+   "desc": "Appear on the cover of Hot 4's Magazine in Stage 3"
+  },
+  {
+   "ra": 261091,
+   "points": 5,
+   "type": "",
+   "title": "Four on the Floor DVD",
+   "desc": "Reach a 2 Star visual rating and appear on the cover of the Four on the Floor DVD in Stage 3"
+  },
+  {
+   "ra": 261092,
+   "points": 5,
+   "type": "",
+   "title": "Underground Speed Zone DVD",
+   "desc": "Reach a 3 Star visual rating and appear on the cover of the Underground Speed Zone DVD in Stage 3"
+  },
+  {
+   "ra": 261046,
+   "points": 5,
+   "type": "progression",
+   "title": "Sponsor 2 - Sponsor Events",
+   "desc": "Complete the Sponsor Events Required for your 2nd Sponsor"
+  },
+  {
+   "ra": 261042,
+   "points": 5,
+   "type": "progression",
+   "title": "Sponsor 2 - World Events",
+   "desc": "Complete the World Events Required for your 2nd Sponsor"
+  },
+  {
+   "ra": 261050,
+   "points": 5,
+   "type": "missable",
+   "title": "Navigator, Garage with the Elevator",
+   "desc": "Complete all available SUV Events before proceeding to Stage 4"
+  },
+  {
+   "ra": 261030,
+   "points": 10,
+   "type": "missable",
+   "title": "Stage 3 - Full Clear",
+   "desc": "Complete all non SUV races before finishing Stage 3"
+  },
+  {
+   "ra": 261054,
+   "points": 10,
+   "type": "missable",
+   "title": "Stage 3 - Hard Finish",
+   "desc": "Complete the final URL Race of Stage 3 with Career Difficulty set to Hard"
+  },
+  {
+   "ra": 261063,
+   "points": 5,
+   "type": "progression",
+   "title": "House in the Hills",
+   "desc": "Complete Stage 3"
+  },
+  {
+   "ra": 261038,
+   "points": 5,
+   "type": "missable",
+   "title": "Coal Harbor East Shopper",
+   "desc": "Discover and enter all 20 available locations including the new car lot before proceeding to Stage 5"
+  },
+  {
+   "ra": 261064,
+   "points": 5,
+   "type": "missable",
+   "title": "No Spoilers!",
+   "desc": "Win 4 Outrun events in Stage 4 and complete the special event to earn unique spoilers"
+  },
+  {
+   "ra": 261065,
+   "points": 5,
+   "type": "missable",
+   "title": "Wrapped Up",
+   "desc": "Win 6 Outrun events in Stage 4 and complete the special event to earn a unique vinyl"
+  },
+  {
+   "ra": 261060,
+   "points": 5,
+   "type": "missable",
+   "title": "The Upper Upper Hand",
+   "desc": "Win 9 Outrun events in Stage 4 and complete the special event to earn a unique performance part"
+  },
+  {
+   "ra": 261076,
+   "points": 5,
+   "type": "",
+   "title": "Elaborare Magazine",
+   "desc": "Appear on the cover of Elaborare Magazine in Stage 4"
+  },
+  {
+   "ra": 261077,
+   "points": 5,
+   "type": "",
+   "title": "Maxi Tuning Magazine",
+   "desc": "Appear on the cover of Maxi Tuning Magazine in Stage 4"
+  },
+  {
+   "ra": 261078,
+   "points": 5,
+   "type": "",
+   "title": "Spoiler Magazine",
+   "desc": "Appear on the cover of Spoiler Magazine in Stage 4"
+  },
+  {
+   "ra": 261079,
+   "points": 5,
+   "type": "",
+   "title": "AutoMaxx Magazine",
+   "desc": "Appear on the cover of AutoMaxx Magazine in Stage 4"
+  },
+  {
+   "ra": 261080,
+   "points": 5,
+   "type": "",
+   "title": "Stuff Magazine",
+   "desc": "Appear on the cover of Stuff Magazine in Stage 4"
+  },
+  {
+   "ra": 261081,
+   "points": 5,
+   "type": "",
+   "title": "Chrom und Flammen Magazine",
+   "desc": "Appear on the cover of Chrom und Flammen Magazine in Stage 4"
+  },
+  {
+   "ra": 261093,
+   "points": 5,
+   "type": "",
+   "title": "Speed Demons 3 DVD",
+   "desc": "Reach a 4 Star visual rating and appear on the cover of the Speed Demons 3 DVD in Stage 4"
+  },
+  {
+   "ra": 261094,
+   "points": 5,
+   "type": "",
+   "title": "Modified to the Max DVD",
+   "desc": "Reach a 5 Star visual rating and appear on the cover of the Modified to the Max DVD in Stage 4"
+  },
+  {
+   "ra": 261095,
+   "points": 5,
+   "type": "",
+   "title": "Burning Wheels DVD",
+   "desc": "Reach a 6 Star visual rating and appear on the cover of the Burning Wheels DVD in Stage 4"
+  },
+  {
+   "ra": 261047,
+   "points": 5,
+   "type": "",
+   "title": "Sponsor 3 - Sponsor Events",
+   "desc": "Complete the Sponsor Events Required for your 3rd Sponsor"
+  },
+  {
+   "ra": 261043,
+   "points": 5,
+   "type": "",
+   "title": "Sponsor 3 - World Events",
+   "desc": "Complete the World Events Required for your 3rd Sponsor"
+  },
+  {
+   "ra": 261051,
+   "points": 5,
+   "type": "missable",
+   "title": "Hummer be Hummin",
+   "desc": "Complete the SUV Events before proceeding to Stage 5"
+  },
+  {
+   "ra": 261031,
+   "points": 10,
+   "type": "missable",
+   "title": "Stage 4 - Full Clear",
+   "desc": "Complete all non SUV races before finishing Stage 4"
+  },
+  {
+   "ra": 261055,
+   "points": 25,
+   "type": "missable",
+   "title": "Stage 4 - Hard Finish",
+   "desc": "Complete the final URL Race of Stage 4 with Career Difficulty set to Hard"
+  },
+  {
+   "ra": 261066,
+   "points": 5,
+   "type": "progression",
+   "title": "Notorious",
+   "desc": "Complete Stage 4"
+  },
+  {
+   "ra": 261039,
+   "points": 5,
+   "type": "missable",
+   "title": "Coal Harbor West Shopper",
+   "desc": "Discover and enter all 23 available locations before beating the game"
+  },
+  {
+   "ra": 261061,
+   "points": 5,
+   "type": "missable",
+   "title": "The Uppermost Hand",
+   "desc": "Win 6 Outrun events in Stage 5 and complete the special event to earn a unique performance part"
+  },
+  {
+   "ra": 261067,
+   "points": 5,
+   "type": "missable",
+   "title": "Big Body",
+   "desc": "Win 11 Outrun events in Stage 5 and complete the special event to earn a unique wide body kit"
+  },
+  {
+   "ra": 261082,
+   "points": 5,
+   "type": "",
+   "title": "Import Tuner Magazine",
+   "desc": "Appear on the cover of Import Tuner Magazine in Stage 5"
+  },
+  {
+   "ra": 261083,
+   "points": 5,
+   "type": "",
+   "title": "Street Car Magazine II",
+   "desc": "Appear on the cover of Street Car Magazine in Stage 5"
+  },
+  {
+   "ra": 261084,
+   "points": 5,
+   "type": "",
+   "title": "GTI Magazine II",
+   "desc": "Appear on the cover of GTI Magazine in Stage 5"
+  },
+  {
+   "ra": 261085,
+   "points": 5,
+   "type": "",
+   "title": "Auto Motor Magazine",
+   "desc": "Appear on the cover of Auto Motor Magazine in Stage 5"
+  },
+  {
+   "ra": 261086,
+   "points": 5,
+   "type": "",
+   "title": "Swiss Tuner Magazine",
+   "desc": "Appear on the cover of Swiss Tuner Magazine in Stage 5"
+  },
+  {
+   "ra": 261087,
+   "points": 5,
+   "type": "",
+   "title": "Super Street Magazine",
+   "desc": "Appear on the cover of Super Street Magazine in Stage 5"
+  },
+  {
+   "ra": 261088,
+   "points": 5,
+   "type": "",
+   "title": "Power Magazine",
+   "desc": "Appear on the cover of Power Magazine in Stage 5"
+  },
+  {
+   "ra": 261089,
+   "points": 5,
+   "type": "",
+   "title": "Street Tuner Magazine",
+   "desc": "Appear on the cover of Street Tuner Magazine in Stage 5"
+  },
+  {
+   "ra": 261096,
+   "points": 5,
+   "type": "",
+   "title": "Slammed & Stretched DVD",
+   "desc": "Reach a 7 Star visual rating and appear on the cover of the Slammed & Stretched DVD in Stage 5"
+  },
+  {
+   "ra": 261097,
+   "points": 5,
+   "type": "",
+   "title": "Straight From The Streets IV DVD",
+   "desc": "Reach a 8 Star visual rating and appear on the cover of the Straight From The Streets IV DVD in Stage 5"
+  },
+  {
+   "ra": 261098,
+   "points": 5,
+   "type": "",
+   "title": "Racing Street Unleashed DVD",
+   "desc": "Reach a 9 Star visual rating and appear on the cover of the Racing Street Unleashed DVD in Stage 5"
+  },
+  {
+   "ra": 261099,
+   "points": 5,
+   "type": "",
+   "title": "Blacktop Bandits DVD",
+   "desc": "Reach a 10 Star visual rating and appear on the cover of the Blacktop Bandits DVD in Stage 5"
+  },
+  {
+   "ra": 261048,
+   "points": 5,
+   "type": "",
+   "title": "Sponsor 4 - Sponsor Events",
+   "desc": "Complete the Sponsor Events Required for your 4th Sponsor"
+  },
+  {
+   "ra": 261044,
+   "points": 5,
+   "type": "",
+   "title": "Sponsor 4 - World Events",
+   "desc": "Complete the World Events Required for your 4th Sponsor"
+  },
+  {
+   "ra": 261052,
+   "points": 5,
+   "type": "missable",
+   "title": "King Kong in the Trunk",
+   "desc": "Complete the SUV Events in Stage 5 before beating the game"
+  },
+  {
+   "ra": 261032,
+   "points": 10,
+   "type": "missable",
+   "title": "Stage 5 - Full Clear",
+   "desc": "Complete all non SUV races before finishing Stage 5"
+  },
+  {
+   "ra": 261056,
+   "points": 25,
+   "type": "missable",
+   "title": "Stage 5 - Hard Finish",
+   "desc": "Complete the final URL Race of Stage 5 with Career Difficulty set to Hard"
+  },
+  {
+   "ra": 261068,
+   "points": 25,
+   "type": "win_condition",
+   "title": "Riders on the Storm",
+   "desc": "Complete Need for Speed Underground 2"
+  },
+  {
+   "ra": 261069,
+   "points": 50,
+   "type": "",
+   "title": "Making Rachel Proud",
+   "desc": "Win every event in the game, earning at least 99% (open the Stats page in Explore Mode after completing the last race in the same session)"
+  },
+  {
+   "ra": 261027,
+   "points": 5,
+   "type": "",
+   "title": "Makes all the Difference",
+   "desc": "Win an event with Neon Underglow equipped"
+  },
+  {
+   "ra": 261100,
+   "points": 5,
+   "type": "",
+   "title": "Insane Drift",
+   "desc": "Earn 50k+ points in a single Drift and complete the Career mode Event (in one continuous drift, not entire event, can be a repeat event from the World Map)"
+  },
+  {
+   "ra": 261101,
+   "points": 10,
+   "type": "",
+   "title": "Drift King",
+   "desc": "Earn 100k+ points in a single Drift and complete the Career mode Event (in one continuous drift, not entire event, can be a repeat event from the World Map)"
+  },
+  {
+   "ra": 261102,
+   "points": 25,
+   "type": "",
+   "title": "Drift God",
+   "desc": "Earn 200k+ points in a single Drift and complete the Career mode Event (in one continuous drift, not entire event, can be a repeat event from the World Map)"
+  }
+ ]
+}

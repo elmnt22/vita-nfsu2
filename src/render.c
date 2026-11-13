@@ -3234,6 +3234,9 @@ void render_batch_reuse_selftest(void) {
 }
 
 void draw_batch(const N2Batch *b) {
+#ifdef OPENUG2_SIM_PRE_H
+    { extern uint32_t g_sim_probe_tag; g_sim_probe_tag = b->texkey; }   /* test aid: "probe" names the batch's texture */
+#endif
     glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(BatchedVertex), (void*)0);

@@ -965,6 +965,7 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
                 for (int i = 0; i < nv; i++) { a8 = (uint8_t)(a8 + payload[pos++]); col[i*4 + c] = a8; }
             }
             gp += (size_t)nv * 4;
+            n2_fix_flat_prelight(v, col, nv);   /* tiles cached before the fix */
         }
         N2Mesh *m = &out->m[out->n];
         N2SharedGeometry *g = &geoms[out->n];

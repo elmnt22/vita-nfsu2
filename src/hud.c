@@ -362,10 +362,13 @@ static int   g_map_pin = -1;
  * cluster bottom-right at 16:9 instead of drifting inward or stretching. */
 static int hud_pin_of(float ax) { return ax < -106.0f ? -1 : ax > 106.0f ? 1 : 0; }
 /* a whole screen's pin: centred 4:3, or the left edge (screen 2) */
-#define screen_pin(w) ((w)->screen == 2 ? -1 : 0)
+/* -2: PC_Loading's strip centred under the widescreen art's logo
+   (hud_wide_loading_pin) */
+#define screen_pin(w) ((w)->screen == 2 ? (hud_wide_loading_tex() ? -2 : -1) : 0)
 
 static void fe_ndc(float asp, int pin, float fx, float fy, float *nx, float *ny) {
-    *nx = (float)pin + (fx - (float)pin * 320.0f) / (240.0f * asp);
+    float p = pin == -2 ? hud_wide_loading_pin(asp) : (float)pin;
+    *nx = p + (fx - p * 320.0f) / (240.0f * asp);
     *ny = -fy / 240.0f;
 }
 
@@ -568,7 +571,10 @@ static void hud_classify(Hud *h) {
             o->hash == FE_TURBO_RED_2) h->gate[i] = G_TURBO;
         else if (o->hash == FE_NOS_TRACK || o->hash == FE_NOS_BACKING ||
                  o->hash == FE_NOS_FILL) h->gate[i] = G_NOS;
-        else if (i == corner) h->gate[i] = G_RACE;
+        /* 3rdperson_BoxCorner (0x411301e3): always drawn. Nothing in SPEED2.EXE names
+           its hash, and it is authored visible (alpha 255, not mode-hidden), so free
+           roam keeps it behind "Bank:" too (it was gated to races before 11-13). */
+        else if (i == corner) h->gate[i] = G_ALWAYS;
         else if (pos >= 0 && feng_inside(p, i, pos)) h->gate[i] = G_POS;
         else if ((laps >= 0 && feng_inside(p, i, laps)) || lap_obj) h->gate[i] = G_LAPS;
         else if (bank >= 0 && feng_inside(p, i, bank)) h->gate[i] = G_BANK;
@@ -1299,6 +1305,115 @@ Hud *hud_init_screen(const char *dataroot, const char *bundle, const char *packa
         hud_screen_hide_h(h, 0xaf4a85ebu, 1);
     }
     return h;
+}
+
+/* The loading screens' backdrop PC_load.tga (PC_Loading, Loading) in the
+   widescreen mod's 2:1 art (nfsmods.xyz/mod/3786, made with the Custom FNGs
+   Pack): on the PC the whole texture stretches over a 16:9 screen in place
+   of the 4:3 picture. Shipped with the app (tools/pcload_wide.py ->
+   app0:assets/pc_load_wide.dxt, DXT1 1024x512), so no mod files are needed;
+   ux0:data/NFSU2/pc_load_wide.dxt replaces it for testing. Loaded once and
+   kept (256 KB); 0 when missing: the 4:3 art is drawn as before. */
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+#  define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#endif
+static void wide_dxt1(const unsigned char *src, int w, int h, unsigned char *out) {
+    for (int by = 0; by < h / 4; by++)
+        for (int bx = 0; bx < w / 4; bx++, src += 8) {
+            unsigned c0 = (unsigned)src[0] | (unsigned)src[1] << 8, c1 = (unsigned)src[2] | (unsigned)src[3] << 8;
+            unsigned char p[4][4];
+            for (int k = 0; k < 2; k++) {
+                unsigned c = k ? c1 : c0;
+                p[k][0] = (unsigned char)((c >> 11 & 31) * 255 / 31);
+                p[k][1] = (unsigned char)((c >> 5 & 63) * 255 / 63);
+                p[k][2] = (unsigned char)((c & 31) * 255 / 31);
+                p[k][3] = 255;
+            }
+            for (int ch = 0; ch < 3; ch++) {
+                if (c0 > c1) {
+                    p[2][ch] = (unsigned char)((2 * p[0][ch] + p[1][ch]) / 3);
+                    p[3][ch] = (unsigned char)((p[0][ch] + 2 * p[1][ch]) / 3);
+                } else {
+                    p[2][ch] = (unsigned char)((p[0][ch] + p[1][ch]) / 2);
+                    p[3][ch] = 0;
+                }
+            }
+            p[2][3] = 255; p[3][3] = c0 > c1 ? 255 : 0;
+            uint32_t bits = (uint32_t)src[4] | (uint32_t)src[5] << 8 | (uint32_t)src[6] << 16 | (uint32_t)src[7] << 24;
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++)
+                    memcpy(out + ((size_t)(by * 4 + y) * w + bx * 4 + x) * 4, p[bits >> (2 * (y * 4 + x)) & 3], 4);
+        }
+}
+GLuint hud_wide_loading_tex(void) {
+    static GLuint tex; static int tried;
+    if (tried) return tex;
+    tried = 1;
+    static const char *const k_path[2] = { "ux0:data/NFSU2/pc_load_wide.dxt", "app0:assets/pc_load_wide.dxt" };
+    for (int k = 0; k < 2 && !tex; k++) {
+        FILE *f = fopen(k_path[k], "rb");
+        if (!f) continue;
+        unsigned char hd[16];
+        unsigned char *px = NULL;
+        int w = 0, ht = 0;
+        size_t n = 0;
+        if (fread(hd, 1, 16, f) == 16 && !memcmp(hd, "OUWIDE01", 8) && hd[12] == 1) {
+            w = hd[8] | hd[9] << 8; ht = hd[10] | hd[11] << 8;
+            n = (size_t)w * ht / 2;
+            if (w >= 4 && ht >= 4 && !(w & 3) && !(ht & 3)) px = (unsigned char *)malloc(n);
+            if (px && fread(px, 1, n, f) != n) { free(px); px = NULL; }
+        }
+        fclose(f);
+        if (!px) { printf("loading screen: %s is not a pc_load_wide.dxt, ignored\n", k_path[k]); continue; }
+        glGenTextures(1, &tex);
+        if (tex) {
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            unsigned char *rgba = NULL;
+            if (g_tex_s3tc)
+                glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, w, ht, 0, (GLsizei)n, px);
+            else if ((rgba = (unsigned char *)malloc((size_t)w * ht * 4)) != NULL) {
+                wide_dxt1(px, w, ht, rgba);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, ht, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+                free(rgba);
+            } else { glDeleteTextures(1, &tex); tex = 0; }
+            if (tex) {
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                printf("loading screen: widescreen backdrop %s (%dx%d%s)\n", k_path[k], w, ht, g_tex_s3tc ? ", DXT1" : ", decoded");
+            }
+        }
+        free(px);
+    }
+    return tex;
+}
+float hud_wide_loading_pin(float asp) {
+    /* nx = p + (fx - 320 p) / (240 asp) = -0.25 (the logo's centre) at the
+       strip's centre fx -82 (its "LOADING" left edge ~-161, last circle's
+       right edge ~-2; Vita HW shot 11-13) */
+    float k = 1.0f - 320.0f / (240.0f * asp);
+    if (k < 0.02f) return -1.0f;   /* 4:3: the authored layout */
+    float p = (-0.25f + 82.0f / (240.0f * asp)) / k;
+    return p < -1.0f ? -1.0f : p > 0.0f ? 0.0f : p;
+}
+int hud_is_wide_loading_res(const char *name) {
+    /* PC_load.tga (PC_Loading, Loading, UG_LS_Splash). Not the console's
+       U2_loading_BG.tga (Loading_Controller, Loading_Tips): the picture
+       without its logo, under the screen's own UG_load_logo -- the wide art
+       there showed two logos (sim 11-13) */
+    static const char *const k[1] = { "pc_load" };
+    if (!name) return 0;
+    for (int j = 0; j < 1; j++) {
+        int i = 0;
+        for (; k[j][i]; i++) {
+            char c = name[i] >= 'A' && name[i] <= 'Z' ? (char)(name[i] + 32) : name[i];
+            if (c != k[j][i]) break;
+        }
+        if (!k[j][i] && (!name[i] || name[i] == '.')) return 1;
+    }
+    return 0;
 }
 
 static int screen_obj(const Hud *h, const char *name) {
@@ -3166,6 +3281,17 @@ static void fe_anim_draw(Hud *h, const HudDC *dc, int i) {
     if (!t->tex) {
         if (strncmp(h->pk->res[res].name, "White16x16", 10)) return;
         t = &white;
+    }
+    /* PC_Loading's backdrop: the widescreen art over the whole screen */
+    if (w->screen && hud_is_wide_loading_res(h->pk->res[res].name) && hud_wide_loading_tex() &&
+        fabsf(o->size[0]) >= 600.0f && fabsf(o->size[1]) >= 440.0f) {
+        float v[20];
+        put_vert(v,      -1.0f,  1.0f, 0.0f, 0.0f);
+        put_vert(v + 5,   1.0f,  1.0f, 1.0f, 0.0f);
+        put_vert(v + 10,  1.0f, -1.0f, 1.0f, 1.0f);
+        put_vert(v + 15, -1.0f, -1.0f, 0.0f, 1.0f);
+        hud_batch(h, dc, hud_wide_loading_tex(), v, 1, pl.rgba);
+        return;
     }
     int pin = w->screen ? screen_pin(w) : hud_pin_of(h->pk->obj[o->root].ax);
     /* a whole screen's full-screen art (PC_Loading's backdrop) covers the

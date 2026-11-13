@@ -58,8 +58,16 @@ engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
   Controls, Jukebox and Credits.
 - **Audio.** Per-car engine, turbo, shift, skid and collision sounds from the
   game's own sound banks, plus music and speech.
-- **Graphics.** The original world shading, car reflections, bloom, regional
-  fog, rain, particles, the speed and nitrous blur, and smackable props.
+- **Graphics.** The original world shading, car reflections, each car's own
+  ground shadow, bloom, regional fog, rain, particles, the speed and nitrous
+  blur, and smackable props. The title and loading screens use widescreen
+  art.
+- **Trophies (optional).** 76 Vita trophies based on the RetroAchievements
+  set for the game. Progress is kept in your profile. They can be turned off
+  in [Settings](#settings).
+- **Fast travel (optional).** A native version of the NFSU2FastTravel PC mod.
+  When it is on, choosing **No** on the World Map's GPS prompt puts you at
+  that place. Off by default; turn it on in [Settings](#settings).
 - **World streaming.** The whole city streams in while you drive.
 - **Languages.** The game uses the Vita's system language when the original
   game has it. That covers English, French, German, Italian, Spanish, Dutch,
@@ -89,6 +97,9 @@ engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
   have it yet, extract it with **ShaRKBR33D**.
 - About **1.7 GB** free on the memory card for the game data, plus about
   **330 MB** for the converted world cache.
+- For trophies only: the **[NoTrpDrm](https://github.com/Yoti/psv_notrpdrm)**
+  plugin, listed under `*main` in `ur0:tai/config.txt`. Without it the game
+  runs normally and simply reports no trophies.
 
 ---
 
@@ -225,6 +236,8 @@ game starts. A small menu opens before the game loads:
 |---|---|
 | **Logs** | On by default. Off stops `log.txt` and `perf.csv` from being written. `boot.txt` and `crumbs.txt` are always kept. |
 | **Frame rate** | **30 FPS** (default, locked and even) or **Unlocked** (up to 60, varies; experimental). |
+| **Fast travel** | Off by default. On: on the World Map, choosing **No** on the GPS prompt takes you straight to that place (`fasttravel.txt`). |
+| **Trophies** | On by default. Off: progress is still saved in your profile, but nothing is reported to the system (`notrophy.txt`). |
 | **Reset caches** | Deletes `ux0:data/NFSU2/cache`: the converted world data, shaders and shop lists. Your profiles and options are kept. On the next boot the game converts the world again, or you can send it again from the Prep Tool. |
 
 **Start Game** (or START) saves the settings and restarts the game.
@@ -311,12 +324,27 @@ supported targets are the three scripts above.
 - **[vitacompanion](https://github.com/devnoname120/vitacompanion)** by
   devnoname120, for FTP and remote launch during development.
 - **[minimp3](https://github.com/lieff/minimp3)** by lieff.
+- **[NFSU2FastTravel](https://github.com/CrabJournal/NFSU2FastTravel)** by
+  CrabJournal, the PC mod the fast travel option is based on.
+- **BigWeedSmokerMan** for the
+  [RetroAchievements set](https://retroachievements.org/game/5613) the
+  trophy list is based on.
+- The author of the **Widescreen Start/Loading Screen** mod
+  ([nfsmods.xyz/mod/3786](https://nfsmods.xyz/mod/3786)) for the wide
+  title and loading art used in the VPK. The art is not in this repository.
+- **[NoTrpDrm](https://github.com/Yoti/psv_notrpdrm)** by Yoti, which lets
+  homebrew unlock trophies.
 - **[Dear ImGui](https://github.com/ocornut/imgui)** by Omar Cornut.
 - **Electronic Arts / EA Black Box** for the original game.
 
 ## License and legal
 
-The code is MIT licensed (see [LICENSE](LICENSE)). Third-party code keeps
+The code is licensed under the
+**[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)**
+(see [LICENSE](LICENSE)). You may use, change and share it for noncommercial
+purposes. **Commercial use is not allowed.** The original OpenUG2 code this
+port started from was released under the MIT License and stays available
+under it; the MIT text is kept in [LICENSE](LICENSE). Third-party code keeps
 its own license.
 
 Need for Speed and Need for Speed Underground 2 are trademarks of Electronic

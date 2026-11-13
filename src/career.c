@@ -7,6 +7,7 @@
 #include "career.h"
 #include "airace.h"
 #include "perfparts.h"
+#include "trophy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,6 +106,9 @@ const unsigned char *career_sms_by_hash(uint32_t h)                     /* 0x501
 int career_nshowcases(void) { return (int)(TN[5] / CAR_SHOWCASE); }
 const unsigned char *career_showcase(int i) { return i >= 0 && i < career_nshowcases() ? T[5] + i * CAR_SHOWCASE : NULL; }
 int career_nchallenges(void) { return (int)(TN[10] / CAR_CHALLENGE); }
+int career_nshops(void) { return (int)(TN[1] / CAR_SHOP); }
+const unsigned char *career_shop(int i) { return i >= 0 && i < career_nshops() ? T[1] + (long)i * CAR_SHOP : NULL; }
+uint32_t career_hash(const char *s) { return bstringhash(s); }
 const unsigned char *career_challenge(int i) { return i >= 0 && i < career_nchallenges() ? T[10] + i * CAR_CHALLENGE : NULL; }
 
 /* ------------------------------------------------------- the stage infos */
@@ -298,6 +302,7 @@ int career_stage_cleared(int stage) { return stage >= 0 && stage < 8 && g_career
 static void stage_cleared(int stage)                                    /* NotifyStageCleared 80125fb0 */
 {
     if (stage != g_career.stage) return;
+    trophy_stage_cleared(stage);                 /* before the stage advances (its missables) */
     g_career.stage = stage + 1;
     printf("career: stage %d cleared, now stage %d\n", stage, g_career.stage);
     cs_stage_started(g_career.stage);
@@ -608,6 +613,7 @@ void career_commit_win(uint32_t h, int reward, float margin)
             cstage_world_done(&g_career.st[g_career.stage & 7]) == (signed char)wc[7]) career_sms_add_wc(wc);
     }
     printf("career: won %s ($%d)\n", career_string(rd16(ev)), g_career.cash);
+    trophy_event_won(ev);
 }
 void career_commit_lose(uint32_t h)                                     /* CommitLoseEvent 80127178 */
 {
@@ -1525,6 +1531,7 @@ void career_enter_shop(const unsigned char *shop, const float pos[3], uint16_t h
     c->engaged_preset = 0;                       /* +0x7e1c = 0: the engaged event is done with */
     c->engaged_event = NULL;
     if (c->wcs.wc && career_wc_goal_shop(shop)) c->wcs.state = CWC_IN_SHOP;   /* NotifyEngageShopTrigger 8012d0d0 */
+    trophy_check();
 }
 
 /* ---- WorldChallengeState (GC 0x803b4ca4; CAREER.md "C5w") ---------------- */
@@ -1602,6 +1609,7 @@ static void wc_succeed(void)                                               /* No
     c->wcs.wc = NULL;
     c->wcs.state = CWC_NONE;
     career_recalc_zones();
+    trophy_check();
 }
 void career_wc_unique_chosen(void) { g_career.wcs.state = CWC_DONE; wc_succeed(); }
 void career_wc_failure_accepted(void)
@@ -2105,6 +2113,7 @@ void career_fill_statistics(CareerStats *s)
     s->rep[1] += s->rep[0];
     {   int n = c->st[0].npoints + c->st[1].npoints;
         s->avg[1] = n ? (c->st[0].points + c->st[1].points) / (float)n : 0.0f; }
+    trophy_check();                              /* the Status screen (RA's "open the Stats page") */
 }
 void career_showcase_completed(const unsigned char *sc)
 {
@@ -2115,6 +2124,7 @@ void career_showcase_completed(const unsigned char *sc)
     memset(&g_cw.cur, 0, sizeof g_cw.cur);       /* ExitTriggerZone */
     career_recalc_zones();
     printf("career: showcase %s completed\n", (const char *)sc);
+    trophy_check();
 }
 /* PlayerCareerState::NotifyBeginGetAway 80126f4c: the SMS (kind 4); the
    speech's HandleOutrunStart is C10's */
@@ -2138,6 +2148,7 @@ void career_encounter_finished(int won)
         }
     career_recalc_zones();
     printf("career: Outrun %s ($%d, %d won this stage)\n", won ? "won" : "lost", c->cash, s->dc);
+    trophy_check();
 }
 /* PlayerCareerState::NotifyInSMSAutoTriggerZone 801260bc (queue 8012c9a8):
    a help zone (type 0x12) holding the car -- its kind 15 tip once, then
