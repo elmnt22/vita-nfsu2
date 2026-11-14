@@ -45,16 +45,15 @@ static const unsigned char *pkg_find(int cat, int lvl)                  /* 0x500
 
 int perf_init(const unsigned char *g, long len)
 {
-    free(g_copy); g_copy = NULL;
+    free(g_copy); g_copy = NULL; g_copylen = 0;
     g_npkg = 0; g_ntype = 0; g_ready = 0; g_nbrand = 0;
     memset(g_part, 0, sizeof g_part);
-    /* keep the chunks we point into */
-    g_copy = (unsigned char *)malloc((size_t)len);
-    if (!g_copy) return 0;
-    memcpy(g_copy, g, (size_t)len); g_copylen = len;
-    g = g_copy;
+    /* Walk the chunk tree (containers have the top bit set) for the chunks
+       we point into, then keep copies of just those bodies (a few hundred
+       KB) -- a whole GLOBALB copy held 7.8 MB for the whole run. */
+    long pkg_o = -1, pkg_n_ = 0, brand_o = -1, brand_n = 0;
+    long combo_o[64]; long combo_sz[64]; int ncombo = 0;
     int got = 0;
-    /* walk the chunk tree (containers have the top bit set) */
     long stack_end[8]; int depth = 0;
     long o = 0, end = len;
     stack_end[0] = end;
@@ -66,21 +65,34 @@ int perf_init(const unsigned char *g, long len)
             stack_end[++depth] = end; end = next; o = body;
             continue;
         }
-        if (id == 0x34a15 && !g_npkg && sz % PKG_SIZE == 0) {          /* loaded once (0x8641f4) */
-            g_pkg = g + body; g_npkg = (int)(sz / PKG_SIZE); got |= 1;
-        } else if (id == 0x34a31 && g_ntype < 64 && sz >= 4) {          /* loader 0x599440 */
-            g_ncombo[g_ntype] = (int)rd32(g + body);
-            g_combo[g_ntype] = g + body + 4;
-            if ((long)g_ncombo[g_ntype] * 16 + 4 > (long)sz) g_ncombo[g_ntype] = (int)((sz - 4) / 16);
-            g_ntype++; got |= 2;
-        } else if (id == 0x34a14 && !g_nbrand && sz % 0x44 == 0) {     /* the brand list */
-            g_brand = g + body; g_nbrand = (int)(sz / 0x44);
+        if (id == 0x34a15 && pkg_o < 0 && sz % PKG_SIZE == 0) {           /* loaded once (0x8641f4) */
+            pkg_o = body; pkg_n_ = sz; got |= 1;
+        } else if (id == 0x34a31 && ncombo < 64 && sz >= 4) {           /* loader 0x599440 */
+            combo_o[ncombo] = body; combo_sz[ncombo] = sz; ncombo++; got |= 2;
+        } else if (id == 0x34a14 && brand_o < 0 && sz % 0x44 == 0) {   /* the brand list */
+            brand_o = body; brand_n = sz;
         } else if (id == 0x34a32 && sz >= sizeof g_lim) {
             for (int i = 0; i < 30; i++) g_lim[i] = rdf(g + body + 4 * i);
             got |= 4;
         }
         o = next;
         while (o >= end && depth > 0) { o = end; end = stack_end[depth--]; }
+    }
+    long total = (pkg_o >= 0 ? pkg_n_ : 0) + (brand_o >= 0 ? brand_n : 0);
+    for (int t = 0; t < ncombo; t++) total += (combo_sz[t] + 3) & ~3L;
+    g_copy = (unsigned char *)malloc((size_t)(total ? total : 4));
+    if (!g_copy) return 0;
+    g_copylen = total;
+    unsigned char *w = g_copy;
+    if (pkg_o >= 0) { memcpy(w, g + pkg_o, (size_t)pkg_n_); g_pkg = w; g_npkg = (int)(pkg_n_ / PKG_SIZE); w += pkg_n_; }
+    if (brand_o >= 0) { memcpy(w, g + brand_o, (size_t)brand_n); g_brand = w; g_nbrand = (int)(brand_n / 0x44); w += brand_n; }
+    for (int t = 0; t < ncombo; t++) {
+        memcpy(w, g + combo_o[t], (size_t)combo_sz[t]);
+        g_ncombo[g_ntype] = (int)rd32(w);
+        g_combo[g_ntype] = w + 4;
+        if ((long)g_ncombo[g_ntype] * 16 + 4 > combo_sz[t]) g_ncombo[g_ntype] = (int)((combo_sz[t] - 4) / 16);
+        g_ntype++;
+        w += (combo_sz[t] + 3) & ~3L;
     }
     for (int i = 0; i < g_npkg; i++) {
         const unsigned char *k = g_pkg + i * PKG_SIZE;

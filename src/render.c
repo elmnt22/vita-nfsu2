@@ -1406,10 +1406,18 @@ typedef struct { uint64_t key; int idx, cell_x, cell_y; unsigned char group; } B
 /* A far LOD stand-in (world role 2) of a tall building: the skyline. Its
    batches are culled at the far plane instead of the shorter world view
    distance, so the city's towers do not pop in a cell at a time at 300 m. */
-#define N2_BATCH_TALL_M 30.0f
+#define N2_BATCH_TALL_M 0.0f
 static int batch_tall(const N2Mesh *m) {
+    float tall_m = N2_BATCH_TALL_M;
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_TALL_M=<m> -- the stand-in height drawn to the far plane */
+        static float env = -1.0f;
+        if (env < 0.0f) env = getenv("OPENUG2_TALL_M") ? (float)atof(getenv("OPENUG2_TALL_M")) : N2_BATCH_TALL_M;
+        tall_m = env;
+    }
+#endif
     return m->world_role == 2 && m->cat != N2_ROAD && m->cat != N2_TERRAIN && m->world_bounds_valid &&
-           m->world_bounds[5] - m->world_bounds[2] >= N2_BATCH_TALL_M;
+           m->world_bounds[5] - m->world_bounds[2] >= tall_m;
 }
 static unsigned char batch_group(const N2Mesh *m, int mode) {
     return (unsigned char)(n2_world_batch_material_group(m, mode) | (m->reflect ? 0x80 : 0) |

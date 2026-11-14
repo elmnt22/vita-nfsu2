@@ -62,6 +62,7 @@ static int n2_find_record(const unsigned char *g, long len, const char *name, un
 #include "music.h"
 #include "options.h"
 #include "profile.h"
+#include "savenote.h"
 #include "garage_line.h"
 #include "carsfx.h"
 #include "resource.h"
@@ -547,6 +548,12 @@ static int g_showroom;                 /* drawing the room this frame */
 #ifdef __vita__
 static int g_refl_ready;               /* this frame's road reflection is rendered */
 static int g_room_refl_ready;          /* this frame's garage floor reflection (view 4) is rendered */
+#ifdef OPENUG2_SIM_PRE_H
+static long g_simgate[2][5];   /* test aid: in-view batches by distance band (other, stand-in) */
+#endif
+/* Far LOD stand-ins draw out to here (horizontal distance to the batch box),
+   past the 300 m view distance of the rest; the far plane stays beyond it. */
+#define WORLD_STANDIN_GATE 500.0f
 static int g_fog_linear;               /* fog_density is the regional linear fog's 1/(250-start) */
 static long g_refl_batches;            /* reflective batches drawn, for the 60-frame log */
 extern int vita_gfx_mode;
@@ -2701,6 +2708,16 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
     if (candidate->nkeys < 512) candidate->keys[candidate->nkeys++] = N2_AUDIO_SKIN;   /* 0x631e20 */
     hitch_mark("car.read");
     candidate->globaldata=car_global_get(dataroot,&candidate->globallen);
+    if(!candidate->globaldata){
+        /* (11-14 player report, a drag that never started) GLOBALB is one 8 MB
+           block: on a fragmented heap it fails with tens of MB free (hwlog48
+           "malloc(7820 KB) failed, heap in use 63120 KB"), and without it the car
+           has no record -- no race. Once more after the parsed rim library and
+           the tiles' read-ahead buffers have gone. */
+        rim_lib_forget(); world_tiles_trim(0);
+        candidate->globaldata=car_global_get(dataroot,&candidate->globallen);
+        printf("car: GLOBALB %s on the second try\n", candidate->globaldata ? "read" : "could not be read");
+    }
     hitch_mark("car.globalb");
     candidate->globaltpk=g_car_global_tpk;
     if(candidate->globaldata)
@@ -2939,7 +2956,14 @@ extern volatile int vita_wd_armed, vita_wd_sec, vita_wd_load;
 extern volatile unsigned vita_wd_beat;
 unsigned vita_variant_switch_total(void);
 #endif
+/* test aid: autodrive.txt "race quit" exits 20 s after the results screen
+   opens, so an unattended Vita run can launch the next one */
+static int g_autoquit; static Uint32 g_autoquit_at;
 static void pf_mark(int s) {
+    if (g_autoquit_at && SDL_GetTicks() > g_autoquit_at) {
+        printf("autodrive: quit after the results screen%c", 10);
+        fflush(NULL); exit(0);
+    }
 #ifdef __vita__
     vita_wd_beat++; vita_wd_sec = s;    /* the race-hang watchdog's heartbeat */
 #endif
@@ -2955,6 +2979,8 @@ unsigned vita_heap_top_mb(void);
 static unsigned long long wt_last;
 static double wt_ms[PF_WORLD_PARTS];
 static int wt_frames;
+static long wt_fade_sum, wt_fade_dist_sum;   /* fade-pass batches (all / distance band only) per 60 frames */
+static float g_view_dyn_log = 300.0f;         /* the adaptive view distance, for that log line */
 static void WT_MARK(int part) {
     unsigned long long now = sceKernelGetProcessTimeWide();
     if (part >= 0) {
@@ -7038,14 +7064,32 @@ static int tunnel_zone_probe(const float p[3], float car_z, const void **zone)
         }
     return 2;
 }
+/* The ground at a scene path's start nearest the height the car stands at
+   (its grid slot): a look from 30 m up alone took the highest layer there --
+   on event 4014 (IntroNis03 v1) a deck 17 m over the start road, so the cars
+   fell out of the sky at the start and one dropped through the world
+   (player reports 11-14). The near look first; the 30 m one still finds a
+   road that climbs between the slot and the path's start. */
+static int rt_nis_ground_near(WCollCtx *wc, float x, float y, float zcar, float *z)
+{
+    float za = 0, zb = 0, nrm[3]; int surf, a, b;
+    a = rt_ground(wc, x, y, zcar + 3.0f, &za, nrm, &surf);
+    b = rt_ground(wc, x, y, zcar + 30.0f, &zb, nrm, &surf);
+    if (a && b) *z = fabsf(za - zcar) <= fabsf(zb - zcar) ? za : zb;
+    else if (a || b) *z = a ? za : zb;
+    else return 0;
+    if (b && fabsf(zb - *z) > 2.0f)
+        printf("pre-race scene: path start (%.1f %.1f) on the layer at %.2f, not the one %.1f m above%c",
+               x, y, *z, zb - *z, 10);
+    return 1;
+}
 /* 0x4309d0, place count 0: the car put down standing at its path's start,
    its controller gone (0x5eba30(0)), on the NIS mover (5) */
 static void rt_nis_put(N2Sim *s, WCollCtx *wc, const NisCar *q)
 {
     N2State st; n2sim_state(s, &st);
-    float p[3] = { q->x, q->y, st.pos[2] }, z, nrm[3];
-    int surf;
-    if (rt_ground(wc, p[0], p[1], st.pos[2] + 30.0f, &z, nrm, &surf)) p[2] = z;
+    float p[3] = { q->x, q->y, st.pos[2] }, z;
+    if (rt_nis_ground_near(wc, p[0], p[1], st.pos[2], &z)) p[2] = z;
     float h = q->heading * (6.28318531f / 65536.0f);
     if (h > 3.14159265f) h -= 6.28318531f;
     n2sim_reset(s, p, h);
@@ -7090,10 +7134,10 @@ static int rt_nis_start(float carpos[3], float *heading)
     if (q->on) {
         g_n2_nistgt = *q;
         WCollCtx c; wcoll_ctx_init(&c);
-        float z, nrm[3]; int surf;
+        float z;
         float zr = carpos[2];
         carpos[0] = q->x; carpos[1] = q->y;
-        if (rt_ground(&c, q->x, q->y, zr + 30.0f, &z, nrm, &surf)) carpos[2] = z;
+        if (rt_nis_ground_near(&c, q->x, q->y, zr, &z)) carpos[2] = z;
         float h = q->heading * (6.28318531f / 65536.0f);
         if (h > 3.14159265f) h -= 6.28318531f;
         *heading = h;
@@ -8006,6 +8050,7 @@ static void rt_results(const char *dataroot, const char *carname)
     for (int i = 0; i < n; i++) g_resalt.time[i] = row[i].time;
     rt_stats_build(me ? me : "", carname);
     printf("results: %d racers, player \"%s\"%c", n, me ? me : "", 10);
+    if (g_autoquit && !g_autoquit_at) g_autoquit_at = SDL_GetTicks() + 20000;
 }
 /* The post-race screens after the results, an offline Quick Race's list of
    the post-race screen manager 0x4f3ea0: UI_PostRaceResults, then
@@ -11672,6 +11717,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
             FILE *af = fopen("ux0:data/NFSU2/autodrive.txt", "r");
             autodrive_file = 0;
             if (af) { autodrive_file = (fgets(ab, sizeof ab, af) && !strncmp(ab, "race", 4)) ? 2 : 1; fclose(af); }
+            if (af && strstr(ab, "quit")) g_autoquit = 1;
             if (!autodrive) autodrive = autodrive_file;
         }
         if (autodrive && !(autodrive == 2 && g_rt.roam) && g_rt.human && !g_rt.drag && 0 <= g_rt.start && g_rt.start + 1.0f < g_rt.t) {
@@ -18563,6 +18609,7 @@ int main(int argc, char **argv) {
         troot, trackname, runtime_scenery_event, sky_profile, resident_policy, tier != 2
     };
     float failed_resident_cell[2] = {NAN, NAN};
+    Uint32 resident_retry_at = 0;   /* (Vita) a race's failed cell may try again from then */
     /* Scenery set (free roam -1, or a race event's own barriers) the active
        area was built with, and the one the current/last build uses. When
        resident_args.scenery_event changes (race start/quit) the area is
@@ -19434,6 +19481,9 @@ int main(int argc, char **argv) {
                 ls_pump();
                 float sp[3] = { carpos[0], carpos[1], carpos[2] }, sh = heading;
                 int setup_ok = ng > 0 && rt_race_setup(troot, dataroot, carname, &world.city.ev[ev], laps, carpos, &heading);
+#ifdef OPENUG2_SIM_PRE_H
+                if (getenv("OPENUG2_SIM_RACEFAIL")) { rt_end(); setup_ok = 0; }   /* test aid: the failed start's way out */
+#endif
                 hitch_mark("race.setup");
                 if (setup_ok) {
                     resident_args.scenery_event = world.city.ev[ev].id;
@@ -19447,6 +19497,22 @@ int main(int argc, char **argv) {
                     world.city.race.active = 0;
                     printf("garage: race %d could not start (the race manager could not be set up)\n",
                            world.city.ev[ev].id);
+                    /* (11-14 player report: a Quick Race drag "panned around the car
+                       forever") race_state 3 with no front end is the menu orbit with
+                       the keys held back -- a soft lock. Back to driving, and out of
+                       the career to the main menu, so the player can try again. */
+                    race_state = 1; g_ride_ready = 0; garage_race = -1;
+                    if (!g_career_mode && !g_fe) {
+                        world_tiles_trim(1);
+                        Shop *fe = shop_open(dataroot, carname, &carcfg, modification,
+                                             wheel_brands[wheel_brand], wheel_style);
+                        if (fe) {
+                            shop_main_menu(fe);
+                            fe_quick_race_data(fe, carname, carlist, ncars);
+                            g_fe = fe; g_fe_in = 0;
+                            printf("front end: main menu (the race did not start)\n");
+                        } else world_tiles_trim(0);
+                    }
                 }
             }
         }
@@ -19677,6 +19743,10 @@ int main(int argc, char **argv) {
                 world_resident_free(g_sw.cand); g_sw.cand = NULL;
                 world_city_free(&g_sw.city);
                 venue_relaunch(strcmp(next_track, "STREAML4RA") ? next_track : NULL, next_ev);
+                /* only here when the relaunch itself failed: there is no world to
+                   go on with (a NULL area below) -- end cleanly, not on a fault */
+                printf("track switch: the relaunch failed; quitting\n");
+                fflush(NULL); exit(1);
             }
             world_resident_activate(&active_resident, &g_sw.cand);   /* g_sw.cand <- NULL */
             world.neighborhood = active_resident->world;
@@ -20933,7 +21003,13 @@ int main(int argc, char **argv) {
             else if (brand >= 0 && brand != wheel_brand) {
                 char wlp[1024];
                 snprintf(wlp, sizeof wlp, "%s/CARS/WHEELS/GEOMETRY_%s.BIN", dataroot, wheel_brands[brand]);
+                /* (11-14 player report: no rim but stock would show) another brand's
+                   library is one 1-11 MB block on a fragmented heap: the parsed copy
+                   of the old one (~5 MB, only ever reused for the same library) goes
+                   first, so its room is there for the read */
+                rim_lib_forget();
                 cand = n2_read_file(wlp, &cand_len);
+                if (!cand) printf("rims: %s could not be read (no room for one block, or the file is missing)\n", wlp);
             }
             if (brand == -2) { /* nothing to change */ }
             else if (cand && (g_rim_base = shop_rim_base(dataroot, g_shop_rim_folder, g_shop_rim_style), 1) &&
@@ -21250,6 +21326,11 @@ int main(int argc, char **argv) {
             prepared = NULL;
             prepared_status = 0;
         }
+        if (resident_retry_at && (Sint32)(SDL_GetTicks() - resident_retry_at) >= 0) {
+            resident_retry_at = 0;
+            failed_resident_cell[0] = failed_resident_cell[1] = NAN;
+            printf("resident build: the failed cell may try again%c", 10);
+        }
         if (resident_wanted) {
             if (!(target[0] == failed_resident_cell[0] &&
                   target[1] == failed_resident_cell[1])) {
@@ -21346,7 +21427,20 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "resident build failed at cell (%.0f, %.0f); "
                             "keeping generation %lu\n", target[0], target[1],
                             active_resident->generation);
+#ifdef __vita__
+                    /* (11-14 player report: a drag "just crashed") this ended the
+                       game in a race -- an exit to LiveArea, which a player reads as
+                       a crash. A build fails for room (the placement cache is flushed
+                       above): give the tiles' read-ahead back too and let the same
+                       cell try again in 2 s, the current area staying meanwhile. */
+                    if (race_state == 0) {
+                        world_tiles_trim(0);
+                        resident_retry_at = SDL_GetTicks() + 2000u;
+                        if (!resident_retry_at) resident_retry_at = 1;
+                    }
+#else
                     if(race_state==0) { running=0; final_status=1; }
+#endif
                 } else if (build_status > 0) {
                     uint32_t activate_begin = SDL_GetTicks();
                     hitch_mark("act.pre");
@@ -24236,6 +24330,7 @@ int main(int argc, char **argv) {
            10000+; the fog-off 2000 m covers the strips and is cheap there
            (opaque world ~0.5 ms). */
         if (!g_fog_linear) zfar = 2000.0f;
+        if (zfar < WORLD_STANDIN_GATE + 200.0f) zfar = WORLD_STANDIN_GATE + 200.0f;   /* a stand-in tile reaching past the gate is not sliced */
         /* Retail far clip (eViewPlatInfo::CalculateViewMatricies 0x5c7ec0): player
            view 1 -- the view the NIS cameras drive too -- uses 15000 m outright
            (other views take Camera +0xc0, 10000 from CameraMover's ctor 0x44ab90;
@@ -25167,12 +25262,81 @@ int main(int argc, char **argv) {
            build that brought them, instead of popping: drawn after the opaque
            and cutout world, blended at that strength with depth writes on. */
         #define WFADE_MS 900u
-        static int fadeq[2048]; int nfadeq = 0;
+        static int fadeq[2048]; static float fadea[2048]; int nfadeq = 0, nfade_dist = 0;
+        #define WDFADE_FRAC 0.2f   /* distance fade band: the last 20% of a gate */
+        static int dfade_on = -1;   /* test aid: ux0:data/NFSU2/nodistfade.txt (or OPENUG2_NO_DFADE) = hard cut */
+        if (dfade_on < 0) {
+            FILE *df = fopen("ux0:data/NFSU2/nodistfade.txt", "r");
+            dfade_on = !df && !getenv("OPENUG2_NO_DFADE");
+            if (df) fclose(df);
+            printf("world: distance fade %s (stand-ins to %.0f m)\n", dfade_on ? "on" : "off", (double)WORLD_STANDIN_GATE);
+        }
         static unsigned fade_gen = ~0u; static Uint32 fade_t0;
         float fade_p = 1.0f;
         if (active_resident) {
             Uint32 now = SDL_GetTicks();
-            if ((unsigned)active_resident->generation != fade_gen) { fade_gen = (unsigned)active_resident->generation; fade_t0 = now; }
+            if ((unsigned)active_resident->generation != fade_gen) {
+                fade_gen = (unsigned)active_resident->generation; fade_t0 = now;
+#ifdef OPENUG2_SIM_PRE_H
+                {   /* test aid (simulator): pop census. Batches are matched between
+                       generations by bounds + texture + mesh count; the ones that
+                       appear without a fade-in, or vanish, inside the gate they draw
+                       to, are pops, counted by distance from the camera. */
+                    static uint32_t *pk; static int npk, cappk;
+                    static long pops[2][2][5], gens;   /* [appear/vanish][tall][band] */
+                    uint32_t *ck = (uint32_t *)malloc((size_t)(nbatch ? nbatch : 1) * 4u * 2u);
+                    if (ck) {
+                        int nck = 0;
+                        for (int k = 0; k < nbatch; k++) {
+                            const N2Batch *b = &wbatch[k];
+                            uint32_t h = 2166136261u;
+                            const unsigned char *pb = (const unsigned char *)b->bbox_min;
+                            for (int q = 0; q < 24; q++) h = (h ^ pb[q]) * 16777619u;
+                            h = (h ^ b->texkey) * 16777619u; h = (h ^ (uint32_t)b->nmesh) * 16777619u;
+                            ck[nck++] = h;
+                        }
+                        #define POPBAND(d) ((d) < 100.0f ? 0 : (d) < 200.0f ? 1 : (d) < 300.0f ? 2 : (d) < 400.0f ? 3 : 4)
+                        if (npk) {
+                            for (int k = 0; k < nbatch; k++) {   /* appear */
+                                const N2Batch *b = &wbatch[k];
+                                if (b->fade_in || b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD) continue;
+                                int seen = 0;
+                                for (int q = 0; q < npk && !seen; q++) seen = pk[2*q] == ck[k];
+                                if (seen) continue;
+                                float cx = 0.5f * (b->bbox_min[0] + b->bbox_max[0]) - cam[0];
+                                float cy = 0.5f * (b->bbox_min[1] + b->bbox_max[1]) - cam[1];
+                                float d = sqrtf(cx*cx + cy*cy);
+                                if (d < (b->tall ? WORLD_STANDIN_GATE : VIEW_DIST)) pops[0][b->tall ? 1 : 0][POPBAND(d)]++;
+                            }
+                            for (int q = 0; q < npk; q++) {   /* vanish: stored centre packed as 2 x int16 metres */
+                                int seen = 0;
+                                for (int k = 0; k < nck && !seen; k++) seen = ck[k] == pk[2*q];
+                                if (seen) continue;
+                                uint32_t c = pk[2*q+1];
+                                float cx = (float)(int16_t)(c & 0xffff) - cam[0], cy = (float)(int16_t)(c >> 16) - cam[1];
+                                float d = sqrtf(cx*cx + cy*cy);
+                                if (d < WORLD_STANDIN_GATE) pops[1][0][POPBAND(d)]++;
+                            }
+                            if (++gens % 10 == 0)
+                                printf("sim pop census (%ld gens): appear unfaded <100 %ld/%ld 100-200 %ld/%ld 200-300 %ld/%ld 300-400 %ld/%ld 400+ %ld/%ld (plain/tall) | vanish <100 %ld 100-200 %ld 200-300 %ld 300-400 %ld 400+ %ld\n",
+                                       gens, pops[0][0][0], pops[0][1][0], pops[0][0][1], pops[0][1][1], pops[0][0][2], pops[0][1][2],
+                                       pops[0][0][3], pops[0][1][3], pops[0][0][4], pops[0][1][4],
+                                       pops[1][0][0], pops[1][0][1], pops[1][0][2], pops[1][0][3], pops[1][0][4]);
+                        }
+                        #undef POPBAND
+                        if (nbatch > cappk) { free(pk); pk = (uint32_t *)malloc((size_t)nbatch * 8u); cappk = pk ? nbatch : 0; }
+                        npk = 0;
+                        for (int k = 0; pk && k < nbatch; k++) {
+                            const N2Batch *b = &wbatch[k];
+                            int16_t x = (int16_t)(0.5f * (b->bbox_min[0] + b->bbox_max[0]));
+                            int16_t y = (int16_t)(0.5f * (b->bbox_min[1] + b->bbox_max[1]));
+                            pk[2*npk] = ck[k]; pk[2*npk+1] = (uint16_t)x | (uint32_t)(uint16_t)y << 16; npk++;
+                        }
+                        free(ck);
+                    }
+                }
+#endif
+            }
             if (now - fade_t0 < WFADE_MS) fade_p = (float)(now - fade_t0) / (float)WFADE_MS;
         }
         {   static int fhold = -1;   /* test aid: OPENUG2_FADE_HOLD=<0..1> pins the fade strength */
@@ -25196,8 +25360,51 @@ int main(int argc, char **argv) {
         #endif
         glUniform1f(rp.uVColor, g_dbg.vcolor);   /* apply source prelight to world geom */
         static int tall_on = -1;   /* test aid: OPENUG2_NO_TALL culls the tall stand-ins at the view distance again */
-        if (tall_on < 0) tall_on = getenv("OPENUG2_NO_TALL") ? 0 : 1;
+        if (tall_on < 0) {   /* ... or ux0:data/NFSU2/notall.txt on the Vita (A/B runs) */
+            FILE *nt = fopen("ux0:data/NFSU2/notall.txt", "r");
+            tall_on = getenv("OPENUG2_NO_TALL") || nt ? 0 : 1;
+            if (nt) fclose(nt);
+            printf("world: stand-ins to %.0f m %s\n", (double)WORLD_STANDIN_GATE, tall_on ? "on" : "off (notall.txt)");
+        }
         static long tall_far, tall_res;   /* tall batches drawn past the view distance / held (60-frame sums) */
+        /* Adaptive view distance: ordinary world objects draw past VIEW_DIST,
+           up to VIEW_DIST_MAX, while the frame has headroom -- the GPU's busy
+           time (sdl_vita.c gx watcher) under 72% of the wall clock and the
+           frame rate held -- and pull back fast when either runs short. The
+           distance fade band moves with it, so the change never pops.
+           ux0:data/NFSU2/noviewdyn.txt holds VIEW_DIST (A/B runs). */
+        #define VIEW_DIST_MAX 400.0f
+        static float view_ext = 0.0f; static int view_dyn_on = -1;   /* metres past VIEW_DIST */
+#ifdef __vita__
+        {
+            extern void vita_gx_start(void); extern unsigned vita_gx_busy_total(void);
+            static Uint32 vd_t0; static unsigned vd_b0, vd_frames;
+            if (view_dyn_on < 0) {
+                FILE *nv = fopen("ux0:data/NFSU2/noviewdyn.txt", "r");
+                view_dyn_on = !nv && !getenv("OPENUG2_NO_VIEWDYN");
+                if (nv) fclose(nv);
+                if (view_dyn_on) vita_gx_start();   /* the watcher also runs without perf.csv now */
+                printf("world: adaptive view distance %s (%.0f-%.0f m)\n", view_dyn_on ? "on" : "off",
+                       (double)VIEW_DIST, (double)VIEW_DIST_MAX);
+            }
+            if (view_dyn_on && passmode == 0) {
+                Uint32 now = SDL_GetTicks();
+                vd_frames++;
+                if (!vd_t0) { vd_t0 = now; vd_b0 = vita_gx_busy_total(); vd_frames = 0; }
+                else if (now - vd_t0 >= 500) {
+                    unsigned b = vita_gx_busy_total();
+                    float wall = (float)(now - vd_t0), u = (float)(b - vd_b0) / 1000.0f / wall;
+                    float fps = 1000.0f * (float)vd_frames / wall;
+                    if (u > 0.85f || fps < 28.5f) view_ext -= 25.0f;          /* busy: back off fast */
+                    else if (u < 0.72f && fps > 29.5f) view_ext += 10.0f;     /* headroom: creep out */
+                    if (view_ext > VIEW_DIST_MAX - VIEW_DIST) view_ext = VIEW_DIST_MAX - VIEW_DIST;
+                    if (view_ext < 0.0f) view_ext = 0.0f;
+                    vd_t0 = now; vd_b0 = b; vd_frames = 0;
+                    g_view_dyn_log = VIEW_DIST + view_ext;
+                }
+            }
+        }
+#endif
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
             N2Batch *b = &wbatch[k];
@@ -25219,16 +25426,49 @@ int main(int argc, char **argv) {
               while (bd < 5 && dd >= BAND[bd]) bd++;
               band_b[bd]++; band_m[bd] += b->nmesh;
               for (int sc=0;sc<8;sc++) band_sc[bd][sc] += b->scen_count[sc]; }
-            if (dx*dx + dy*dy > (b->tall && tall_on ? zfar_world*zfar_world : VIEW_DIST*VIEW_DIST)) {
+#if defined(__vita__) && defined(OPENUG2_SIM_PRE_H)
+            {   /* test aid (simulator): batches in view by distance band, stand-ins apart (pop-in work) */
+                float dd2 = dx*dx + dy*dy;
+                if (world_box_in_view(world_planes,b->bbox_min,b->bbox_max)) {
+                    int bd = dd2 < 300.0f*300.0f ? 0 : dd2 < 400.0f*400.0f ? 1 : dd2 < 500.0f*500.0f ? 2 : dd2 < 700.0f*700.0f ? 3 : 4;
+                    g_simgate[b->tall ? 1 : 0][bd]++;
+                }
+            }
+#endif
+            /* the gate: stand-ins (N2Batch.tall = every far LOD stand-in) reach
+               WORLD_STANDIN_GATE, the rest the view distance */
+            float gate = b->tall && tall_on ? WORLD_STANDIN_GATE : VIEW_DIST + view_ext;
+            if (dx*dx + dy*dy > gate*gate) {
                 far_meshes += b->nmesh; far_batches++;
                 for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
                 continue;
             }
+            if (b->fade_in == 2) {   /* a stand-in fading out over its tile's new full models (world_tiles.c) */
+            #ifdef __vita__
+                if (fade_p >= 1.0f || b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD || !VITA_PROBE(2) ||
+                    nfadeq >= (int)(sizeof fadeq / sizeof *fadeq)) continue;
+            #else
+                continue;
+            #endif
+            }
             #ifdef __vita__
             if (!world_box_in_view(world_planes,b->bbox_min,b->bbox_max)) continue;
             if (b->tall) { tall_res++; if (dx*dx + dy*dy > VIEW_DIST*VIEW_DIST) tall_far++; }
-            if (b->fade_in && fade_p < 1.0f && VITA_PROBE(2) && b->drawmode != N2_DRAW_BLEND && b->drawmode != N2_DRAW_ADD &&
-                nfadeq < (int)(sizeof fadeq / sizeof *fadeq)) { fadeq[nfadeq++] = k; continue; }
+            if (b->drawmode != N2_DRAW_BLEND && b->drawmode != N2_DRAW_ADD && VITA_PROBE(2) &&
+                nfadeq < (int)(sizeof fadeq / sizeof *fadeq)) {
+                /* Distance fade: the last WDFADE_FRAC of the gate fades out
+                   (blended pass below) instead of a hard cut -- the retail
+                   fog tops out at 40%, so a cut there showed 60% of the
+                   building. Off while DOF writes alpha (fade_p pinned to 1). */
+                float a = 1.0f;
+                if (dfade_on && !render_dof_writes()) {
+                    float band = gate * WDFADE_FRAC, d = sqrtf(dx*dx + dy*dy);
+                    if (d > gate - band) { a = (gate - d) / band; a = a * a * (3.0f - 2.0f * a); }
+                }
+                if (b->fade_in == 2) a *= 1.0f - fade_p * fade_p * (3.0f - 2.0f * fade_p);   /* fading out */
+                else if (b->fade_in && fade_p < 1.0f) a *= fade_p * fade_p * (3.0f - 2.0f * fade_p);
+                if (a < 1.0f) { fadea[nfadeq] = a; fadeq[nfadeq++] = k; nfade_dist += !b->fade_in; continue; }
+            }
             #endif
             if (b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD) {
                 if (defcap > 0) {
@@ -25333,12 +25573,13 @@ int main(int argc, char **argv) {
         }
         #ifdef __vita__
         if (nfadeq && !g_showroom) {   /* the arriving buildings (see WFADE_MS); none in a showroom (no world there) */
-            float fa = fade_p * fade_p * (3.0f - 2.0f * fade_p);   /* smoothstep */
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glUniform1f(rp.uAlpha, fa < 0.02f ? 0.02f : fa);
+            float lasta = -1.0f;
             for (int q = 0; q < nfadeq; q++) {
                 N2Batch *b = &wbatch[fadeq[q]];
+                float fa = fadea[q] < 0.02f ? 0.02f : fadea[q];   /* the batch's own strength (fade-in x distance) */
+                if (fa != lasta) { glUniform1f(rp.uAlpha, fa); lasta = fa; }
                 if (b->tex != lasttex) {
                     if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
                     else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
@@ -25356,6 +25597,7 @@ int main(int argc, char **argv) {
             glUniform1f(rp.uAlpha, 1.0f);
             glDisable(GL_BLEND);
         }
+        wt_fade_sum += nfadeq; wt_fade_dist_sum += nfade_dist;
         #endif
         if (lastmode == N2_DRAW_CUTOUT) glUniform1f(rp.uAlphaTest, 0.0f);
         if (g_dbg.show_track && (passmode == 0 || passmode == 1) && active_resident) {
@@ -25384,6 +25626,12 @@ int main(int argc, char **argv) {
                        wo/60.0, wc/60.0, wb/60.0, nbatch, g_refl_batches/60.0, nrefl_res,
                        g_refl_ready ? "" : " (reflection off)", tall_res/60.0, tall_far/60.0, VIEW_DIST);
                 g_refl_batches = 0; tall_res = tall_far = 0;
+#if defined(OPENUG2_SIM_PRE_H)
+                printf("sim gate census/frame: other <300 %.1f 300-400 %.1f 400-500 %.1f 500-700 %.1f >700 %.1f | stand-in <300 %.1f 300-400 %.1f 400-500 %.1f 500-700 %.1f >700 %.1f\n",
+                       g_simgate[0][0]/60.0, g_simgate[0][1]/60.0, g_simgate[0][2]/60.0, g_simgate[0][3]/60.0, g_simgate[0][4]/60.0,
+                       g_simgate[1][0]/60.0, g_simgate[1][1]/60.0, g_simgate[1][2]/60.0, g_simgate[1][3]/60.0, g_simgate[1][4]/60.0);
+                memset(g_simgate, 0, sizeof g_simgate);
+#endif
                 if (g_ai_tilt.tilt > 0) {
                     AiTiltRecord r = g_ai_tilt; memset(&g_ai_tilt, 0, sizeof g_ai_tilt);
                     printf("traffic tilt %.1f deg (pitch %.1f roll %.1f) at (%.1f, %.1f, z %.2f) len %.1f; "
@@ -25545,10 +25793,11 @@ int main(int argc, char **argv) {
         #ifdef __vita__
         if (++wt_frames == 60) {
             printf("world_draw ms/frame: fog %.2f camclip %.2f refl %.2f env %.2f mirror %.2f carvis+lights %.2f "
-                   "sky %.2f vista %.2f opaque+cull %.2f cut+blend %.2f rest %.2f\n",
+                   "sky %.2f vista %.2f opaque+cull %.2f cut+blend %.2f rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m\n",
                    wt_ms[0]/60, wt_ms[7]/60, wt_ms[8]/60, wt_ms[9]/60, wt_ms[10]/60, wt_ms[1]/60,
-                   wt_ms[2]/60, wt_ms[3]/60, wt_ms[4]/60, wt_ms[5]/60, wt_ms[6]/60);
-            memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0;
+                   wt_ms[2]/60, wt_ms[3]/60, wt_ms[4]/60, wt_ms[5]/60, wt_ms[6]/60,
+                   wt_fade_sum/60.0, wt_fade_dist_sum/60.0, (double)g_view_dyn_log);
+            memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0; wt_fade_sum = wt_fade_dist_sum = 0;
         }
         #endif
         pf_mark(PF_WORLD_DRAW);
@@ -29302,6 +29551,13 @@ int main(int argc, char **argv) {
             const unsigned char *csc = g_fe && g_showroom ? shop_cover_due(g_fe) : NULL;
             if (csc) shop_cover_capture(csc, sw, sh);
             if (g_sc.shot > 0 && --g_sc.shot == 0) { shop_cover_capture(g_sc.sc, sw, sh); sc_accept_done(); }
+#ifdef OPENUG2_SIM_PRE_H
+            {   /* test aid: OPENUG2_SIM_SAVENOTE=<ms> saves the profile once that long after boot */
+                static int sn_done; const char *e = sn_done ? NULL : getenv("OPENUG2_SIM_SAVENOTE");
+                if (e && SDL_GetTicks() > (Uint32)atoi(e)) { sn_done = 1; printf("sim: save note test, profile_save %d%c", profile_named() ? profile_save() : -1, 10); }
+            }
+#endif
+            savenote_draw(dataroot, sw, sh);   /* "Save complete." in the corner (port addition, after the photos) */
         }
         SDL_GL_SwapWindow(win);
         pf_mark(PF_SWAP);

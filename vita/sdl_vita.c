@@ -526,21 +526,33 @@ volatile unsigned vita_wd_beat;
 volatile int vita_wd_load;
 #define WD_SECONDS 15
 #define WD_LOAD_SECONDS 120
+/* Everywhere else (front end, shops, crib, free roam, loads) once the main
+   loop runs: a player-reported hard freeze (11-14, a shop after skipping the
+   speech) left nothing behind. The longest normal main-thread stall seen on
+   HW is ~20 s (a free-roam start), so 90 s is only ever a real hang -- the
+   game then ends with a crumb + core dump instead of freezing for good. */
+#define WD_IDLE_SECONDS 90
 static int wd_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
     unsigned last = vita_wd_beat;
     int last_load = vita_wd_load;
-    Uint64 since = sceKernelGetProcessTimeWide();
+    Uint64 since = sceKernelGetProcessTimeWide(), prev = since;
     for (;;) {
         sceKernelDelayThread(500 * 1000);
         Uint64 now = sceKernelGetProcessTimeWide();
         unsigned b = vita_wd_beat;
-        int load = vita_wd_load;
-        if (b != last || load != last_load || !(vita_wd_armed || load)) { last = b; last_load = load; since = now; continue; }
-        if (now - since < (Uint64)(load ? WD_LOAD_SECONDS : WD_SECONDS) * 1000000u) continue;
+        int load = vita_wd_load, armed = vita_wd_armed;
+        /* a long gap in this thread's own sleep = the Vita was suspended
+           (standby / PS button): the main loop gets its time to beat again */
+        int resumed = now - prev > 5000000u;
+        prev = now;
+        if (b != last || load != last_load || resumed || b == 0) { last = b; last_load = load; since = now; continue; }
+        unsigned lim = load ? WD_LOAD_SECONDS : armed ? WD_SECONDS : WD_IDLE_SECONDS;
+        if (now - since < (Uint64)lim * 1000000u) continue;
         vita_crumb("WATCHDOG: main loop stuck %u s after perf mark %d (beat %u, %s) -- "
                    "faulting for a core dump", (unsigned)((now - since) / 1000000u), vita_wd_sec, b,
-                   load ? "in the boot world load, step in the crumbs above" : "armed in a race");
+                   load ? "in the boot world load, step in the crumbs above"
+                   : armed ? "armed in a race" : "outside a race (front end / shop / free roam / load)");
         vita_log_flush();
         sceKernelDelayThread(1000 * 1000);          /* let the log writer drain */
         *(volatile int *)0 = 0x57d;                 /* the core dump */
@@ -1138,8 +1150,23 @@ static int gx_watch(SceSize args, void *argp) {
     return 0;
 }
 
+/* the GPU's busy microseconds so far (32-bit, differenced by the caller), 0 while the watcher is off */
+unsigned vita_gx_busy_total(void) { return gx_on ? gx_busy_us : 0; }
+
 void vita_gx_start(void) {
     if (gx_on) return;
+    {   /* unattended runs: ux0:data/NFSU2/gfxmode.txt "<n>" starts in A/B mode n
+           (1 = the GPU probe), as Select+Triangle would step to it */
+        FILE *gm = fopen("ux0:data/NFSU2/gfxmode.txt", "r");
+        int m = 0;
+        if (gm) {
+            if (fscanf(gm, "%d", &m) == 1 && m > 0 && m < 4) {   /* GFX_MODES (defined below) */
+                vita_gfx_mode = m;
+                printf("vita: gfx mode %d from gfxmode.txt\n", m);
+            }
+            fclose(gm);
+        }
+    }
     /* High priority so completion timestamps are not delayed behind the
        streaming worker; it sleeps between 100-250 us polls. */
     SceUID uid = sceKernelCreateThread("gx-watch", gx_watch, 100, 0x4000, 0,

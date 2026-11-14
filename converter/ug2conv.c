@@ -484,13 +484,14 @@ static void remote_list(HINTERNET c, const char *dir) {
         if (!FtpSetCurrentDirectoryA(c, dir)) return;
         WIN32_FIND_DATAA d;
         HINTERNET f = FtpFindFirstFileA(c, NULL, &d, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
-        if (!f) return;
+        if (!f) { FtpSetCurrentDirectoryA(c, "/"); return; }
         do {
             if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY || g_nrent >= 512) continue;
             snprintf(g_rent[g_nrent].name, sizeof g_rent[0].name, "%s", d.cFileName);
             g_rent[g_nrent++].size = ((long long)d.nFileSizeHigh << 32) | d.nFileSizeLow;
         } while (InternetFindNextFileA(f, &d));
         InternetCloseHandle(f);
+        FtpSetCurrentDirectoryA(c, "/");   /* back to the root: the uploads' paths start at ux0:/ */
     }
 }
 static int already_there(HINTERNET c, const SendFile *f) {
@@ -505,14 +506,15 @@ static int already_there(HINTERNET c, const SendFile *f) {
     return 0;
 }
 
-/* every folder on the way to the file (made once each) */
+/* every folder on the way to the file (made once each per send) */
+static char g_made[256];
 static void make_dirs(HINTERNET c, const char *remote) {
-    static char made[256];
+    char *made = g_made;
     char dir[256]; snprintf(dir, sizeof dir, "%s", remote);
     char *s = strrchr(dir, '/'); if (!s) return;
     *s = 0;
     if (!strcmp(dir, made)) return;
-    snprintf(made, sizeof made, "%s", dir);
+    snprintf(made, sizeof g_made, "%s", dir);
     if (!c) { char p[MAX_PATH + 300]; dest_path(p, sizeof p, dir); SHCreateDirectoryExA(NULL, p, NULL); return; }
     for (char *q = dir + 5; (q = strchr(q, '/')) != NULL; q++) {   /* past "ux0:/" */
         *q = 0; FtpCreateDirectoryA(c, dir); *q = '/';   /* already there is fine */
@@ -520,24 +522,40 @@ static void make_dirs(HINTERNET c, const char *remote) {
     FtpCreateDirectoryA(c, dir);
 }
 
+static char g_why[200];   /* put_file's reason when it fails */
+static void why_net(const char *what) {
+    DWORD e = GetLastError(), ext = 0, n = sizeof g_why;
+    char resp[160] = ""; DWORD rn = sizeof resp;
+    if (e == ERROR_INTERNET_EXTENDED_ERROR) InternetGetLastResponseInfoA(&ext, resp, &rn);
+    for (char *q = resp; *q; q++) if (*q == '\r' || *q == '\n') *q = ' ';
+    (void)n;
+    snprintf(g_why, sizeof g_why, "%s (error %lu%s%s)", what, (unsigned long)e, resp[0] ? ", the Vita said: " : "", resp);
+}
 static int put_file(HINTERNET c, const SendFile *f, char *buf, DWORD bufsz) {
+    g_why[0] = 0;
     HANDLE h = CreateFileA(f->local, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (h == INVALID_HANDLE_VALUE) {
+        snprintf(g_why, sizeof g_why, "this PC could not read %s (error %lu)", f->local, (unsigned long)GetLastError());
+        return 0;
+    }
     HINTERNET r = NULL; HANDLE o = INVALID_HANDLE_VALUE;
     if (c) r = FtpOpenFileA(c, f->remote, GENERIC_WRITE, FTP_TRANSFER_TYPE_BINARY, 0);
     else { char p[MAX_PATH + 300]; dest_path(p, sizeof p, f->remote);
            o = CreateFileA(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL); }
     int ok = c ? r != NULL : o != INVALID_HANDLE_VALUE;
+    if (!ok) { if (c) why_net("the Vita refused the file"); else snprintf(g_why, sizeof g_why, "could not create it (error %lu)", (unsigned long)GetLastError()); }
     DWORD got;
     while (ok && ReadFile(h, buf, bufsz, &got, NULL) && got) {
         for (DWORD off = 0; ok && off < got; ) {
             DWORD w = 0;
             ok = (c ? InternetWriteFile(r, buf + off, got - off, &w) : WriteFile(o, buf + off, got - off, &w, NULL)) && w;
+            if (!ok) { if (c) why_net("the connection dropped"); else snprintf(g_why, sizeof g_why, "writing failed (error %lu%s)",
+                           (unsigned long)GetLastError(), GetLastError() == ERROR_DISK_FULL ? ", the memory card is full" : ""); }
             off += w; g_send.sent += w;
         }
     }
     CloseHandle(h);
-    if (r && !InternetCloseHandle(r)) ok = 0;
+    if (r && !InternetCloseHandle(r)) { if (ok) why_net("the Vita did not finish the file"); ok = 0; }
     if (o != INVALID_HANDLE_VALUE && !CloseHandle(o)) ok = 0;
     return ok;
 }
@@ -557,7 +575,7 @@ static void send_all(void) {
         c = net ? InternetConnectA(net, g_send.ip, FTP_PORT, NULL, NULL, INTERNET_SERVICE_FTP,
                                    INTERNET_FLAG_PASSIVE, 0) : NULL;
     }
-    g_rdir[0] = 0;
+    g_rdir[0] = 0; g_made[0] = 0;
     if (!to_dir && !c) {
         ok = 0;
         snprintf(g_send.msg, sizeof g_send.msg, "Could not reach the Vita at %s. Is its FTP server on "
@@ -574,13 +592,22 @@ static void send_all(void) {
         for (int i = 0; i < n && ok; i++) {
             g_send.file = i;
             if (already_there(c, &files[i])) { g_send.sent += files[i].size; g_send.skipped++; continue; }
+            long long sent0 = g_send.sent;
             make_dirs(c, files[i].remote);
             ok = put_file(c, &files[i], buf, sizeof buf);
+            if (!ok && c) {   /* once more on a fresh connection (a Wi-Fi drop, a server that lost its place) */
+                InternetCloseHandle(c);
+                c = InternetConnectA(net, g_send.ip, FTP_PORT, NULL, NULL, INTERNET_SERVICE_FTP, INTERNET_FLAG_PASSIVE, 0);
+                g_send.sent = sent0; g_made[0] = 0; g_rdir[0] = 0;
+                if (c) { make_dirs(c, files[i].remote); ok = put_file(c, &files[i], buf, sizeof buf); }
+                else snprintf(g_why, sizeof g_why, "the Vita stopped answering");
+            }
             if (ok) moved += files[i].size;
             if (!ok) snprintf(g_send.msg, sizeof g_send.msg, to_dir
-                              ? "Copying %s failed. Is the memory card still connected, with enough free space?"
-                              : "Sending %s failed. Check the Wi-Fi and the free space on the memory card, and try again "
-                                "(files already sent are skipped).", files[i].remote + 5);
+                              ? "Copying %s failed: %s. Is the memory card still connected, with enough free space?"
+                              : "Sending %s failed: %s. Check the Wi-Fi, keep the Vita awake (Settings > Power Save: "
+                                "auto-standby off), and try again (files already sent are skipped).",
+                              files[i].remote + 5, g_why[0] ? g_why : "unknown reason");
         }
         char skip[96] = "";
         if (g_send.skipped) snprintf(skip, sizeof skip, " (%d game file%s already there, skipped)", g_send.skipped,

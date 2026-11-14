@@ -208,7 +208,8 @@ static int big_take(size_t n, size_t *got) {
 }
 
 /* ---- pointer map ----------------------------------------------------------- */
-typedef struct { void *p; uint32_t start; uint32_t big; size_t req; void *caller; } Rec;   /* big = pages*4K or 0 */
+typedef struct { void *p; uint32_t start; uint32_t big; size_t req; void *caller, *caller2; } Rec;
+static __thread void *sh_caller2;   /* the game call site's own caller (big-block census) */   /* big = pages*4K or 0 */
 static Rec *map; static uint32_t mapcap, mapused, maptomb;
 #define TOMB ((void *)1)
 static uint32_t hidx(void *p) { return (uint32_t)(((uintptr_t)p >> 3) * 2654435761u); }
@@ -249,7 +250,7 @@ static void sh_init(void) {
 
 /* the model's placement for a new block of n bytes: 0 = could not place */
 static int place(void *p, size_t n, void *caller) {
-    Rec r; memset(&r, 0, sizeof r); r.p = p; r.req = n; r.caller = caller;
+    Rec r; memset(&r, 0, sizeof r); r.p = p; r.req = n; r.caller = caller; r.caller2 = sh_caller2;
     size_t got = 0; int ok = 0;
     if (n >= sh_bigmin && big_take(n, &got)) { r.big = (uint32_t)got; ok = 1; }
     if (!ok) {
@@ -353,9 +354,9 @@ char *sim_strdup_at(const char *s, void *caller) {
     return d;
 }
 /* what sim_pre.h's macros call: the return address is the game's call site */
-__attribute__((noinline)) void *sim_malloc(size_t n) { return sim_malloc_at(n, __builtin_return_address(0)); }
-__attribute__((noinline)) void *sim_calloc(size_t c, size_t n) { return sim_calloc_at(c, n, __builtin_return_address(0)); }
-__attribute__((noinline)) void *sim_realloc(void *q, size_t n) { return sim_realloc_at(q, n, __builtin_return_address(0)); }
+__attribute__((noinline)) void *sim_malloc(size_t n) { sh_caller2 = __builtin_return_address(1); return sim_malloc_at(n, __builtin_return_address(0)); }
+__attribute__((noinline)) void *sim_calloc(size_t c, size_t n) { sh_caller2 = __builtin_return_address(1); return sim_calloc_at(c, n, __builtin_return_address(0)); }
+__attribute__((noinline)) void *sim_realloc(void *q, size_t n) { sh_caller2 = __builtin_return_address(1); return sim_realloc_at(q, n, __builtin_return_address(0)); }
 __attribute__((noinline)) char *sim_strdup(const char *s) { return sim_strdup_at(s, __builtin_return_address(0)); }
 
 /* walks every chunk below brk: headers, free-chunk footers, coalescing and
@@ -470,5 +471,28 @@ void sim_heap_report(const char *label, int detail) {
         sh_name(top_holder, nm, sizeof nm);
         printf("simheap   brk held by a %u B block from %s\n", (unsigned)top_req, nm);
         free(ag);
+    }
+    if (detail >= 2 && map) {   /* big blocks by call site pair (site <- its caller) */
+        typedef struct { void *a, *b; size_t bytes; uint32_t count; } BAgg;
+        uint32_t cap = 8192, nb = 0; BAgg *bg = (BAgg *)calloc(cap, sizeof *bg);
+        sh_lock();
+        for (uint32_t i = 0; bg && i < mapcap; i++) {
+            Rec *r = &map[i];
+            if (!r->p || r->p == TOMB || !r->big) continue;
+            uint32_t h = (uint32_t)((((uintptr_t)r->caller >> 2) ^ ((uintptr_t)r->caller2 * 31u)) * 2654435761u) & (cap - 1);
+            while ((bg[h].a || bg[h].b) && (bg[h].a != r->caller || bg[h].b != r->caller2)) h = (h + 1) & (cap - 1);
+            bg[h].a = r->caller; bg[h].b = r->caller2; bg[h].bytes += r->big; bg[h].count++;
+        }
+        sh_unlock();
+        if (bg) {
+            for (uint32_t i = 0; i < cap; i++) if (bg[i].a || bg[i].b) bg[nb++] = bg[i];
+            for (uint32_t i = 1; i < nb; i++) { BAgg t = bg[i]; uint32_t j = i; while (j && bg[j-1].bytes < t.bytes) { bg[j] = bg[j-1]; j--; } bg[j] = t; }
+            char n1[256], n2[256];
+            for (uint32_t i = 0; i < nb && i < 24; i++) {
+                sh_name(bg[i].a, n1, sizeof n1); sh_name(bg[i].b, n2, sizeof n2);
+                printf("simheap   big %6u KB in %5u: %s <- %s\n", (unsigned)(bg[i].bytes >> 10), bg[i].count, n1, n2);
+            }
+            free(bg);
+        }
     }
 }

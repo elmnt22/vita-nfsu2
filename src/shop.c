@@ -9,6 +9,7 @@
 #include "vinyl.h"
 #include "n2sim.h"
 #include "profile.h"
+#include "savenote.h"
 #include "pcsave.h"
 #include "career.h"
 #include "airace.h"
@@ -7265,18 +7266,21 @@ static int g_boot_load_done;   /* MC_Background's boot load runs once */
 /* realmc string N (1-based) of memcard/LOCALE_<LANGUAGE>.loc (MemoryCard::LoadLocale
    80105848: GetLanguageName, Chinese = ENGLISH -- no LOCALE_CHINESE): LOCL {tag, size,
    0, count, offsets from the tag}, UTF-16 */
-static const char *rmc_str(const Shop *s, int id) {
+static const char *rmc_str_root(const char *dataroot, int id);
+static const char *rmc_str(const Shop *s, int id) { return rmc_str_root(s->dataroot, id); }
+const char *shop_rmc_string(const char *dataroot, int id) { return rmc_str_root(dataroot, id); }   /* savenote.c */
+static const char *rmc_str_root(const char *dataroot, int id) {
     static char out[16][128];
     static int ok;
     if (!ok) {
         ok = 1;
         char path[600];
-        snprintf(path, sizeof path, "%s/memcard/LOCALE_%s.loc", s->dataroot,
+        snprintf(path, sizeof path, "%s/memcard/LOCALE_%s.loc", dataroot,
                  n2_lang() == 9 ? "ENGLISH" : k_n2_lang_name[n2_lang()]);
         FILE *f = fopen(path, "rb");
         if (!f) {   /* older installs copied LOCALE_ENGLISH.loc only */
             printf("shop: %s not found, English memcard text\n", path);
-            snprintf(path, sizeof path, "%s/memcard/LOCALE_ENGLISH.loc", s->dataroot);
+            snprintf(path, sizeof path, "%s/memcard/LOCALE_ENGLISH.loc", dataroot);
             f = fopen(path, "rb");
         }
         static unsigned char b[4096];
@@ -7386,7 +7390,7 @@ static int mc_quiet(const Shop *s) { return g_opt.autosave && s->mc_ret != SC_PR
 static void mc_write(Shop *s) {
     if (profile_save()) {
         if (mc_quiet(s)) mc_exit(s, 1);
-        else mc_rmc(s, RM_SAVED, 8, profile_name(), 1);           /* "Save complete." */
+        else { savenote_cancel(); mc_rmc(s, RM_SAVED, 8, profile_name(), 1); }   /* "Save complete." (the dialog says it, no corner note) */
     } else mc_rmc(s, RM_SAVE_FAIL, 9, profile_name(), 1);         /* "Unable to save %1." */
 }
 /* Save(name) 0x4d9b80 -> realmc 0x6fce82 */
@@ -9056,6 +9060,10 @@ static void kb_backspace(Shop *s) {
 static void kb_done(Shop *s) {
     if (kb_cursor(s) == 0) return;
     audio_fe_play(FE_SND_SELECT);
+    /* (port, user 11-14) a new profile starts with autosave on -- the original
+       starts it off (0x515aa0) and a freeze lost players' races; a name that
+       already has a save keeps its own setting */
+    if (!profile_exists(s->kb_text)) { g_opt.autosave = 1; options_save(); printf("memcard: new profile, autosave on%c", 10); }
     profile_set_name(s->kb_text);
     s->mc_view = MCV_MSG;
     mc_focus(s);
@@ -9826,7 +9834,7 @@ static void shop_input_screen(Shop *s, int key) {
     case SC_RIM_BRAND:
         if (key == SHOP_KEY_LEFT) scroller_move(&s->rims, -1);
         else if (key == SHOP_KEY_RIGHT) scroller_move(&s->rims, 1);
-        else if (key == SHOP_KEY_OK) { build_rims(s, s->rims.sel); s->screen = SC_RIMS; }
+        else if (key == SHOP_KEY_OK) { build_rims(s, s->rims.sel); s->screen = SC_RIMS; rim_preview(s, 0.0f); }   /* the highlighted rim on the car (11-14 player report) */
         else if (key == SHOP_KEY_BACK) {   /* CalcPrevScreenFromRimBrand 80160c78: UI_GenericParts_Browser */
             /* a new PartSelectionScreen: SetupBodyShop 80164368 with DAT_803d96e4
                (StartBrowsingWheels) snaps the category strip to Rims (0x1d), not
@@ -9858,6 +9866,7 @@ static void shop_input_screen(Shop *s, int key) {
                 s->prev_style = s->rim_style; s->rim_pending = 1; s->rim_debounce = 0.35f;
             }
             build_rims(s, s->rims.sel);
+            rim_preview(s, 0.35f);   /* then the new brand's highlighted rim, as Up / Down shows it */
         } else if (key == SHOP_KEY_OK && s->nparts > 0 && s->rim_nsizes[s->part_sel] > 0) {
             /* 0x567a50 -> 0x55fb00: the style's sizes, on the fitted one */
             s->size_mode = 1; s->size_sel = 0;

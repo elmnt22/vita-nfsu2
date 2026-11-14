@@ -1,5 +1,6 @@
 /* profile.c -- the player profile and its save files (see profile.h). */
 #include "profile.h"
+#include "savenote.h"
 #include "options.h"
 #include "career.h"
 #include "trophy.h"
@@ -254,6 +255,7 @@ int profile_save(void) {
     int ok = write_file(path, f, total);
     free(f); free(pay);
     printf("profile: %s %s (%ld bytes)\n", ok ? "saved" : "cannot save", g_name, total);
+    if (ok) savenote_saved();   /* the corner note (port addition, savenote.c) */
     return ok;
 }
 
