@@ -34,6 +34,7 @@ typedef struct {
 int world_tiles_ready(const char *trackname);
 #include "nfsu2.h"
 #include "world_instance.h"
+#include <SDL.h>
 /* 1 when the world should load from tiles (a tile set exists and
    ux0:data/NFSU2/notileload.txt does not). */
 int world_tiles_enabled(const char *trackname);
@@ -75,5 +76,10 @@ void world_tiles_migrate_start(void);
 int world_tiles_migrate_needed(void);
 int world_tiles_migrate_sync(WTileProgress *p);
 const char *world_tiles_migrate_track(void);
+/* Every stand-in (world role 2) at least minh tall in the track's tile set,
+   one tile at a time (any thread; skyline.c). Returns tiles read, -1 no set. */
+int world_tiles_each_standin(const char *track, float minh,
+                             void (*cb)(void *ctx, const N2Mesh *m), void *ctx,
+                             SDL_atomic_t *abort_flag);
 
 #endif

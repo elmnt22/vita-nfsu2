@@ -22,7 +22,7 @@ CFLAGS=(-O2 -g -fno-omit-frame-pointer -std=gnu99 -w -fno-strict-aliasing -DN2_G
 GAME_FLAGS=(-include "$ROOT/sim/include/sim_pre.h")
 
 SRC="src/main.c src/render.c src/physics.c src/n2sim.c src/wcoll.c src/carcoll.c src/airacer.c src/perfparts.c src/airace.c src/racepath.c src/style.c src/ai.c src/audio.c src/resource.c src/world.c
-     src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/jumpcam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/profile.c src/pcsave.c src/garage_line.c src/vinyl.c src/partanim.c src/smokeable.c src/worldanim.c src/career.c src/trophy.c src/movie.c src/mplay.c src/speech.c src/tuning.c src/replay.c src/rain.c src/reverb.c src/savenote.c"
+     src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/jumpcam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/profile.c src/pcsave.c src/garage_line.c src/vinyl.c src/partanim.c src/smokeable.c src/skyline.c src/worldanim.c src/career.c src/trophy.c src/movie.c src/mplay.c src/speech.c src/tuning.c src/replay.c src/rain.c src/reverb.c src/savenote.c"
 
 OBJS=(); pids=()
 # SIM_JOBS=N caps parallel compiles (0/unset = all at once) -- share RAM with other sessions' builds

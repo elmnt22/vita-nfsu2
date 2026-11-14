@@ -950,6 +950,10 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
     ok = world_texture_decode(w, g, tk, &tt, pass);
     noisy = ok && n2_tex_noise(&tt);
 #endif
+    if (ok && !noisy && owner && owner->world_role == 2) {
+        extern void skyline_texavg_note(uint32_t key, const N2Tex *t);
+        skyline_texavg_note(tk, &tt);   /* the far skyline's flat colour (skyline.c) */
+    }
     if (ok && !noisy) {
 #ifdef __vita__
         /* Upload the original DXT blocks, not the CPU-decoded RGB: 4-8x less

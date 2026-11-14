@@ -319,6 +319,11 @@ void render_mesh_normals(const N2Mesh *m, float *nor);
    bounds, prepared off the render thread so batch upload only copies. */
 typedef struct { BatchedVertex *v; float bb[6]; unsigned char borrowed, hash_valid; uint64_t hash[2]; } PackedMesh;
 int  render_pack_mesh(const N2Mesh *m, PackedMesh *out);    /* 1 = ok */
+/* Vita: drop CPU batch copies whose GPU buffers now exist (keeps bb/hash) */
+void render_world_packed_trim(const N2Scene *s);
+void render_world_packed_trim_flush(void);
+/* Vita worker: pack the meshes of planned batches the GPU does not hold (see render.c) */
+int render_world_plan_fill(WorldBatchUpload *j);
 /* Apply upload_tex's 64px+ box halving ahead of time (any thread). */
 void render_prehalve_tex(N2Tex *t);
 extern int g_world_dxt;

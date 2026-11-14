@@ -51,6 +51,7 @@ typedef struct {
     void *verts, *idx, *vcol, *packed;
     float packed_bb[6];
     uint64_t packed_hash[2];
+    unsigned char packed_hashed;   /* bb/hash valid even after packed was freed (Vita, 11-14) */
     N2GeomBlock *block;   /* non-NULL: verts/idx/vcol and this record live in it */
 } N2SharedGeometry;
 static void n2_block_free(N2GeomBlock *b) { free(b->data); free(b->geoms); free(b); }

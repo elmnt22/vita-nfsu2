@@ -338,6 +338,12 @@ static int resident_worker_precompute(WorldResident *candidate) {
     free(logical); free(modes);
     VMARK("  worker: batch plan %s in %u ms",r->cpu_plan ? "prepared" : "fallback",
         (unsigned)((SDL_GetPerformanceCounter()-plan_begin)*1000/SDL_GetPerformanceFrequency()));
+    if (r->cpu_plan) {
+        Uint64 f0=SDL_GetPerformanceCounter();
+        int filled=render_world_plan_fill(r->cpu_plan);
+        VMARK("  worker: %d meshes packed for batches the GPU lacks, %u ms",filled,
+            (unsigned)((SDL_GetPerformanceCounter()-f0)*1000/SDL_GetPerformanceFrequency()));
+    }
     extern void vita_mark_stats(void);
     vita_mark_stats();
     if (world_build_aborted()) return 0;
@@ -692,6 +698,8 @@ static int resident_resources_step(WorldResidentResources *resources,
     }
     resident_free_normals(resources);
     hitch_mark("fin.free_normals");
+    render_world_packed_trim(&neighborhood->scene);
+    hitch_mark("fin.packed_trim");
     if (include_vista && !resident_vista_batches(resources, neighborhood)) goto fail;
     hitch_mark("fin.vista");
 
@@ -1009,6 +1017,7 @@ static int resident_worker(void *data) {
     WResidentJob *job = data;
 #ifdef __vita__
     extern void vita_heap_report(const char *label);
+    render_world_packed_trim_flush();
     vita_heap_report("at build start");
 #endif
     job->ok = world_resident_prepare(job->candidate, &job->args,

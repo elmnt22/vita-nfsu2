@@ -56,6 +56,7 @@
 #include "style.h"
 #include "chasecam.h"
 #include "jumpcam.h"
+#include "skyline.h"
 static int n2_find_record(const unsigned char *g, long len, const char *name, unsigned char *out);
 #include "ai.h"
 #include "audio.h"
@@ -553,7 +554,36 @@ static long g_simgate[2][5];   /* test aid: in-view batches by distance band (ot
 #endif
 /* Far LOD stand-ins draw out to here (horizontal distance to the batch box),
    past the 300 m view distance of the rest; the far plane stays beyond it. */
-#define WORLD_STANDIN_GATE 500.0f
+#define WORLD_STANDIN_GATE_M 650.0f   /* 11-14: 500 -> 650 with the far ring 192 -> 320 m (world_tiles.c) */
+static float standin_gate(void) {   /* ux0:data/NFSU2/sigate.txt "<m>" or OPENUG2_SIGATE: A/B runs */
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        v = WORLD_STANDIN_GATE_M;
+        const char *e = getenv("OPENUG2_SIGATE");
+        FILE *f = e ? NULL : fopen("ux0:data/NFSU2/sigate.txt", "r");
+        if (e) v = (float)atof(e);
+        else if (f) { float t; if (fscanf(f, "%f", &t) == 1) v = t; fclose(f); }
+        if (v < 300.0f) v = 300.0f; if (v > 1000.0f) v = 1000.0f;
+    }
+    return v;
+}
+#define WORLD_STANDIN_GATE standin_gate()
+/* metres of reach per metre of stand-in batch height (sik.txt / OPENUG2_SIK; 0 = every
+   stand-in to WORLD_STANDIN_GATE, the 11-14 noon behaviour) */
+#define WORLD_STANDIN_K 14.0f
+static float standin_k(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        v = WORLD_STANDIN_K;
+        const char *e = getenv("OPENUG2_SIK");
+        FILE *f = e ? NULL : fopen("ux0:data/NFSU2/sik.txt", "r");
+        if (e) v = (float)atof(e);
+        else if (f) { float t; if (fscanf(f, "%f", &t) == 1) v = t; fclose(f); }
+        if (v <= 0.0f) v = 1000.0f;
+        printf("world: stand-ins reach %.0f m per metre of height, to %.0f m\n", (double)v, (double)standin_gate());
+    }
+    return v;
+}
 static int g_fog_linear;               /* fog_density is the regional linear fog's 1/(250-start) */
 static long g_refl_batches;            /* reflective batches drawn, for the 60-frame log */
 extern int vita_gfx_mode;
@@ -14207,6 +14237,23 @@ static int world_flares_sections(const float eye[3], const short **list)
 {
     return g_wcoll ? wcoll_visible_sections(g_wcoll, eye, list) : -2;
 }
+/* skyline.c draw callbacks (the world pass state they touch) */
+typedef struct { const float (*planes)[4]; GLint uUseTex, uColor, uAlphaTest; GLuint *lasttex; int *lastmode; int begun; } SkyDrawCtx;
+static int world_box_in_view(const float planes[6][4], const float lo[3], const float hi[3]);
+static int sky_in_view(const float lo[3], const float hi[3], void *ctx) {
+    return world_box_in_view((const float (*)[4])((SkyDrawCtx *)ctx)->planes, lo, hi);
+}
+static void sky_begin(void *ctx) {
+    SkyDrawCtx *c = (SkyDrawCtx *)ctx;
+    static int tint = -1;   /* test aid: OPENUG2_SKYLINE_TINT draws the skyline red */
+    if (tint < 0) tint = getenv("OPENUG2_SKYLINE_TINT") != NULL;
+    glUniform1f(c->uUseTex, 0.0f); glUniform3f(c->uColor, 1.0f, tint ? 0.15f : 1.0f, tint ? 0.15f : 1.0f); *c->lasttex = 0;
+    if (*c->lastmode != N2_DRAW_OPAQUE) { glUniform1f(c->uAlphaTest, 0.0f); *c->lastmode = N2_DRAW_OPAQUE; }
+    glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(2.0f, 8.0f);
+    if (tint) { const char *t = getenv("OPENUG2_SKYLINE_TINT"); if (t[0] == '2') glDisable(GL_DEPTH_TEST); }   /* =2: over everything */
+    c->begun = 1;
+}
+
 int main(int argc, char **argv) {
     world_region_hook = world_flares_hook;
     if (!getenv("OPENUG2_FLARE_OLDPICK")) aciddraw_world_flares_sections(world_flares_sections);   /* test aid: A/B the old 200 m pick */
@@ -19686,6 +19733,7 @@ int main(int argc, char **argv) {
             smk_free();
             wa_free();
             world_tiles_reset();
+            skyline_reset();
             world_texture_cache_clear();
             res_unpin();
             world_instance_library_release();
@@ -24332,7 +24380,9 @@ int main(int argc, char **argv) {
            10000+; the fog-off 2000 m covers the strips and is cheap there
            (opaque world ~0.5 ms). */
         if (!g_fog_linear) zfar = 2000.0f;
-        if (zfar < WORLD_STANDIN_GATE + 200.0f) zfar = WORLD_STANDIN_GATE + 200.0f;   /* a stand-in tile reaching past the gate is not sliced */
+        if (zfar < WORLD_STANDIN_GATE + 400.0f) zfar = WORLD_STANDIN_GATE + 400.0f;
+        {   int nsk = 0; skyline_batches(&nsk);   /* the resident skyline (skyline.c) reaches farther */
+            if (nsk && g_fog_linear && zfar < skyline_outer() + 200.0f) zfar = skyline_outer() + 200.0f; }   /* a stand-in batch reaching past the gate is not sliced (256 m stand-in cells: diagonal 362 m) */
         /* Retail far clip (eViewPlatInfo::CalculateViewMatricies 0x5c7ec0): player
            view 1 -- the view the NIS cameras drive too -- uses 15000 m outright
            (other views take Camera +0xc0, 10000 from CameraMover's ctor 0x44ab90;
@@ -25447,7 +25497,15 @@ int main(int argc, char **argv) {
 #endif
             /* the gate: stand-ins (N2Batch.tall = every far LOD stand-in) reach
                WORLD_STANDIN_GATE, the rest the view distance */
-            float gate = b->tall && tall_on ? WORLD_STANDIN_GATE : VIEW_DIST + view_ext;
+            float gate = VIEW_DIST + view_ext;
+            if (b->tall && tall_on) {
+                /* the skyline by height: a stand-in batch reaches SIK x its box
+                   height, between the view distance and WORLD_STANDIN_GATE --
+                   towers to 650 m, low blocks end with the rest (hwlog51: the
+                   650 m gate for every stand-in doubled the missed frames) */
+                float g = standin_k() * (b->bbox_max[2] - b->bbox_min[2]);
+                gate = g > WORLD_STANDIN_GATE ? WORLD_STANDIN_GATE : g > gate ? g : gate;
+            }
             if (dx*dx + dy*dy > gate*gate) {
                 far_meshes += b->nmesh; far_batches++;
                 for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
@@ -25553,6 +25611,25 @@ int main(int argc, char **argv) {
         }
         (void)cur_refl;
         #endif
+        /* the resident skyline (skyline.c): cells wholly past skyline_inner(),
+           flat-coloured, pushed back a little in depth so a streamed stand-in
+           of the same building wins where both draw */
+        if (g_dbg.show_track && passmode == 0 && tall_on && VITA_PROBE(2)) {
+            static int sky_logn; static long sky_drawn, sky_frames;
+            if (resident_args.trackname) skyline_start(resident_args.trackname);
+            skyline_pump();
+            int nsk = 0; skyline_batches(&nsk);
+            if (nsk) {
+                SkyDrawCtx sc = { world_planes, uUseTex, uColor, rp.uAlphaTest, &lasttex, &lastmode, 0 };
+                int d = skyline_draw(cam, sky_in_view, &sc, sky_begin);
+                if (sc.begun) { glDisable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(0.0f, 0.0f); glEnable(GL_DEPTH_TEST); }
+                sky_drawn += d; g_dbg.drawn += d;
+                if (++sky_frames >= 600) {
+                    if (sky_logn++ < 400) printf("skyline: %.1f draws/frame (%d blocks)\n", (double)sky_drawn / (double)sky_frames, nsk);
+                    sky_drawn = sky_frames = 0;
+                }
+            }
+        }
         WT_MARK(4);
         if (ndefcut && VITA_PROBE(3)) {
             /* Nearest first. A discarding draw cannot be hidden-surface

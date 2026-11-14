@@ -804,6 +804,12 @@ static void wt_src_close(WtSrc *s) {
     g_wt_last_io_ms = wt_ms();
 }
 
+#ifdef OPENUG2_SIM_PRE_H
+static int g_tilestat_tex[4];
+static int wt_read_decode(const char *track, int tx, int ty, WtLoaded *out, int ground);
+static void wt_release(WtLoaded *t);
+static int wt_ground_cat(int cat);
+#endif
 static int wt_index_load(const char *track) {
     if (g_wt_index && !strcmp(g_wt_track, track)) return 1;
     free(g_wt_index); g_wt_index = NULL; g_wt_nindex = 0;
@@ -812,6 +818,55 @@ static int wt_index_load(const char *track) {
     WtPackTab *t = wt_pack_probe(track, 0);
     printf("world tiles: %s index %d tiles, %s\n", track, g_wt_nindex,
            t ? "pack" : "loose files (no pack yet)");
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_TILESTAT -- the whole set's geometry by role and,
+           for the far stand-ins, by height (for an always-resident skyline estimate) */
+        static int done;
+        if (!done && getenv("OPENUG2_TILESTAT")) {
+            done = 1;
+            static const float HB[] = { 10, 15, 20, 25, 30, 40, 60, 1e9f };
+            enum { NB = 8 };
+            long long rv[3] = {0}, rb[3] = {0}, rm[3] = {0}, hv[NB] = {0}, hb[NB] = {0}, hm[NB] = {0};
+            long long texs = 0; int tiles_si = 0;
+            for (int i = 0; i < g_wt_nindex; i++) {
+                WtLoaded L;
+                if (!wt_read_decode(track, g_wt_index[i].x, g_wt_index[i].y, &L, 0)) continue;
+                int had = 0;
+                for (int k = 0; k < L.n; k++) {
+                    const N2Mesh *m = &L.m[k];
+                    if (wt_ground_cat(m->cat)) continue;
+                    int r = m->world_role > 2 ? 0 : m->world_role;
+                    long long b = (long long)m->nverts * 28 + (long long)m->nidx * 2;
+                    rv[r] += m->nverts; rb[r] += b; rm[r]++;
+                    if (r == 2 && m->world_bounds_valid) {
+                        float h = m->world_bounds[5] - m->world_bounds[2];
+                        int q = 0; while (q < NB - 1 && h >= HB[q]) q++;
+                        hv[q] += m->nverts; hb[q] += b; hm[q]++; had = 1;
+                        for (int c = 0; c < 4; c++) {   /* distinct textures of the >= 20/25/30/40 m sets */
+                            static const float th[4] = { 20, 25, 30, 40 };
+                            static uint32_t tk[4][8192]; static int ntk[4];
+                            if (h < th[c]) continue;
+                            int f = 0; for (int z = 0; z < ntk[c] && !f; z++) f = tk[c][z] == m->texkey;
+                            if (!f && ntk[c] < 8192) tk[c][ntk[c]++] = m->texkey;
+                            g_tilestat_tex[c] = ntk[c];
+                        }
+                    }
+                }
+                tiles_si += had; (void)texs;
+                wt_release(&L);
+            }
+            static const char *rn[3] = { "drawn", "collision", "stand-in" };
+            for (int r = 0; r < 3; r++)
+                printf("tilestat %s: role %s %lld meshes, %lld verts, %lld KB (GPU layout)\n", track, rn[r], rm[r], rv[r], rb[r] >> 10);
+            for (int q = 0; q < NB; q++)
+                printf("tilestat %s: stand-ins height %s%.0f m: %lld meshes, %lld verts, %lld KB\n", track,
+                       q ? ">=" : "<", (double)(q ? HB[q-1] : HB[0]), hm[q], hv[q], hb[q] >> 10);
+            printf("tilestat %s: %d of %d tiles have stand-ins\n", track, tiles_si, g_wt_nindex);
+            printf("tilestat %s: distinct stand-in textures >=20 m %d, >=25 m %d, >=30 m %d, >=40 m %d\n", track,
+                   g_tilestat_tex[0], g_tilestat_tex[1], g_tilestat_tex[2], g_tilestat_tex[3]);
+        }
+    }
+#endif
     return 1;
 }
 
@@ -899,7 +954,7 @@ static int wt_reduced_keep(int mode, int cat, int role, const float *wb) {
 }
 /* The far ring: tiles this far past the ground reach contribute their
    stand-ins only. ux0:data/NFSU2/farring.txt = metres (0 = off). */
-#define WT_FAR_EXTRA_M 192.0f
+#define WT_FAR_EXTRA_M 192.0f   /* 11-14: 320 m tried (run G: heap 110/115 MB, GPU hang after 18 min) -- back to 192 */
 static float wt_far_extra(void) {
     static float v = -1.0f;
     if (v < 0.0f) {
@@ -2184,4 +2239,39 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
     wt_preload_after(track, fx, fy, radius);
     VMARK("  tiles assembled: %d meshes, %ld new tiles", scene->count, loaded_now);
     return scene->count;
+}
+
+/* Every stand-in of the track at least minh tall, tile by tile, for the
+   always-resident skyline (skyline.c). Its own index copy, the preload's pack
+   handle slot (a second handle if that is busy) and plain allocations, so it
+   runs beside the loader and the read-ahead; a short pause per tile leaves
+   the card to the streaming. Returns the tiles read, -1 without a tile set. */
+int world_tiles_each_standin(const char *track, float minh,
+                             void (*cb)(void *ctx, const N2Mesh *m), void *ctx,
+                             SDL_atomic_t *abort_flag) {
+    WtIndexEntry *idx = NULL; int n = 0;
+    if (!wt_index_read(track, &idx, &n)) return -1;
+    int read = 0;
+    for (int i = 0; i < n; i++) {
+        if (abort_flag && SDL_AtomicGet(abort_flag)) break;
+        if (idx[i].x == -32768) continue;   /* the track's global entry */
+        long len = 0; int packed = 0;
+        unsigned char *data = wt_fetch(track, idx[i].x, idx[i].y, 2, NULL, &len, &packed);
+        if (!data) continue;
+        WtLoaded L;
+        int ok = wt_decode(data, len, idx[i].x, idx[i].y, &L, NULL, WT_FAR_ONLY);
+        free(data);
+        if (!ok) continue;
+        read++;
+        for (int k = 0; k < L.n; k++) {
+            const N2Mesh *m = &L.m[k];
+            if (m->world_role != 2 || !m->world_bounds_valid) continue;
+            if (m->world_bounds[5] - m->world_bounds[2] < minh) continue;
+            cb(ctx, m);
+        }
+        wt_release(&L);
+        SDL_Delay(4);
+    }
+    free(idx);
+    return read;
 }
