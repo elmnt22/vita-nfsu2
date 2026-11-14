@@ -314,6 +314,7 @@ void audio_set_speech_level(float v);
 /* GameFlow state 3 (front end) vs in game: picks the music channel and which
    speech duck events fire (SFXObj_Speech fields 0 / 1) */
 void audio_set_frontend(int fe);
+void audio_fe_quiet(int on);   /* 1: no game sound (engine, tyres, fx) under a front-end screen */
 /* the current speech ducks in mB (music, FE sounds), for logs */
 void audio_duck_levels(int *mus, int *fe);
 float audio_speech_gain(void);

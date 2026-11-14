@@ -545,6 +545,42 @@ static float poly_z(const Poly *o, const float *p)
     return (-1.0f / o->n[2]) * ((o->n[0] * p[0] + o->n[1] * p[1]) - o->d);
 }
 
+/* (port) the 2D footprints of a barrier group's polygons, for the GPS route
+   search: per polygon its two vertices farthest apart in xy (x0 y0 x1 y1),
+   duplicates (the x20..x39 collision copies) dropped */
+int wcoll_group_walls(const WColl *w, const char *name, float *seg, int max)
+{
+    if (!w || !name || !seg || max < 1) return 0;
+    uint32_t h = str_hash(name);
+    int gi = -1, n = 0;
+    for (int i = 1; i < w->ngroups && gi < 0; i++) if (w->groups[i].hash == h) gi = i;
+    if (gi < 0) return 0;
+    for (int pk = 0; pk < w->npacks; pk++) {
+        const Pack *k = &w->packs[pk];
+        for (int pi = 0; pi < k->npoly && n < max; pi++) {
+            const unsigned char *q = k->poly + 32 * pi;
+            if (q[0] != gi) continue;
+            Poly o;
+            poly_expand(q, &o);
+            int a = 0, b = 1; float best = -1.0f;
+            for (int i = 0; i < o.nv; i++)
+                for (int j = i + 1; j < o.nv; j++) {
+                    float dx = o.v[j][0] - o.v[i][0], dy = o.v[j][1] - o.v[i][1], d = dx * dx + dy * dy;
+                    if (d > best) { best = d; a = i; b = j; }
+                }
+            float s[4] = { o.v[a][0], o.v[a][1], o.v[b][0], o.v[b][1] };
+            int dup = 0;
+            for (int i = 0; i < n && !dup; i++) {
+                const float *t = seg + 4 * i;
+                dup = (t[0] == s[0] && t[1] == s[1] && t[2] == s[2] && t[3] == s[3]) ||
+                      (t[0] == s[2] && t[1] == s[3] && t[2] == s[0] && t[3] == s[1]);
+            }
+            if (!dup) { memcpy(seg + 4 * n, s, sizeof s); n++; }
+        }
+    }
+    return n;
+}
+
 static void push_cache(WCollCtx *c, int poly)
 {
     int n = c->ncache + 1;

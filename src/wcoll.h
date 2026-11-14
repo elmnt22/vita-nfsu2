@@ -48,6 +48,9 @@ void wcoll_ctx_init(WCollCtx *c);
 int  wcoll_enable_group(WColl *w, const char *name);
 void wcoll_clear_groups(WColl *w);
 const char *wcoll_poly_group(const WColl *w, int id);   /* diagnostics */
+/* (port) the xy footprints (x0 y0 x1 y1 per wall) of a group's polygons, for
+ * the GPS route search to keep out of the lock walls. Returns the count. */
+int  wcoll_group_walls(const WColl *w, const char *name, float *seg, int max);
 
 /* VisibleSectionManager::FindDrivableSection 0x5e00d0: the visible-section
  * list (chunk 0x34153) of the drivable section under p (xy). Returns its

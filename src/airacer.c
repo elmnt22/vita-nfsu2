@@ -6883,7 +6883,35 @@ struct AiGps {
     PfNode node;               /* +0x3f0 (+0x400 its target) */
     AiWorld *w; AiRacer *r;    /* r->L: the GPS FuturePoints +0x4b0 (+0xac set) */
     float  halfwid;            /* 0x5ec250: half the car-space box's width */
+    float *walls; int nwalls;  /* (port) the career lock walls' xy footprints (x0 y0 x1 y1) */
 };
+/* (port) the search keeps out of the stage's lock walls (BARRIERS_CAREER<n>):
+   the original's road net has no closures for them, so its A* would send the
+   player into a wall (the stage-0 drive from the airport). A road hop p -> q
+   that crosses one is a dead end, like a Stop link. Set by pf_service. */
+static const float *pf_walls; static int pf_nwalls;
+static int pf_seg_cross(float ax, float ay, float bx, float by, const float *w)
+{
+    float rx = bx - ax, ry = by - ay, sx = w[2] - w[0], sy = w[3] - w[1];
+    float den = rx * sy - ry * sx;
+    if (fabsf(den) < 1e-6f) return 0;                                   /* parallel: along the wall, not through it */
+    float qx = w[0] - ax, qy = w[1] - ay;
+    float t = (qx * sy - qy * sx) / den, u = (qx * ry - qy * rx) / den;
+    float slack = 1.0f / (sqrtf(sx * sx + sy * sy) + 1e-3f);           /* 1 m past the wall's ends */
+    return t >= 0.0f && t <= 1.0f && u >= -slack && u <= 1.0f + slack;
+}
+static int pf_blocked(Pt *p, Pt *q)
+{
+    if (!pf_nwalls || !p || !q) return 0;
+    float ax = pt_x(p), ay = pt_y(p), bx = pt_x(q), by = pt_y(q);
+    float mnx = fminf(ax, bx) - 2.0f, mxx = fmaxf(ax, bx) + 2.0f, mny = fminf(ay, by) - 2.0f, mxy = fmaxf(ay, by) + 2.0f;
+    for (int i = 0; i < pf_nwalls; i++) {
+        const float *w = pf_walls + 4 * i;
+        if (fmaxf(w[0], w[2]) < mnx || fminf(w[0], w[2]) > mxx || fmaxf(w[1], w[3]) < mny || fminf(w[1], w[3]) > mxy) continue;
+        if (pf_seg_cross(ax, ay, bx, by, w)) return 1;
+    }
+    return 0;
+}
 
 static PfNode *pf_alloc(AiGps *g)
 {
@@ -6978,11 +7006,11 @@ static void pf_figure(PfNode *N, const AiNet *n, int P)
             continue;
         }
         int nd = (int)(f >> 23 & 1) != N->dir;
-        if (lk_always(l, P)) { pf_addsucc(N, n, lk_pt(n, l), nd, l, P); return; }
-        if (!lk_ignore(l, P) && !lk_never(l, P)) pf_addsucc(N, n, lk_pt(n, l), nd, l, P);
+        if (lk_always(l, P)) { if (!pf_blocked(N->cur, lk_pt(n, l))) pf_addsucc(N, n, lk_pt(n, l), nd, l, P); return; }
+        if (!lk_ignore(l, P) && !lk_never(l, P) && !pf_blocked(N->cur, lk_pt(n, l))) pf_addsucc(N, n, lk_pt(n, l), nd, l, P);
     }
     Pt *q = pt_next(n, N->cur, N->dir != 0);
-    if (q && N->nsucc < 3) {
+    if (q && N->nsucc < 3 && !pf_blocked(N->cur, q)) {
         N->succ[(int)N->nsucc].pt = q;
         N->succ[(int)N->nsucc].dir = N->dir != 0;
         N->succ[(int)N->nsucc].dec = 0xffff;
@@ -7030,12 +7058,15 @@ static void pf_traverse(PfNode *N, const AiNet *n, int P)
         if (stop || !N->cur) continue;
         if (must) {
             Pt *q = lk_pt(n, must);
+            if (pf_blocked(p, q)) { N->cur = NULL; break; }             /* (port) a lock wall */
             N->g = pt_travel(n, p, q, N->dir == 0) + N->g;
             N->cur = q;
             N->dir ^= (char)(lk_flags(must) >> 23 & 1);
         } else {
+            Pt *q = pt_next(n, p, N->dir != 0);
+            if (pf_blocked(p, q)) { N->cur = NULL; break; }             /* (port) a lock wall */
             N->g = (N->dir ? pt_seglen(p) : pt_prevseglen(n, p)) + N->g;   /* 0x401a30 */
-            N->cur = pt_next(n, p, N->dir != 0);
+            N->cur = q;
         }
     }
     pf_estimate(N);
@@ -7179,6 +7210,10 @@ static void pf_astar(AiGps *g, uint64_t t0)
 static void pf_service(AiGps *g)
 {
     uint64_t t0 = SDL_GetPerformanceCounter();
+    pf_walls = g->walls; pf_nwalls = g->nwalls;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_GPSNOWALLS")) pf_nwalls = 0;   /* test aid: the original's search (A/B) */
+#endif
     if (g->state == 1) pf_build(g, t0);
     if (g->state == 2 && g->algorithm == 1) pf_astar(g, t0);
     if (g->state != 3) return;
@@ -7226,9 +7261,32 @@ void aigps_free(AiGps *g)
     if (!g) return;
     if (g->r) { fl_reset(&g->r->L); free(g->r); }
     aiworld_free(g->w);
+    free(g->walls);
     free(g);
 }
 void aigps_set_halfwidth(AiGps *g, float half_wid) { if (g && 0 < half_wid) g->halfwid = half_wid; }
+void aigps_set_walls(AiGps *g, const float *seg, int n)
+{
+    if (!g) return;
+    free(g->walls); g->walls = NULL; g->nwalls = 0;
+    if (n > 0 && seg && (g->walls = (float *)malloc(sizeof(float) * 4 * (size_t)n)) != NULL) {
+        memcpy(g->walls, seg, sizeof(float) * 4 * (size_t)n); g->nwalls = n;
+    }
+}
+int aigps_path_wall_hits(const AiGps *g)
+{
+    if (!g || !g->nwalls) return 0;
+    int n = aigps_path(g, NULL, 0), hits = 0;
+    if (n < 2) return 0;
+    float *xyz = (float *)malloc(sizeof(float) * 3 * (size_t)n);
+    if (!xyz) return 0;
+    n = aigps_path(g, xyz, n);
+    for (int i = 0; i + 1 < n; i++)
+        for (int k = 0; k < g->nwalls; k++)
+            if (pf_seg_cross(xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 3], xyz[3 * i + 4], g->walls + 4 * k)) { hits++; break; }
+    free(xyz);
+    return hits;
+}
 /* 0x40c440 SubmitRequest(pos, dir, target, postedness 2, algorithm 1, car):
    only when the manager is idle */
 void aigps_submit(AiGps *g, const float pos[3], const float fwd[2], const float target[3])

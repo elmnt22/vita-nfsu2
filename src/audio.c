@@ -1476,6 +1476,11 @@ static MixEvt g_evt_mus_fe = { -810, 0x8005, 0x8011 },   /* evt 11 -> Music ch0 
 volatile int g_speech_state;
 static volatile int g_fe_side = 1;
 void audio_set_frontend(int fe) { g_fe_side = fe ? 1 : 0; }
+/* the front end (title, main menu, shops, crib) has no game sound: only its
+   own sounds, the speech and the music, as the pause menu (the dyno run under
+   its chart screen excepted -- main.c decides) */
+static volatile int g_fe_quiet;
+void audio_fe_quiet(int on) { g_fe_quiet = on ? 1 : 0; }
 static void evt_atr(MixEvt *e, int trig) {   /* UpdateATREvent */
     float A = (float)(e->att & 0xfff) * 16.666670f, R = (float)(e->rel & 0xfff) * 16.666670f, x;
     unsigned w;
@@ -1668,7 +1673,7 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
     if (!g_lv_stereo)   /* Mono: both channels the songs' mid */
         for (int i = 0; i < n; i++) mus[i * 2] = mus[i * 2 + 1] = 0.5f * (mus[i * 2] + mus[i * 2 + 1]);
     const float lvsp = SPEECH_MIX * g_lv_speech * lvm;
-    if (g_game_mute) {   /* paused: the front-end sounds, the speech and the music only */
+    if (g_game_mute || g_fe_quiet) {   /* paused / front end: the front-end sounds, the speech and the music only */
 #ifdef OPENUG2_SIM_PRE_H
         sim_mix_stats(mus, lvmus, spk, lvsp, fe, fe, 0.62f * lvm * gfe, n, ncar, sp_on, dmus, d_fe);
 #endif

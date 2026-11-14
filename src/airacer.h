@@ -310,6 +310,9 @@ int    aigps_path(const AiGps *g, float *xyz, int max); /* debug: the solved rou
 /* optional: half the car-space box's width (0x5ec250; default 1 m), the
    off-path tolerance of UpdateGPSFuturePoints */
 void   aigps_set_halfwidth(AiGps *g, float half_wid);
+/* (port) the lock walls (x0 y0 x1 y1 each) the route search must not cross */
+void   aigps_set_walls(AiGps *g, const float *seg, int n);
+int    aigps_path_wall_hits(const AiGps *g);   /* diagnostics: solved-route hops crossing a set wall */
 
 /* ---- the controller's FuturePoints for the camera -------------------------
    The list a controller returns from vt+0x24 (ctrl +0x370), as

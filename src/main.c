@@ -9454,10 +9454,31 @@ static struct {
     AiGps *pf;                      /* ThePathfindingManager + the controller's GPS FList, on g_rt.net */
     float arrow[3]; int arrow_ok;   /* RenderGPSArrow's last aim (held through a re-route search) */
     int pend;                       /* MaybeTargetGPSForShopEvent still to run: 'A' / 'B' */
+    int fake_z_on; float fake_z;    /* (sim test aid) OPENUG2_SIM_GPSFAKE's height */
 } g_gps;
+/* (port) the route search keeps out of the stage's lock walls: their
+   footprints from the collision world, again when the stage, the collision
+   world or the road net changes (aigps_set_walls; airacer.c pf_blocked) */
+static void gps_walls_sync(AiGps *p)
+{
+    static const void *w_pf, *w_coll; static int w_stage = -2, w_career = -1;
+    int stage = g_career_mode ? g_wg_career_stage : -1;
+    if (!p || (p == w_pf && (const void *)g_wcoll == w_coll && stage == w_stage && g_career_mode == w_career)) return;
+    w_pf = p; w_coll = g_wcoll; w_stage = stage; w_career = g_career_mode;
+    static float seg[4 * 1024];
+    int n = 0;
+    char gn[48] = "";
+    if (g_wcoll && stage >= 0) {
+        snprintf(gn, sizeof gn, "BARRIERS_CAREER%d", stage);
+        n = wcoll_group_walls(g_wcoll, gn, seg, 1024);
+    }
+    aigps_set_walls(p, seg, n);
+    if (stage >= 0) printf("gps: route search keeps out of %d lock walls (%s)\n", n, gn);
+}
 static AiGps *gps_pf(void)
 {
     if (!g_gps.pf && g_rt.net) g_gps.pf = aigps_new(g_rt.net);
+    gps_walls_sync(g_gps.pf);
     return g_gps.pf;
 }
 static void gps_pend(int which) { g_gps.pend = which; }
@@ -9507,7 +9528,7 @@ static void gps_start(const CareerZone *z, float x, float y)      /* GPSManager:
     if (gps_status() <= 3) gps_stop();
     const unsigned char *r = gps_zone_rec(z->zone);
     if (r) { gps_zone_point(r, g_gps.target); memcpy(&g_gps.x, r + 4, 4); memcpy(&g_gps.y, r + 8, 4); }
-    else { g_gps.target[0] = x; g_gps.target[1] = y; g_gps.target[2] = g_n2s.pos[2]; g_gps.x = x; g_gps.y = y; }
+    else { g_gps.target[0] = x; g_gps.target[1] = y; g_gps.target[2] = g_gps.fake_z_on ? g_gps.fake_z : g_n2s.pos[2]; g_gps.x = x; g_gps.y = y; }
     AiGps *p = gps_pf();
     if (p) { float pos[3], fwd[2]; gps_car(pos, fwd); aigps_submit(p, pos, fwd, g_gps.target); }
     g_gps.zone = *z; g_gps.active = 1; g_gps.arrow_ok = 0;
@@ -9530,11 +9551,25 @@ static void gps_tick(void)
 {
     if (g_gps.pend && g_career_mode && g_rt.zones && g_rt.net) { int w = g_gps.pend; g_gps.pend = 0; gps_target_shop_event(w); }
     if (!g_gps.active || !g_gps.pf) return;
+    gps_walls_sync(g_gps.pf);
     float pos[3], fwd[2]; gps_car(pos, fwd);
     int was = gps_status();
     aigps_tick(g_gps.pf, pos, fwd, g_n2s.speed);
     int now = gps_status();
     if (now != was) printf("gps: status %d -> %d (controller %d)\n", was, now, aigps_ctrl_state(g_gps.pf));
+    if (now == 3 && was != 3) printf("gps: route %d points, %d hops through a lock wall\n",
+                                     aigps_path(g_gps.pf, NULL, 0), aigps_path_wall_hits(g_gps.pf));
+#ifdef OPENUG2_SIM_PRE_H
+    if (now == 3 && was != 3 && getenv("OPENUG2_SIM_GPSDUMP")) {   /* test aid: the route and the walls for a plot */
+        static float xyz[3 * 2048], seg[4 * 1024];
+        int n = aigps_path(g_gps.pf, xyz, 2048);
+        for (int i = 0; i < n; i++) printf("gpsdump P %.1f %.1f %.1f\n", (double)xyz[3 * i], (double)xyz[3 * i + 1], (double)xyz[3 * i + 2]);
+        char gn[48]; snprintf(gn, sizeof gn, "BARRIERS_CAREER%d", g_wg_career_stage);
+        int m = wcoll_group_walls(g_wcoll, gn, seg, 1024);
+        for (int i = 0; i < m; i++) printf("gpsdump W %.1f %.1f %.1f %.1f\n", (double)seg[4 * i], (double)seg[4 * i + 1], (double)seg[4 * i + 2], (double)seg[4 * i + 3]);
+        printf("gpsdump C %.1f %.1f %.2f\n", (double)pos[0], (double)pos[1], (double)atan2f(fwd[1], fwd[0]));
+    }
+#endif
 }
 
 /* ---- the in-game World Map (C7a; E:/re-tools/out/career/c7/WORLDMAP_SCREEN.md)
@@ -20685,6 +20720,7 @@ int main(int argc, char **argv) {
             }
             if (gf && !fake_done && g_career_mode && race_state == 1 && g_rt.roam && g_rt.net && g_rt.zones && g_ride_ready &&
                 !g_pause.on && !g_fe && sscanf(gf, "%f %f", &q[0], &q[1]) == 2) {
+                if (sscanf(gf, "%*f %*f %f", &g_gps.fake_z) == 1) g_gps.fake_z_on = 1;
                 fake_done = 1;
                 CareerZone u; memset(&u, 0, sizeof u);
                 u.zone = 0xdeadbeefu;                    /* no such zone: the point itself (some zones hash 0) */
@@ -21622,6 +21658,15 @@ int main(int argc, char **argv) {
         /* the replay screen too: the world stays at THE_PRESENT while the
            replay's frames are shown (replay.c) */
         if ((g_pause.on || rp_up()) && !tun_dyno_live()) { pause_rs = race_state; race_state = 4; }
+        {   /* no engine / car sound under the title screen, the main menu or any
+               other front-end screen; the dyno run (and its DynoEnter revs) plays the engine */
+            static int feq = -1;
+            int q = (race_state == 3 || g_fe) && !tun_dyno_live() && !g_tt_rev;
+#ifdef OPENUG2_SIM_PRE_H
+            if (getenv("OPENUG2_SIM_NOFEQUIET")) q = 0;   /* test aid: the old behaviour (A/B) */
+#endif
+            if (q != feq) { audio_fe_quiet(q); feq = q; printf("audio: front end game sound %s\n", q ? "off" : "on"); }
+        }
         if (g_tt_rev) {   /* the DynoEnter revs (one step a tick, as the race NIS's) */
             nis_rev_step(&g_tt_revs, 1);
             g_engine.target_rpm = g_tt_revs.rpm;
