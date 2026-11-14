@@ -2981,6 +2981,8 @@ static double wt_ms[PF_WORLD_PARTS];
 static int wt_frames;
 static long wt_fade_sum, wt_fade_dist_sum;   /* fade-pass batches (all / distance band only) per 60 frames */
 static float g_view_dyn_log = 300.0f;         /* the adaptive view distance, for that log line */
+static unsigned g_vd_swap_us;                  /* main thread time blocked in the swap (adaptive view: CPU work = wall - this) */
+static float g_vd_cpu_log;                     /* that CPU work share, for the log line */
 static void WT_MARK(int part) {
     unsigned long long now = sceKernelGetProcessTimeWide();
     if (part >= 0) {
@@ -25378,7 +25380,7 @@ int main(int argc, char **argv) {
 #ifdef __vita__
         {
             extern void vita_gx_start(void); extern unsigned vita_gx_busy_total(void);
-            static Uint32 vd_t0; static unsigned vd_b0, vd_frames;
+            static Uint32 vd_t0; static unsigned vd_b0, vd_frames, vd_s0;
             if (view_dyn_on < 0) {
                 FILE *nv = fopen("ux0:data/NFSU2/noviewdyn.txt", "r");
                 view_dyn_on = !nv && !getenv("OPENUG2_NO_VIEWDYN");
@@ -25390,16 +25392,24 @@ int main(int argc, char **argv) {
             if (view_dyn_on && passmode == 0) {
                 Uint32 now = SDL_GetTicks();
                 vd_frames++;
-                if (!vd_t0) { vd_t0 = now; vd_b0 = vita_gx_busy_total(); vd_frames = 0; }
+                if (!vd_t0) { vd_t0 = now; vd_b0 = vita_gx_busy_total(); vd_s0 = g_vd_swap_us; vd_frames = 0; }
                 else if (now - vd_t0 >= 500) {
                     unsigned b = vita_gx_busy_total();
                     float wall = (float)(now - vd_t0), u = (float)(b - vd_b0) / 1000.0f / wall;
                     float fps = 1000.0f * (float)vd_frames / wall;
+                    /* the CPU side too (hwlog50: at 400 m the GPU kept its room but the
+                       extra draws added ~1 ms of main-thread work, 3 ms at p99, and the
+                       missed frames went 25 -> 92). Gating on c (wall minus swap wait) was tried
+                       (hwlog50_D): the view sat at 300 m a third of the race, draws and c did
+                       not drop (713 draws, the stand-ins and fades are the extra cost) and c
+                       also holds GPU back-pressure (vitaGL queue waits) -- so it is logged only */
+                    float c = 1.0f - (float)(g_vd_swap_us - vd_s0) / 1000.0f / wall;
                     if (u > 0.85f || fps < 28.5f) view_ext -= 25.0f;          /* busy: back off fast */
                     else if (u < 0.72f && fps > 29.5f) view_ext += 10.0f;     /* headroom: creep out */
                     if (view_ext > VIEW_DIST_MAX - VIEW_DIST) view_ext = VIEW_DIST_MAX - VIEW_DIST;
                     if (view_ext < 0.0f) view_ext = 0.0f;
-                    vd_t0 = now; vd_b0 = b; vd_frames = 0;
+                    vd_t0 = now; vd_b0 = b; vd_s0 = g_vd_swap_us; vd_frames = 0;
+                    g_vd_cpu_log = c;
                     g_view_dyn_log = VIEW_DIST + view_ext;
                 }
             }
@@ -25793,10 +25803,10 @@ int main(int argc, char **argv) {
         #ifdef __vita__
         if (++wt_frames == 60) {
             printf("world_draw ms/frame: fog %.2f camclip %.2f refl %.2f env %.2f mirror %.2f carvis+lights %.2f "
-                   "sky %.2f vista %.2f opaque+cull %.2f cut+blend %.2f rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m\n",
+                   "sky %.2f vista %.2f opaque+cull %.2f cut+blend %.2f rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m (cpu %.2f)\n",
                    wt_ms[0]/60, wt_ms[7]/60, wt_ms[8]/60, wt_ms[9]/60, wt_ms[10]/60, wt_ms[1]/60,
                    wt_ms[2]/60, wt_ms[3]/60, wt_ms[4]/60, wt_ms[5]/60, wt_ms[6]/60,
-                   wt_fade_sum/60.0, wt_fade_dist_sum/60.0, (double)g_view_dyn_log);
+                   wt_fade_sum/60.0, wt_fade_dist_sum/60.0, (double)g_view_dyn_log, (double)g_vd_cpu_log);
             memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0; wt_fade_sum = wt_fade_dist_sum = 0;
         }
         #endif
@@ -29559,7 +29569,13 @@ int main(int argc, char **argv) {
 #endif
             savenote_draw(dataroot, sw, sh);   /* "Save complete." in the corner (port addition, after the photos) */
         }
+#ifdef __vita__
+        {   Uint64 sw0 = SDL_GetPerformanceCounter();
+            SDL_GL_SwapWindow(win);
+            g_vd_swap_us += (unsigned)((SDL_GetPerformanceCounter() - sw0) * 1000000u / SDL_GetPerformanceFrequency()); }
+#else
         SDL_GL_SwapWindow(win);
+#endif
         pf_mark(PF_SWAP);
         if (pf_csv) {
             pf_detail.race_event = race_state == 1 && world.city.race.active && !world.city.race.finished
