@@ -434,7 +434,7 @@
 { "NIS/Scene_ShopEnter1_EvtTrk.txt", 226LL, 0x8c4bccb0u },
 { "NIS/Scene_ShopExit1_BundleB.bun", 3664LL, 0xf5ffa939u },
 { "NIS/Scene_ShopExit1_EvtTrk.txt", 210LL, 0x6606d372u },
-{ "SDATA/sdat.viv", 259484480LL, 0x914e252du },
+{ "SDATA/sdat.viv", 259484480LL, 0x34ff63a3u },
 { "SOUND/ENGINE/CAR_00_ENG_MB_SPU.abk", 111760LL, 0x90edc367u },
 { "SOUND/ENGINE/CAR_01_ENG_MB_SPU.abk", 94092LL, 0xdf2190a7u },
 { "SOUND/ENGINE/CAR_02_ENG_MB_SPU.abk", 83600LL, 0x0b7d6eb8u },

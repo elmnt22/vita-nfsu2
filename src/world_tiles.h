@@ -16,9 +16,10 @@
 
 #define WTILE_SIZE     128.0f
 #define WTILE_CELL     4          /* tiles per conversion cell side (512 m) */
-#define WTILE_VERSION  5   /* 2: far full models keep their prelight; 3: 1 mm grid deltas + LZ4;
+#define WTILE_VERSION  6   /* 2: far full models keep their prelight; 3: 1 mm grid deltas + LZ4;
                                     4: road reflection flag per mesh;
-                                    5: that flag read with the right bit (0x40) */
+                                    5: that flag read with the right bit (0x40);
+                                    6: n2_skip_filler keeps a 0x11 first vertex byte (L4RA road hole at -1200,275) */
 #define WTILE_DIR      "ux0:data/NFSU2/cache/tiles"
 
 typedef struct {

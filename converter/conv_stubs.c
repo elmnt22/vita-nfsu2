@@ -53,3 +53,11 @@ uint32_t carfx_new_light_revision(void) { static uint32_t r; return ++r; }
 /* 11-12: nfsu2.h n2_lang() asks the Vita's system language (built __vita__
  * like the simulator); -1 = unknown -> English, OPENUG2_LANG still overrides */
 int vita_system_lang(void) { return -1; }
+
+/* 11-13: render.c's simulator probe tag (test aid, built with the sim prefix) */
+uint32_t g_sim_probe_tag;
+
+/* 11-13: the widescreen PC_Loading art (hud.c); no loading screens here */
+unsigned int hud_wide_loading_tex(void) { return 0; }
+int hud_is_wide_loading_res(const char *name) { (void)name; return 0; }
+float hud_wide_loading_pin(float asp) { (void)asp; return 0.0f; }

@@ -104,7 +104,7 @@ files already sent are skipped.
 Copy the game folders (see the [README](../README.md#2-copy-the-game-data))
 and the **`cache`** folder from the output folder into
 **`ux0:data/NFSU2/`**, so you get for example
-`ux0:data/NFSU2/cache/tiles/STREAML4RA_v5.idx`.
+`ux0:data/NFSU2/cache/tiles/STREAML4RA_v6.idx`.
 
 ### Checking it worked
 

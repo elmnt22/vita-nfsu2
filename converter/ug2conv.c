@@ -114,6 +114,17 @@ static const GameFile k_game[] = {
 #include "game_manifest.inc"
 };
 #define NGAME ((int)(sizeof k_game / sizeof *k_game))
+/* Other genuine retail versions of a file that the port handles the same way.
+   FrontB.lzc: an earlier retail print (2004-10-22); the only change inside is
+   the online lobby screen OL_Lobby.fng, which the port never loads. */
+static const GameFile k_game_alt[] = {
+    { "FRONTEND/FrontB.lzc", 1750887LL, 0xa0d8bc03u },
+};
+static const GameFile *game_alt(const char *rel, long long size) {
+    for (size_t i = 0; i < sizeof k_game_alt / sizeof *k_game_alt; i++)
+        if (!strcmp(k_game_alt[i].rel, rel) && k_game_alt[i].size == size) return &k_game_alt[i];
+    return NULL;
+}
 #define V12_EXE_SIZE 4800512LL   /* SPEED2.EXE v1.2 (Feb 9 2005); the data files are v1.0's, unchanged */
 
 static unsigned g_crctab[256];
@@ -179,14 +190,14 @@ static int check_game(const char *game) {
         long long sz = file_size(p);
         const char *why = NULL;
         if (sz < 0) { why = "missing"; g_chk.missing++; }
-        else if (sz != g->size) { why = "different size"; g_chk.bad++; }
+        else if (sz != g->size && !game_alt(g->rel, sz)) { why = "different size"; g_chk.bad++; }
         else if (!quick) {
             HANDLE h = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
             unsigned c = 0; DWORD got; int rd = h != INVALID_HANDLE_VALUE;
             while (rd && ReadFile(h, buf, sizeof buf, &got, NULL) && got) { c = crc32_add(c, buf, got); g_chk.bytes += got; }
             if (rd) CloseHandle(h);
             if (!rd) { why = "can't be read"; g_chk.bad++; }
-            else if (c != g->crc) { why = "different contents"; g_chk.bad++; }
+            else if (sz == g->size ? c != g->crc : c != game_alt(g->rel, sz)->crc) { why = "different contents"; g_chk.bad++; }
             g_chk.bytes -= sz;   /* counted below */
         }
         g_chk.bytes += g->size;

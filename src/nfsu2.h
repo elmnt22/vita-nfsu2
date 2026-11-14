@@ -383,9 +383,16 @@ static uint32_t n2_u32(const unsigned char *p) {
     return asset_chunk_u32(p);
 }
 
-/* Skip the run of 0x11 filler bytes that prefixes a vertex/leaf payload. */
+/* Skip the run of 0x11 filler bytes that prefixes a vertex/leaf payload.
+   The filler pads the payload to an aligned file offset, and chunk data starts
+   4-aligned, so the real run is a multiple of 4. Data can itself begin with
+   0x11: STREAML4RA's TRN_CN_ROADA_CHOP_C8_R1 has 52 filler bytes and a first
+   vertex x of -1216.72 (bytes 11 17 98 c4); eating 53 shifted every vertex a
+   byte and the road piece at (-1200, 275) was rejected (a hole showing the
+   sky dome). So round the run down to the 4-byte boundary. */
 static int n2_skip_filler(const unsigned char *p, int n) {
-    int i = 0; while (i < n && p[i] == 0x11) i++; return i;
+    int i = 0; while (i < n && p[i] == 0x11) i++;
+    return i < n ? i & ~3 : i;
 }
 /* A TPK's pixel payload (0x33320002) starts 0x80-aligned from the chunk
    header (all 583 retail packs). The filler run can overshoot into pixel

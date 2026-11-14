@@ -20,6 +20,9 @@ import zlib
 FOLDERS = ["CARS", "CREDITS", "FRONTEND", "GLOBAL", "LANGUAGES", "MOVIES", "NIS",
            "SDATA", "SOUND", "SUBTITLES", "TRACKS", "memcard"]
 SKIP = [re.compile(r"^SOUND/ENGINE/CAR_\d+_ENG_MB_EE\.ABK$", re.I)]
+# The reference copy's SDATA/sdat.viv lost its last 832 bytes (zeros, the end of
+# speech/nisaudio.big). This is the CRC of a good retail copy, same size.
+CRC_FIX = {"SDATA/sdat.viv": (259484480, 0x34ff63a3)}
 
 
 def crc32(path):
@@ -49,7 +52,10 @@ def main():
                     skipped += 1
                     continue
                 sz = os.path.getsize(p)
-                rows.append((rel, sz, crc32(p)))
+                c = crc32(p)
+                if rel in CRC_FIX and CRC_FIX[rel][0] == sz:
+                    c = CRC_FIX[rel][1]
+                rows.append((rel, sz, c))
                 total += sz
     rows.sort(key=lambda r: r[0].lower())
     with open(out, "w", newline="\n") as f:

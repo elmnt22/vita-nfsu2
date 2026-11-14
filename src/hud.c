@@ -142,7 +142,7 @@ enum { G_ALWAYS, G_TURBO, G_NOS, G_RACE, G_POS, G_LAPS, G_BANK, G_SMS, G_COUNT }
 enum { R_NONE, R_RPM_NEEDLE, R_TURBO_NEEDLE, R_SPEED, R_GEAR, R_SHIFT,
        R_NOS_FILL, R_MAP_SLOT, R_MAP_NORTH, R_POS_NUM, R_POS_SUFFIX, R_POS_OF,
        R_LAP_LABEL, R_LAP_NUM, R_LAP_OF, R_BANK_VALUE, R_COUNTDOWN, R_UNITS,
-       R_ANIM, R_NOS_LINE };   /* drift HUD: a ported widget's object, drawn from its FEng state */
+       R_ANIM, R_NOS_LINE, R_CORNER };   /* drift HUD: a ported widget's object, drawn from its FEng state */
 
 /* Measured dial geometry: the rev scale is the shipped 3rdperson_10500lines
  * art, whose "0" sits straight below the hub and whose numerals advance
@@ -187,6 +187,7 @@ struct Hud {
     unsigned char tach[FENG_MAX_OBJ];   /* in the tach group (the Gauges option) */
     unsigned char mmap[FENG_MAX_OBJ];   /* the minimap (the Race / Explore Map option) */
     int     o_player, o_gps, o_gate, o_track, o_wrong;
+    int     o_bank_label;          /* "Bank:" (0x31b0d166), the free-roam box's left reach */
     struct HudArc nos_arc;
     GLuint  arrow_tex;
     int     preview;
@@ -574,7 +575,7 @@ static void hud_classify(Hud *h) {
         /* 3rdperson_BoxCorner (0x411301e3): always drawn. Nothing in SPEED2.EXE names
            its hash, and it is authored visible (alpha 255, not mode-hidden), so free
            roam keeps it behind "Bank:" too (it was gated to races before 11-13). */
-        else if (i == corner) h->gate[i] = G_ALWAYS;
+        else if (i == corner) { h->gate[i] = G_ALWAYS; h->role[i] = R_CORNER; }
         else if (pos >= 0 && feng_inside(p, i, pos)) h->gate[i] = G_POS;
         else if ((laps >= 0 && feng_inside(p, i, laps)) || lap_obj) h->gate[i] = G_LAPS;
         else if (bank >= 0 && feng_inside(p, i, bank)) h->gate[i] = G_BANK;
@@ -585,6 +586,7 @@ static void hud_classify(Hud *h) {
         h->draw[k] = (short)i;
     }
     h->o_player = feng_find(p, FE_MAP_PLAYER);
+    h->o_bank_label = feng_find(p, 0x31b0d166u);
     h->o_gps = feng_find(p, FE_MAP_GPS);
     h->o_gate = feng_find(p, FE_MAP_GATE);
     h->o_wrong = feng_find(p, FE_WRONG_WAY);
@@ -4539,6 +4541,28 @@ static void hud_draw_screen(Hud *h, const HudDC *dc, const HudState *s) {
         case R_ANIM:
             if (h->dw) fe_anim_draw(h, dc, i);
             break;
+        case R_CORNER: {
+            /* 3rdperson_BoxCorner is the race box: its art (256x64, the shade
+               in texels ~8..160) covers the position readout, but the retail
+               layout starts "Bank:" (left-justified, x 119) ~20 units left of
+               the shade (x 137). Port-side (user 11-13): behind the bank in
+               free roam, stretch it from the shade's right edge so it starts
+               6 units before "Bank:". Races keep the authored box. */
+            int bl = h->o_bank_label;
+            if (s->racing || !gate_on[G_BANK] || bl < 0 || o->size[0] <= 0.0f) { fe_sprite(h, dc, i); break; }
+            float w = o->size[0], left = o->ax - 0.5f * w;
+            float vis_l = left + w * (8.0f / 256.0f), vis_r = left + w * (160.0f / 256.0f);
+            float want_l = p->obj[bl].ax - 6.0f;
+            if (want_l >= vis_l) { fe_sprite(h, dc, i); break; }
+            float sx = (vis_r - want_l) / (vis_r - vis_l);
+            float w2 = w * sx, left2 = vis_r - w2 * (160.0f / 256.0f);
+            const HudTex *t = (o->res >= 0 && o->res < p->nres) ? &h->rt[o->res] : NULL;
+            if (!t || !t->tex) break;
+            float nx, ny;
+            fe_ndc(dc->asp, hud_pin_of(p->obj[o->root].ax), left2 + 0.5f * w2, o->ay, &nx, &ny);
+            hud_blit(dc, t->tex, w2 / 240.0f, fabsf(o->size[1]) / 240.0f, nx, ny, 0.0f,
+                     o->rgba[0], o->rgba[1], o->rgba[2], o->rgba[3]);
+            break; }
         default:
             if (o->type == FENG_STRING) fe_text(h, dc, i, o->text, o->rgba);
             else fe_sprite(h, dc, i);
