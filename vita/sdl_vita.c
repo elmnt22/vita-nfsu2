@@ -932,8 +932,9 @@ static void vt_unlock(int i) {
 /* after vglInit: the setup dialog (installs the pack the first time) needs swaps */
 static void vita_trophy_setup(void) {
     if (vt_skip) return;
-    SceUID fd = sceIoOpen(TROPHY_OFF_FILE, SCE_O_RDONLY, 0);
-    if (fd >= 0) { sceIoClose(fd); printf("trophy: system off (notrophy.txt)\n"); return; }
+    SceUID fd = sceIoOpen(TROPHY_ON_FILE, SCE_O_RDONLY, 0);   /* opt-in: off by default */
+    if (fd < 0) { printf("trophy: system off (no trophies.txt)\n"); return; }
+    sceIoClose(fd);
     char comm_id[12] = {0};
     static char sign[160] = {0xb9, 0xdd, 0xe1, 0x3b, 0x01, 0x00};
     sceAppMgrAppParamGetString(0, 12, comm_id, sizeof comm_id);   /* the title id */

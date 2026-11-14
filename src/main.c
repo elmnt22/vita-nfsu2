@@ -15932,7 +15932,7 @@ int main(int argc, char **argv) {
     audio_load_traffic_clip(dataroot);
     options_load();
     profile_init();
-    trophy_init();                       /* LiveArea Settings: notrophy.txt switches them off */
+    trophy_init();                       /* LiveArea Settings: trophies.txt switches them on */
     g_manual = g_opt.p[0].manual;
     g_cc_setting = g_opt.p[0].camera;
     SDL_AudioDeviceID adev = audio_init();

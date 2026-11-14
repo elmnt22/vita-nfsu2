@@ -12,8 +12,8 @@
      Frame rate  fps60.txt   present = unlocked (vsync, up to 60), else locked 30
      Fast travel fasttravel.txt  present = the World Map's GPS dialog "No"
                              moves the car to the entry (NFSU2FastTravel mod)
-     Trophies    notrophy.txt  present = no trophies reported to the system
-                             (progress is still kept in the profile)
+     Trophies    trophies.txt  present = trophies reported to the system; off
+                             by default (progress is still kept in the profile)
      Reset caches            deletes ux0:data/NFSU2/cache (converted world
                              tiles, shaders, shop/parts lists); profiles,
                              options and the game data are kept
@@ -40,7 +40,7 @@ enum { STG_UP = 1, STG_DOWN = 2, STG_LEFT = 4, STG_RIGHT = 8, STG_CROSS = 16, ST
 #define BS_NOLOG  "ux0:data/NFSU2/nolog.txt"
 #define BS_FPS60  "ux0:data/NFSU2/fps60.txt"
 #define BS_FTRAV  "ux0:data/NFSU2/fasttravel.txt"
-#define BS_NOTRP  "ux0:data/NFSU2/notrophy.txt"     /* = trophy.h TROPHY_OFF_FILE */
+#define BS_TRP    "ux0:data/NFSU2/trophies.txt"     /* = trophy.h TROPHY_ON_FILE */
 #define BS_CACHE  "ux0:data/NFSU2/cache"
 
 /* one rasterised glyph: w x h coverage, left = pen to bitmap's left edge,
@@ -258,7 +258,7 @@ static void bs_face_button(float cx, float cy, float r, int cross)
 static void boot_settings_run(void) {
     enum { I_LOGS, I_FPS, I_FTRAV, I_TROPHY, I_RESET, I_START, I_N };
     int logs = !bs_exists(BS_NOLOG), unlocked = bs_exists(BS_FPS60), ftrav = bs_exists(BS_FTRAV);
-    int trophies = !bs_exists(BS_NOTRP);
+    int trophies = bs_exists(BS_TRP);
     int sel = 0, confirm = 0, quit = 0;
     char status[64] = "";
     unsigned prev = bs_pad();   /* the L+R that opened the screen is not a press */
@@ -320,7 +320,7 @@ static void boot_settings_run(void) {
                 break;
             case I_TROPHY:
                 trophies = !trophies;
-                if (trophies) bs_remove(BS_NOTRP); else bs_touch(BS_NOTRP);
+                if (trophies) bs_touch(BS_TRP); else bs_remove(BS_TRP);
                 status[0] = 0;
                 break;
             case I_RESET:

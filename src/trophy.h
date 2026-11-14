@@ -11,8 +11,8 @@
  * evaluated only while its stage is still the current one.
  *
  * Unlocked trophies are kept as bits in the profile (block TRPH). With
- * trophies switched off in the LiveArea Settings (notrophy.txt) progress
- * is still kept, but nothing is reported to the system; switching them on
+ * trophies off (the default: no trophies.txt, set in the LiveArea
+ * Settings) progress is still kept, but nothing is reported to the system; switching them on
  * reports what was earned at the next profile load.
  *
  * Optional: none of this changes the game. */
@@ -28,9 +28,9 @@ extern "C" {
 #define TROPHY_N 76
 
 #ifdef __vita__
-#define TROPHY_OFF_FILE "ux0:data/NFSU2/notrophy.txt"
+#define TROPHY_ON_FILE "ux0:data/NFSU2/trophies.txt"   /* opt-in: off without it */
 #else
-#define TROPHY_OFF_FILE "notrophy.txt"
+#define TROPHY_ON_FILE "trophies.txt"
 #endif
 
 typedef struct { uint32_t ra_id; const char *title; } TrophyInfo;

@@ -87,7 +87,7 @@ static const TrophyInfo k_info[TROPHY_N] = {
 
 static struct {
     uint8_t bit[(TROPHY_N + 7) / 8];
-    int off;                    /* notrophy.txt: nothing reported to the system */
+    int off;                    /* no trophies.txt (the default): nothing reported to the system */
     float drift_peak;           /* the race's best single drift (points) */
 } g_tr;
 
@@ -100,10 +100,10 @@ int trophy_count(void) { int n = 0; for (int i = 0; i < TROPHY_N; i++) n += trop
 
 void trophy_init(void)
 {
-    FILE *f = fopen(TROPHY_OFF_FILE, "rb");
-    g_tr.off = f != NULL;
+    FILE *f = fopen(TROPHY_ON_FILE, "rb");
+    g_tr.off = f == NULL;
     if (f) fclose(f);
-    printf("trophy: %s (%s)\n", g_tr.off ? "off" : "on", TROPHY_OFF_FILE);
+    printf("trophy: %s (%s)\n", g_tr.off ? "off" : "on", TROPHY_ON_FILE);
 }
 void trophy_default(void) { memset(g_tr.bit, 0, sizeof g_tr.bit); }
 
