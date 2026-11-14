@@ -539,6 +539,10 @@ static int wd_thread(SceSize args, void *argp) {
     Uint64 since = sceKernelGetProcessTimeWide(), prev = since;
     for (;;) {
         sceKernelDelayThread(500 * 1000);
+        /* keep the system awake from a boot-started thread: without it an app
+           nobody touches is suspended ~15 s after launch (unattended HW runs
+           stopped mid-boot; the main thread is blocked in loads then) */
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         Uint64 now = sceKernelGetProcessTimeWide();
         unsigned b = vita_wd_beat;
         int load = vita_wd_load, armed = vita_wd_armed;
