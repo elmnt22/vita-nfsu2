@@ -1691,11 +1691,24 @@ static volatile unsigned vcopy_head, vcopy_tail;
 static SceUID vcopy_sem = -1;
 static int vcopy_state;   /* 0 untried, 1 running, -1 copy inline */
 static volatile unsigned long long vcopy_us, vcopy_bytes;
+/* 11-15 hwlog66: one SignalSema per job was 2 kernel calls a batch (~2500
+   batches a big handoff). The worker now drains the ring and sleeps only
+   when it is empty; the producer signals only a sleeping worker (both sides
+   publish, full barrier, then read the other's flag: no lost wake-up; a
+   spare signal is one more empty pass). */
+static volatile int vcopy_sleeping;
 static int vcopy_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
     for (;;) {
-        sceKernelWaitSema(vcopy_sem, 1, NULL);
         __sync_synchronize();
+        if (vcopy_tail == vcopy_head) {
+            vcopy_sleeping = 1;
+            __sync_synchronize();
+            if (vcopy_tail == vcopy_head) sceKernelWaitSema(vcopy_sem, 1, NULL);
+            vcopy_sleeping = 0;
+            __sync_synchronize();
+            continue;
+        }
         unsigned t = vcopy_tail;
         unsigned long long t0 = sceKernelGetProcessTimeWide();
         sceClibMemcpy(vcopy_q[t % VCOPY_RING].dst, vcopy_q[t % VCOPY_RING].src, vcopy_q[t % VCOPY_RING].n);
@@ -1721,7 +1734,8 @@ void vita_copy_push(void *dst, const void *src, unsigned n) {
     vcopy_q[h % VCOPY_RING].dst = dst; vcopy_q[h % VCOPY_RING].src = src; vcopy_q[h % VCOPY_RING].n = n;
     __sync_synchronize();
     vcopy_head = h + 1;
-    sceKernelSignalSema(vcopy_sem, 1);
+    __sync_synchronize();
+    if (vcopy_sleeping) { vcopy_sleeping = 0; sceKernelSignalSema(vcopy_sem, 1); }
 }
 int vita_copy_idle(void) { __sync_synchronize(); return vcopy_tail == vcopy_head; }
 void vita_copy_wait(void) { while (!vita_copy_idle()) sceKernelDelayThread(100); }

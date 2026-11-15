@@ -2679,7 +2679,7 @@ static const PerfParts *g_load_pp;   /* an opponent's fitted performance parts, 
 /* a traffic model's skin (RideInfo +7, 0x61bc20): its <CAR>_SKIN1 meshes
    wear <CAR>_SKIN<n>; 0 the model's own */
 static int g_load_skin;
-static Uint64 g_wd_submit;   /* world opaque draw_batch time, 60 frames (world_draw ms/frame line) */
+static Uint64 g_wd_submit; static unsigned g_wd_tick;   /* world opaque draw_batch time, 60 frames (world_draw ms/frame line) */
 static Uint64 g_wd_cb[4];    /* cut+blend split, 60 frames: cutout, fade, props+anims, blend (11-15) */
 static Uint64 g_wd_props[2]; /* props split: smokeables, world anims */
 #if defined(OPENUG2_SIM_PRE_H)
@@ -11749,7 +11749,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                The player's own stall reset never fires (the camera is always
                within 50 m), so unattended runs could not finish. */
             static int test = -1;
-            static float away_t, still_t;
+            static float away_t, still_t, anchor[2];
             if (test < 0) {
                 FILE *af = fopen("ux0:data/NFSU2/autodrive.txt", "r");
                 test = af || getenv("OPENUG2_AUTODRIVE");
@@ -11764,10 +11764,15 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                     float dot = d > 1.0f ? (dx * cosf(st.heading) + dy * sinf(st.heading)) / d : 1.0f;
                     away_t = (dot < -0.3f && st.speed > 3.0f) ? away_t + wdt : 0;
                 }
-                still_t = fabsf(st.speed) < 1.0f ? still_t + wdt : 0;
+                /* stuck = under 5 m from where it was for 8 s (11-15 hwlog67:
+                   the car rocked against a wall on lap 2 at 1-2 m/s, so a
+                   speed test never fired and the race never finished) */
+                if (hypotf(st.pos[0] - anchor[0], st.pos[1] - anchor[1]) > 5.0f) {
+                    anchor[0] = st.pos[0]; anchor[1] = st.pos[1]; still_t = 0;
+                } else still_t += wdt;
                 if (want || away_t > 4.0f || still_t > 8.0f) {
                     const char *why = want ? "asked" : away_t > 4.0f ? "wrong way" : "stuck";
-                    away_t = still_t = 0;
+                    away_t = still_t = 0; anchor[0] = anchor[1] = 1e9f;
                     if (airacer_reset_pose(g_rt.pdrv, rp, &rh, &rv)) {
                         WCollCtx gc; wcoll_ctx_init(&gc);
                         float q[3] = { rp[0], rp[1], rp[2] + 1.0f };
@@ -14356,7 +14361,7 @@ int main(int argc, char **argv) {
         Uint64 t0 = SDL_GetPerformanceCounter(), x = 0;
         for (int i = 0; i < 20000; i++) x += SDL_GetPerformanceCounter();
         Uint64 t1 = SDL_GetPerformanceCounter();
-        printf("timer: SDL_GetPerformanceCounter %.0f ns a call (%u)\n",
+        vita_mark("timer: SDL_GetPerformanceCounter %.0f ns a call (%u)",   /* boot.txt: printf is not logged yet */
                (double)(t1 - t0) * 1e9 / (double)SDL_GetPerformanceFrequency() / 20000.0, (unsigned)(x & 1));
     }
     {   /* LiveArea Settings button / L+R held: the Settings screen, then a restart */
@@ -25953,10 +25958,13 @@ int main(int argc, char **argv) {
             }
             if (b->reflect) g_refl_batches++;
             #endif
-            {   Uint64 s0 = SDL_GetPerformanceCounter();
+            /* every 8th draw timed, x8 (11-15 hwlog67: one timer read is
+               735 ns on the Vita, two a draw were ~0.3 ms/frame) */
+            if ((++g_wd_tick & 7) == 0) {
+                Uint64 s0 = SDL_GetPerformanceCounter();
                 draw_batch(b);
-                g_wd_submit += SDL_GetPerformanceCounter() - s0;
-            }
+                g_wd_submit += (SDL_GetPerformanceCounter() - s0) * 8;
+            } else draw_batch(b);
             for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
             g_dbg.drawn++; wbdrawn++;
             if (nviskept < 4096) viskept[nviskept++] = k;
@@ -25987,10 +25995,11 @@ int main(int argc, char **argv) {
                     glUniform1f(rp.uAlphaTest, 0.0f);
                     lastmode = b->drawmode;
                 }
-                {   Uint64 s0 = SDL_GetPerformanceCounter();
+                if ((++g_wd_tick & 7) == 0) {
+                    Uint64 s0 = SDL_GetPerformanceCounter();
                     draw_batch(b);
-                    g_wd_submit += SDL_GetPerformanceCounter() - s0;
-                }
+                    g_wd_submit += (SDL_GetPerformanceCounter() - s0) * 8;
+                } else draw_batch(b);
                 for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
                 g_dbg.drawn++; wbdrawn++; g_refl_batches++;
                 if (nviskept < 4096) viskept[nviskept++] = reflq[q];

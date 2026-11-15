@@ -1710,7 +1710,7 @@ static PackedMesh *g_batch_packed;
 static const uint64_t *g_batch_prepared_hash;
 #ifdef __vita__
 unsigned long long sceKernelGetProcessTimeWide(void);
-static unsigned long long g_batch_pack_us, g_batch_gl_us;
+static unsigned long long g_batch_pack_us, g_batch_gl_us, g_batch_alloc_us, g_batch_push_us;
 static long g_batch_src_meshes, g_batch_src_verts;   /* hash-only meshes rebuilt from source */
 static long g_batch_asm, g_batch_deferred;   /* batches uploaded from worker-assembled arrays */
 static long g_batch_bytes;
@@ -1798,11 +1798,14 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
                 memset(b, 0, sizeof *b); return 0;
             }
             if (g_batch_copy) {
+                unsigned long long tp = sceKernelGetProcessTimeWide();
+                g_batch_alloc_us += tp - tg;
                 vita_copy_push(dv, pb->bv, (unsigned)nv * (unsigned)sizeof(BatchedVertex));
                 vita_copy_push(di, pb->bi, (unsigned)ni * 2u);
                 /* vitaGL keeps the pointer (unmap only clears its flag); the
                    simulator's desktop GL copied inline and needs it unmapped */
                 glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER); glUnmapBuffer(GL_ARRAY_BUFFER);
+                g_batch_push_us += sceKernelGetProcessTimeWide() - tp;
                 g_batch_copied++;
             }
             g_batch_bytes += (long)nv * (long)sizeof(BatchedVertex) + (long)ni * 2;
@@ -2165,7 +2168,10 @@ WorldBatchUpload *upload_world_batches_prepare_cpu(const N2Scene *s,
    rebased), so batch_emit on the GL thread does no per-mesh work (hwlog51_L:
    26 ms of CPU packing per build there). Own packed copies are freed here
    once assembled. */
-#define PLAN_ARENA_MAX (8u << 20)
+/* 11-15 hwlog65: 8 MB covered 1014 of 2490 new batches on a 20 MB handoff;
+   the rest packed + copied on the frame thread (86 + 143 ms). The arrays
+   replace the packed copies they are built from, so 16 MB costs little more (big blocks peak 122 of 125 MB: not more). */
+#define PLAN_ARENA_MAX (16u << 20)
 static void plan_assemble(WorldBatchUpload *j) {
     /* 11-14 hwlog55: one 4-8 MB malloc here failed downtown with 35-45 MB
        free (the heap in small holes). The arrays now go in 256 KB slabs (a
@@ -3458,9 +3464,12 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
 #ifdef __vita__
     {   unsigned long long cus, cby; vita_copy_stats(&cus, &cby);
         printf("batches: %d built, CPU packing %llu ms, GL buffers %llu ms, %ld KB uploaded"
-               " (%ld batches copied on the worker: %llu KB in %llu ms, frame thread waited %llu ms)\n",
+               " (%ld batches copied on the worker: %llu KB in %llu ms, frame thread waited %llu ms;"
+               " their GL alloc+map %llu ms, queueing %llu ms)\n",
                nb, g_batch_pack_us / 1000, g_batch_gl_us / 1000, g_batch_bytes >> 10,
-               g_batch_copied, cby >> 10, cus / 1000, g_batch_wait_us / 1000); }
+               g_batch_copied, cby >> 10, cus / 1000, g_batch_wait_us / 1000,
+               g_batch_alloc_us / 1000, g_batch_push_us / 1000); }
+    g_batch_alloc_us = g_batch_push_us = 0;
     g_batch_pack_us = g_batch_gl_us = 0; g_batch_bytes = 0; g_batch_copied = 0; g_batch_wait_us = 0;
     printf("tile GPU reuse: %ld batches, %ld KB retained without upload; "
            "%ld meshes (%ld KB) rebuilt from source (CPU copy freed); %ld uploaded from worker-assembled arrays, %ld steps ended early\n",
