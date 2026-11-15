@@ -197,6 +197,8 @@ void SDL_CloseAudioDevice(SDL_AudioDeviceID dev);
 typedef int (*SDL_ThreadFunction)(void *data);
 SDL_Thread *SDL_CreateThread(SDL_ThreadFunction fn, const char *name, void *data);
 void SDL_WaitThread(SDL_Thread *t, int *status);
+typedef unsigned long SDL_threadID;
+SDL_threadID SDL_ThreadID(void);   /* the calling thread (sceKernelGetThreadId) */
 
 /* Vita extra: left-stick steering in [-1,1] (+1 = left, like A); 0 when centred. */
 float vita_analog_steer(void);
@@ -221,6 +223,12 @@ void vita_shader_failed(unsigned type, const char *src, const char *log);
 /* Vita extra: run fn(0..n-1, ctx) across the calling thread and two workers
    pinned to cores 1 and 2; returns when every index is done. */
 void vita_parallel_for(int n, void (*fn)(int i, void *ctx), void *ctx);
+/* GPU-buffer copies on a worker (cores 1-2): push from the frame thread only;
+   nothing may draw or free dst/src until vita_copy_idle() */
+void vita_copy_push(void *dst, const void *src, unsigned n);
+int  vita_copy_idle(void);
+void vita_copy_wait(void);
+void vita_copy_stats(unsigned long long *us, unsigned long long *bytes);
 
 #ifdef __cplusplus
 }

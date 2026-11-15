@@ -1678,6 +1678,57 @@ SDL_Thread *SDL_CreateThread(SDL_ThreadFunction fn, const char *name, void *data
     return t;
 }
 
+/* ---- copy worker (vita_copy_push) -------------------------------------------
+   11-15 (PERF_PLAN P2.3): a world area's batch upload copies 10-30 MB of
+   worker-assembled vertex/index arrays into GPU memory, ~7 us/KB on the frame
+   thread (hwlog62: 200 ms at the handoffs that outrun streaming). The frame
+   thread now only allocates the GL buffer; this thread (cores 1-2) does the
+   copy, and the upload is not finished until vita_copy_idle(). One producer
+   (the frame thread), one consumer, a ring of jobs. */
+#define VCOPY_RING 8192
+static struct { void *dst; const void *src; unsigned n; } vcopy_q[VCOPY_RING];
+static volatile unsigned vcopy_head, vcopy_tail;
+static SceUID vcopy_sem = -1;
+static int vcopy_state;   /* 0 untried, 1 running, -1 copy inline */
+static volatile unsigned long long vcopy_us, vcopy_bytes;
+static int vcopy_thread(SceSize args, void *argp) {
+    (void)args; (void)argp;
+    for (;;) {
+        sceKernelWaitSema(vcopy_sem, 1, NULL);
+        __sync_synchronize();
+        unsigned t = vcopy_tail;
+        unsigned long long t0 = sceKernelGetProcessTimeWide();
+        sceClibMemcpy(vcopy_q[t % VCOPY_RING].dst, vcopy_q[t % VCOPY_RING].src, vcopy_q[t % VCOPY_RING].n);
+        vcopy_us += sceKernelGetProcessTimeWide() - t0;
+        vcopy_bytes += vcopy_q[t % VCOPY_RING].n;
+        __sync_synchronize();
+        vcopy_tail = t + 1;
+    }
+    return 0;
+}
+void vita_copy_push(void *dst, const void *src, unsigned n) {
+    if (!n) return;
+    if (!vcopy_state) {
+        vcopy_sem = sceKernelCreateSema("copy-jobs", 0, 0, VCOPY_RING, NULL);
+        SceUID uid = vcopy_sem < 0 ? -1 : sceKernelCreateThread("gpu-copy", vcopy_thread, 140, 0x4000, 0,
+                                                                SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);
+        vcopy_state = uid >= 0 && sceKernelStartThread(uid, 0, NULL) >= 0 ? 1 : -1;
+        printf("gpu copy worker: %s\n", vcopy_state > 0 ? "on cores 1-2" : "failed, copying inline");
+    }
+    if (vcopy_state < 0) { sceClibMemcpy(dst, src, n); return; }
+    while (vcopy_head - vcopy_tail >= VCOPY_RING) sceKernelDelayThread(100);
+    unsigned h = vcopy_head;
+    vcopy_q[h % VCOPY_RING].dst = dst; vcopy_q[h % VCOPY_RING].src = src; vcopy_q[h % VCOPY_RING].n = n;
+    __sync_synchronize();
+    vcopy_head = h + 1;
+    sceKernelSignalSema(vcopy_sem, 1);
+}
+int vita_copy_idle(void) { __sync_synchronize(); return vcopy_tail == vcopy_head; }
+void vita_copy_wait(void) { while (!vita_copy_idle()) sceKernelDelayThread(100); }
+void vita_copy_stats(unsigned long long *us, unsigned long long *bytes) {
+    *us = vcopy_us; *bytes = vcopy_bytes; vcopy_us = vcopy_bytes = 0;
+}
+
 extern int vita_gfx_mode;
 /* ---- parallel-for (vita_parallel_for) ---------------------------------------
    Two persistent workers, one per spare core, sleep on their own semaphore.
@@ -1768,6 +1819,8 @@ void vita_parallel_for(int n, void (*fn)(int i, void *ctx), void *ctx) {
     sceKernelWaitSema(pfor_done, use, NULL);
     __sync_synchronize();
 }
+
+SDL_threadID SDL_ThreadID(void) { return (SDL_threadID)sceKernelGetThreadId(); }
 
 void SDL_WaitThread(SDL_Thread *t, int *status) {
     if (!t) return;

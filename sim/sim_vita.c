@@ -318,6 +318,11 @@ const char *vita_user_name(void) {
 void vita_parallel_for(int n, void (*fn)(int i, void *ctx), void *ctx) { for (int i = 0; i < n; i++) fn(i, ctx); }
 void vita_parallel_async(int n, void (*fn)(int i, void *ctx), void *ctx) { for (int i = 0; i < n; i++) fn(i, ctx); }
 void vita_parallel_join(void) {}
+/* GPU-buffer copies: inline here (the Vita runs them on a worker) */
+void vita_copy_push(void *dst, const void *src, unsigned n) { memcpy(dst, src, n); }
+int vita_copy_idle(void) { return 1; }
+void vita_copy_wait(void) {}
+void vita_copy_stats(unsigned long long *us, unsigned long long *bytes) { *us = 0; *bytes = 0; }
 
 /* ---- progress screen (the tile conversion before the renderer exists) ----- */
 static SDL_Window *g_win;

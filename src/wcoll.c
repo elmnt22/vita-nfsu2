@@ -1,6 +1,7 @@
 /* wcoll.c — the retail NFSU2 collision world (see wcoll.h). */
 #include "wcoll.h"
 #include "resource.h"
+#include "SDL.h"
 
 #include <float.h>
 #include <math.h>
@@ -293,9 +294,28 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
     return w;
 }
 
+/* direct-mapped cache of expanded polygons; the packs never change while a
+   WColl lives, so an entry is exact until wcoll_free clears it */
+#define PC_BITS 11
+typedef struct { const WColl *w; uint32_t key; WCollPoly p; } PolyCache;
+static PolyCache g_pc[1 << PC_BITS];
+/* the calling thread: on the Vita the user read-only thread register
+   (TPIDRURO, one instruction; sceKernelGetThreadId would be a call per
+   ground query) */
+static inline uintptr_t pc_self(void) {
+#if defined(__arm__) && !defined(OPENUG2_SIM_PRE_H)
+    uintptr_t v; __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(v)); return v;
+#else
+    return (uintptr_t)SDL_ThreadID();
+#endif
+}
+static uintptr_t g_pc_tid;
+void wcoll_cache_thread(void) { g_pc_tid = pc_self(); }
+
 void wcoll_free(WColl *w)
 {
     if (!w) return;
+    for (int i = 0; i < (1 << PC_BITS); i++) if (g_pc[i].w == w) g_pc[i].w = NULL;
     for (int i = 0; i < w->npacks; i++) free(w->packs[i].data);
     for (int i = 0; i < w->nbnd; i++) free(w->bnd[i].xy);
     free(w->packs); free(w->bnd); free(w->order); free(w->groups); free(w->enabled);
@@ -524,6 +544,18 @@ static void poly_expand(const unsigned char *q, Poly *o)                /* 0x5d7
     o->d = o->v[0][0]*n[0] + o->v[0][1]*n[1] + o->v[0][2]*n[2];
 }
 
+/* polygon pi of pack: from the cache on the frame thread (exact: the packs
+   never change while the WColl lives), else expanded into tmp. The pointer
+   is good until the next poly_at. */
+static const Poly *poly_at(const WColl *w, int pack, const unsigned char *q, int pi, int main, Poly *tmp)
+{
+    if (!main) { poly_expand(q, tmp); return tmp; }
+    uint32_t key = ((uint32_t)pack << 16) | (uint32_t)pi;
+    PolyCache *e = &g_pc[(key * 2654435761u) >> (32 - PC_BITS)];
+    if (e->w != w || e->key != key) { poly_expand(q, &e->p); e->w = w; e->key = key; }
+    return &e->p;
+}
+
 /* 0x5d3330: the largest edge function, <= 0 inside (counter-clockwise) */
 static float poly_edge(const Poly *o, const float *p)
 {
@@ -602,19 +634,21 @@ float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
     }
     const Pack *k = &w->packs[c->pack];
     float limit = p[2] + 1.0f;
-    Poly o;
+    Poly tmp;
+    const Poly *op;
+    int mainthr = g_pc_tid && pc_self() == g_pc_tid;
     /* the four most recently used polygons first */
     for (int i = 0; i < c->ncache; i++) {
-        poly_expand(k->poly + 32 * c->cache[i], &o);
-        if (!(poly_edge(&o, p) < 0)) continue;
-        float z = poly_z(&o, p);
-        if (!(o.flags & 1) || (z <= limit && limit - z < 4.0f)) {
+        op = poly_at(w, c->pack, k->poly + 32 * c->cache[i], c->cache[i], mainthr, &tmp);
+        if (!(poly_edge(op, p) < 0)) continue;
+        float z = poly_z(op, p);
+        if (!(op->flags & 1) || (z <= limit && limit - z < 4.0f)) {
             int id = c->cache[i];
             memmove(&c->cache[1], &c->cache[0], (size_t)i * sizeof c->cache[0]);
             c->cache[0] = id;
             if (found) *found = 1;
-            if (surface) *surface = o.surface;
-            if (normal) memcpy(normal, o.n, 12);
+            if (surface) *surface = op->surface;
+            if (normal) memcpy(normal, op->n, 12);
             return z;
         }
     }
@@ -645,14 +679,14 @@ float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
             if (px > rds16(q + 8 + ((sel >> 4) & 3) * 2) * 8192) continue;
             if (py > rds16(q + 0x10 + (sel >> 6) * 2) * 8192) continue;
             if (q[0] && (c->nogroups || !w->enabled[q[0]])) continue;   /* barrier group off (0x5d8150: the collider's list) */
-            poly_expand(q, &o);
-            float ed = poly_edge(&o, p);
+            op = poly_at(w, c->pack, q, pi, mainthr, &tmp);
+            float ed = poly_edge(op, p);
             if (ed > 0) continue;
-            float z = poly_z(&o, p);
-            if (!(o.flags & 1) && ed < 0) { best = pi; bz = z; break; }
+            float z = poly_z(op, p);
+            if (!(op->flags & 1) && ed < 0) { best = pi; bz = z; break; }
             if (!(z > bz) || !(z <= limit)) continue;
             best = pi; bz = z;
-            if (o.flags & 0x40) continue;
+            if (op->flags & 0x40) continue;
             if (limit - z < 4.0f) break;
         }
         limit = FLT_MAX;
@@ -663,11 +697,11 @@ float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
         if (normal) { normal[0] = normal[1] = 0; normal[2] = -1; }
         return p[2];
     }
-    poly_expand(k->poly + 32 * best, &o);
-    if (!(o.flags & 0x40)) push_cache(c, best);
+    op = poly_at(w, c->pack, k->poly + 32 * best, best, mainthr, &tmp);
+    if (!(op->flags & 0x40)) push_cache(c, best);
     if (found) *found = 1;
-    if (surface) *surface = o.surface;
-    if (normal) memcpy(normal, o.n, 12);
+    if (surface) *surface = op->surface;
+    if (normal) memcpy(normal, op->n, 12);
     return bz;
 }
 
@@ -721,8 +755,10 @@ int wcoll_gather(WColl *w, WCollCtx *c, const float pos[3], const float mn[2], c
     for (int i = 1; i < n; i++)                 /* ascending, as 0x5ae930 sorts */
         for (int j = i; j > 0 && ids[j - 1] > ids[j]; j--) { int t = ids[j]; ids[j] = ids[j - 1]; ids[j - 1] = t; }
     int m = 0;
+    int mainthr = g_pc_tid && pc_self() == g_pc_tid;   /* cached polygons: frame thread only (11-15) */
     for (int i = 0; i < n && m < max; i++) {
-        poly_expand(k->poly + 32 * ids[i], &out[m]);
+        if (mainthr) out[m] = *poly_at(w, c->pack, k->poly + 32 * ids[i], ids[i], 1, NULL);
+        else poly_expand(k->poly + 32 * ids[i], &out[m]);
         out[m].id = (c->pack << 16) | ids[i];
         m++;
     }

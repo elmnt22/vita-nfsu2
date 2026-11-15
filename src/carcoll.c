@@ -706,6 +706,7 @@ typedef struct {
     WCollPoly (*poly)[MAXPOLY];
     int *np;
     CPair *pairs; int npairs;
+    const float (*pos)[3];    /* each body's centre, read once per run (11-15) */
 } World;
 
 static N2Body body_of(const CarCollCar *k)
@@ -1180,12 +1181,14 @@ static int near_poly(const CarColl *c, const N2Body *b, const WCollPoly *p)
 
 /* 0x5b23b0 for one car: its polygons (0x5ae930, box 0x5a9de0) and the cars
    whose boxes overlap its own; new pairs only */
+static Uint64 g_bp_world;   /* broadphase census: the world-polygon part */
 static void broadphase(World *W, int ci)
 {
     CarCollCar *K = &W->cars[ci];
     N2Body b = body_of(K);
     CarColl *c = K->c;
     int sleeper = K->ops && K->ops->asleep;
+    Uint64 bw0 = SDL_GetPerformanceCounter();
     if (W->w && K->wc && !sleeper) {
         float mn[2] = { b.pos[0] - c->rad, b.pos[1] - c->rad }, mx[2] = { b.pos[0] + c->rad, b.pos[1] + c->rad };
         static WCollPoly cand[160];
@@ -1200,6 +1203,7 @@ static void broadphase(World *W, int ci)
             W->np[ci]++;
         }
     }
+    g_bp_world += SDL_GetPerformanceCounter() - bw0;
     /* car against car: 0x593980 both ways -- neither switched off (+0x17),
        both colliding with cars (+0x190, set by 0x5aec20) */
     if (K->nocollide) return;
@@ -1209,9 +1213,11 @@ static void broadphase(World *W, int ci)
         if ((K->noprops && W->cars[o].ops) || (K->ops && W->cars[o].noprops)) continue;
         /* the box test first (port order only: both tests just skip, and the
            pair-list scan below is the costly one with many cars) */
-        N2Body ob = body_of(&W->cars[o]);
+        /* positions read once per run (11-15, PERF_PLAN P5): a whole body
+           copy for every other car, both ways, ~380 a run with 20 bodies */
+        const float *op = W->pos[o];
         float r = c->rad + W->cars[o].c->rad;
-        if (fabsf(ob.pos[0] - b.pos[0]) > r || fabsf(ob.pos[1] - b.pos[1]) > r) continue;
+        if (fabsf(op[0] - b.pos[0]) > r || fabsf(op[1] - b.pos[1]) > r) continue;
         int have = 0;
         for (int j = 0; j < W->npairs && !have; j++)
             have = W->pairs[j].b >= 0 && ((W->pairs[j].a == ci && W->pairs[j].b == o) || (W->pairs[j].a == o && W->pairs[j].b == ci));
@@ -1268,8 +1274,11 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
     int nl = 0, done = 0;
     for (int i = 0; i < n; i++) np[i] = 0;
     /* PERF_PLAN P5 census: where a contacts pass goes (logged every 1200 runs) */
-    static double tb, tn, tr; static long runs, pairs_sum, iters_sum;
+    static double tb, tn, tr, tw; static long runs, pairs_sum, iters_sum;
     Uint64 c0 = SDL_GetPerformanceCounter();
+    static float bpos[CARCOLL_MAXCARS][3];
+    for (int i = 0; i < n; i++) { N2Body b = body_of(&cars[i]); memcpy(bpos[i], b.pos, sizeof bpos[i]); }
+    W.pos = (const float (*)[3])bpos;
     for (int i = 0; i < n; i++) broadphase(&W, i);
     Uint64 c1 = SDL_GetPerformanceCounter();
     for (int i = 0; i < W.npairs; i++) {
@@ -1296,6 +1305,8 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
         }
         nl = keep;
         int first = W.npairs;
+        {   N2Body rb = body_of(&cars[ma]); memcpy(bpos[ma], rb.pos, sizeof bpos[ma]);   /* the moved bodies */
+            if (mb >= 0) { rb = body_of(&cars[mb]); memcpy(bpos[mb], rb.pos, sizeof bpos[mb]); } }
         broadphase(&W, ma);
         if (mb >= 0) broadphase(&W, mb);
         for (int i = 0; i < W.npairs; i++) {
@@ -1309,12 +1320,13 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
     }
     {   double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
         Uint64 c3 = SDL_GetPerformanceCounter();
+        tw += (double)g_bp_world * f; g_bp_world = 0;
         tb += (double)(c1 - c0) * f; tn += (double)(c2 - c1) * f; tr += (double)(c3 - c2) * f;
         pairs_sum += W.npairs; iters_sum += iters;
         if (n > 1 && ++runs >= 1200) {
-            printf("contacts over %ld runs: broadphase %.3f narrow %.3f resolve %.3f ms/run, %.1f pairs, %.2f resolves (%d bodies)\n",
-                   runs, tb / runs, tn / runs, tr / runs, (double)pairs_sum / runs, (double)iters_sum / runs, n);
-            tb = tn = tr = 0; runs = pairs_sum = iters_sum = 0;
+            printf("contacts over %ld runs: broadphase %.3f (world %.3f) narrow %.3f resolve %.3f ms/run, %.1f pairs, %.2f resolves (%d bodies)\n",
+                   runs, tb / runs, tw / runs, tn / runs, tr / runs, (double)pairs_sum / runs, (double)iters_sum / runs, n);
+            tb = tn = tr = tw = 0; runs = pairs_sum = iters_sum = 0;
         }
     }
     g_npairs = W.npairs;

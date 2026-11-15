@@ -2682,6 +2682,9 @@ static int g_load_skin;
 static Uint64 g_wd_submit;   /* world opaque draw_batch time, 60 frames (world_draw ms/frame line) */
 static Uint64 g_wd_cb[4];    /* cut+blend split, 60 frames: cutout, fade, props+anims, blend (11-15) */
 static Uint64 g_wd_props[2]; /* props split: smokeables, world anims */
+#if defined(OPENUG2_SIM_PRE_H)
+static int g_vl_dbg[4096], g_vl_dbg_n;   /* visible-list skips in the frustum (OPENUG2_VISLIST_PAINT) */
+#endif
 static int g_route_glide;   /* the route.txt test glide is moving the car (no tyre marks: its physics resets every tick) */
 static const N2CarConfig *g_load_cfg;   /* the RideInfo parts to load with (an opponent's preset), NULL stock */
 static unsigned char *g_shared_cartex; static long g_shared_cartex_len; static int g_shared_cartex_tried;   /* the shared car pack */
@@ -14341,9 +14344,17 @@ static void sky_begin(void *ctx) {
 
 int main(int argc, char **argv) {
     world_region_hook = world_flares_hook;
+    wcoll_cache_thread();   /* polygon cache for main-thread gathers */
     if (!getenv("OPENUG2_FLARE_OLDPICK")) aciddraw_world_flares_sections(world_flares_sections);   /* test aid: A/B the old 200 m pick */
 #ifdef __vita__
     vita_mark("main entered");
+    {   /* 11-15: what one timer read costs (the draw loops read it per draw) */
+        Uint64 t0 = SDL_GetPerformanceCounter(), x = 0;
+        for (int i = 0; i < 20000; i++) x += SDL_GetPerformanceCounter();
+        Uint64 t1 = SDL_GetPerformanceCounter();
+        printf("timer: SDL_GetPerformanceCounter %.0f ns a call (%u)\n",
+               (double)(t1 - t0) * 1e9 / (double)SDL_GetPerformanceFrequency() / 20000.0, (unsigned)(x & 1));
+    }
     {   /* LiveArea Settings button / L+R held: the Settings screen, then a restart */
         extern void vita_settings_boot(void);
         vita_settings_boot();
@@ -25717,6 +25728,80 @@ int main(int argc, char **argv) {
             else cc_use = 0;
         }
 #endif
+#ifdef __vita__
+        /* PERF_PLAN P3.2 (11-15): the game's own visible-section list.
+           VisibleSectionManager::FindDrivableSection(eye) 0x5e00d0 gives the
+           drivable section's list (chunk 0x34153); retail draws the scenery of
+           the listed sections only. A full-detail batch whose meshes all come
+           from scenery sections off the eye's list is skipped -- unless the list
+           names the district's LOD section (x98/x99) instead: retail draws the
+           LOD there, the port its full detail. Kept as before:
+           ground meshes (no scenery record), the stand-ins and skyline (the
+           port's far LOD, past what retail streams), batches of more than 4
+           sections, and every batch when the eye is in no drivable section.
+           vislist.txt = on (opt-in); OPENUG2_VISLIST_VERIFY=1 (simulator) counts
+           skipped batches that the frustum test would have drawn. */
+        static int vl_on = -1;
+        if (vl_on < 0) {
+            /* opt-in: the sim paint check (11-15) showed visible batches
+               (a searchlight beam, building fronts) off the eye's list */
+            FILE *f = fopen("ux0:data/NFSU2/vislist.txt", "r");
+            vl_on = (f != NULL) || getenv("OPENUG2_VISLIST") != NULL;
+            if (f) fclose(f);
+            printf("world: visible-section lists %s\n", vl_on ? "on" : "off");
+        }
+        static const N2Batch *vl_src; static int vl_n = -1, vl_cap; static unsigned long vl_gen = ~0ul;
+        static uint16_t (*vl_sec)[4]; static unsigned char *vl_cnt;   /* cnt 0xff = always drawn */
+        static unsigned char vl_bits[65536 / 8]; static short vl_last[128]; static int vl_nlast;
+        static long vl_skipped, vl_frames, vl_listed, vl_wouldview;
+        int vl_use = 0;
+        if (vl_on && !mapaudit && nbatch > 0 && active_resident && wbatch == active_resident->resources.ordinary &&
+            active_resident->resources.mesh_batch) {
+            if (vl_src != wbatch || vl_n != nbatch || vl_gen != active_resident->generation) {
+                vl_src = wbatch; vl_n = nbatch; vl_gen = active_resident->generation;
+                if (nbatch > vl_cap) {
+                    uint16_t (*ns)[4] = (uint16_t (*)[4])realloc(vl_sec, (size_t)nbatch * sizeof *ns);
+                    if (ns) vl_sec = ns;
+                    unsigned char *nc = (unsigned char *)realloc(vl_cnt, (size_t)nbatch);
+                    if (nc) vl_cnt = nc;
+                    vl_cap = ns && nc ? nbatch : 0;
+                }
+                if (vl_cap >= nbatch) {
+                    memset(vl_cnt, 0, (size_t)nbatch);
+                    const N2Scene *sc = &active_resident->world.scene;
+                    const int *mb = active_resident->resources.mesh_batch;
+                    int nm2 = sc->count < active_resident->resources.mesh_count ? sc->count : active_resident->resources.mesh_count;
+                    for (int i = 0; i < nm2; i++) {
+                        int bk = mb[i];
+                        if (bk < 0 || bk >= nbatch || vl_cnt[bk] == 0xff) continue;
+                        const N2Mesh *m = &sc->meshes[i];
+                        if (!m->scen_has) { vl_cnt[bk] = 0xff; continue; }
+                        int c = vl_cnt[bk], j = 0;
+                        while (j < c && vl_sec[bk][j] != m->scen_region) j++;
+                        if (j < c) continue;
+                        if (c == 4) { vl_cnt[bk] = 0xff; continue; }
+                        vl_sec[bk][c] = m->scen_region; vl_cnt[bk] = (unsigned char)(c + 1);
+                    }
+                    for (int k = 0; k < nbatch; k++)
+                        if (!vl_cnt[k] || wbatch[k].tall) vl_cnt[k] = 0xff;   /* no mesh known / far LOD: drawn */
+                } else vl_n = -1;
+            }
+            if (vl_n == nbatch) {
+                const short *vl = NULL;
+                int nvl = world_flares_sections(cam, &vl);
+                for (int i = 0; i < vl_nlast; i++) vl_bits[(unsigned short)vl_last[i] >> 3] = 0;
+                vl_nlast = 0;
+                if (nvl > 0 && vl) {
+                    for (int i = 0; i < nvl && i < 128; i++) {
+                        vl_bits[(unsigned short)vl[i] >> 3] |= (unsigned char)(1u << (vl[i] & 7));
+                        vl_last[vl_nlast++] = vl[i];
+                    }
+                    vl_use = 1; vl_listed++;
+                }
+                vl_frames++;
+            }
+        }
+#endif
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
             N2Batch *b = &wbatch[k];
@@ -25727,6 +25812,27 @@ int main(int argc, char **argv) {
                 continue;
             }
             cc_tested++;
+            if (vl_use && vl_cnt[k] != 0xff) {
+                int c = vl_cnt[k], seen = 0;
+                for (int j = 0; j < c && !seen; j++) {
+                    /* the section, or its district's LOD sections (x98/x99): where
+                       retail would draw the LOD the port has full detail loaded */
+                    unsigned sx = vl_sec[k][j], lod = sx / 100u * 100u + 98u;
+                    seen = ((vl_bits[sx >> 3] >> (sx & 7)) & 1) || ((vl_bits[lod >> 3] >> (lod & 7)) & 1) ||
+                           ((vl_bits[(lod + 1) >> 3] >> ((lod + 1) & 7)) & 1);
+                }
+                if (!seen) {
+                    vl_skipped++;
+#if defined(OPENUG2_SIM_PRE_H)
+                    {   static int vv = -1; if (vv < 0) vv = getenv("OPENUG2_VISLIST_VERIFY") != NULL;
+                        if (vv && world_box_in_view(world_planes, b->bbox_min, b->bbox_max)) {
+                            vl_wouldview++;
+                            if (g_vl_dbg_n < 4096) g_vl_dbg[g_vl_dbg_n++] = k;
+                        } }
+#endif
+                    continue;
+                }
+            }
 #endif
             /* A batch whose meshes named a texture the resolver could not
                supply has nothing to draw. Untextured it falls back to a flat
@@ -25857,6 +25963,11 @@ int main(int argc, char **argv) {
                    cc_frames, (double)cc_ncell, (double)cc_skipped / cc_frames, (double)cc_tested / cc_frames,
                    cc_verify ? (cc_bad ? " -- VERIFY FAILED" : " (verify: 0 wrong)") : "");
             if (cc_verify && cc_bad) printf("world: cell cull verify: %ld skipped batches were in view\n", cc_bad);
+            if (vl_frames)
+                printf("world: visible-section lists over %ld frames: listed %ld, %.1f batches skipped per frame"
+                       " (%.1f of them in the frustum)\n", vl_frames, vl_listed,
+                       (double)vl_skipped / vl_frames, (double)vl_wouldview / vl_frames);
+            vl_skipped = vl_frames = vl_listed = vl_wouldview = 0;
             cc_skipped = cc_tested = cc_bad = cc_frames = 0;
         }
         if (nreflq) {
@@ -25979,6 +26090,52 @@ int main(int argc, char **argv) {
         wt_fade_sum += nfadeq; wt_fade_dist_sum += nfade_dist;
         #endif
         cb2 = SDL_GetPerformanceCounter();
+#if defined(OPENUG2_SIM_PRE_H)
+        if (g_vl_dbg_n && getenv("OPENUG2_VISLIST_PAINT")) {
+            /* test aid: the batches the visible-section lists skipped, painted
+               flat magenta and depth tested against the finished world: any
+               magenta on screen = a skipped batch that was not hidden */
+            glDepthMask(GL_FALSE);
+            glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 1.0f, 0.0f, 1.0f);
+            glUniform1f(rp.uAlphaTest, 0.0f);
+            for (int q = 0; q < g_vl_dbg_n; q++) draw_batch(&wbatch[g_vl_dbg[q]]);
+            glDepthMask(GL_TRUE);
+            lasttex = (GLuint)-1; lastmode = -1;
+        }
+        g_vl_dbg_n = 0;
+        {   /* test aid (simulator, OPENUG2_VISDIAG=1; PERF_PLAN P3.1): how many
+               drawn world batches hold no mesh of a section in the eye's
+               visible-section list (chunk 0x34153), scenery ids seen */
+            static int vd = -1, vdf; if (vd < 0) vd = getenv("OPENUG2_VISDIAG") != NULL;
+            if (vd && active_resident && active_resident->resources.mesh_batch && ++vdf % 300 == 0) {
+                const short *vl = NULL; int nvl = world_flares_sections(cam, &vl);
+                static unsigned char inb[4096]; static unsigned char vis[65536 / 8];
+                memset(vis, 0, sizeof vis);
+                for (int i = 0; i < nvl; i++) vis[(unsigned short)vl[i] >> 3] |= 1 << (vl[i] & 7);
+                const N2Scene *sc = &active_resident->world.scene;
+                const int *mb = active_resident->resources.mesh_batch;
+                /* 0 none, 1 only hidden sections, 2 a visible or ground mesh */
+                static unsigned char bst[16384]; int nb = nbatch < 16384 ? nbatch : 16384;
+                memset(bst, 0, (size_t)nb);
+                int rmin = 65535, rmax = 0, nground = 0;
+                for (int i = 0; i < sc->count && i < active_resident->resources.mesh_count; i++) {
+                    int b = mb[i]; if (b < 0 || b >= nb) continue;
+                    const N2Mesh *m = &sc->meshes[i];
+                    if (!m->scen_has) { bst[b] = 2; nground++; continue; }
+                    if (m->scen_region < rmin) rmin = m->scen_region;
+                    if (m->scen_region > rmax) rmax = m->scen_region;
+                    if (vis[m->scen_region >> 3] & (1 << (m->scen_region & 7))) bst[b] = 2;
+                    else if (!bst[b]) bst[b] = 1;
+                }
+                int hid = 0, kept = 0;
+                for (int q = 0; q < nviskept; q++) { int b = viskept[q]; if (b < nb) { if (bst[b] == 1) hid++; else kept++; } }
+                printf("visdiag: eye (%.0f %.0f) list %d [", cam[0], cam[1], nvl);
+                for (int i = 0; i < nvl && i < 12; i++) printf("%s%d", i ? " " : "", vl[i]);
+                printf("%s] | scenery regions %d..%d, %d ground meshes | drawn batches %d: %d hold only hidden sections\n",
+                       nvl > 12 ? " ..." : "", rmin, rmax, nground, nviskept, hid);
+            }
+        }
+#endif
         if (lastmode == N2_DRAW_CUTOUT) glUniform1f(rp.uAlphaTest, 0.0f);
         if (g_dbg.show_track && (passmode == 0 || passmode == 1) && active_resident) {
             /* the smokeable props: their meshes are out of the batches */
@@ -27940,6 +28097,7 @@ int main(int argc, char **argv) {
                            g_rt.active && g_rt.nis && race_state == 0);
         }
         pf_mark(PF_PD_SOUND);
+        Uint64 g_pc_t0 = SDL_GetPerformanceCounter(), g_pc_t1 = 0, g_pc_t2 = 0, g_pc_t3 = 0, g_pc_t4 = 0;
         /* The car effects (0x5f5730 per car, once per drawn frame) and the
            particle system's tick (0x492e10), then its draw (0x48bdf0) */
         {   /* the world animations (0x4321c0), on the particles' clock */
@@ -28034,7 +28192,9 @@ int main(int argc, char **argv) {
             { static int rf; rf = g_showroom ? rf + 1 : 0;   /* HW check: should stay 0 (purge preview aside) */
               if (rf == 120) printf("showroom: %d particles live after 120 frames%s\n", acid_live_particles(), g_acid_fe.c ? " (purge preview on)" : ""); }
             acid_world_pause(g_showroom);   /* the shop's own entrance marker would refill it */
+            g_pc_t1 = SDL_GetPerformanceCounter();
             acid_tick(acid_dt);
+            g_pc_t2 = SDL_GetPerformanceCounter();
             if (VITA_PROBE(7) || (g_showroom && (g_acid_fe.c || acid_live_particles() > 0))) {   /* showroom: the purge preview */
                 /* pixels per unit size at unit depth: the screen-size clamp's
                    view +0xc (assumed half the viewport height / tan(fovy/2)) */
@@ -28044,12 +28204,28 @@ int main(int argc, char **argv) {
                 /* eRenderWorldLightFlares runs in the game's state 6 only (not the front end) */
                 aciddraw_world_flares_enable(!g_showroom && g_dbg.show_track && (passmode == 0 || passmode == 2));
                 { const WorldNeighborhood *fa = active_resident ? &active_resident->world : &world.neighborhood; aciddraw_world_flares_area(fa->center[0], fa->center[1], fa->radius); }   /* no flares over unplaced buildings */
+                g_pc_t3 = SDL_GetPerformanceCounter();
                 g_dbg.drawn += aciddraw_draw(V, MVP, proj, incar);
+                g_pc_t4 = SDL_GetPerformanceCounter();
                 glUseProgram(rp.prog);
                 glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
             }
         }
         pf_mark(PF_PD_PARTICLES);
+        {   /* census (11-15, PERF_PLAN): hwlog61 particles 2.2 ms/frame --
+               slot steps (cars' effects), acid_tick, aciddraw_draw */
+            static Uint64 a[4]; static int n;
+            Uint64 now = SDL_GetPerformanceCounter();
+            if (g_pc_t1) { a[0] += g_pc_t1 - g_pc_t0; a[1] += g_pc_t2 - g_pc_t1; }
+            if (g_pc_t3) a[2] += g_pc_t4 - g_pc_t3;
+            a[3] += now - g_pc_t0;
+            if (++n == 600) {
+                double f = 1000.0 / (double)SDL_GetPerformanceFrequency() / 600.0;
+                printf("particles over 600 frames: %.3f ms/frame (car slots %.3f, tick %.3f, draw %.3f), %d live\n",
+                       a[3] * f, a[0] * f, a[1] * f, a[2] * f, acid_live_particles());
+                memset(a, 0, sizeof a); n = 0;
+            }
+        }
 
         /* Authored point lights are render-only; gameplay owns no part of this pass. */
         /* port-only lamp halos from the 0x135003 lights (the eLight database, which the

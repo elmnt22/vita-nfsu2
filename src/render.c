@@ -1714,6 +1714,11 @@ static unsigned long long g_batch_pack_us, g_batch_gl_us;
 static long g_batch_src_meshes, g_batch_src_verts;   /* hash-only meshes rebuilt from source */
 static long g_batch_asm, g_batch_deferred;   /* batches uploaded from worker-assembled arrays */
 static long g_batch_bytes;
+/* worker-assembled arrays copied on the GPU-copy worker (sdl_vita.c);
+   ux0:data/NFSU2/nogpucopy.txt copies inline as before */
+static int g_batch_copy;
+static long g_batch_copied;
+static unsigned long long g_batch_wait_us;
 #endif
 
 /* A batch of the worker's plan. meta: bb/scen/named computed on the worker
@@ -1778,13 +1783,27 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
             }
             unsigned long long tg = sceKernelGetProcessTimeWide();
             g_batch_pack_us += tg - g_batch_t0;
+            /* allocate here, copy on the GPU-copy worker (11-15, PERF_PLAN
+               P2.3); the step finishes only once the copies are done, and
+               the arrays live in the plan's arena until then */
+            void *dv = NULL, *di = NULL;
             glGenBuffers(1, &b->vbo); glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
-            glBufferData(GL_ARRAY_BUFFER, (long)nv * (long)sizeof(BatchedVertex), pb->bv, GL_STATIC_DRAW);
+            glBufferData(GL_ARRAY_BUFFER, (long)nv * (long)sizeof(BatchedVertex), g_batch_copy ? NULL : pb->bv, GL_STATIC_DRAW);
+            if (g_batch_copy) dv = glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
             glGenBuffers(1, &b->ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, pb->bi, GL_STATIC_DRAW);
-            if (glGetError() != GL_NO_ERROR) {
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, g_batch_copy ? NULL : pb->bi, GL_STATIC_DRAW);
+            if (g_batch_copy) di = glMapBuffer(GL_ELEMENT_ARRAY_BUFFER, GL_WRITE_ONLY);
+            if (glGetError() != GL_NO_ERROR || (g_batch_copy && (!dv || !di))) {
                 glDeleteBuffers(1, &b->vbo); glDeleteBuffers(1, &b->ibo);
                 memset(b, 0, sizeof *b); return 0;
+            }
+            if (g_batch_copy) {
+                vita_copy_push(dv, pb->bv, (unsigned)nv * (unsigned)sizeof(BatchedVertex));
+                vita_copy_push(di, pb->bi, (unsigned)ni * 2u);
+                /* vitaGL keeps the pointer (unmap only clears its flag); the
+                   simulator's desktop GL copied inline and needs it unmapped */
+                glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER); glUnmapBuffer(GL_ARRAY_BUFFER);
+                g_batch_copied++;
             }
             g_batch_bytes += (long)nv * (long)sizeof(BatchedVertex) + (long)ni * 2;
             SharedBatchBuffers *q = calloc(1, sizeof *q);
@@ -2000,6 +2019,9 @@ struct WorldBatchUpload {
 void upload_world_batches_cancel(WorldBatchUpload **slot) {
     if (!slot || !*slot) return;
     WorldBatchUpload *j = *slot;
+#ifdef __vita__
+    vita_copy_wait();   /* copies into this job's buffers from its arena */
+#endif
     render_batch_array_free(&j->batches, &j->count);
     plan_slabs_free(j->arena); free(j->prepared); free(j->ent); free(j->run0); free(j->run1); free(j);
     *slot = NULL;
@@ -3342,6 +3364,9 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
 #ifdef __vita__
     g_batch_reuse = 1;
     if (!j->next) g_batch_reused = g_batch_reused_bytes = 0;
+    {   static int copy_on = -1;
+        if (copy_on < 0) { FILE *f = fopen("ux0:data/NFSU2/nogpucopy.txt", "rb"); copy_on = !f; if (f) fclose(f); }
+        g_batch_copy = copy_on; }
 #endif
 #ifdef __vita__
     /* Count limits alone allow a large resident to monopolise a frame.
@@ -3420,12 +3445,23 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     /* smooth: the last batches' frame leaves the sort and the mesh map
        (several ms on a city area) to the next call */
     if (smooth && emitted) return 0;
+    /* the GPU-copy worker still filling this area's buffers: a sliced step
+       comes back next frame, a synchronous one waits */
+    if (!vita_copy_idle()) {
+        if (sliced) return 0;
+        unsigned long long w0 = sceKernelGetProcessTimeWide();
+        vita_copy_wait();
+        g_batch_wait_us += sceKernelGetProcessTimeWide() - w0;
+    }
 #endif
     int nb = j->count;
 #ifdef __vita__
-    printf("batches: %d built, CPU packing %llu ms, GL buffers %llu ms, %ld KB uploaded\n",
-           nb, g_batch_pack_us / 1000, g_batch_gl_us / 1000, g_batch_bytes >> 10);
-    g_batch_pack_us = g_batch_gl_us = 0; g_batch_bytes = 0;
+    {   unsigned long long cus, cby; vita_copy_stats(&cus, &cby);
+        printf("batches: %d built, CPU packing %llu ms, GL buffers %llu ms, %ld KB uploaded"
+               " (%ld batches copied on the worker: %llu KB in %llu ms, frame thread waited %llu ms)\n",
+               nb, g_batch_pack_us / 1000, g_batch_gl_us / 1000, g_batch_bytes >> 10,
+               g_batch_copied, cby >> 10, cus / 1000, g_batch_wait_us / 1000); }
+    g_batch_pack_us = g_batch_gl_us = 0; g_batch_bytes = 0; g_batch_copied = 0; g_batch_wait_us = 0;
     printf("tile GPU reuse: %ld batches, %ld KB retained without upload; "
            "%ld meshes (%ld KB) rebuilt from source (CPU copy freed); %ld uploaded from worker-assembled arrays, %ld steps ended early\n",
            g_batch_reused, g_batch_reused_bytes >> 10, g_batch_src_meshes,

@@ -33,6 +33,18 @@ extern PFNGLBUFFERDATAPROC sim_glBufferData;
 #define glBufferData sim_glBufferData
 extern PFNGLBUFFERSUBDATAPROC sim_glBufferSubData;
 #define glBufferSubData sim_glBufferSubData
+typedef void *(APIENTRY *SIM_PFNMAPBUFFER)(GLenum, GLenum);
+typedef GLboolean (APIENTRY *SIM_PFNUNMAPBUFFER)(GLenum);
+extern SIM_PFNMAPBUFFER sim_glMapBuffer;
+/* vitaGL-like map: a staging copy uploaded by glBufferSubData at unmap */
+void *sim_stage_map(GLenum target, GLenum access);
+GLboolean sim_stage_unmap(GLenum target);
+#define glMapBuffer sim_stage_map
+extern SIM_PFNUNMAPBUFFER sim_glUnmapBuffer;
+#define glUnmapBuffer sim_stage_unmap
+#ifndef GL_WRITE_ONLY
+#define GL_WRITE_ONLY 0x88B9
+#endif
 extern PFNGLCHECKFRAMEBUFFERSTATUSPROC sim_glCheckFramebufferStatus;
 #define glCheckFramebufferStatus sim_glCheckFramebufferStatus
 extern PFNGLCLEARPROC sim_glClear;

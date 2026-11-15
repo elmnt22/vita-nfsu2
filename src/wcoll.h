@@ -39,6 +39,7 @@ typedef struct {
  * has none. */
 WColl *wcoll_load(const char *stream_bun, const char *track_bun);
 void   wcoll_free(WColl *w);
+void   wcoll_cache_thread(void);   /* the thread whose gathers use the polygon cache (main) */
 int    wcoll_pack_count(const WColl *w);
 
 void wcoll_ctx_init(WCollCtx *c);

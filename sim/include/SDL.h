@@ -59,6 +59,10 @@ extern float vita_lstick_y;
 extern int vita_probe_skip;
 void vita_shader_failed(unsigned type, const char *src, const char *log);
 void vita_parallel_for(int n, void (*fn)(int i, void *ctx), void *ctx);
+void vita_copy_push(void *dst, const void *src, unsigned n);
+int  vita_copy_idle(void);
+void vita_copy_wait(void);
+void vita_copy_stats(unsigned long long *us, unsigned long long *bytes);
 
 #ifdef __cplusplus
 }

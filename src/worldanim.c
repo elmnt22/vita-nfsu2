@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "SDL.h"
 
 static uint32_t rd32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint16_t rd16(const unsigned char *p) { return (uint16_t)(p[0] | p[1] << 8); }
@@ -614,6 +615,30 @@ static void ent_world(const WaEnt *e, float W[16])
         m4mul(W, g.tr[e->tree].in->M, W);
 }
 
+/* The draw's world matrices, the parent chain's product kept per entity for
+   the frame (11-15, PERF_PLAN P3): hwlog62 the per-entity chain walk was
+   ~0.48 ms/frame for 124 entities. Same product (L_e . L_p1 . L_p2 ...);
+   a parent with a pending pose is brought up to date first (SpaceNode::Update
+   order: the parent's matrix before the child's). */
+static float (*g_wc)[16]; static unsigned *g_wcs; static int g_wc_cap; static unsigned g_wframe;
+static const float *ent_chain(int i, int depth)
+{
+    WaEnt *e = &g.ent[i];
+    if (g_wcs[i] == g_wframe) return g_wc[i];
+    if (e->pending) pose_update(e);
+    if (e->parent >= 0 && depth < 16) m4mul(e->local, ent_chain(e->parent, depth + 1), g_wc[i]);
+    else memcpy(g_wc[i], e->local, sizeof e->local);
+    g_wcs[i] = g_wframe;
+    return g_wc[i];
+}
+static void ent_world_frame(int i, float W[16])
+{
+    const WaEnt *e = &g.ent[i];
+    memcpy(W, ent_chain(i, 0), 16 * sizeof(float));
+    if (e->parent < 0 && e->d->name != g.tr[e->tree].in->tree)      /* a second root: at the instance */
+        m4mul(W, g.tr[e->tree].in->M, W);
+}
+
 int wa_entity_pos(unsigned name, float pos[3])
 {
     for (int i = 0; i < g.nent; i++) {
@@ -762,11 +787,23 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
         for (int c = 0; c < 4; c++) g.planes[p][c] = MVP[c * 4 + 3] + (p & 1 ? -1.0f : 1.0f) * MVP[c * 4 + (p >> 1)];
     g.have_planes = 1;
     planes = (const float (*)[4])g.planes;
+    /* census (11-15, PERF_PLAN P3): hwlog61 world anims 1.15-1.4 ms/frame */
+    static Uint64 t_all; static long c_ent, c_drawn, c_frames;
+    Uint64 tq = SDL_GetPerformanceCounter();
+    int chain = 1;
+    if (g.nent > g_wc_cap) {
+        free(g_wc); free(g_wcs);
+        g_wc = malloc((size_t)g.nent * sizeof *g_wc); g_wcs = calloc((size_t)g.nent, sizeof *g_wcs);
+        g_wc_cap = g_wc && g_wcs ? g.nent : 0;
+    }
+    if (g_wc_cap < g.nent) chain = 0;
+    if (++g_wframe == 0) { g_wframe = 1; if (g_wcs) memset(g_wcs, 0, (size_t)g_wc_cap * sizeof *g_wcs); }
     for (int i = 0; i < g.nent; i++) {
         WaEnt *e = &g.ent[i];
         if (e->model < 0) continue;
         WaModel *m = &g.mdl[e->model];
         if (m->state <= 0) continue;
+        c_ent++;
         /* RenderWorldModels 0x61d4b0 -> WorldModel::Render 0x61d150 (GC
            8024cdf0): eView::GetPixelSize(node position, 35 m 0x7a6794) 0x48acb0
            >= 2, then GetVisibleState(model box, node matrix) 0x48f6f0. The
@@ -774,9 +811,9 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
            only brought up to date (SpaceNode::Update 0x60bb10). The
            camera-inside-box skip (WorldModel +0x18) is never armed: the ctor
            (GC 8024ca1c) stores 0 and nothing else writes it for these. */
-        if (e->pending) pose_update(e);
         float W[16];
-        ent_world(e, W);
+        if (chain) ent_world_frame(i, W);
+        else { if (e->pending) pose_update(e); ent_world(e, W); }
         float lo[3], hi[3];
         for (int k = 0; k < 3; k++) { lo[k] = W[12 + k]; hi[k] = W[12 + k]; }
         for (int r = 0; r < 3; r++)
@@ -815,6 +852,7 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
            with none, prelit like the world. No world-anim solid has the bit
            (STREAML4RA: 14 of the 20 anim solids found, all +0xe = 0; the 0x40
            solids are XS_ props), so the world pass's prelit state is right. */
+        c_drawn++;
         float M2[16];
         mat_mul(MVP, W, M2);
         glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, M2);
@@ -838,6 +876,14 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
         }
         glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MVP);
         render_model(rp, NULL);
+    }
+    t_all += SDL_GetPerformanceCounter() - tq;
+    if (++c_frames >= 600) {
+        double f = 1000.0 / (double)SDL_GetPerformanceFrequency() / (double)c_frames;
+        printf("world anims draw over %ld frames: %.3f ms/frame; %.1f entities, %.1f drawn%s\n",
+               c_frames, (double)t_all * f, (double)c_ent / c_frames, (double)c_drawn / c_frames,
+               chain ? "" : " (no chain cache)");
+        t_all = 0; c_ent = c_drawn = c_frames = 0;
     }
     if (cur_cut) glUniform1f(rp->uAlphaTest, 0.0f);
     if (cur_blend) {

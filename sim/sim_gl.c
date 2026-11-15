@@ -15,6 +15,8 @@ PFNGLBLENDEQUATIONSEPARATEPROC sim_glBlendEquationSeparate;
 PFNGLBLENDFUNCPROC sim_glBlendFunc;
 PFNGLBLENDFUNCSEPARATEPROC sim_glBlendFuncSeparate;
 PFNGLBUFFERDATAPROC sim_glBufferData;
+SIM_PFNMAPBUFFER sim_glMapBuffer;
+SIM_PFNUNMAPBUFFER sim_glUnmapBuffer;
 PFNGLBUFFERSUBDATAPROC sim_glBufferSubData;
 PFNGLCHECKFRAMEBUFFERSTATUSPROC sim_glCheckFramebufferStatus;
 PFNGLCLEARPROC sim_glClear;
@@ -159,6 +161,8 @@ int sim_gl_load(void) {
     if (!(sim_glBlendFunc = (PFNGLBLENDFUNCPROC)SDL_GL_GetProcAddress("glBlendFunc"))) { printf("sim: GL entry glBlendFunc missing\n"); missing++; }
     if (!(sim_glBlendFuncSeparate = (PFNGLBLENDFUNCSEPARATEPROC)SDL_GL_GetProcAddress("glBlendFuncSeparate"))) { printf("sim: GL entry glBlendFuncSeparate missing\n"); missing++; }
     if (!(sim_glBufferData = (PFNGLBUFFERDATAPROC)SDL_GL_GetProcAddress("glBufferData"))) { printf("sim: GL entry glBufferData missing\n"); missing++; }
+    if (!(sim_glMapBuffer = (SIM_PFNMAPBUFFER)SDL_GL_GetProcAddress("glMapBuffer"))) { printf("sim: GL entry glMapBuffer missing\n"); missing++; }
+    if (!(sim_glUnmapBuffer = (SIM_PFNUNMAPBUFFER)SDL_GL_GetProcAddress("glUnmapBuffer"))) { printf("sim: GL entry glUnmapBuffer missing\n"); missing++; }
     if (!(sim_glBufferSubData = (PFNGLBUFFERSUBDATAPROC)SDL_GL_GetProcAddress("glBufferSubData"))) { printf("sim: GL entry glBufferSubData missing\n"); missing++; }
     if (!(sim_glCheckFramebufferStatus = (PFNGLCHECKFRAMEBUFFERSTATUSPROC)SDL_GL_GetProcAddress("glCheckFramebufferStatus"))) { printf("sim: GL entry glCheckFramebufferStatus missing\n"); missing++; }
     if (!(sim_glClear = (PFNGLCLEARPROC)SDL_GL_GetProcAddress("glClear"))) { printf("sim: GL entry glClear missing\n"); missing++; }
@@ -289,4 +293,24 @@ int sim_gl_load(void) {
     if (!(sim_glVertexAttribPointer = (PFNGLVERTEXATTRIBPOINTERPROC)SDL_GL_GetProcAddress("glVertexAttribPointer"))) { printf("sim: GL entry glVertexAttribPointer missing\n"); missing++; }
     if (!(sim_glViewport = (PFNGLVIEWPORTPROC)SDL_GL_GetProcAddress("glViewport"))) { printf("sim: GL entry glViewport missing\n"); missing++; }
     return missing;
+}
+
+/* glMapBuffer as the game uses it (render.c batch upload): the Vita's
+   vitaGL hands out the buffer's own memory; here a staging block per target
+   that glUnmapBuffer uploads with glBufferSubData. */
+static void *g_stage[2]; static GLint g_stage_n[2];
+void *sim_stage_map(GLenum target, GLenum access) {
+    (void)access;
+    int t = target == GL_ELEMENT_ARRAY_BUFFER;
+    GLint n = 0; sim_glGetBufferParameteriv(target, GL_BUFFER_SIZE, &n);
+    if (n <= 0) return NULL;
+    free(g_stage[t]); g_stage[t] = malloc((size_t)n); g_stage_n[t] = g_stage[t] ? n : 0;
+    return g_stage[t];
+}
+GLboolean sim_stage_unmap(GLenum target) {
+    int t = target == GL_ELEMENT_ARRAY_BUFFER;
+    if (!g_stage[t]) return GL_FALSE;
+    sim_glBufferSubData(target, 0, g_stage_n[t], g_stage[t]);
+    free(g_stage[t]); g_stage[t] = NULL; g_stage_n[t] = 0;
+    return GL_TRUE;
 }
