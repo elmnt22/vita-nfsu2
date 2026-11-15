@@ -11816,6 +11816,12 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
     }
     hitch_mark("rt.player_ctl");
     RtStepBatch steps; steps.n = 0; steps.dt = dt;
+    /* PERF_PLAN P5.1 census (11-15): hwlog67's rt.opp_ctl is 1.6-1.8 ms a
+       frame while ai prof puts airacer_frame at 0.08 ms a racer tick; the
+       controller loops' time split into the AI controller and the rest,
+       logged every 600 ticks */
+    static Uint64 cp_opp_ai, cp_opp_all, cp_tr_ai, cp_tr_all; static int cp_ticks, cp_nopp, cp_ntr;
+    Uint64 cp_t0 = SDL_GetPerformanceCounter();
     for (int k = 0; k < g_rt.n && !g_rt.field_gone; k++) {
         RtCar *c = &g_rt.car[k];
         N2Controls ctl;
@@ -11830,7 +11836,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
             continue;
         }
         if (!rt_on(k)) continue;
-        airacer_frame(c->r, wdt, &ctl);
+        { Uint64 a0 = SDL_GetPerformanceCounter(); airacer_frame(c->r, wdt, &ctl); cp_opp_ai += SDL_GetPerformanceCounter() - a0; cp_nopp++; }
         g_rt.asteer[k] = ctl.steer;
         g_rt.abrake[k] = ctl.brake; g_rt.ahbrake[k] = ctl.handbrake;
         if (n2sim_brake(c->s) > 0.05f) g_rt.abrake_t[k] = g_rt.t;   /* UpdateBrakelightsState 0x5f62b0: +0x948 */
@@ -11867,12 +11873,14 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         steps.s[steps.n++] = c->s;
     }
     hitch_mark("rt.opp_ctl");
+    Uint64 cp_t1 = SDL_GetPerformanceCounter();
+    cp_opp_all += cp_t1 - cp_t0;
     RT_FCRUMB("tick %d: traffic", g_rt.ticks);
     for (int i = 0; i < g_rt.ntr; i++) {                 /* the traffic: TrafficController 0x429d90 */
         RtCar *c = &g_rt.tcar[i];
         N2Controls ctl;
         RT_FCRUMB("tick %d: traffic %d frame (mover %d)", g_rt.ticks, i, airacer_mover(c->r));
-        airacer_frame(c->r, wdt, &ctl);
+        { Uint64 a0 = SDL_GetPerformanceCounter(); airacer_frame(c->r, wdt, &ctl); cp_tr_ai += SDL_GetPerformanceCounter() - a0; cp_ntr++; }
         rt_traffic_put(i);
         int mv = airacer_mover(c->r);
         if (!mv) continue;                               /* off the road net: not simulated */
@@ -11882,6 +11890,14 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         steps.s[steps.n++] = c->s;
     }
     hitch_mark("rt.traffic_ctl");
+    cp_tr_all += SDL_GetPerformanceCounter() - cp_t1;
+    if (++cp_ticks >= 600) {
+        double f = 1000.0 / (double)SDL_GetPerformanceFrequency() / cp_ticks;
+        printf("rt controllers over %d ticks (ms/tick): opponents %.3f (AI %.3f, %.1f cars) | traffic %.3f (AI %.3f, %.1f cars)\n",
+               cp_ticks, cp_opp_all * f, cp_opp_ai * f, (double)cp_nopp / cp_ticks,
+               cp_tr_all * f, cp_tr_ai * f, (double)cp_ntr / cp_ticks);
+        cp_opp_ai = cp_opp_all = cp_tr_ai = cp_tr_all = 0; cp_ticks = cp_nopp = cp_ntr = 0;
+    }
     pf_detail.race_control += pf_elapsed(pf_race_control);
     Uint64 pf_race_physics = pf_stamp();
     RT_FCRUMB("tick %d: steps (%d)", g_rt.ticks, steps.n);
