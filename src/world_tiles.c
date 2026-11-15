@@ -392,8 +392,39 @@ static void wt_mesh_centre(const N2Mesh *m, float *x, float *y) {
 
 static long long g_wt_raw_total, g_wt_stored_total;
 
+/* ---- ready tiles (PERF_PLAN P2, 11-15) ------------------------------------
+ * A tile can instead hold its meshes in the decoded layout (what wt_decode
+ * builds: f32 verts [+ normals], u16 indices, prelight, decoded bounds), so
+ * a load is one LZ4 pass into the block the meshes live in. Tile header
+ * version WTILE_READY_VERSION (older decoders refuse the tile instead of
+ * misreading it). Payload: u32 "RDY1", mesh count, header offset, pad to
+ * 16, the geometry, then every WTileMesh (world_bounds = the decoded ones):
+ * the headers last, so a full load trims them off its block in place.
+ * Written when readytiles.txt / OPENUG2_READYTILES is present at
+ * conversion: the converter builds the v6 payload, decodes it with the
+ * loader's own decoder and stores that, so a ready tile loads into exactly
+ * the meshes the v6 tile does. */
+#define WTILE_READY_VERSION (0x100 | WTILE_VERSION)
+#define WT_READY_MAGIC 0x31594452u   /* "RDY1" */
+static int wt_ready_fmt(void) {
+    static int on = -1;
+    if (on < 0) {
+        FILE *f = fopen("ux0:data/NFSU2/readytiles.txt", "rb");
+        on = f != NULL || getenv("OPENUG2_READYTILES") != NULL;
+        if (f) fclose(f);
+        if (on) printf("tiles: writing ready tiles (decoded layout)\n");
+    }
+    return on;
+}
+static int wt_ready_payload(const WtBuf *b, int tx, int ty, unsigned char **outp, size_t *outn);
+
 /* one tile file's bytes (header + stored payload) appended to the pack */
-static int wt_write_tile(WtPackW *pw, int tx, int ty, const WtBuf *b, size_t *stored_out) {
+static int wt_write_tile(WtPackW *pw, int tx, int ty, const WtBuf *b0, size_t *stored_out) {
+    WtBuf rb; const WtBuf *b = b0;
+    unsigned char *rp = NULL; size_t rn = 0;
+    if (wt_ready_fmt() && b0->n && wt_ready_payload(b0, tx, ty, &rp, &rn)) {
+        rb = *b0; rb.p = rp; rb.n = rn; rb.cap = rn; b = &rb;
+    }
     /* compress, then prove it by decompressing; raw if it does not pay or fails */
     int cap = (int)(b->n + b->n / 255 + 64);
     uint8_t *z = b->n ? (uint8_t *)malloc((size_t)cap) : NULL;
@@ -405,12 +436,12 @@ static int wt_write_tile(WtPackW *pw, int tx, int ty, const WtBuf *b, size_t *st
         if (!good) { printf("tiles: compression check failed for (%d,%d); stored raw\n", tx, ty); zn = 0; }
     } else zn = 0;
     uint32_t off = pw->pos;
-    uint32_t hdr[8] = { 0x54324755u /* "UG2T" */, WTILE_VERSION, (uint32_t)tx, (uint32_t)ty,
+    uint32_t hdr[8] = { 0x54324755u /* "UG2T" */, rp ? WTILE_READY_VERSION : WTILE_VERSION, (uint32_t)tx, (uint32_t)ty,
                         (uint32_t)b->meshes, (uint32_t)b->n, (uint32_t)(zn ? zn : (int)b->n), zn ? 1u : 0u };
     const void *body = zn ? (const void *)z : (const void *)b->p;
     size_t bodyn = zn ? (size_t)zn : b->n;
     int ok = wt_pw_put(pw, hdr, sizeof hdr) && wt_pw_put(pw, body, bodyn) && wt_pw_entry(pw, tx, ty, off);
-    free(z);
+    free(z); free(rp);
     g_wt_raw_total += (long long)b->n; g_wt_stored_total += (long long)bodyn;
     if (stored_out) *stored_out = bodyn + sizeof hdr;
     return ok;
@@ -1013,12 +1044,103 @@ static float wt_far_extra(void) {
 /* decoded tile geometry alive anywhere (the cache, the read-ahead, residents
    still drawing or retiring): PERF_PLAN P0.2 census */
 static volatile long long g_wt_geo_live;
+/* a ready tile (see wt_ready_payload): one LZ4 pass straight into the
+   block the meshes live in; a reduced (ground / far) load copies only the
+   meshes it keeps out of the scratch */
+static int wt_decode_ready(unsigned char *data, long len, const uint32_t *hdr, int tx, int ty,
+                           WtLoaded *out, WtScratch *scr, int ground_only) {
+    size_t plen = hdr[5];
+    int ok = hdr[4] < 200000 && hdr[6] == (uint32_t)(len - 32) && plen < (256u << 20) && plen >= 12;
+    if (!ok) return 0;
+    unsigned char *buf = ground_only ? (scr ? wt_scratch(scr, plen) : (unsigned char *)malloc(plen))
+                                     : (unsigned char *)malloc(plen);
+    if (!buf) return 0;
+    if (hdr[7] & 1) ok = lz4_decompress(data + 32, (int)hdr[6], buf, (int)plen);
+    else memcpy(buf, data + 32, plen);
+    uint32_t rh[3];
+    if (ok) { memcpy(rh, buf, sizeof rh); ok = rh[0] == WT_READY_MAGIC && rh[1] == hdr[4] && rh[2] >= 16 &&
+                                               rh[2] + (size_t)rh[1] * sizeof(WTileMesh) == plen; }
+    uint32_t nm = ok ? rh[1] : 0, nsel = 0;
+    size_t gp = 0, total = 0;
+    WTileMesh *hs = NULL;   /* the headers, copied out before the block is trimmed */
+    if (ok && nm) { hs = (WTileMesh *)malloc((size_t)nm * sizeof *hs); if (hs) memcpy(hs, buf + rh[2], (size_t)nm * sizeof *hs); else ok = 0; }
+    for (uint32_t k = 0; ok && k < nm; k++) {   /* sizes + bounds checks */
+        const WTileMesh h = hs[k];
+        if (h.nverts == 0 || h.nverts > 65536 || h.nidx == 0 || h.nidx > (1u << 22)) { ok = 0; break; }
+        gp += wt_dec_size(&h);
+        if (16 + gp > rh[2]) { ok = 0; break; }
+        if (ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) continue;
+        total += wt_dec_size(&h); nsel++;
+    }
+    N2GeomBlock *blk = NULL; N2SharedGeometry *geoms = NULL; unsigned char *geo = NULL;
+    if (ok) {
+        blk = (N2GeomBlock *)calloc(1, sizeof *blk);
+        geoms = nsel ? (N2SharedGeometry *)calloc(nsel, sizeof *geoms) : NULL;
+        out->m = nsel ? (N2Mesh *)calloc(nsel, sizeof *out->m) : NULL;
+        if (ground_only) geo = (unsigned char *)malloc(total ? total : 4);
+        else {   /* drop the headers off the end: shrinks in place */
+            unsigned char *nb = (unsigned char *)realloc(buf, 16 + gp);
+            if (nb) buf = nb;
+            geo = buf;
+        }
+        if (!blk || !geo || (nsel && (!geoms || !out->m))) ok = 0;
+    }
+    if (!ok) {
+        free(blk); free(geoms); free(out->m); out->m = NULL; free(hs);
+        if (ground_only && geo) free(geo);
+        if (!ground_only || !scr) free(buf);
+        return 0;
+    }
+    size_t bytes = ground_only ? total : 16 + gp;
+    blk->data = geo; blk->geoms = geoms; blk->refs = 1;
+    blk->acct = &g_wt_geo_live; blk->bytes = (long long)bytes;
+    __sync_fetch_and_add(&g_wt_geo_live, (long long)bytes);
+    size_t sp = 16, dp = ground_only ? 0 : 16;
+    for (uint32_t k = 0; k < nm; k++) {
+        const WTileMesh h = hs[k];
+        size_t ds = wt_dec_size(&h);
+        if (ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) { sp += ds; continue; }
+        if (ground_only) memcpy(geo + dp, buf + sp, ds);
+        int nv = (int)h.nverts;
+        unsigned char *base = geo + dp;
+        float *v = (float *)base;
+        size_t vb = (size_t)nv * (h.authored_normals ? 8 : 5) * 4;
+        uint16_t *ix = (uint16_t *)(base + vb);
+        unsigned char *col = h.has_vcol ? base + vb + ((((size_t)h.nidx * 2) + 3) & ~(size_t)3) : NULL;
+        N2Mesh *m = &out->m[out->n];
+        N2SharedGeometry *g = &geoms[out->n];
+        m->verts = v; m->idx = ix; m->vcol = col;
+        g->refs = 1; g->verts = m->verts; g->idx = m->idx; g->vcol = m->vcol;
+        g->block = blk; blk->refs++;
+        m->shared_geometry = g;
+        m->nverts = nv; m->nidx = (int)h.nidx; m->texkey = h.texkey;
+        m->cat = h.cat; m->mat_exact = h.mat_exact; m->scen = h.scen; m->world_role = h.world_role;
+        m->inst = h.inst; m->authored_normals = h.authored_normals;
+        m->scen_has = h.scen_has; m->scen_region = h.scen_region; m->scen_index = h.scen_index;
+        m->terrain_biased = h.terrain_biased; m->vrepair = h.vrepair; m->draw_mode = h.draw_mode;
+        m->reflect = (h.flags & WTM_REFLECT) != 0;
+        memcpy(m->world_bounds, h.world_bounds, sizeof m->world_bounds);
+        m->world_bounds_valid = 1;
+        memcpy(m->sname, h.sname, sizeof m->sname); m->sname[sizeof m->sname - 1] = 0;
+        memcpy(m->aname, h.aname, sizeof m->aname); m->aname[sizeof m->aname - 1] = 0;
+        out->n++;
+        sp += ds; dp += ds;
+    }
+    free(hs);
+    if (ground_only && !scr) free(buf);
+    out->bytes = bytes + (size_t)nsel * (sizeof *geoms + sizeof *out->m);
+    if (__atomic_sub_fetch(&blk->refs, 1, __ATOMIC_ACQ_REL) == 0) n2_block_free(blk);
+    return 1;
+}
+
 static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *out, WtScratch *scr,
                      int ground_only) {
     memset(out, 0, sizeof *out); out->tx = tx; out->ty = ty; out->ground = ground_only;
     uint32_t hdr[8];
     int ok = data && len >= (long)sizeof hdr;
     if (ok) memcpy(hdr, data, sizeof hdr);
+    if (ok && hdr[0] == 0x54324755u && hdr[1] == WTILE_READY_VERSION)
+        return wt_decode_ready(data, len, hdr, tx, ty, out, scr, ground_only);
     ok = ok && hdr[0] == 0x54324755u && hdr[1] == WTILE_VERSION && hdr[4] < 200000 &&
          hdr[6] == (uint32_t)(len - (long)sizeof hdr) && hdr[5] < (256u << 20);
     unsigned char *payload = NULL;
@@ -1130,6 +1252,85 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
     /* drop the decoder's hold: from here the meshes keep the block alive */
     if (__atomic_sub_fetch(&blk->refs, 1, __ATOMIC_ACQ_REL) == 0) n2_block_free(blk);
     return 1;
+}
+
+/* the v6 payload in b -> a ready payload (malloc'd), 0 on any failure */
+static int wt_ready_payload(const WtBuf *b, int tx, int ty, unsigned char **outp, size_t *outn) {
+    *outp = NULL; *outn = 0;
+    size_t L = 32 + b->n;
+    unsigned char *img = (unsigned char *)malloc(L);
+    if (!img) return 0;
+    uint32_t hdr[8] = { 0x54324755u, WTILE_VERSION, (uint32_t)tx, (uint32_t)ty,
+                        (uint32_t)b->meshes, (uint32_t)b->n, (uint32_t)b->n, 0 };
+    memcpy(img, hdr, 32); if (b->n) memcpy(img + 32, b->p, b->n);
+    WtLoaded t;
+    int ok = wt_decode(img, (long)L, tx, ty, &t, NULL, 0) && t.n == (int)b->meshes;
+    const N2GeomBlock *blk = ok && t.n ? t.m[0].shared_geometry->block : NULL;
+    size_t geon = blk ? (size_t)blk->bytes : 0;
+    size_t goff = 16, hoff = goff + ((geon + 3) & ~(size_t)3);
+    unsigned char *o = ok ? (unsigned char *)calloc(1, hoff + (size_t)t.n * sizeof(WTileMesh) + 4) : NULL;
+    if (!o) ok = 0;
+    size_t pos = 0, gp = 0;
+    for (int k = 0; ok && k < t.n; k++) {
+        WTileMesh h;
+        memcpy(&h, b->p + pos, sizeof h);
+        pos += sizeof h + wt_enc_size(&h);
+        const N2Mesh *m = &t.m[k];
+        /* the decoded meshes sit back to back in the block, in order */
+        ok = (unsigned char *)m->verts == (unsigned char *)blk->data + gp && m->nverts == (int)h.nverts;
+        memcpy(h.world_bounds, m->world_bounds, sizeof h.world_bounds);
+        memcpy(o + hoff + (size_t)k * sizeof h, &h, sizeof h);
+        gp += wt_dec_size(&h);
+    }
+    if (ok && gp != geon) ok = 0;
+    if (ok) {
+        uint32_t rh[3] = { WT_READY_MAGIC, (uint32_t)t.n, (uint32_t)hoff };
+        memcpy(o, rh, sizeof rh);
+        if (geon) memcpy(o + goff, blk->data, geon);
+        *outp = o; *outn = hoff + (size_t)t.n * sizeof(WTileMesh);
+#if defined(OPENUG2_SIM_PRE_H)
+        {   /* test aid (simulator, OPENUG2_READY_VERIFY=1): the ready decoder
+               gives exactly the v6 decoder's meshes, full and reduced loads */
+            static int vf = -1; if (vf < 0) vf = getenv("OPENUG2_READY_VERIFY") != NULL;
+            static long vt, vbad;
+            for (int mode = 0; vf && mode < 3; mode++) {
+                int md = mode == 0 ? 0 : mode == 1 ? WT_GROUND_ONLY : WT_FAR_ONLY;
+                uint32_t h2[8] = { 0x54324755u, WTILE_READY_VERSION, (uint32_t)tx, (uint32_t)ty,
+                                   (uint32_t)t.n, (uint32_t)*outn, (uint32_t)*outn, 0 };
+                unsigned char *im2 = (unsigned char *)malloc(32 + *outn);
+                memcpy(im2, h2, 32); memcpy(im2 + 32, o, *outn);
+                WtLoaded r, q;
+                int a1 = wt_decode(img, (long)L, tx, ty, &q, NULL, md);
+                int a2 = wt_decode(im2, (long)(32 + *outn), tx, ty, &r, NULL, md);
+                int bad = !a1 || !a2 || q.n != r.n || q.bytes + (md ? 0 : 16) != r.bytes;   /* a full ready load keeps its 16-byte lead */
+                for (int k = 0; !bad && k < q.n; k++) {
+                    const N2Mesh *x = &q.m[k], *y = &r.m[k];
+                    size_t nv = (size_t)x->nverts;
+                    bad = x->nverts != y->nverts || x->nidx != y->nidx || x->texkey != y->texkey ||
+                          x->cat != y->cat || x->mat_exact != y->mat_exact || x->scen != y->scen ||
+                          x->world_role != y->world_role || x->inst != y->inst ||
+                          x->authored_normals != y->authored_normals || x->scen_has != y->scen_has ||
+                          x->scen_region != y->scen_region || x->scen_index != y->scen_index ||
+                          x->terrain_biased != y->terrain_biased || x->vrepair != y->vrepair ||
+                          x->draw_mode != y->draw_mode || x->reflect != y->reflect ||
+                          memcmp(x->world_bounds, y->world_bounds, sizeof x->world_bounds) ||
+                          strcmp(x->sname, y->sname) || strcmp(x->aname, y->aname) ||
+                          memcmp(x->verts, y->verts, nv * (x->authored_normals ? 8 : 5) * 4) ||
+                          memcmp(x->idx, y->idx, (size_t)x->nidx * 2) ||
+                          (!x->vcol != !y->vcol) || (x->vcol && memcmp(x->vcol, y->vcol, nv * 4));
+                }
+                vt++; if (bad) { vbad++; printf("ready verify: (%d,%d) mode %d DIFFERS\n", tx, ty, md); }
+                if (a1) wt_release(&q);
+                if (a2) wt_release(&r);
+                free(im2);
+                if (vt % 600 == 0 || bad) printf("ready verify: %ld loads compared, %ld differ\n", vt, vbad);
+            }
+        }
+#endif
+    } else free(o);
+    if (t.m || t.n) wt_release(&t);
+    free(img);
+    return ok;
 }
 
 static volatile unsigned g_wt_read_ms, g_wt_decode_ms;   /* loader-thread work, per assembly */
