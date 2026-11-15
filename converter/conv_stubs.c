@@ -48,6 +48,7 @@ void carfx_lights_changed(void) { }
 /* 11-12: carfx.c's light-list generation (world.c stamps a region's lights
  * with it); no car lighting here, a counter is enough */
 #include <stdint.h>
+#include <string.h>
 uint32_t carfx_new_light_revision(void) { static uint32_t r; return ++r; }
 
 /* 11-12: nfsu2.h n2_lang() asks the Vita's system language (built __vita__
@@ -61,3 +62,13 @@ uint32_t g_sim_probe_tag;
 unsigned int hud_wide_loading_tex(void) { return 0; }
 int hud_is_wide_loading_res(const char *name) { (void)name; return 0; }
 float hud_wide_loading_pin(float asp) { (void)asp; return 0.0f; }
+
+/* 11-15: added since the last Prep Tool build (save note, skyline, the
+   Vita copy thread); none of them run during a conversion */
+struct N2Tex;
+void savenote_cancel(void) {}
+void skyline_texavg_note(uint32_t key, const struct N2Tex *t) { (void)key; (void)t; }
+void vita_copy_push(void *dst, const void *src, unsigned n) { memcpy(dst, src, n); }
+int vita_copy_idle(void) { return 1; }
+void vita_copy_wait(void) {}
+void vita_copy_stats(unsigned long long *us, unsigned long long *bytes) { *us = 0; *bytes = 0; }

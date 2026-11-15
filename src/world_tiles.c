@@ -152,7 +152,7 @@ static int wt_pw_finish(WtPackW *w, const char *track, int ok) {
    16 (the Vita's own conversion), 47.8 MB at 64 (the Prep Tool). The card
    reads ~10 MB/s while streaming (hwlog67), so a smaller pack is faster
    reads. Conversion runs one tile at a time on one thread. */
-#ifdef __vita__
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)   /* the console; the simulator + Prep Tool: 64 */
 #define WT_LZ4_DEPTH 16
 #else
 #define WT_LZ4_DEPTH 64
