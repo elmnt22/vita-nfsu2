@@ -5948,9 +5948,13 @@ static void rt_height_watch(RtCar *c, int kind, int k, float dt)
     float hx = st->pos[0] - lastxy[kind][k][0], hy = st->pos[1] - lastxy[kind][k][1];
     if (hx * hx + hy * hy > 64.0f) dz = 0.0f;           /* put somewhere else (traffic teleporter, reset) */
     lastz[kind][k] = z; lastxy[kind][k][0] = st->pos[0]; lastxy[kind][k][1] = st->pos[1]; seen[kind][k] = 1;
+    int jump = fabsf(dz) > 1.5f, drop = st->vel[2] < -12.0f;
+    /* the ground only when a line may follow (11-15: a ground query per car
+       per tick for this log was ~0.8 ms/frame downtown, hwlog61 rt.cars_in) */
+    if (!jump && !drop && st->wheels_down) return;
     float gz = 0, n[3]; int surf = 0;
     int found = rt_ground(&c->wc, st->pos[0], st->pos[1], z + 1.0f, &gz, n, &surf);
-    int jump = fabsf(dz) > 1.5f, drop = st->vel[2] < -12.0f, high = !found || z - gz > 3.0f;
+    int high = !found || z - gz > 3.0f;
     if (!(jump || drop || (high && !st->wheels_down))) return;
     if (clock - lastlog[kind][k] < 1.0f && lastlog[kind][k] > 0) return;
     lastlog[kind][k] = clock;
