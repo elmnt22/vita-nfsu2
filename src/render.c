@@ -1712,8 +1712,20 @@ static const uint64_t *g_batch_prepared_hash;
 unsigned long long sceKernelGetProcessTimeWide(void);
 static unsigned long long g_batch_pack_us, g_batch_gl_us;
 static long g_batch_src_meshes, g_batch_src_verts;   /* hash-only meshes rebuilt from source */
+static long g_batch_asm, g_batch_deferred;   /* batches uploaded from worker-assembled arrays */
 static long g_batch_bytes;
 #endif
+
+/* A batch of the worker's plan. meta: bb/scen/named computed on the worker
+   (11-14 night); bv/bi: the batch's final vertex and index arrays, assembled
+   on the worker when the GPU did not hold it at plan time (in the plan's
+   arena), so the GL thread only uploads them. */
+struct PreparedBatch {
+    int begin, end; uint64_t hash[2];
+    int meta, named, scen[8], nv, ni; float bb[6];
+    BatchedVertex *bv; uint16_t *bi;
+};
+static const struct PreparedBatch *g_batch_prep;   /* set for the duration of an emit */
 
 static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
                        GLuint tex, N2Batch *b, int bidx, const char *audit,
@@ -1724,6 +1736,88 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     }
 #ifdef __vita__
     unsigned long long g_batch_t0 = sceKernelGetProcessTimeWide();
+    const struct PreparedBatch *pb = g_batch_prep;
+    if (g_batch_reuse && pb && pb->meta && !audit) {
+        /* the worker did the per-mesh work: reuse or upload, no mesh walk */
+        const N2Mesh *m0 = &s->meshes[ent[i0].idx];
+        SharedBatchBuffers *p = batch_buffers_find(pb->hash, nv, ni);
+        int up = 0;
+        memset(b, 0, sizeof *b);
+        if (p) {
+            p->refs++; b->vbo = p->vbo; b->ibo = p->ibo; b->shared_buffers = p;
+            g_batch_reused++; g_batch_reused_bytes += (long)nv*sizeof(BatchedVertex)+(long)ni*2;
+        } else if (pb->bv) {
+            static int verify = -1;
+            if (verify < 0) { const char *e = getenv("OPENUG2_ASM_VERIFY"); verify = e && e[0] == '1'; }
+            if (verify) {   /* sim check: the arrays equal a rebuild from the source meshes */
+                static long vok, vbad;
+                int vo = 0, io = 0, bad = 0;
+                for (int k = i0; k < i1 && !bad; k++) {
+                    const N2Mesh *m = &s->meshes[ent[k].idx];
+                    float *nor = (float *)calloc((size_t)m->nverts * 3, sizeof(float));
+                    if (!nor) break;
+                    mesh_normals(m, nor);
+                    for (int v = 0; v < m->nverts && !bad; v++) {
+                        BatchedVertex o; memset(&o, 0, sizeof o); const float *q = m->verts + v*5;
+                        o.pos[0]=q[0]; o.pos[1]=q[1]; o.pos[2]=q[2]; o.uv[0]=q[3]; o.uv[1]=q[4];
+                        BV_SET_NORMAL(&o, nor[v*3], nor[v*3+1], nor[v*3+2]);
+                        if (m->vcol) { o.col[0]=m->vcol[v*4]; o.col[1]=m->vcol[v*4+1];
+                                       o.col[2]=m->vcol[v*4+2]; o.col[3]=m->vcol[v*4+3]; }
+                        else o.col[0]=o.col[1]=o.col[2]=o.col[3]=255;
+                        const BatchedVertex *a = &pb->bv[vo + v];
+                        if (memcmp(a->pos, o.pos, sizeof o.pos) || memcmp(a->uv, o.uv, sizeof o.uv) ||
+                            memcmp(a->col, o.col, sizeof o.col)) bad = 1;
+                    }
+                    for (int t = 0; t < m->nidx && !bad; t++)
+                        if (pb->bi[io + t] != (uint16_t)(m->idx[t] + vo)) bad = 2;
+                    free(nor); vo += m->nverts; io += m->nidx;
+                }
+                if (bad) vbad++; else vok++;
+                if (bad || ((vok + vbad) & 255) == 0)
+                    fprintf(stderr, "asm verify: %ld ok, %ld bad (last batch %d: %d)\n", vok, vbad, bidx, bad);
+            }
+            unsigned long long tg = sceKernelGetProcessTimeWide();
+            g_batch_pack_us += tg - g_batch_t0;
+            glGenBuffers(1, &b->vbo); glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
+            glBufferData(GL_ARRAY_BUFFER, (long)nv * (long)sizeof(BatchedVertex), pb->bv, GL_STATIC_DRAW);
+            glGenBuffers(1, &b->ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, pb->bi, GL_STATIC_DRAW);
+            if (glGetError() != GL_NO_ERROR) {
+                glDeleteBuffers(1, &b->vbo); glDeleteBuffers(1, &b->ibo);
+                memset(b, 0, sizeof *b); return 0;
+            }
+            g_batch_bytes += (long)nv * (long)sizeof(BatchedVertex) + (long)ni * 2;
+            SharedBatchBuffers *q = calloc(1, sizeof *q);
+            if (q) {
+                q->hash[0] = pb->hash[0]; q->hash[1] = pb->hash[1];
+                q->nv = nv; q->ni = ni; q->refs = 1; q->vbo = b->vbo; q->ibo = b->ibo;
+                unsigned slot = pb->hash[0] & (SHARED_BATCH_SLOTS-1);
+                sbl_lock(); q->next = g_shared_batches[slot]; g_shared_batches[slot] = q; sbl_unlock();
+                b->shared_buffers = q;
+            }
+            g_batch_gl_us += sceKernelGetProcessTimeWide() - tg;
+            g_batch_asm++;
+            up = 1;
+        }
+        if (p || up) {
+            b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
+            b->texkey = m0->texkey;
+            b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
+            b->reflect = m0->reflect; b->fade_in = m0->fade_in;
+            b->tall = (unsigned char)batch_tall(m0);
+            memcpy(b->scen_count, pb->scen, sizeof b->scen_count);
+            b->unresolved = (unsigned char)(!tex && pb->named == i1 - i0);
+            for (int c = 0; c < 3; c++) { b->bbox_min[c] = pb->bb[c]; b->bbox_max[c] = pb->bb[c+3]; }
+            if (g_batch_packed) for (int k = i0; k < i1; k++) {   /* own copies left (none, usually) */
+                PackedMesh *pk = &g_batch_packed[ent[k].idx];
+                if (pk->v && !pk->borrowed) free(pk->v);
+                pk->v = NULL;
+            }
+            if (p) g_batch_pack_us += sceKernelGetProcessTimeWide() - g_batch_t0;
+            return 1;
+        }
+        /* neither: fall through to the mesh path (pk->v or the source) */
+    }
     if (g_batch_reuse && g_batch_prepared_hash && g_batch_packed && !audit) {
         SharedBatchBuffers *p=batch_buffers_find(g_batch_prepared_hash,nv,ni);
         if (p) {
@@ -1890,15 +1984,16 @@ struct WorldBatchUpload {
     N2Batch *batches;
     int *run0, *run1;
     int meshes, next, count;
-    struct PreparedBatch { int begin, end; uint64_t hash[2]; } *prepared;
+    struct PreparedBatch *prepared;
     int prepared_count;
+    void *arena;   /* the prepared batches' assembled arrays (render_world_plan_fill) */
 };
 
 void upload_world_batches_cancel(WorldBatchUpload **slot) {
     if (!slot || !*slot) return;
     WorldBatchUpload *j = *slot;
     render_batch_array_free(&j->batches, &j->count);
-    free(j->prepared); free(j->ent); free(j->run0); free(j->run1); free(j);
+    free(j->prepared); free(j->arena); free(j->ent); free(j->run0); free(j->run1); free(j);
     *slot = NULL;
 }
 
@@ -2033,6 +2128,77 @@ WorldBatchUpload *upload_world_batches_prepare_cpu(const N2Scene *s,
    copies them (11-14: with the CPU copies freed after upload, rebuilding those
    meshes there took packing from 27 to 37 ms a build and the stream frames
    missed more often, hwlog51_I). Returns the meshes packed. */
+#ifdef __vita__
+/* Worker, end of render_world_plan_fill: each prepared batch's bounds, scene
+   counts and named-texture count, and -- for the batches the GPU lacks, while
+   an 8 MB arena lasts -- its final arrays (vertices concatenated, indices
+   rebased), so batch_emit on the GL thread does no per-mesh work (hwlog51_L:
+   26 ms of CPU packing per build there). Own packed copies are freed here
+   once assembled. */
+#define PLAN_ARENA_MAX (8u << 20)
+static void plan_assemble(WorldBatchUpload *j) {
+    extern int world_build_aborted(void);
+    if (!j || !j->prepared || !j->packed) return;
+    unsigned char *want = (unsigned char *)calloc((size_t)(j->prepared_count ? j->prepared_count : 1), 1);
+    if (!want) return;
+    size_t total = 0;
+    for (int b = 0; b < j->prepared_count; b++) {
+        struct PreparedBatch *p = &j->prepared[b];
+        int nv = 0, ni = 0, ok = 1;
+        for (int c = 0; c < 3; c++) { p->bb[c] = 1e30f; p->bb[c+3] = -1e30f; }
+        memset(p->scen, 0, sizeof p->scen); p->named = 0;
+        for (int k = p->begin; k < p->end; k++) {
+            int idx = j->ent[k].idx; const N2Mesh *m = &j->scene->meshes[idx];
+            const PackedMesh *pk = &j->packed[idx];
+            nv += m->nverts; ni += m->nidx;
+            for (int c = 0; c < 3; c++) {
+                if (pk->bb[c] < p->bb[c]) p->bb[c] = pk->bb[c];
+                if (pk->bb[c+3] > p->bb[c+3]) p->bb[c+3] = pk->bb[c+3];
+            }
+            if (m->scen >= 0 && m->scen < 8) p->scen[m->scen]++;
+            if (m->texkey) p->named++;
+            ok &= pk->v != NULL;
+        }
+        p->meta = 1; p->nv = nv; p->ni = ni;
+        if (!ok) continue;
+        sbl_lock(); int have = batch_buffers_find(p->hash, nv, ni) != NULL; sbl_unlock();
+        if (have) continue;
+        size_t need = ((size_t)nv * sizeof(BatchedVertex) + (size_t)ni * 2 + 15) & ~(size_t)15;
+        if (total + need > PLAN_ARENA_MAX) continue;
+        want[b] = 1; total += need;
+    }
+    unsigned char *arena = total ? (unsigned char *)malloc(total) : NULL;
+    if (arena) {
+        size_t at = 0;
+        for (int b = 0; b < j->prepared_count; b++) {
+            if (!want[b]) continue;
+            struct PreparedBatch *p = &j->prepared[b];
+            int nv = 0, ni = 0;
+            for (int k = p->begin; k < p->end; k++) {
+                const N2Mesh *m = &j->scene->meshes[j->ent[k].idx]; nv += m->nverts; ni += m->nidx;
+            }
+            BatchedVertex *bv = (BatchedVertex *)(arena + at);
+            uint16_t *bi = (uint16_t *)(arena + at + (size_t)nv * sizeof *bv);
+            at += ((size_t)nv * sizeof *bv + (size_t)ni * 2 + 15) & ~(size_t)15;
+            int vo = 0, io = 0;
+            for (int k = p->begin; k < p->end; k++) {
+                const N2Mesh *m = &j->scene->meshes[j->ent[k].idx];
+                PackedMesh *pk = &j->packed[j->ent[k].idx];
+                memcpy(bv + vo, pk->v, (size_t)m->nverts * sizeof *bv);
+                for (int t = 0; t < m->nidx; t++) bi[io + t] = (uint16_t)(m->idx[t] + vo);
+                vo += m->nverts; io += m->nidx;
+            }
+            p->bv = bv; p->bi = bi;
+            for (int k = p->begin; k < p->end; k++) {   /* own copies: done with */
+                PackedMesh *pk = &j->packed[j->ent[k].idx];
+                if (!pk->borrowed) { free(pk->v); pk->v = NULL; }
+            }
+        }
+        j->arena = arena;
+    }
+    free(want);
+}
+#endif
 int render_world_plan_fill(WorldBatchUpload *j) {
 #ifdef __vita__
     if (!j || !j->prepared || !j->packed) return 0;
@@ -2072,17 +2238,23 @@ int render_world_plan_fill(WorldBatchUpload *j) {
             filled++;
         }
     }
+    plan_assemble(j);
     return filled;
 #else
     (void)j; return 0;
 #endif
 }
 
-int upload_world_batches_bind_prepared(WorldBatchUpload *j, const GLuint *textures,
-    GLuint terrain_texture, const unsigned char *modes) {
+static int bind_prepared(WorldBatchUpload *j, const GLuint *textures,
+    GLuint terrain_texture, const unsigned char *modes, int checked) {
     if (!j || !j->prepared || j->count || j->next) return 0;
-    /* Texture failures or different material modes use the original grouping. */
-    for (int b=0; b<j->prepared_count; b++) {
+    /* Texture failures or different material modes use the original grouping.
+       checked: the caller compared every mesh's texture/mode with the worker's
+       (world_resident.c tex lookup), so the groups and runs are the planned ones. */
+    static int verify = -1;
+    if (verify < 0) { const char *e = getenv("OPENUG2_ASM_VERIFY"); verify = e && e[0] == '1'; }
+    if (checked && verify) printf("worker batch plan: verifying the lookup check\n");
+    if (!checked || verify) for (int b=0; b<j->prepared_count; b++) {
         struct PreparedBatch *p=&j->prepared[b]; GLuint first=0;
         for (int k=p->begin; k<p->end; k++) {
             int idx=j->ent[k].idx; const N2Mesh *m=&j->scene->meshes[idx];
@@ -2104,8 +2276,17 @@ int upload_world_batches_bind_prepared(WorldBatchUpload *j, const GLuint *textur
         j->ent[k].key=tex;
     }
     j->modes=modes;
-    printf("worker batch plan: %d prepared runs accepted\n",j->prepared_count);
+    printf("worker batch plan: %d prepared runs accepted%s\n",j->prepared_count,
+           checked ? " (checked at lookup)" : "");
     return 1;
+}
+int upload_world_batches_bind_prepared(WorldBatchUpload *j, const GLuint *textures,
+    GLuint terrain_texture, const unsigned char *modes) {
+    return bind_prepared(j, textures, terrain_texture, modes, 0);
+}
+int upload_world_batches_bind_checked(WorldBatchUpload *j, const GLuint *textures,
+    GLuint terrain_texture, const unsigned char *modes) {
+    return bind_prepared(j, textures, terrain_texture, modes, 1);
 }
 
 /* 11-14 step 2: the packed copy (28 B/vertex, 14-22 MB in a race) was kept for
@@ -2127,13 +2308,19 @@ void render_world_packed_trim_flush(void) {
 #endif
 }
 void render_world_packed_trim(const N2Scene *s) {
+    render_world_packed_trim_list(s, NULL, 0);
+}
+void render_world_packed_trim_list(const N2Scene *s, const int *list, int list_n) {
 #ifdef __vita__
     static int off = -1;
     if (off < 0) { FILE *f = fopen("ux0:data/NFSU2/nopktrim.txt", "r"); off = f != NULL; if (f) fclose(f);
         printf("world: CPU batch copies %s after upload\n", off ? "kept (nopktrim.txt)" : "freed"); }
     if (off || !s) return;
     long n = 0, bytes = 0;
-    for (int i = 0; i < s->count; i++) {
+    int walk = list ? list_n : s->count;
+    for (int w = 0; w < walk; w++) {
+        int i = list ? list[w] : w;
+        if (i < 0 || i >= s->count) continue;
         const N2Mesh *m = &s->meshes[i];
         N2SharedGeometry *g = m->shared_geometry;
         if (!g || !g->packed || !g->packed_hashed || m->fade_in) continue;
@@ -2153,7 +2340,7 @@ void render_world_packed_trim(const N2Scene *s) {
     if ((calls++ & 7) == 0 || bytes > (4l << 20))
         printf("world: %ld CPU batch copies freed (%ld KB)\n", n, bytes >> 10);
 #else
-    (void)s;
+    (void)s; (void)list; (void)list_n;
 #endif
 }
 
@@ -3121,17 +3308,33 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     unsigned long long budget_us = max_batches >= 128 ? 24000 : 4000;   /* smooth: a city frame has ~7 ms to spare, and a batch can run over (hwlog29: 9 ms steps at 6) */
     int sliced = max_batches != INT_MAX, emitted = 0, smooth = sliced && max_batches < 128;
 #endif
+    /* GL microseconds per KB uploaded, learned from this run's uploads: a
+       smooth step stops before a batch that would carry the frame past its
+       budget, instead of finding out after (hwlog51_L: 7-9 ms upload frames
+       on a 4 ms budget, the overshoot being one large batch) */
+    static double us_per_kb = 0;
     while (j->next < j->meshes && max_batches > 0) {
 #ifdef __vita__
         long reused_before = g_batch_reused;
+        if (smooth && emitted && us_per_kb > 0 && j->prepared && j->count < j->prepared_count) {
+            const struct PreparedBatch *pb = &j->prepared[j->count];
+            if (pb->meta && pb->bv && !batch_buffers_find(pb->hash, pb->nv, pb->ni)) {
+                double kb = ((double)pb->nv * sizeof(BatchedVertex) + (double)pb->ni * 2) / 1024.0;
+                unsigned long long spent = sceKernelGetProcessTimeWide() - step_begin;
+                if ((double)spent + kb * us_per_kb > (double)budget_us) { g_batch_deferred++; break; }
+            }
+        }
+        long bytes_before = g_batch_bytes;
+        unsigned long long emit_t0 = sceKernelGetProcessTimeWide();
 #endif
         int i0 = j->next, i = i0 + 1;
         if (j->prepared) {
             assert(j->count<j->prepared_count && j->prepared[j->count].begin==i0);
             i=j->prepared[j->count].end;
             g_batch_prepared_hash=j->prepared[j->count].hash;
+            g_batch_prep=&j->prepared[j->count];
         } else {
-        g_batch_prepared_hash=NULL;
+        g_batch_prepared_hash=NULL; g_batch_prep=NULL;
         int verts = s->meshes[ent[i0].idx].nverts;
         while (i < j->meshes && ent[i].key == ent[i0].key &&
                ent[i].cell_x == ent[i0].cell_x && ent[i].cell_y == ent[i0].cell_y &&
@@ -3142,7 +3345,7 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
         if (!batch_emit(s, ent, i0, i, (GLuint)ent[i0].key,
                         &bat[j->count], j->count, audit, j->modes)) {
             g_batch_normals = NULL; g_batch_packed = NULL;
-            g_batch_prepared_hash=NULL;
+            g_batch_prepared_hash=NULL; g_batch_prep=NULL;
 #ifdef __vita__
             g_batch_reuse = 0;
 #endif
@@ -3151,6 +3354,11 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
         run0[j->count] = i0; run1[j->count] = i;
         j->count++; j->next = i;
 #ifdef __vita__
+        if (g_batch_bytes - bytes_before >= 16384) {
+            double r = (double)(sceKernelGetProcessTimeWide() - emit_t0) * 1024.0 /
+                       (double)(g_batch_bytes - bytes_before);
+            us_per_kb = us_per_kb > 0 ? us_per_kb * 0.75 + r * 0.25 : r;
+        }
         emitted++;
         /* Retained GPU buffers still cost CPU packing time, bounded below,
            but should not consume the allowance for actual GPU uploads. */
@@ -3161,7 +3369,7 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
 #endif
     }
     g_batch_normals = NULL; g_batch_packed = NULL;
-    g_batch_prepared_hash=NULL;
+    g_batch_prepared_hash=NULL; g_batch_prep=NULL;
 #ifdef __vita__
     g_batch_reuse = 0;
 #endif
@@ -3177,10 +3385,11 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
            nb, g_batch_pack_us / 1000, g_batch_gl_us / 1000, g_batch_bytes >> 10);
     g_batch_pack_us = g_batch_gl_us = 0; g_batch_bytes = 0;
     printf("tile GPU reuse: %ld batches, %ld KB retained without upload; "
-           "%ld meshes (%ld KB) rebuilt from source (CPU copy freed)\n",
+           "%ld meshes (%ld KB) rebuilt from source (CPU copy freed); %ld uploaded from worker-assembled arrays, %ld steps ended early\n",
            g_batch_reused, g_batch_reused_bytes >> 10, g_batch_src_meshes,
-           g_batch_src_verts * (long)sizeof(BatchedVertex) >> 10);
+           g_batch_src_verts * (long)sizeof(BatchedVertex) >> 10, g_batch_asm, g_batch_deferred);
     g_batch_reused = g_batch_reused_bytes = 0; g_batch_src_meshes = g_batch_src_verts = 0;
+    g_batch_asm = 0; g_batch_deferred = 0;
 #endif
     qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);   /* minimise texture binds */
     /* mesh -> final batch, replayed from each batch's own emission run so it is

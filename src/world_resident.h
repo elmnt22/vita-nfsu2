@@ -30,6 +30,10 @@ int world_resident_route_point(const WResidentPolicy *policy,
                                const float (*visited)[2], int visited_count,
                                float out_pos[3], float out_center[2]);
 
+/* Vita: what the worker's batch plan assumed per mesh (8 bytes, so the
+   render thread's texture lookup need not walk the mesh records). */
+typedef struct { uint32_t key; unsigned char resolved, raw, mode, pad; } ResidentMeshTex;
+
 typedef struct {
     uint32_t *texture_keys;
     GLuint *textures;
@@ -51,6 +55,11 @@ typedef struct {
     struct PhysWallIndex *wall_index;   /* Vita: the worker's index of the obstacles, until activation */
     WorldBatchUpload *upload;  /* owns partial ordinary batches until complete */
     WorldBatchUpload *cpu_plan; /* worker-created grouping; no GPU owners */
+    ResidentMeshTex *mesh_tex;  /* Vita: the plan's per-mesh texture assumptions */
+    int mesh_tex_n;
+    int plan_checked;           /* lookup matched mesh_tex for every mesh */
+    int *trim_list;             /* Vita: meshes whose shared geometry holds a packed copy */
+    int trim_n;
     float **mesh_normals;      /* Vita: precomputed by the worker, per mesh */
     int normals_count;
     PackedMesh *mesh_packed;   /* Vita: batch-layout vertices from the worker */

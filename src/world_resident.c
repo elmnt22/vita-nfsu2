@@ -171,6 +171,8 @@ void world_resident_resources_free(WorldResidentResources *resources) {
     if (!resources) return;
     upload_world_batches_cancel(&resources->upload);
     upload_world_batches_cancel(&resources->cpu_plan);
+    free(resources->mesh_tex); resources->mesh_tex = NULL; resources->mesh_tex_n = 0;
+    free(resources->trim_list); resources->trim_list = NULL; resources->trim_n = 0;
     resident_free_normals(resources);
     /* World textures belong to the process-wide key cache in world.c and are
        shared with every other resident: this array only borrows them. The
@@ -238,6 +240,52 @@ static int resident_vista_batches(WorldResidentResources *resources,
     }
     return 1;
 }
+
+#ifdef __vita__
+/* Finish step: hand the worker's per-mesh normals / packed arrays to the
+   worker to free at its next build start (hwlog51_L: their free() calls were
+   2.3 ms of a finish frame). Locked: the lists are swapped, not shared. */
+typedef struct { float **normals; PackedMesh *packed; int n; } ResidentDeferred;
+static ResidentDeferred *g_rdef; static int g_rdef_n, g_rdef_cap;
+static volatile int g_rdef_lock;
+static void rdef_lock(void) { while (__sync_lock_test_and_set(&g_rdef_lock, 1)) { } }
+static void rdef_unlock(void) { __sync_lock_release(&g_rdef_lock); }
+static int resident_defer_normals(WorldResidentResources *r) {
+    if (!r->mesh_normals && !r->mesh_packed) return 1;
+    int ok = 0;
+    rdef_lock();
+    if (g_rdef_n == g_rdef_cap) {
+        int c = g_rdef_cap ? g_rdef_cap * 2 : 8;
+        ResidentDeferred *q = (ResidentDeferred *)realloc(g_rdef, (size_t)c * sizeof *q);
+        if (q) { g_rdef = q; g_rdef_cap = c; }
+    }
+    if (g_rdef_n < g_rdef_cap) {
+        ResidentDeferred *d = &g_rdef[g_rdef_n++];
+        d->normals = r->mesh_normals; d->packed = r->mesh_packed; d->n = r->normals_count;
+        ok = 1;
+    }
+    rdef_unlock();
+    if (!ok) return 0;
+    r->mesh_normals = NULL; r->mesh_packed = NULL; r->normals_count = 0;
+    return 1;
+}
+/* Worker, at a build start. */
+static void resident_deferred_flush(void) {
+    rdef_lock();
+    ResidentDeferred *list = g_rdef; int n = g_rdef_n;
+    g_rdef = NULL; g_rdef_n = g_rdef_cap = 0;
+    rdef_unlock();
+    for (int k = 0; k < n; k++) {
+        ResidentDeferred *d = &list[k];
+        if (d->normals) for (int i = 0; i < d->n; i++) free(d->normals[i]);
+        free(d->normals);
+        if (d->packed) for (int i = 0; i < d->n; i++)
+            if (!d->packed[i].borrowed) free(d->packed[i].v);
+        free(d->packed);
+    }
+    free(list);
+}
+#endif
 
 static uint32_t wrb_ms(struct timespec *a, struct timespec *b) {
     return (uint32_t)((b->tv_sec - a->tv_sec) * 1000 +
@@ -311,12 +359,22 @@ static int resident_worker_precompute(WorldResident *candidate) {
     if (r->mesh_packed) {
         int reused_packed = 0;
         r->normals_count = n; /* cleanup also owns a partially packed abort */
+        free(r->trim_list); r->trim_n = 0;
+        r->trim_list = (int *)malloc((size_t)(n ? n : 1) * sizeof *r->trim_list);
         for (int i = 0; i < n; i++) {
             if ((i & 31) == 0 && world_build_aborted()) return 0;
             const N2Mesh *m = &scene->meshes[i];
-            if (m->world_role == 1 || m->world_role == 3 || m->cat == N2_SKY || m->cat == N2_GLOW) continue;   /* not world batches (3: smokeable.c draws it) */
+            if (m->world_role == 1 || m->world_role == 3 || m->cat == N2_SKY || m->cat == N2_GLOW) {
+                /* not world batches (3: smokeable.c draws it) -- but a prop can
+                   share a geometry another build packed: the trim frees it */
+                if (r->trim_list && m->shared_geometry && m->shared_geometry->packed)
+                    r->trim_list[r->trim_n++] = i;
+                continue;
+            }
             if (m->shared_geometry && m->shared_geometry->packed) reused_packed++;
             render_pack_mesh(m, &r->mesh_packed[i]);
+            if (r->trim_list && m->shared_geometry && m->shared_geometry->packed)
+                r->trim_list[r->trim_n++] = i;
         }
         VMARK("  worker: %d packed meshes reused", reused_packed);
     }
@@ -325,13 +383,24 @@ static int resident_worker_precompute(WorldResident *candidate) {
     Uint64 plan_begin=SDL_GetPerformanceCounter();
     GLuint *logical=calloc((size_t)n,sizeof *logical);
     unsigned char *modes=calloc((size_t)n,sizeof *modes);
+    free(r->mesh_tex); r->mesh_tex = NULL; r->mesh_tex_n = 0;
+    if (logical && modes && r->mesh_packed)
+        r->mesh_tex=(ResidentMeshTex *)malloc((size_t)(n ? n : 1)*sizeof *r->mesh_tex);
     if (logical && modes && r->mesh_packed) {
         for (int i=0; i<n; i++) {
             const N2Mesh *m=&scene->meshes[i]; unsigned char mode=0;
             int resolved=world_predecoded_texture_info(m->texkey,&mode);
             logical[i]=resolved ? m->texkey : m->cat==N2_TERRAIN ? UINT32_MAX : 0;
             modes[i]=resolved ? n2_world_draw_mode(m,mode) : N2_DRAW_OPAQUE;
+            if (r->mesh_tex) {
+                ResidentMeshTex *t=&r->mesh_tex[i];
+                t->key=m->texkey; t->resolved=(unsigned char)(resolved!=0);
+                t->raw=mode; t->mode=modes[i]; t->pad=(unsigned char)((m->cat==N2_TERRAIN) |
+                    /* 2: not in the plan (upload_world_batches_begin's filter) */
+                    ((m->world_role==1 || m->world_role==3 || m->cat==N2_SKY || m->cat==N2_GLOW) << 1));
+            }
         }
+        if (r->mesh_tex) r->mesh_tex_n=n;
         r->cpu_plan=upload_world_batches_prepare_cpu(scene,
             (const float (*)[4])candidate->world.mbb,logical,modes,r->mesh_packed);
     }
@@ -591,22 +660,65 @@ static int resident_resources_step(WorldResidentResources *resources,
             slots[j].index = j;
         }
         qsort(slots, (size_t)nt, sizeof *slots, resident_tex_slot_cmp);
+        /* The worker's per-mesh record (mesh_tex) stands in for the mesh
+           array, and neighbours mostly share a key: the lookup no longer
+           walks ~15k mesh records on this thread. When every mesh matches
+           the plan's assumption the plan binds without revalidating. */
+        const ResidentMeshTex *mt = resources->mesh_tex &&
+            resources->mesh_tex_n == mesh_count ? resources->mesh_tex : NULL;
+        int ok = mt != NULL, lastj = -1, have_last = 0, nfu = 0, nmd = 0, nrf = 0;
+        uint32_t lastkey = 0;
         for (int i = 0; i < mesh_count; i++) {
             resources->mesh_batch[i] = -1;
-            uint32_t key = neighborhood->scene.meshes[i].texkey;
-            int lo = 0, hi = nt;
-            while (lo < hi) {
-                int mid = (lo + hi) / 2;
-                if (slots[mid].key < key) lo = mid + 1; else hi = mid;
+            uint32_t key = mt ? mt[i].key : neighborhood->scene.meshes[i].texkey;
+            int j;
+            if (have_last && key == lastkey) j = lastj;
+            else {
+                int lo = 0, hi = nt;
+                while (lo < hi) {
+                    int mid = (lo + hi) / 2;
+                    if (slots[mid].key < key) lo = mid + 1; else hi = mid;
+                }
+                j = lo < nt && slots[lo].key == key ? slots[lo].index : -1;
+                lastkey = key; lastj = j; have_last = 1;
             }
-            if (lo < nt && slots[lo].key == key) {
-                int j = slots[lo].index;
+            /* What the plan needs (upload_world_batches_bind_prepared): each
+               mesh's effective mode as planned, and one texture per planned
+               run. Runs are grouped by the worker's key, or by "unresolved"
+               (0, or terrain): a key the lookup misses gives all its meshes
+               0 -- still one texture -- unless a terrain mesh shares it (that
+               one gets the grass); a key the worker missed but the lookup
+               found splits the "unresolved" run. */
+            if (j >= 0) {
+                unsigned char tm = resources->texture_modes[j];
                 resources->mesh_textures[i] = resources->textures[j];
-                resources->mesh_modes[i] = (unsigned char)n2_world_draw_mode(
-                    &neighborhood->scene.meshes[i], resources->texture_modes[j]);
+                if (mt && mt[i].resolved && mt[i].raw == tm)
+                    resources->mesh_modes[i] = mt[i].mode;
+                else {
+                    resources->mesh_modes[i] = (unsigned char)n2_world_draw_mode(
+                        &neighborhood->scene.meshes[i], tm);
+                    if (!mt) ok = 0;
+                    else if (mt[i].pad & 2) {}   /* not planned */
+                    else if (!mt[i].resolved) { ok = 0; nfu++; }
+                    else if (resources->mesh_modes[i] != mt[i].mode) { ok = 0; nmd++; }
+                }
+            } else if (mt && !(mt[i].pad & 2) &&
+                       (mt[i].mode != N2_DRAW_OPAQUE || (mt[i].resolved && (mt[i].pad & 1)))) {
+                ok = 0; nrf++;
             }
         }
         free(slots);
+        resources->plan_checked = ok;
+        {
+            static unsigned looks, fast;
+            looks++; fast += ok != 0;
+            if ((looks & 15) == 1 || !ok)
+                printf("resident: tex lookup %s (%u of %u builds matched the worker plan;"
+                       " %d found/unplanned, %d mode, %d planned/missing)\n",
+                       ok ? "matched the plan" : mt ? "differs from the plan" : "without a plan",
+                       fast, looks, nfu, nmd, nrf);
+        }
+        free(resources->mesh_tex); resources->mesh_tex = NULL; resources->mesh_tex_n = 0;
         resources->texture_ticks += SDL_GetPerformanceCounter() - texture_begin;
         hitch_mark("fin.tex_lookup");
         resources->setup_stage = 2;
@@ -655,7 +767,8 @@ static int resident_resources_step(WorldResidentResources *resources,
     if (resources->setup_stage == 8) {
         Uint64 batch_begin = SDL_GetPerformanceCounter();
         if (resources->cpu_plan) {
-            if (upload_world_batches_bind_prepared(resources->cpu_plan,
+            if ((resources->plan_checked ? upload_world_batches_bind_checked :
+                 upload_world_batches_bind_prepared)(resources->cpu_plan,
                     resources->mesh_textures,resources->terrain_texture,resources->mesh_modes)) {
                 resources->upload=resources->cpu_plan; resources->cpu_plan=NULL;
             } else {
@@ -696,9 +809,33 @@ static int resident_resources_step(WorldResidentResources *resources,
         resources->setup_stage = 9;
         if (smooth) { resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin; return 0; }
     }
+#ifdef __vita__
+    if (!resident_defer_normals(resources))
+#endif
     resident_free_normals(resources);
     hitch_mark("fin.free_normals");
-    render_world_packed_trim(&neighborhood->scene);
+    /* only the meshes the worker saw holding a shared packed copy (hwlog51_L:
+       walking all ~15k mesh records was ~3 ms of a finish frame) */
+    render_world_packed_trim_list(&neighborhood->scene, resources->trim_list,
+                                  resources->trim_n);
+    free(resources->trim_list); resources->trim_list = NULL; resources->trim_n = 0;
+    {   /* sim check: what a whole-scene walk would still have freed */
+        static int verify = -1;
+        if (verify < 0) { const char *e = getenv("OPENUG2_ASM_VERIFY"); verify = e && e[0] == '1'; }
+        if (verify) {
+            int left = 0;
+            const N2Scene *sc = &neighborhood->scene;
+            for (int i = 0; i < sc->count; i++) {
+                const N2SharedGeometry *g = sc->meshes[i].shared_geometry;
+                if (g && g->packed && g->packed_hashed && !sc->meshes[i].fade_in) {
+                    if (left < 3) printf("trim verify: left mesh %d role %d cat %d nverts %d\n", i,
+                        sc->meshes[i].world_role, sc->meshes[i].cat, sc->meshes[i].nverts);
+                    left++;
+                }
+            }
+            printf("trim verify: %d copies a full walk would still free\n", left);
+        }
+    }
     hitch_mark("fin.packed_trim");
     if (include_vista && !resident_vista_batches(resources, neighborhood)) goto fail;
     hitch_mark("fin.vista");
@@ -1018,6 +1155,7 @@ static int resident_worker(void *data) {
 #ifdef __vita__
     extern void vita_heap_report(const char *label);
     render_world_packed_trim_flush();
+    resident_deferred_flush();
     vita_heap_report("at build start");
 #endif
     job->ok = world_resident_prepare(job->candidate, &job->args,

@@ -321,6 +321,9 @@ typedef struct { BatchedVertex *v; float bb[6]; unsigned char borrowed, hash_val
 int  render_pack_mesh(const N2Mesh *m, PackedMesh *out);    /* 1 = ok */
 /* Vita: drop CPU batch copies whose GPU buffers now exist (keeps bb/hash) */
 void render_world_packed_trim(const N2Scene *s);
+/* The same over only the listed meshes (the worker's list of meshes whose
+ * shared geometry holds a packed copy); list NULL walks the whole scene. */
+void render_world_packed_trim_list(const N2Scene *s, const int *list, int n);
 void render_world_packed_trim_flush(void);
 /* Vita worker: pack the meshes of planned batches the GPU does not hold (see render.c) */
 int render_world_plan_fill(WorldBatchUpload *j);
@@ -338,6 +341,10 @@ WorldBatchUpload *upload_world_batches_prepare_cpu(const N2Scene *scene,
     const float (*bounds)[4], const GLuint *logical_textures,
     const unsigned char *modes, PackedMesh *packed);
 int upload_world_batches_bind_prepared(WorldBatchUpload *job, const GLuint *textures,
+    GLuint terrain_texture, const unsigned char *modes);
+/* The same, when the caller already matched every mesh's texture and mode
+ * with the worker's plan: skips the per-mesh revalidation. */
+int upload_world_batches_bind_checked(WorldBatchUpload *job, const GLuint *textures,
     GLuint terrain_texture, const unsigned char *modes);
 /* Same merge, but for one category (N2_SKY / N2_GLOW) pulled out of the main
  * batching pass above — grouped by texture only, no spatial cell/cull grid,
