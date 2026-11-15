@@ -23342,8 +23342,12 @@ int main(int argc, char **argv) {
                         float h = atan2f(dy, dx);
                         carpos[0] = x; carpos[1] = y; carpos[2] = z;
                         if (fabsf(remainderf(h - heading, 6.2831853f)) > 0.5f) cam_snap = 1;
-                        heading = h; speed = rg_speed;
-                        vel[0] = cosf(h) * rg_speed; vel[1] = sinf(h) * rg_speed;
+                        /* per tick, as the physics keeps them (PHYS_KMH): in m/s
+                           the streaming saw 60x the speed and finished every
+                           build in one urgent step (11-15: hwlog56-67 route
+                           runs, 98-100% urgent vs 0 on the user's drive) */
+                        heading = h; speed = step;
+                        vel[0] = cosf(h) * step; vel[1] = sinf(h) * step;
                         g_n2_live = 0;
                     }
                 }
