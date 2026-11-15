@@ -14,6 +14,19 @@
 #define SKYLINE_OUTER_M 1500.0f
 #define SKYLINE_FILE_VER 1
 #define SKYLINE_MAXV    65535
+/* ux0:data/NFSU2/skyminh.txt "<m>" or OPENUG2_SKYMINH: the height cut (A/B runs;
+   another height has its own cache file) */
+static float sky_min_h(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        v = SKYLINE_MIN_H;
+        const char *e = getenv("OPENUG2_SKYMINH"); float x;
+        FILE *f = fopen("ux0:data/NFSU2/skyminh.txt", "r");
+        if (f) { if (fscanf(f, "%f", &x) == 1 && x >= 10.0f && x <= 80.0f) v = x; fclose(f); }
+        else if (e && (x = (float)atof(e)) >= 10.0f && x <= 80.0f) v = x;
+    }
+    return v;
+}
 
 typedef struct { float p[3]; signed char n[4]; unsigned char c[4]; } SkyV;   /* 20 B, the cache's own layout */
 typedef struct { uint32_t texkey, nv, ni; float bb[6]; } SkyMesh;
@@ -150,7 +163,8 @@ static void collect(void *ctx, const N2Mesh *m) {
     free(nor);
 }
 static void cache_path(char *out, size_t n) {
-    snprintf(out, n, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER);
+    if (sky_min_h() == SKYLINE_MIN_H) snprintf(out, n, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER);
+    else snprintf(out, n, "%s/%s_sky_v%d_%d_h%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER, (int)sky_min_h());
 }
 static int cache_read(void) {
     char path[256]; cache_path(path, sizeof path);
@@ -158,7 +172,7 @@ static int cache_read(void) {
     if (!f) return 0;
     uint32_t h[6];
     int ok = fread(h, sizeof h, 1, f) == 1 && h[0] == 0x31594b53u /* SKY1 */ && h[1] == SKYLINE_FILE_VER &&
-             h[2] == (uint32_t)(SKYLINE_MIN_H * 10.0f) && h[3] < 1000000u && h[4] < 20000000u && h[5] < 60000000u;
+             h[2] == (uint32_t)(sky_min_h() * 10.0f) && h[3] < 1000000u && h[4] < 20000000u && h[5] < 60000000u;
     if (ok) {
         S.nmesh = S.cmesh = (int)h[3]; S.nv = S.cv = (long)h[4]; S.ni = S.ci = (long)h[5];
         S.mesh = (SkyMesh *)malloc((size_t)S.nmesh * sizeof *S.mesh + 1);
@@ -179,7 +193,7 @@ static void cache_write(void) {
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
     if (!f) return;
-    uint32_t h[6] = { 0x31594b53u, SKYLINE_FILE_VER, (uint32_t)(SKYLINE_MIN_H * 10.0f),
+    uint32_t h[6] = { 0x31594b53u, SKYLINE_FILE_VER, (uint32_t)(sky_min_h() * 10.0f),
                       (uint32_t)S.nmesh, (uint32_t)S.nv, (uint32_t)S.ni };
     int ok = fwrite(h, sizeof h, 1, f) == 1 &&
              fwrite(S.mesh, sizeof *S.mesh, (size_t)S.nmesh, f) == (size_t)S.nmesh &&
@@ -246,10 +260,10 @@ static int loader(void *arg) {
     (void)arg;
     int ok = cache_read();
     if (!ok && !SDL_AtomicGet(&S.abort)) {
-        int tiles = world_tiles_each_standin(S.track, SKYLINE_MIN_H, collect, NULL, &S.abort);
+        int tiles = world_tiles_each_standin(S.track, sky_min_h(), collect, NULL, &S.abort);
         ok = tiles > 0 && S.nmesh > 0 && !SDL_AtomicGet(&S.abort);
         printf("skyline: built from %d tiles: %d stand-ins >= %.0f m, %ld verts, %ld KB\n", tiles, S.nmesh,
-               (double)SKYLINE_MIN_H, S.nv, (S.nv * (long)sizeof(SkyV) + S.ni * 2) >> 10);
+               (double)sky_min_h(), S.nv, (S.nv * (long)sizeof(SkyV) + S.ni * 2) >> 10);
         if (ok) { cache_write(); S.built = 1; }
     }
     if (ok && !SDL_AtomicGet(&S.abort)) ok = plan();
@@ -386,7 +400,7 @@ static void draw_range(const N2Batch *b, int first, int count) {
 int skyline_draw(const float cam[3], int (*in_view)(const float lo[3], const float hi[3], void *ctx),
                  void *ctx, void (*begin)(void *ctx)) {
     int n = SDL_AtomicGet(&S.state) == 3 ? S.nbatch : 0, draws = 0;
-    float in2 = SKYLINE_INNER_M * SKYLINE_INNER_M, out2 = SKYLINE_OUTER_M * SKYLINE_OUTER_M;
+    float inner = skyline_inner(), in2 = inner * inner, out2 = SKYLINE_OUTER_M * SKYLINE_OUTER_M;
     enum { NS = SKYLINE_BLOCK * SKYLINE_BLOCK };
     for (int q = 0; q < n; q++) {
         const N2Batch *b = &S.batch[q]; const SkyRun *r = &S.bsub[q];
@@ -417,5 +431,17 @@ const N2Batch *skyline_batches(int *n) {
     if (n) *n = SDL_AtomicGet(&S.state) == 3 ? S.nbatch : 0;
     return S.batch;
 }
-float skyline_inner(void) { return SKYLINE_INNER_M; }
+/* ux0:data/NFSU2/skyinner.txt "<m>" or OPENUG2_SKYINNER: the inner edge (A/B runs) */
+float skyline_inner(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        v = SKYLINE_INNER_M;
+        const char *e = getenv("OPENUG2_SKYINNER"); float x;
+        FILE *f = fopen("ux0:data/NFSU2/skyinner.txt", "r");
+        if (f) { if (fscanf(f, "%f", &x) == 1 && x >= 100.0f && x <= 1000.0f) v = x; fclose(f); }
+        else if (e && (x = (float)atof(e)) >= 100.0f && x <= 1000.0f) v = x;
+        printf("skyline: inner edge %.0f m\n", (double)v);
+    }
+    return v;
+}
 float skyline_outer(void) { return SKYLINE_OUTER_M; }
