@@ -1458,6 +1458,10 @@ static int bsort_cmp(const void *a, const void *b) {
     if (aa->group != bb->group) return aa->group < bb->group ? -1 : 1;
     return aa->idx < bb->idx ? -1 : aa->idx > bb->idx ? 1 : 0;
 }
+static int u64_cmp(const void *a, const void *b) {
+    unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
+    return x < y ? -1 : x > y;
+}
 static int btex_cmp(const void *a, const void *b) {   /* final texture order */
     GLuint ta = ((const N2Batch *)a)->tex, tb = ((const N2Batch *)b)->tex;
     return ta < tb ? -1 : ta > tb ? 1 : 0;
@@ -3506,7 +3510,19 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     g_batch_asm = 0; g_batch_deferred = 0;
     hitch_mark("fin.up_stats");
 #endif
-    qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);   /* minimise texture binds */
+    /* minimise texture binds: texture order, emission order within a
+       texture (hwlog72: qsort moving the ~120-byte batches was up to 8.4 ms
+       a build; 8-byte keys, then one permuting copy) */
+    {   unsigned long long *key = nb > 1 ? malloc((size_t)nb * sizeof *key) : NULL;
+        N2Batch *sorted = key ? malloc((size_t)nb * sizeof *sorted) : NULL;
+        if (sorted) {
+            for (int b = 0; b < nb; b++)
+                key[b] = (unsigned long long)bat[b].tex << 32 | (unsigned)b;
+            qsort(key, (size_t)nb, sizeof *key, u64_cmp);
+            for (int b = 0; b < nb; b++) sorted[b] = bat[(unsigned)key[b]];
+            free(bat); bat = j->batches = sorted;   /* the smooth tail reads it back next call */
+        } else if (nb > 1) qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);
+        free(key); }
 #ifdef __vita__
     hitch_mark("fin.up_sort");
     /* hwlog69: the completing step was 10-13 ms on every downtown build

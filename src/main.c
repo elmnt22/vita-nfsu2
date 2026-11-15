@@ -21623,14 +21623,14 @@ int main(int argc, char **argv) {
                     /* hwlog69: half the downtown misses were a finish slice
                        landing on a frame already near 33 ms; the frame before
                        predicts it, so an unhurried slice waits for a lighter
-                       frame -- at most two in a row, so the finish never
+                       frame -- at most three in a row (hwlog72: two let a slice every third frame land in long heavy stretches), so the finish never
                        stalls; urgent finishes never wait (heavy.txt N = ms,
                        0 = off) */
                     static int heavy_ms = -1;
-                    if (heavy_ms < 0) { FILE *hf = fopen("ux0:data/NFSU2/heavy.txt", "rb"); heavy_ms = 28;
-                        if (hf) { if (fscanf(hf, "%d", &heavy_ms) != 1) heavy_ms = 28; fclose(hf); }
+                    if (heavy_ms < 0) { FILE *hf = fopen("ux0:data/NFSU2/heavy.txt", "rb"); heavy_ms = 27;
+                        if (hf) { if (fscanf(hf, "%d", &heavy_ms) != 1) heavy_ms = 27; fclose(hf); }
                         printf("stream finish: unhurried slices wait out frames over %d ms busy\n", heavy_ms); }
-                    int heavy = heavy_ms > 0 && fin_budget == 48 && prepared_status >= 0 && fin_heavy_run < 2 &&
+                    int heavy = heavy_ms > 0 && fin_budget == 48 && prepared_status >= 0 && fin_heavy_run < 3 &&
                                 g_vita_busy_us > g_fin_prev_us &&
                                 g_vita_busy_us - g_fin_prev_us > (unsigned)heavy_ms * 1000u;
                     g_fin_prev_us = 0;
