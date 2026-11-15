@@ -227,6 +227,7 @@ int  world_ground_grid_build(WGroundGrid *grid, const N2Scene *scene,
                              const float (*mbb)[4]);
 void world_ground_grid_activate(const WGroundGrid *grid);
 void world_ground_grid_free(WGroundGrid *grid);
+int  world_ground_grid_is_active(const WGroundGrid *grid);
 
 /* Decode + upload every distinct mesh texture (own TPK -> LOC4 -> master).
  * After all original region attempts, retry unbound requests against

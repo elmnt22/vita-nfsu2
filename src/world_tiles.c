@@ -1161,6 +1161,22 @@ static volatile int g_wt_paused;      /* world_tiles_trim(1) .. (0) */
 static volatile long long g_wt_prefetch_hits;
 static volatile int g_wt_pf_busy;     /* the read-ahead is past its pause check */
 static int g_wt_up_ready, g_wt_up_now;   /* per assembly: upgrades swapped in / read by the build */
+/* stored bytes in hand (state 4, 11-15 PERF_PLAN P1): when kernel blocks are
+   too short for a decoded tile, the read-ahead still reads the tile's stored
+   (compressed) bytes -- a fraction of its decoded size -- so the build
+   decodes it without waiting on the card. hwlog59: kernel user free swung
+   12-30 MB with each area handoff, the 4 MB room rule held the read-ahead
+   off about half the time and only 24% of new tiles were ready. */
+static unsigned char *volatile *g_wt_raw;
+static long *g_wt_rawlen;
+static volatile long long g_wt_raw_bytes, g_wt_raw_hits;
+#define WT_RAW_CAP (8LL << 20)
+static void wt_raw_drop(int i) {   /* any thread; CAS 4 -> 1 -> 0 */
+    if (!g_wt_raw || g_wt_state[i] != 4 || !__sync_bool_compare_and_swap(&g_wt_state[i], 4, 1)) return;
+    unsigned char *p = g_wt_raw[i]; g_wt_raw[i] = NULL;
+    if (p) { __sync_fetch_and_sub(&g_wt_raw_bytes, (long long)g_wt_rawlen[i]); free(p); }
+    __sync_synchronize(); g_wt_state[i] = 0;
+}
 #define WT_PREFETCH_CAP (24LL << 20)
 #define WT_PREFETCH_ROOM_MB 4u    /* a tile (<= ~3 MB decoded) must fit in kernel blocks; 12 MB cut read-ahead hits 83% -> 33% (10-11) */
 
@@ -1392,9 +1408,10 @@ static int wt_prefetch_thread(void *arg) {
         /* drop prepared tiles that went stale (well away from the aim) */
         for (int i = 0; i < g_wt_nindex; i++) {
             float far = reach + 256.0f;
-            if (g_wt_state[i] != 2 && g_wt_upst[i] != 2) continue;
+            if (g_wt_state[i] != 2 && g_wt_state[i] != 4 && g_wt_upst[i] != 2) continue;
             if (wt_tile_d2(&g_wt_index[i], ax, ay) < far * far) continue;
             wt_up_drop(i);
+            wt_raw_drop(i);
             if (g_wt_state[i] != 2 || !__sync_bool_compare_and_swap(&g_wt_state[i], 2, 1)) continue;
             WtLoaded *t = g_wt_ready[i]; g_wt_ready[i] = NULL;
             if (t) { __sync_fetch_and_sub(&g_wt_ready_bytes, (long long)t->bytes); wt_release(t); free(t); }
@@ -1405,16 +1422,40 @@ static int wt_prefetch_thread(void *arg) {
            the heap leaves a ~1 MB hole there when it goes stale or is
            replaced, and those holes are what starve the builds (10-11) */
         extern unsigned vita_bigblk_room_mb(void);
-        if (vita_bigblk_room_mb() < WT_PREFETCH_ROOM_MB) continue;
+        unsigned room = vita_bigblk_room_mb();
+        if (room < WT_PREFETCH_ROOM_MB) {
+            /* short: the nearest missing tile's stored bytes only (a tile's
+               stored size is well under 1 MB; 1 MB of room keeps it in a
+               kernel block, out of the heap) */
+            if (room < 1u || !g_wt_raw || g_wt_raw_bytes >= WT_RAW_CAP) continue;
+            int rb = -1; float rd = reach * reach;
+            for (int i = 0; i < g_wt_nindex; i++) {
+                const WtIndexEntry *e = &g_wt_index[i];
+                if (e->x == -32768 || g_wt_state[i] != 0) continue;
+                float d = wt_tile_d2(e, ax, ay);
+                if (d < rd) { rd = d; rb = i; }
+            }
+            if (rb < 0 || !__sync_bool_compare_and_swap(&g_wt_state[rb], 0, 1)) continue;
+            g_wt_ra_work = 1;
+            long len = 0; int packed = 0;
+            unsigned char *p = wt_preload_take(g_wt_track, g_wt_index[rb].x, g_wt_index[rb].y, NULL, &len);
+            if (!p) p = wt_fetch(g_wt_track, g_wt_index[rb].x, g_wt_index[rb].y, 0, NULL, &len, &packed);
+            if (p) { g_wt_raw[rb] = p; g_wt_rawlen[rb] = len; __sync_fetch_and_add(&g_wt_raw_bytes, (long long)len); }
+            __sync_synchronize();
+            g_wt_state[rb] = p ? 4 : 0;
+            if (!p) SDL_Delay(500);
+            continue;
+        }
         /* nearest work in reach of the aim: a missing tile, or an owned
-           ground-only one whose buildings the aim needs */
+           ground-only one whose buildings the aim needs, or stored bytes in
+           hand that room now lets it decode */
         int best = -1, up = 0; float bd = reach * reach;
         for (int i = 0; i < g_wt_nindex; i++) {
             const WtIndexEntry *e = &g_wt_index[i];
             if (e->x == -32768) continue;
             int st = g_wt_state[i];
             int want_up = st == 3 && g_wt_owned_ground[i] && g_wt_upst[i] == 0 && wt_objects_at(e, ax, ay, object_radius);
-            if (st != 0 && !want_up) continue;
+            if (st != 0 && st != 4 && !want_up) continue;
             float d = wt_tile_d2(e, ax, ay);
             if (d < bd) { bd = d; best = i; up = want_up; }
         }
@@ -1432,11 +1473,18 @@ static int wt_prefetch_thread(void *arg) {
             if (!ok) SDL_Delay(500);
             continue;
         }
-        if (!__sync_bool_compare_and_swap(&g_wt_state[best], 0, 1)) continue;
+        unsigned char *rawp = NULL; long rawn = 0;
+        if (g_wt_state[best] == 4) {   /* bytes in hand: decode them now */
+            if (!__sync_bool_compare_and_swap(&g_wt_state[best], 4, 1)) continue;
+            rawp = g_wt_raw[best]; rawn = g_wt_rawlen[best]; g_wt_raw[best] = NULL;
+            if (rawp) __sync_fetch_and_sub(&g_wt_raw_bytes, (long long)rawn);
+        } else if (!__sync_bool_compare_and_swap(&g_wt_state[best], 0, 1)) continue;
         WtLoaded *t = (WtLoaded *)calloc(1, sizeof *t);
         int mode = wt_objects_at(e, ax, ay, object_radius) ? 0
                  : wt_tile_d2(e, ax, ay) > (g_wt_radius + 60.0f) * (g_wt_radius + 60.0f) ? WT_FAR_ONLY : WT_GROUND_ONLY;
-        int ok = t && wt_read_decode_t(g_wt_track, e->x, e->y, t, 0, mode);
+        int ok;
+        if (rawp) { ok = t && wt_decode(rawp, rawn, e->x, e->y, t, NULL, mode); free(rawp); }
+        else ok = t && wt_read_decode_t(g_wt_track, e->x, e->y, t, 0, mode);
         if (ok) { g_wt_ready[best] = t; __sync_fetch_and_add(&g_wt_ready_bytes, (long long)t->bytes); }
         else free(t);
         __sync_synchronize();
@@ -1478,6 +1526,7 @@ static void wt_trim(int pause, int keep_preload) {
     long long freed = 0;
     for (int i = 0; g_wt_state && i < g_wt_nindex; i++) {
         if (g_wt_upst[i] == 2) { freed += g_wt_up[i] ? (long long)g_wt_up[i]->bytes : 0; wt_up_drop(i); }
+        if (g_wt_state[i] == 4) { freed += g_wt_rawlen[i]; wt_raw_drop(i); continue; }
         if (g_wt_state[i] != 2 || !__sync_bool_compare_and_swap(&g_wt_state[i], 2, 1)) continue;
         WtLoaded *t = g_wt_ready[i]; g_wt_ready[i] = NULL;
         if (t) { freed += (long long)t->bytes; __sync_fetch_and_sub(&g_wt_ready_bytes, (long long)t->bytes); wt_release(t); free(t); }
@@ -1504,8 +1553,12 @@ static void wt_prefetch_start(void) {
     g_wt_up = (WtLoaded *volatile *)calloc(n, sizeof *g_wt_up);
     g_wt_upst = (volatile int *)calloc(n, sizeof *g_wt_upst);
     g_wt_owned_ground = (volatile char *)calloc(n, 1);
+    g_wt_raw = (unsigned char *volatile *)calloc(n, sizeof *g_wt_raw);
+    g_wt_rawlen = (long *)calloc(n, sizeof *g_wt_rawlen);
+    if (!g_wt_raw || !g_wt_rawlen) { free((void *)g_wt_raw); free(g_wt_rawlen); g_wt_raw = NULL; g_wt_rawlen = NULL; }   /* optional */
     volatile int *st = (volatile int *)calloc(n, sizeof *st);
     if (!st || !g_wt_ready || !g_wt_up || !g_wt_upst || !g_wt_owned_ground) {
+        free((void *)g_wt_raw); free(g_wt_rawlen); g_wt_raw = NULL; g_wt_rawlen = NULL;
         free((void *)st); free((void *)g_wt_ready); free((void *)g_wt_up);
         free((void *)g_wt_upst); free((void *)g_wt_owned_ground);
         g_wt_ready = g_wt_up = NULL; g_wt_upst = NULL; g_wt_owned_ground = NULL;
@@ -1783,6 +1836,21 @@ static int wt_take(const char *track, int idx, int tx, int ty, WtLoaded *out, in
             g_wt_owned_ground[idx] = (char)out->ground;
             return 1;
         }
+        if (st == 4 && __sync_bool_compare_and_swap(&g_wt_state[idx], 4, 3)) {   /* stored bytes in hand */
+            unsigned char *p = g_wt_raw[idx]; long n = g_wt_rawlen[idx]; g_wt_raw[idx] = NULL;
+            __sync_fetch_and_sub(&g_wt_raw_bytes, (long long)n);
+            WtScratch *sc = g_wt_scr[1];
+            int mine = __sync_bool_compare_and_swap(&sc[0].busy, 0, 1);
+            unsigned t1 = wt_ms();
+            int ok = p && wt_decode(p, n, tx, ty, out, mine ? &sc[1] : NULL, mode);
+            g_wt_decode_ms += wt_ms() - t1;
+            if (mine) { __sync_synchronize(); sc[0].busy = 0; }
+            free(p);
+            if (ok) { g_wt_raw_hits++; g_wt_owned_ground[idx] = (char)out->ground; return 1; }
+            if (wt_read_decode(track, tx, ty, out, mode)) { g_wt_owned_ground[idx] = (char)out->ground; return 1; }
+            g_wt_state[idx] = 0;
+            return 0;
+        }
         if (st == 0 && __sync_bool_compare_and_swap(&g_wt_state[idx], 0, 3)) {
             if (wt_read_decode(track, tx, ty, out, mode)) { g_wt_owned_ground[idx] = (char)out->ground; return 1; }
             g_wt_state[idx] = 0;
@@ -1966,6 +2034,7 @@ void world_tiles_reset(void) {
     free((void *)g_wt_up); g_wt_up = NULL;
     free((void *)g_wt_upst); g_wt_upst = NULL;
     free((void *)g_wt_owned_ground); g_wt_owned_ground = NULL;
+    free((void *)g_wt_raw); g_wt_raw = NULL; free(g_wt_rawlen); g_wt_rawlen = NULL; g_wt_raw_bytes = 0;
     g_wt_ready_bytes = 0; g_wt_aim_set = 0;
     free(g_wt_index); g_wt_index = NULL; g_wt_nindex = 0; g_wt_track[0] = 0;
     free(sel.items); memset(&sel, 0, sizeof sel); sel_event = 0x7fffffff; sel_effective = 0;
@@ -2079,7 +2148,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
     }
 #endif
     unsigned t0 = wt_ms();
-    long long read0 = g_wt_bytes_read, hits0 = g_wt_prefetch_hits;
+    long long read0 = g_wt_bytes_read, hits0 = g_wt_prefetch_hits, rawh0 = g_wt_raw_hits;
     long long npack0 = g_wt_n_pack, nloose0 = g_wt_n_loose, npre0 = g_wt_n_pre;
     /* read-ahead state from the first build of a track on (not only after
        it): with no aim yet (a switch, the boot), it works round this build's
@@ -2247,15 +2316,16 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
     g_wt_radius = radius;
     wt_prefetch_start();
     /* reads by the loader itself, by source: pack / loose file / preloaded bytes */
-    printf("world tiles: %d meshes at (%.0f, %.0f) r %.0f: %ld new tiles (%lld ready from read-ahead, "
+    printf("world tiles: %d meshes at (%.0f, %.0f) r %.0f: %ld new tiles (%lld ready from read-ahead, %lld from its stored bytes, "
            "%lld KB read now: read %u ms, decode %u ms; %lld pack, %lld loose, %lld preloaded), %d kept "
            "(%u KB, %d ground only; upgrades %d ready, %d read now; %d cut to ground; far ring %d tiles %u KB, %d regraded), %ld hidden by scenery, %u ms\n",
            scene->count, fx, fy, radius, loaded_now, (long long)(g_wt_prefetch_hits - hits0),
-           (g_wt_bytes_read - read0) >> 10, g_wt_read_ms, g_wt_decode_ms, g_wt_n_pack - npack0,
+           (long long)(g_wt_raw_hits - rawh0), (g_wt_bytes_read - read0) >> 10, g_wt_read_ms, g_wt_decode_ms, g_wt_n_pack - npack0,
            g_wt_n_loose - nloose0, g_wt_n_pre - npre0, kept, (unsigned)(kept_bytes >> 10),
            kept_ground, g_wt_up_ready, g_wt_up_now, downgraded, kept_far, (unsigned)(far_bytes >> 10), regraded, hidden, wt_ms() - t0);
-    printf("world tiles: geometry %lld KB live: %u KB this cache, %lld KB read-ahead, %lld KB held by older areas\n",
+    printf("world tiles: geometry %lld KB live: %u KB this cache, %lld KB read-ahead (+%lld KB stored bytes), %lld KB held by older areas\n",
            (long long)(g_wt_geo_live >> 10), (unsigned)(kept_bytes >> 10), (long long)(g_wt_ready_bytes >> 10),
+           (long long)(g_wt_raw_bytes >> 10),
            (long long)((g_wt_geo_live - (long long)kept_bytes - g_wt_ready_bytes) >> 10));
     wt_preload_after(track, fx, fy, radius);
     VMARK("  tiles assembled: %d meshes, %ld new tiles", scene->count, loaded_now);

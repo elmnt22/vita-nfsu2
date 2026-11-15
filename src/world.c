@@ -1094,6 +1094,7 @@ static const WGroundGrid *g_active_grid = &g_empty_grid;
 void world_ground_grid_activate(const WGroundGrid *grid) {
     g_active_grid = grid ? grid : &g_empty_grid;
 }
+int world_ground_grid_is_active(const WGroundGrid *grid) { return grid && g_active_grid == grid; }
 
 void world_ground_grid_free(WGroundGrid *grid) {
     if (!grid) return;

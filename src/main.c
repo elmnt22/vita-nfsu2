@@ -2679,6 +2679,8 @@ static const PerfParts *g_load_pp;   /* an opponent's fitted performance parts, 
 /* a traffic model's skin (RideInfo +7, 0x61bc20): its <CAR>_SKIN1 meshes
    wear <CAR>_SKIN<n>; 0 the model's own */
 static int g_load_skin;
+static Uint64 g_wd_submit;   /* world opaque draw_batch time, 60 frames (world_draw ms/frame line) */
+static Uint64 g_wd_cb[4];    /* cut+blend split, 60 frames: cutout, fade, props+anims, blend (11-15) */
 static int g_route_glide;   /* the route.txt test glide is moving the car (no tyre marks: its physics resets every tick) */
 static const N2CarConfig *g_load_cfg;   /* the RideInfo parts to load with (an opponent's preset), NULL stock */
 static unsigned char *g_shared_cartex; static long g_shared_cartex_len; static int g_shared_cartex_tried;   /* the shared car pack */
@@ -11889,7 +11891,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         if (g_rt.nisdrv[k]) cs[nc].wc = NULL;
         cs[nc].nocollide = 0; cs[nc].human = 0; g_rt.csmap[nc++] = k;
     }
-    int with_player = player_n2 && g_cc && g_n2_coll && (g_rt.field_gone || nc == ncexp);   /* its step-start pose is fresh */
+    int with_player = player_n2 && g_cc && g_n2_coll && !g_route_glide && (g_rt.field_gone || nc == ncexp);   /* the test glide passes through */   /* its step-start pose is fresh */
     if (with_player) { cs[nc].c = g_cc; cs[nc].s = g_n2; cs[nc].wc = NULL; cs[nc].nocollide = 0; cs[nc].human = 1; g_rt.csmap[nc++] = g_rt.n; }
     for (int i = 0; i < g_rt.ntr && nc < CARCOLL_MAXCARS; i++) {
         RtCar *c = &g_rt.tcar[i];
@@ -13051,38 +13053,70 @@ static int race_line_lead_point(const float car[2], const float vel_mps[2],
    in reach it pulls back toward the car, so the build covers every turn
    instead of betting on straight on (a velocity aim lost a whole build to
    each corner taken at speed). 0 when off the road network. */
-static int road_lead_point(const World *w, const float car[2], const float vel_mps[2],
-                           float lead, float cap, float out[2]) {
+/* The search runs in slices (PERF_PLAN P5, 11-15): hwlog56/57 downtown, the
+   whole search in one frame was the stream_policy spike of ~13 ms twice a
+   second (4000 expansions over a 15k-node graph) -- a missed frame each time.
+   road_lead_begin primes it, road_lead_step expands up to `budget` nodes and
+   returns -1 while unfinished, 0 for no answer, 1 with the aim in out.
+   Same search, same answer, only spread over frames. */
+static struct {
+    const World *w; const float *nav; int n;
+    float car[2], hx, hy, lead, cap;
+    int hn, nfront, expanded, active;
+    double sx, sy, wsum;
+} g_rl;
+static float *g_rl_dist; static int *g_rl_prev; static unsigned *g_rl_stamp; static unsigned g_rl_cur;
+static int *g_rl_heapn; static float *g_rl_heapf; static int g_rl_cap_n;
+static int road_lead_begin(const World *w, const float car[2], const float vel_mps[2],
+                           float lead, float cap) {
+    g_rl.active = 0;
     int n = w->city.nnav;
     const float *nav = w->city.nav;
     if (n <= 0 || !nav || !w->city.adjstart || !w->city.adjlist) return 0;
     float sp = sqrtf(vel_mps[0]*vel_mps[0] + vel_mps[1]*vel_mps[1]);
     if (sp < 8.0f || lead < 20.0f) return 0;
-    static float *dist; static int *prev; static unsigned *stamp; static unsigned cur;
-    static int *heapn; static float *heapf; static int cap_n;
-    if (cap_n != n) {
-        free(dist); free(prev); free(stamp); free(heapn); free(heapf);
-        dist = malloc((size_t)n * sizeof *dist); prev = malloc((size_t)n * sizeof *prev);
-        stamp = calloc((size_t)n, sizeof *stamp);
-        heapn = malloc((size_t)n * 4 * sizeof *heapn); heapf = malloc((size_t)n * 4 * sizeof *heapf);
-        cap_n = (dist && prev && stamp && heapn && heapf) ? n : 0; cur = 0;
-        if (!cap_n) return 0;
+    if (g_rl_cap_n != n) {
+        free(g_rl_dist); free(g_rl_prev); free(g_rl_stamp); free(g_rl_heapn); free(g_rl_heapf);
+        g_rl_dist = malloc((size_t)n * sizeof *g_rl_dist); g_rl_prev = malloc((size_t)n * sizeof *g_rl_prev);
+        g_rl_stamp = calloc((size_t)n, sizeof *g_rl_stamp);
+        g_rl_heapn = malloc((size_t)n * 4 * sizeof *g_rl_heapn); g_rl_heapf = malloc((size_t)n * 4 * sizeof *g_rl_heapf);
+        g_rl_cap_n = (g_rl_dist && g_rl_prev && g_rl_stamp && g_rl_heapn && g_rl_heapf) ? n : 0; g_rl_cur = 0;
+        if (!g_rl_cap_n) return 0;
     }
     int start = world_nav_nearest(w, car[0], car[1]);
     if (start < 0) return 0;
     {   float dx = nav[start*2]-car[0], dy = nav[start*2+1]-car[1];
         if (dx*dx + dy*dy > 30.0f*30.0f) return 0; }   /* not on a mapped road */
-    float hx = vel_mps[0]/sp, hy = vel_mps[1]/sp;
-    cur++;
-    int hn = 0;
+    g_rl.w = w; g_rl.nav = nav; g_rl.n = n;
+    g_rl.car[0] = car[0]; g_rl.car[1] = car[1];
+    g_rl.hx = vel_mps[0]/sp; g_rl.hy = vel_mps[1]/sp;
+    g_rl.lead = lead; g_rl.cap = cap;
+    g_rl_cur++;
+    g_rl_stamp[start] = g_rl_cur; g_rl_dist[start] = 0.0f; g_rl_prev[start] = -1;
+    g_rl_heapn[0] = start; g_rl_heapf[0] = 0.0f; g_rl.hn = 1;
+    g_rl.sx = g_rl.sy = g_rl.wsum = 0; g_rl.nfront = 0; g_rl.expanded = 0;
+    g_rl.active = 1;
+    return 1;
+}
+static int road_lead_step(const World *w, int budget, float out[2]) {
+    if (!g_rl.active) return 0;
+    /* the graph changed under a search in progress (track switch): drop it */
+    if (w != g_rl.w || w->city.nav != g_rl.nav || w->city.nnav != g_rl.n || g_rl_cap_n != g_rl.n) {
+        g_rl.active = 0; return 0;
+    }
+    const float *nav = g_rl.nav;
+    const float *car = g_rl.car;
+    float hx = g_rl.hx, hy = g_rl.hy, lead = g_rl.lead, cap = g_rl.cap;
+    int n = g_rl.n, hn = g_rl.hn, expanded = g_rl.expanded, nfront = g_rl.nfront;
+    double sx = g_rl.sx, sy = g_rl.sy, wsum = g_rl.wsum;
+    float *dist = g_rl_dist; int *prev = g_rl_prev; unsigned *stamp = g_rl_stamp, cur = g_rl_cur;
+    int *heapn = g_rl_heapn; float *heapf = g_rl_heapf;
+    int stop = expanded + budget;
 #define RL_PUSH(node, d) do { if (hn < n*4) { int i_ = hn++; heapn[i_] = (node); heapf[i_] = (d); \
         while (i_ > 0) { int p_ = (i_-1)/2; if (heapf[p_] <= heapf[i_]) break; \
             float tf = heapf[p_]; heapf[p_] = heapf[i_]; heapf[i_] = tf; \
             int tn = heapn[p_]; heapn[p_] = heapn[i_]; heapn[i_] = tn; i_ = p_; } } } while (0)
-    stamp[start] = cur; dist[start] = 0.0f; prev[start] = -1;
-    RL_PUSH(start, 0.0f);
-    double sx = 0, sy = 0, wsum = 0; int nfront = 0, expanded = 0;
-    while (hn > 0 && expanded < 4000) {
+    while (hn > 0 && expanded < 4000 && expanded < stop) {
         int u = heapn[0]; float du = heapf[0];
         hn--; heapn[0] = heapn[hn]; heapf[0] = heapf[hn];
         for (int i = 0;;) { int l = i*2+1, r = l+1, m = i;
@@ -13123,9 +13157,18 @@ static int road_lead_point(const World *w, const float car[2], const float vel_m
         }
     }
 #undef RL_PUSH
+    g_rl.hn = hn; g_rl.expanded = expanded; g_rl.nfront = nfront;
+    g_rl.sx = sx; g_rl.sy = sy; g_rl.wsum = wsum;
+    if (hn > 0 && expanded < 4000) return -1;   /* more next frame */
+    g_rl.active = 0;
     if (!nfront || wsum <= 0) return 0;
     out[0] = (float)(sx / wsum); out[1] = (float)(sy / wsum);
     return 1;
+}
+static int road_lead_point(const World *w, const float car[2], const float vel_mps[2],
+                           float lead, float cap, float out[2]) {
+    if (!road_lead_begin(w, car, vel_mps, lead, cap)) return 0;
+    return road_lead_step(w, 1 << 30, out) == 1;
 }
 #endif
 
@@ -21283,20 +21326,36 @@ int main(int argc, char **argv) {
                 stream_route_aim = 1;
             else if (race_state == 1 && !(world.city.race.active && !world.city.race.finished)) {
                 /* free roam: follow the road network (recomputed 4x a second) */
-                static float road_aim[2]; static int road_ok, road_tick;
+                static float road_aim[2]; static int road_ok, road_tick, road_busy;
                 static uint32_t road_seen;
                 /* recompute at once after a gap (race, menu, track switch) or
                    when the kept aim is out of the car's reach: a stale aim
                    from the previous track sent the first career free-roam
                    build to the map edge, 26 s behind the loading screen (HW 11-02) */
                 uint32_t road_now = SDL_GetTicks();
-                int road_stale = road_now - road_seen > 250u ||
-                    (road_ok && hypotf(road_aim[0] - carpos[0], road_aim[1] - carpos[1]) >
-                                max_lead + resident_policy.cell_size);
+                int road_reach = road_ok && hypotf(road_aim[0] - carpos[0], road_aim[1] - carpos[1]) >
+                                max_lead + resident_policy.cell_size;
+                int road_stale = road_now - road_seen > 2000u || road_reach;
+                /* a short gap (a slow frame, a blocking finish) only restarts
+                   the sliced search: hwlog59 the whole search then was the
+                   12-16 ms stream_aim spikes, on frames already long */
+                if (!road_stale && road_now - road_seen > 250u) { road_tick = 30; road_busy = 0; }
                 road_seen = road_now;
-                if (road_stale || ++road_tick >= 15) {
-                    road_tick = 0;
+                /* a long gap or an aim out of reach: the whole search now; else
+                   one search every 30 frames, 200 expansions a frame (hwlog59:
+                   ~5 us an expansion, up to 4000 a search -- every 15 frames
+                   it averaged 0.65 ms/frame) */
+                if (road_stale) {
+                    road_tick = 0; road_busy = 0;
                     road_ok = road_lead_point(&world, carpos, vmps, al, max_lead, road_aim);
+                } else if (road_busy) {
+                    float a[2];
+                    int r = road_lead_step(&world, 200, a);
+                    if (r >= 0) { road_busy = 0; road_ok = r; if (r) { road_aim[0] = a[0]; road_aim[1] = a[1]; } }
+                } else if (++road_tick >= 30) {
+                    road_tick = 0;
+                    road_busy = road_lead_begin(&world, carpos, vmps, al, max_lead);
+                    if (!road_busy) road_ok = 0;
                 }
                 if (road_ok) { stream_at[0] = road_aim[0]; stream_at[1] = road_aim[1]; stream_route_aim = 2; }
                 else {
@@ -21307,6 +21366,7 @@ int main(int argc, char **argv) {
                 if (al > max_lead) { ax *= max_lead/al; ay *= max_lead/al; }
                 stream_at[0] += ax; stream_at[1] += ay;
             } }
+        hitch_mark("stream_aim");
         int resident_wanted = resident_enabled &&
                 world_resident_target(&resident_policy, stream_at[0], stream_at[1],
                                       active_resident->center[0],
@@ -25580,9 +25640,93 @@ int main(int argc, char **argv) {
             }
         }
 #endif
+#ifdef __vita__
+        /* PERF_PLAN P3a (11-15): the batches grouped into 128 m cells (by box
+           centre); a cell whose union box is outside the view frustum skips
+           all its batches at once. Exact: a box outside a plane holds only
+           boxes outside it, so nothing that drew before is lost, and the loop
+           keeps its order (draw order, binds and coplanar results unchanged).
+           hwlog57: opaque+cull 4.5-5.6 ms/frame of which the draw calls were
+           1.4-1.7 -- the rest was this loop testing 3400-4200 batches.
+           nocellcull.txt / OPENUG2_NO_CELLCULL = off; OPENUG2_CELLCULL_VERIFY=1
+           (simulator) runs the full test on every skipped batch and counts any
+           that would have passed it (must stay 0). */
+        static int cc_on = -1, cc_verify;
+        if (cc_on < 0) {
+            FILE *f = fopen("ux0:data/NFSU2/nocellcull.txt", "r");
+            cc_on = !f && !getenv("OPENUG2_NO_CELLCULL");
+            if (f) fclose(f);
+            cc_verify = getenv("OPENUG2_CELLCULL_VERIFY") != NULL;
+            printf("world: cell cull %s\n", cc_on ? "on (128 m cells)" : "off");
+        }
+        static int *cc_cell, cc_cellcap, cc_ncell, cc_boxcap, cc_n = -1, cc_gen = -2;
+        static const N2Batch *cc_src;
+        static float (*cc_box)[6];
+        static unsigned char *cc_vis;
+        static long cc_skipped, cc_tested, cc_bad, cc_frames;
+        int cc_use = cc_on && !mapaudit && nbatch > 0;
+        if (cc_use) {
+            int gen = active_resident ? (int)active_resident->generation : -1;
+            if (cc_src != wbatch || cc_n != nbatch || cc_gen != gen) {
+                cc_src = wbatch; cc_n = nbatch; cc_gen = gen; cc_ncell = 0;
+                if (nbatch > cc_cellcap) {
+                    int *nc = (int *)realloc(cc_cell, (size_t)nbatch * sizeof *nc);
+                    if (nc) { cc_cell = nc; cc_cellcap = nbatch; }
+                }
+                int hcap = 1; while (hcap < 2 * nbatch) hcap <<= 1;
+                int *hkey = (int *)malloc((size_t)hcap * 2 * sizeof(int));
+                if (cc_cellcap >= nbatch && hkey) {
+                    for (int i = 0; i < hcap; i++) hkey[2*i+1] = -1;
+                    for (int k = 0; k < nbatch && cc_cell; k++) {
+                        const N2Batch *b = &wbatch[k];
+                        int cx = (int)floorf(0.5f * (b->bbox_min[0] + b->bbox_max[0]) * (1.0f / 128.0f));
+                        int cy = (int)floorf(0.5f * (b->bbox_min[1] + b->bbox_max[1]) * (1.0f / 128.0f));
+                        int key = (cx & 0xffff) | (cy << 16);
+                        unsigned h = ((unsigned)key * 2654435761u) & (unsigned)(hcap - 1);
+                        while (hkey[2*h+1] >= 0 && hkey[2*h] != key) h = (h + 1) & (unsigned)(hcap - 1);
+                        if (hkey[2*h+1] < 0) {
+                            if (cc_ncell >= cc_boxcap) {
+                                int nb = cc_boxcap ? cc_boxcap * 2 : 1024;
+                                float (*bx)[6] = (float (*)[6])realloc(cc_box, (size_t)nb * sizeof *bx);
+                                unsigned char *vs = (unsigned char *)realloc(cc_vis, (size_t)nb);
+                                if (bx) cc_box = bx;
+                                if (vs) cc_vis = vs;
+                                if (!bx || !vs) { cc_ncell = -1; break; }
+                                cc_boxcap = nb;
+                            }
+                            hkey[2*h] = key; hkey[2*h+1] = cc_ncell;
+                            float *bx = cc_box[cc_ncell++];
+                            for (int c = 0; c < 3; c++) { bx[c] = b->bbox_min[c]; bx[c+3] = b->bbox_max[c]; }
+                        } else {
+                            float *bx = cc_box[hkey[2*h+1]];
+                            for (int c = 0; c < 3; c++) {
+                                if (b->bbox_min[c] < bx[c]) bx[c] = b->bbox_min[c];
+                                if (b->bbox_max[c] > bx[c+3]) bx[c+3] = b->bbox_max[c];
+                            }
+                        }
+                        cc_cell[k] = hkey[2*h+1];
+                    }
+                } else cc_ncell = -1;
+                free(hkey);
+                if (cc_ncell < 0) cc_n = -1;   /* no memory: test per batch, retry next frame */
+            }
+            if (cc_ncell > 0 && cc_n == nbatch)
+                for (int c = 0; c < cc_ncell; c++)
+                    cc_vis[c] = (unsigned char)world_box_in_view(world_planes, cc_box[c], cc_box[c] + 3);
+            else cc_use = 0;
+        }
+#endif
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
             N2Batch *b = &wbatch[k];
+#ifdef __vita__
+            if (cc_use && !cc_vis[cc_cell[k]]) {
+                cc_skipped++;
+                if (cc_verify && world_box_in_view(world_planes, b->bbox_min, b->bbox_max)) cc_bad++;
+                continue;
+            }
+            cc_tested++;
+#endif
             /* A batch whose meshes named a texture the resolver could not
                supply has nothing to draw. Untextured it falls back to a flat
                grey, and under night ambient that is a solid dark slab: it is
@@ -25698,12 +25842,22 @@ int main(int argc, char **argv) {
             }
             if (b->reflect) g_refl_batches++;
             #endif
-            draw_batch(b);
+            {   Uint64 s0 = SDL_GetPerformanceCounter();
+                draw_batch(b);
+                g_wd_submit += SDL_GetPerformanceCounter() - s0;
+            }
             for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
             g_dbg.drawn++; wbdrawn++;
             if (nviskept < 4096) viskept[nviskept++] = k;
         }
         #ifdef __vita__
+        if (cc_use && ++cc_frames >= 600) {
+            printf("world: cell cull over %ld frames: %.0f cells, %.0f batches skipped, %.0f tested per frame%s\n",
+                   cc_frames, (double)cc_ncell, (double)cc_skipped / cc_frames, (double)cc_tested / cc_frames,
+                   cc_verify ? (cc_bad ? " -- VERIFY FAILED" : " (verify: 0 wrong)") : "");
+            if (cc_verify && cc_bad) printf("world: cell cull verify: %ld skipped batches were in view\n", cc_bad);
+            cc_skipped = cc_tested = cc_bad = cc_frames = 0;
+        }
         if (nreflq) {
             vita_set_reflect(1);
             for (int q = 0; q < nreflq; q++) {
@@ -25717,7 +25871,10 @@ int main(int argc, char **argv) {
                     glUniform1f(rp.uAlphaTest, 0.0f);
                     lastmode = b->drawmode;
                 }
-                draw_batch(b);
+                {   Uint64 s0 = SDL_GetPerformanceCounter();
+                    draw_batch(b);
+                    g_wd_submit += SDL_GetPerformanceCounter() - s0;
+                }
                 for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
                 g_dbg.drawn++; wbdrawn++; g_refl_batches++;
                 if (nviskept < 4096) viskept[nviskept++] = reflq[q];
@@ -25746,6 +25903,7 @@ int main(int argc, char **argv) {
             }
         }
         WT_MARK(4);
+        Uint64 cb0 = SDL_GetPerformanceCounter(), cb1 = cb0, cb2 = cb0, cb3 = cb0;
         if (ndefcut && VITA_PROBE(3)) {
             /* Nearest first. A discarding draw cannot be hidden-surface
                removed, but it is still depth tested: drawn front to back,
@@ -25773,6 +25931,7 @@ int main(int argc, char **argv) {
                 if (nviskept < 4096) viskept[nviskept++] = defcut[q];
             }
         }
+        cb1 = SDL_GetPerformanceCounter();
         #ifdef __vita__
         if (nfadeq && !g_showroom) {   /* the arriving buildings (see WFADE_MS); none in a showroom (no world there) */
             glEnable(GL_BLEND);
@@ -25801,6 +25960,7 @@ int main(int argc, char **argv) {
         }
         wt_fade_sum += nfadeq; wt_fade_dist_sum += nfade_dist;
         #endif
+        cb2 = SDL_GetPerformanceCounter();
         if (lastmode == N2_DRAW_CUTOUT) glUniform1f(rp.uAlphaTest, 0.0f);
         if (g_dbg.show_track && (passmode == 0 || passmode == 1) && active_resident) {
             /* the smokeable props: their meshes are out of the batches */
@@ -25816,6 +25976,7 @@ int main(int argc, char **argv) {
             if (tun_active() && tun_on_dyno()) dyroll_draw(&rp, MVP);   /* RenderCars -> RenderRollers */
             lasttex = (GLuint)-1; lastmode = -1;
         }
+        cb3 = SDL_GetPerformanceCounter();
         #ifdef __vita__
         {   /* world draw mix, averaged over 60 frames */
             static int wf; static long wo, wc, wb;
@@ -25894,6 +26055,8 @@ int main(int argc, char **argv) {
             glDisable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);   /* restore the ordinary default */
         }
+        {   Uint64 cb4 = SDL_GetPerformanceCounter();
+            g_wd_cb[0] += cb1 - cb0; g_wd_cb[1] += cb2 - cb1; g_wd_cb[2] += cb3 - cb2; g_wd_cb[3] += cb4 - cb3; }
         if (nrep) {   /* diagnostic overlay: where the restored geometry is */
             glUniform1f(uUseTex, 0.0f);
             glUniform1f(uUnlit, 1.0f);
@@ -25995,11 +26158,18 @@ int main(int argc, char **argv) {
         #ifdef __vita__
         if (++wt_frames == 60) {
             printf("world_draw ms/frame: fog %.2f camclip %.2f refl %.2f env %.2f mirror %.2f carvis+lights %.2f "
-                   "sky %.2f vista %.2f opaque+cull %.2f cut+blend %.2f rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m (cpu %.2f)\n",
+                   "sky %.2f vista %.2f opaque+cull %.2f (opaque draw calls %.2f) cut+blend %.2f (cutout %.2f fade %.2f props %.2f blend %.2f) rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m (cpu %.2f)\n",
                    wt_ms[0]/60, wt_ms[7]/60, wt_ms[8]/60, wt_ms[9]/60, wt_ms[10]/60, wt_ms[1]/60,
-                   wt_ms[2]/60, wt_ms[3]/60, wt_ms[4]/60, wt_ms[5]/60, wt_ms[6]/60,
+                   wt_ms[2]/60, wt_ms[3]/60, wt_ms[4]/60,
+                   (double)g_wd_submit * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   wt_ms[5]/60,
+                   (double)g_wd_cb[0] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   (double)g_wd_cb[1] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   (double)g_wd_cb[2] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   (double)g_wd_cb[3] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   wt_ms[6]/60,
                    wt_fade_sum/60.0, wt_fade_dist_sum/60.0, (double)g_view_dyn_log, (double)g_vd_cpu_log);
-            memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0; wt_fade_sum = wt_fade_dist_sum = 0;
+            memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0; wt_fade_sum = wt_fade_dist_sum = 0; g_wd_submit = 0; memset(g_wd_cb, 0, sizeof g_wd_cb);
         }
         #endif
         pf_mark(PF_WORLD_DRAW);

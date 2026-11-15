@@ -623,13 +623,19 @@ __attribute__((destructor)) static void vita_log_close(void) {
    The engine does not check every allocation, so an out-of-memory turns into
    a NULL write somewhere later. Log the failing request first, straight
    through sceIo so it lands even if stdio is wedged, then let it continue. */
+size_t vita_bigblk_live(void);
+unsigned vita_bigblk_room_mb(void);
 static void vita_oom(const char *fn, size_t n, void *caller) {
     struct mallinfo mi = mallinfo();
-    char line[256];
+    char line[320];
+    /* kernel side too (11-15): a big request fails only when the kernel
+       blocks (room = free user memory past the reserve) and the heap are
+       both short */
     int len = snprintf(line, sizeof line,
-        "OUT OF MEMORY: %s(%u KB) failed, heap in use %u KB of %u KB, caller %p (vita_oom at %p)\n",
+        "OUT OF MEMORY: %s(%u KB) failed, heap in use %u KB of %u KB (%u KB free in holes), kernel blocks %u MB live, %u MB room, caller %p (vita_oom at %p)\n",
         fn, (unsigned)(n >> 10), (unsigned)(mi.uordblks >> 10),
-        (unsigned)(_newlib_heap_size_user >> 10), caller, (void *)vita_oom);
+        (unsigned)(_newlib_heap_size_user >> 10), (unsigned)(mi.fordblks >> 10),
+        (unsigned)(vita_bigblk_live() >> 20), vita_bigblk_room_mb(), caller, (void *)vita_oom);
     SceUID fd = sceIoOpen(VITA_DATA "/oom.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     if (fd >= 0) { sceIoWrite(fd, line, (SceSize)len); sceIoClose(fd); }
     fputs(line, stderr);

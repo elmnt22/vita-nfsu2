@@ -3,6 +3,7 @@
 #include "acid.h"
 
 #include <math.h>
+#include "SDL.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1266,12 +1267,19 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
     World W = { cars, n, w, polys, np, pairs, 0 };
     int nl = 0, done = 0;
     for (int i = 0; i < n; i++) np[i] = 0;
+    /* PERF_PLAN P5 census: where a contacts pass goes (logged every 1200 runs) */
+    static double tb, tn, tr; static long runs, pairs_sum, iters_sum;
+    Uint64 c0 = SDL_GetPerformanceCounter();
     for (int i = 0; i < n; i++) broadphase(&W, i);
+    Uint64 c1 = SDL_GetPerformanceCounter();
     for (int i = 0; i < W.npairs; i++) {
         Contact k;
         if (narrow(&W, i, &k)) insert_contact(list, &nl, &k);
     }
+    Uint64 c2 = SDL_GetPerformanceCounter();
+    int iters = 0;
     for (int iter = 0; nl > 0 && iter < 20; iter++) {     /* DAT_802080 */
+        iters++;
         Contact k = list[0];
         CPair *p = &pairs[k.pair];
         if (resolve(&W, &k, done < maxhits && hits ? &hits[done] : NULL, wake, user))
@@ -1298,6 +1306,16 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
             if (narrow(&W, i, &c2)) insert_contact(list, &nl, &c2);
         }
         (void)first;
+    }
+    {   double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
+        Uint64 c3 = SDL_GetPerformanceCounter();
+        tb += (double)(c1 - c0) * f; tn += (double)(c2 - c1) * f; tr += (double)(c3 - c2) * f;
+        pairs_sum += W.npairs; iters_sum += iters;
+        if (n > 1 && ++runs >= 1200) {
+            printf("contacts over %ld runs: broadphase %.3f narrow %.3f resolve %.3f ms/run, %.1f pairs, %.2f resolves (%d bodies)\n",
+                   runs, tb / runs, tn / runs, tr / runs, (double)pairs_sum / runs, (double)iters_sum / runs, n);
+            tb = tn = tr = 0; runs = pairs_sum = iters_sum = 0;
+        }
     }
     g_npairs = W.npairs;
     return done;                                           /* impulses applied */

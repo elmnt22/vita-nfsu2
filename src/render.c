@@ -2365,6 +2365,9 @@ void render_world_packed_trim_list(const N2Scene *s, const int *list, int list_n
 #endif
 }
 
+#ifdef __vita__
+static int g_pack_keep_selftest;   /* render_batch_reuse_selftest: P1b's drop off */
+#endif
 /* Same per-vertex result as batch_emit's own loop. */
 int render_pack_mesh(const N2Mesh *m, PackedMesh *out) {
     out->v = NULL;
@@ -2413,6 +2416,24 @@ int render_pack_mesh(const N2Mesh *m, PackedMesh *out) {
         memcpy(shared->packed_hash,out->hash,sizeof out->hash);
         shared->packed_hashed = out->hash_valid;
         out->borrowed = 1;
+#ifdef __vita__
+        /* PERF_PLAN P1b (11-15): the copy was only wanted for its hash (GPU
+           reuse) and box; keep those and let it go now, as the trim would
+           after upload. A batch the GPU lacks is repacked by the worker
+           (render_world_plan_fill) and freed once assembled. Sim census at
+           the peak of the double downtown route: 22 MB of these in 9771
+           copies. keeppacked.txt / OPENUG2_KEEP_PACKED = keep them. */
+        static int drop = -1;
+        if (g_pack_keep_selftest) goto keep;   /* the reuse selftest checks the borrowed copy */
+        if (drop < 0) {
+            FILE *f = fopen("ux0:data/NFSU2/keeppacked.txt", "r");
+            drop = !f && !getenv("OPENUG2_KEEP_PACKED");
+            if (f) fclose(f);
+            printf("world: packed copies %s\n", drop ? "dropped after hashing" : "kept until upload (keeppacked.txt)");
+        }
+        if (drop && out->hash_valid) { free(bv); shared->packed = NULL; out->v = NULL; }
+        keep:;
+#endif
     }
     return 1;
 }
@@ -3544,11 +3565,15 @@ void render_batch_reuse_selftest(void) {
     N2Mesh retained_mesh=cached;
     PackedMesh packed_a={0},packed_b={0};
     assert(sizeof(BatchedVertex)==28);   /* Vita layout (render.h) */
+    g_pack_keep_selftest = 1;
     assert(render_pack_mesh(&cached,&packed_a));
     assert(render_pack_mesh(&retained_mesh,&packed_b));
+    g_pack_keep_selftest = 0;
     assert(packed_a.borrowed && packed_b.borrowed && packed_a.v==packed_b.v);
     n2_mesh_geometry_release(&cached);
-    assert(retained_mesh.shared_geometry->refs==1 && packed_b.v[0].pos[0]==-4);
+    /* P1b (11-15): the packed copy is dropped once hashed (v NULL) unless
+       keeppacked.txt keeps it */
+    assert(retained_mesh.shared_geometry->refs==1 && (!packed_b.v || packed_b.v[0].pos[0]==-4));
     n2_mesh_geometry_release(&retained_mesh);
     N2Batch *a = NULL, *b = NULL; int na, nb;
     na = upload_world_batches(&first,bounds,textures,0,&a,NULL,NULL,NULL);

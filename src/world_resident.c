@@ -1334,6 +1334,9 @@ int world_resident_release_meshes_async(WorldResident *r) {
         rel_lock(); it->next = g_rel_head; g_rel_head = it; rel_unlock();
         moved += it->n;
     }
+    /* its ground grid indexes those meshes and is no longer the active one
+       (world_resident swap activated the new area's): ~3 MB downtown */
+    if (moved && !world_ground_grid_is_active(&r->world.grid)) world_ground_grid_free(&r->world.grid);
     return moved;
 }
 long world_resident_release_pending(void) { return g_rel_meshes; }
