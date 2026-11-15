@@ -6517,6 +6517,25 @@ static void rt_traffic_start(const float ppos[3], float pheading, int tdiff)
     printf("race traffic: %d of %d cars (region %d, %d models)%c", g_rt.ntr, cnt, region, g_rt.ntvis, 10);
     RT_CRUMB("traffic: done, %d cars", g_rt.ntr);
 }
+/* test aid (PERF_PLAN, 11-15): shorter unattended HW runs that fit the
+   battery: autodrive.txt "... laps N" (OPENUG2_LAPS in the simulator)
+   overrides a circuit's lap count (events of 2+ laps only); off, the
+   event's own count */
+static int rt_test_laps(int laps) {
+    static int t = -1;
+    if (t < 0) {
+        t = 0;
+        const char *e = getenv("OPENUG2_LAPS");
+        if (e) t = atoi(e);
+        else {
+            char ab[64] = { 0 }; FILE *af = fopen("ux0:data/NFSU2/autodrive.txt", "r");
+            if (af) { if (fgets(ab, sizeof ab, af)) { const char *l = strstr(ab, "laps "); if (l) t = atoi(l + 5); } fclose(af); }
+        }
+        if (t < 0) t = 0;
+    }
+    if (t > 0 && laps > 1 && laps != t) { printf("test laps: %d instead of %d%c", t, laps, 10); return t; }
+    return laps;
+}
 static int rt_start_ai(const char *routes_path, const char *paths_path, const char *trackpos_path,
                        int ev, int circuit, int klass, int suv, const int *skill, int laps)
 {
@@ -6532,7 +6551,7 @@ static int rt_start_ai(const char *routes_path, const char *paths_path, const ch
        the lap length (0x88f2b0) are measured on */
     g_rt.rp = racepath_load(paths_path, ev, g_rt_reverse);
     float lap = g_rt.rp ? racepath_lap(g_rt.rp) : ainet_route_length(g_rt.net);
-    g_rt.laps = laps > 0 ? laps : 1;
+    g_rt.laps = rt_test_laps(laps > 0 ? laps : 1);
     if (g_rt.rp) {
         racecps_init(&g_rt.cps, g_rt.rp, trackpos_path, ev, g_rt_reverse, !circuit, circuit ? g_rt.laps : 1);
         printf("race route: event %d, %.0f m, %d route(s), %d checkpoints (start %.1f%%, finish %.1f%%), %d lap(s)\n",
@@ -6740,7 +6759,7 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
 {
     RT_CRUMB("race setup: event %d", e->id);
     rt_end();
-    g_rt.laps = laps;
+    g_rt.laps = laps = rt_test_laps(laps);
     if (!g_ai_have || !g_n2rec_ok || !perf_ready() || airace_ntypes() <= 0) {
         printf("garage race: no retail AI data, racing alone\n");
         return 0;
