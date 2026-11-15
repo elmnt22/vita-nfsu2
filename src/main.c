@@ -2680,6 +2680,10 @@ static const PerfParts *g_load_pp;   /* an opponent's fitted performance parts, 
    wear <CAR>_SKIN<n>; 0 the model's own */
 static int g_load_skin;
 static Uint64 g_wd_submit; static unsigned g_wd_tick;   /* world opaque draw_batch time, 60 frames (world_draw ms/frame line) */
+/* opaque+cull split (11-15, PERF_PLAN P4.1): [0] cell cull + list setup,
+   [1] the batch loop (with its draws), [2] the wet road run; the rest of
+   the bracket is the skyline */
+static Uint64 g_wd_oc[3];
 static Uint64 g_wd_cb[4];    /* cut+blend split, 60 frames: cutout, fade, props+anims, blend (11-15) */
 static Uint64 g_wd_props[2]; /* props split: smokeables, world anims */
 #if defined(OPENUG2_SIM_PRE_H)
@@ -25474,6 +25478,7 @@ int main(int argc, char **argv) {
         }
 
         WT_MARK(3);
+        Uint64 oc0 = SDL_GetPerformanceCounter();
         /* track: one draw per visible (cell,texture) batch, texture-sorted so
            binds are rare; terrain fallback + untextured-gray are baked into
            the batch key at build time.
@@ -25827,6 +25832,8 @@ int main(int argc, char **argv) {
             }
         }
 #endif
+        Uint64 oc1 = SDL_GetPerformanceCounter();
+        g_wd_oc[0] += oc1 - oc0;
         for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
             if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
             N2Batch *b = &wbatch[k];
@@ -25998,6 +26005,8 @@ int main(int argc, char **argv) {
             vl_skipped = vl_frames = vl_listed = vl_wouldview = 0;
             cc_skipped = cc_tested = cc_bad = cc_frames = 0;
         }
+        Uint64 oc2 = SDL_GetPerformanceCounter();
+        g_wd_oc[1] += oc2 - oc1;
         if (nreflq) {
             vita_set_reflect(1);
             for (int q = 0; q < nreflq; q++) {
@@ -26023,6 +26032,7 @@ int main(int argc, char **argv) {
             vita_set_reflect(0);
         }
         (void)cur_refl;
+        g_wd_oc[2] += SDL_GetPerformanceCounter() - oc2;
         #endif
         /* the resident skyline (skyline.c): cells wholly past skyline_inner(),
            flat-coloured, pushed back a little in depth so a streamed stand-in
@@ -26365,10 +26375,13 @@ int main(int argc, char **argv) {
         #ifdef __vita__
         if (++wt_frames == 60) {
             printf("world_draw ms/frame: fog %.2f camclip %.2f refl %.2f env %.2f mirror %.2f carvis+lights %.2f "
-                   "sky %.2f vista %.2f opaque+cull %.2f (opaque draw calls %.2f) cut+blend %.2f (cutout %.2f fade %.2f props %.2f [smk %.2f anims %.2f] blend %.2f) rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m (cpu %.2f)\n",
+                   "sky %.2f vista %.2f opaque+cull %.2f (opaque draw calls %.2f; setup %.2f loop %.2f wet run %.2f) cut+blend %.2f (cutout %.2f fade %.2f props %.2f [smk %.2f anims %.2f] blend %.2f) rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m (cpu %.2f)\n",
                    wt_ms[0]/60, wt_ms[7]/60, wt_ms[8]/60, wt_ms[9]/60, wt_ms[10]/60, wt_ms[1]/60,
                    wt_ms[2]/60, wt_ms[3]/60, wt_ms[4]/60,
                    (double)g_wd_submit * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   (double)g_wd_oc[0] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   (double)g_wd_oc[1] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   (double)g_wd_oc[2] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
                    wt_ms[5]/60,
                    (double)g_wd_cb[0] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
                    (double)g_wd_cb[1] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
@@ -26378,7 +26391,7 @@ int main(int argc, char **argv) {
                    (double)g_wd_cb[3] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
                    wt_ms[6]/60,
                    wt_fade_sum/60.0, wt_fade_dist_sum/60.0, (double)g_view_dyn_log, (double)g_vd_cpu_log);
-            memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0; wt_fade_sum = wt_fade_dist_sum = 0; g_wd_submit = 0; memset(g_wd_cb, 0, sizeof g_wd_cb); memset(g_wd_props, 0, sizeof g_wd_props);
+            memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0; wt_fade_sum = wt_fade_dist_sum = 0; g_wd_submit = 0; memset(g_wd_oc, 0, sizeof g_wd_oc); memset(g_wd_cb, 0, sizeof g_wd_cb); memset(g_wd_props, 0, sizeof g_wd_props);
         }
         #endif
         pf_mark(PF_WORLD_DRAW);
