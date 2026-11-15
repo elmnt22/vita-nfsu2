@@ -2681,6 +2681,7 @@ static const PerfParts *g_load_pp;   /* an opponent's fitted performance parts, 
 static int g_load_skin;
 static Uint64 g_wd_submit;   /* world opaque draw_batch time, 60 frames (world_draw ms/frame line) */
 static Uint64 g_wd_cb[4];    /* cut+blend split, 60 frames: cutout, fade, props+anims, blend (11-15) */
+static Uint64 g_wd_props[2]; /* props split: smokeables, world anims */
 static int g_route_glide;   /* the route.txt test glide is moving the car (no tyre marks: its physics resets every tick) */
 static const N2CarConfig *g_load_cfg;   /* the RideInfo parts to load with (an opponent's preset), NULL stock */
 static unsigned char *g_shared_cartex; static long g_shared_cartex_len; static int g_shared_cartex_tried;   /* the shared car pack */
@@ -25936,10 +25937,27 @@ int main(int argc, char **argv) {
         if (nfadeq && !g_showroom) {   /* the arriving buildings (see WFADE_MS); none in a showroom (no world there) */
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            /* strengths in 1/24 steps, drawn step by step (11-15, PERF_PLAN
+               P3): hwlog60 fade 1.1-1.4 ms for ~145 batches, each with its
+               own alpha uniform; an even step of ~4% is not visible in a
+               fade that runs over ~40 m. Insertion sort on (step, texture). */
+            for (int q = 0; q < nfadeq; q++) {
+                float a = fadea[q] < 0.02f ? 0.02f : fadea[q];
+                int s = (int)(a * 24.0f + 0.5f); if (s < 1) s = 1; if (s > 24) s = 24;
+                fadea[q] = (float)s * (1.0f / 24.0f);
+            }
+            for (int q = 1; q < nfadeq; q++) {
+                int kq = fadeq[q]; float aq = fadea[q]; GLuint tq = wbatch[kq].tex;
+                int p = q - 1;
+                while (p >= 0 && (fadea[p] > aq || (fadea[p] == aq && wbatch[fadeq[p]].tex > tq))) {
+                    fadeq[p + 1] = fadeq[p]; fadea[p + 1] = fadea[p]; p--;
+                }
+                fadeq[p + 1] = kq; fadea[p + 1] = aq;
+            }
             float lasta = -1.0f;
             for (int q = 0; q < nfadeq; q++) {
                 N2Batch *b = &wbatch[fadeq[q]];
-                float fa = fadea[q] < 0.02f ? 0.02f : fadea[q];   /* the batch's own strength (fade-in x distance) */
+                float fa = fadea[q];   /* the batch's own strength (fade-in x distance), stepped */
                 if (fa != lasta) { glUniform1f(rp.uAlpha, fa); lasta = fa; }
                 if (b->tex != lasttex) {
                     if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
@@ -25967,8 +25985,11 @@ int main(int argc, char **argv) {
             smk_resident(&active_resident->world.scene, active_resident->resources.mesh_textures,
                          active_resident->resources.mesh_modes, active_resident->generation);
             #ifdef __vita__
-            smk_draw(&rp, MVP, cam, VIEW_DIST, (const float (*)[4])world_planes);
-            wa_draw(&rp, MVP, (const float (*)[4])world_planes);   /* RenderWorldModels 0x61d4b0 */
+            {   Uint64 p0 = SDL_GetPerformanceCounter();
+                smk_draw(&rp, MVP, cam, VIEW_DIST, (const float (*)[4])world_planes);
+                Uint64 p1 = SDL_GetPerformanceCounter();
+                wa_draw(&rp, MVP, (const float (*)[4])world_planes);   /* RenderWorldModels 0x61d4b0 */
+                g_wd_props[0] += p1 - p0; g_wd_props[1] += SDL_GetPerformanceCounter() - p1; }
             #else
             smk_draw(&rp, MVP, cam, VIEW_DIST, NULL);
             wa_draw(&rp, MVP, NULL);
@@ -26158,7 +26179,7 @@ int main(int argc, char **argv) {
         #ifdef __vita__
         if (++wt_frames == 60) {
             printf("world_draw ms/frame: fog %.2f camclip %.2f refl %.2f env %.2f mirror %.2f carvis+lights %.2f "
-                   "sky %.2f vista %.2f opaque+cull %.2f (opaque draw calls %.2f) cut+blend %.2f (cutout %.2f fade %.2f props %.2f blend %.2f) rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m (cpu %.2f)\n",
+                   "sky %.2f vista %.2f opaque+cull %.2f (opaque draw calls %.2f) cut+blend %.2f (cutout %.2f fade %.2f props %.2f [smk %.2f anims %.2f] blend %.2f) rest %.2f | fade batches %.1f (distance %.1f) | view %.0f m (cpu %.2f)\n",
                    wt_ms[0]/60, wt_ms[7]/60, wt_ms[8]/60, wt_ms[9]/60, wt_ms[10]/60, wt_ms[1]/60,
                    wt_ms[2]/60, wt_ms[3]/60, wt_ms[4]/60,
                    (double)g_wd_submit * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
@@ -26166,10 +26187,12 @@ int main(int argc, char **argv) {
                    (double)g_wd_cb[0] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
                    (double)g_wd_cb[1] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
                    (double)g_wd_cb[2] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   (double)g_wd_props[0] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
+                   (double)g_wd_props[1] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
                    (double)g_wd_cb[3] * 1000.0 / (double)SDL_GetPerformanceFrequency() / 60.0,
                    wt_ms[6]/60,
                    wt_fade_sum/60.0, wt_fade_dist_sum/60.0, (double)g_view_dyn_log, (double)g_vd_cpu_log);
-            memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0; wt_fade_sum = wt_fade_dist_sum = 0; g_wd_submit = 0; memset(g_wd_cb, 0, sizeof g_wd_cb);
+            memset(wt_ms, 0, sizeof wt_ms); wt_frames = 0; wt_fade_sum = wt_fade_dist_sum = 0; g_wd_submit = 0; memset(g_wd_cb, 0, sizeof g_wd_cb); memset(g_wd_props, 0, sizeof g_wd_props);
         }
         #endif
         pf_mark(PF_WORLD_DRAW);
