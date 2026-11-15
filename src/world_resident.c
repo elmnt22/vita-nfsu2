@@ -846,6 +846,7 @@ static int resident_resources_step(WorldResidentResources *resources,
     for (int i = 0; i < resources->ordinary_count; i++) {
         resources->debug_batches[i].vbo = resources->ordinary[i].vbo;
         resources->debug_batches[i].ibo = resources->ordinary[i].ibo;
+        resources->debug_batches[i].ioff = resources->ordinary[i].ioff;
         resources->debug_batches[i].index_count =
             (uint32_t)resources->ordinary[i].index_count;
         resources->debug_batches[i].chunk_id = (uint32_t)i;

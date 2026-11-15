@@ -18528,7 +18528,7 @@ int main(int argc, char **argv) {
                                    sizeof *wmbatch);
     if (!world2)
         for (int k = 0; k < nbatch; k++) {
-            wmbatch[k].vbo = wbatch[k].vbo; wmbatch[k].ibo = wbatch[k].ibo;
+            wmbatch[k].vbo = wbatch[k].vbo; wmbatch[k].ibo = wbatch[k].ibo; wmbatch[k].ioff = wbatch[k].ioff;
             wmbatch[k].index_count = wbatch[k].index_count;
             wmbatch[k].chunk_id = (uint32_t)k;
         }

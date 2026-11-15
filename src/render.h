@@ -64,6 +64,8 @@ static inline signed char bv_snorm8(float f) {
 typedef struct {
     GLuint vbo;               /* unified interleaved VBO */
     GLuint ibo;               /* consolidated u16 IBO (<= 65535 verts/batch) */
+    unsigned ioff;            /* byte offset of the indices in ibo (11-15: ibo == vbo,
+                                 one buffer a batch, for worker-assembled batches) */
     int index_count;
     uint32_t texkey;          /* first member mesh's TPK key -- DIAGNOSTIC ONLY.
                              Do not gate drawing on it: a batch's members can

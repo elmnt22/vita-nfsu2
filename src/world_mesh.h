@@ -15,6 +15,7 @@
 typedef struct {
     GLuint   vao;          /* reserved: 0 on GL 2.1 core (no VAO); attribs bound per draw */
     GLuint   vbo, ibo;
+    uint32_t ioff;         /* index byte offset in ibo (N2Batch.ioff) */
     uint32_t index_count;
     uint32_t chunk_id;
     char     section_name[64];

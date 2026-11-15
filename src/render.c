@@ -1474,6 +1474,7 @@ typedef struct SharedBatchBuffers {
     struct SharedBatchBuffers *next;
     uint64_t hash[2];
     GLuint vbo, ibo;
+    unsigned ioff;            /* indices' byte offset (ibo == vbo when one buffer) */
     int refs, nv, ni;
 } SharedBatchBuffers;
 #define SHARED_BATCH_SLOTS 4096
@@ -1541,13 +1542,13 @@ void render_batch_release(N2Batch *b) {
             assert(*slot == p);
             *slot = p->next;
             sbl_unlock();
-            GLuint ids[] = {p->vbo, p->ibo}; glDeleteBuffers(2, ids);
+            GLuint ids[] = {p->vbo, p->ibo}; glDeleteBuffers(p->ibo == p->vbo ? 1 : 2, ids);   /* one buffer: once */
             free(p);
         }
     } else
 #endif
     {
-        GLuint ids[] = {b->vbo, b->ibo}; glDeleteBuffers(2, ids);
+        GLuint ids[] = {b->vbo, b->ibo}; glDeleteBuffers(b->ibo == b->vbo ? 1 : 2, ids);
     }
     memset(b, 0, sizeof *b);
 }
@@ -1716,7 +1717,7 @@ static long g_batch_asm, g_batch_deferred;   /* batches uploaded from worker-ass
 static long g_batch_bytes;
 /* worker-assembled arrays copied on the GPU-copy worker (sdl_vita.c);
    ux0:data/NFSU2/nogpucopy.txt copies inline as before */
-static int g_batch_copy;
+static int g_batch_copy, g_batch_onebuf;   /* twobuf.txt: separate vertex/index buffers as before */
 static long g_batch_copied;
 static unsigned long long g_batch_wait_us;
 #endif
@@ -1749,7 +1750,7 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
         int up = 0;
         memset(b, 0, sizeof *b);
         if (p) {
-            p->refs++; b->vbo = p->vbo; b->ibo = p->ibo; b->shared_buffers = p;
+            p->refs++; b->vbo = p->vbo; b->ibo = p->ibo; b->ioff = p->ioff; b->shared_buffers = p;
             g_batch_reused++; g_batch_reused_bytes += (long)nv*sizeof(BatchedVertex)+(long)ni*2;
         } else if (pb->bv) {
             static int verify = -1;
@@ -1787,6 +1788,21 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
                P2.3); the step finishes only once the copies are done, and
                the arrays live in the plan's arena until then */
             void *dv = NULL, *di = NULL;
+            if (g_batch_copy && g_batch_onebuf) {
+                /* one buffer a batch, indices after the vertices (11-15
+                   hwlog66: two allocations a batch were most of the
+                   60-133 ms of GL buffers at a big handoff) */
+                size_t vb = (size_t)nv * sizeof(BatchedVertex);
+                glGenBuffers(1, &b->vbo); glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
+                glBufferData(GL_ARRAY_BUFFER, (long)(vb + (size_t)ni * 2), NULL, GL_STATIC_DRAW);
+                dv = glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
+                b->ibo = b->vbo; b->ioff = (unsigned)vb;
+                di = dv ? (unsigned char *)dv + vb : NULL;
+                if (glGetError() != GL_NO_ERROR || !dv) {
+                    glDeleteBuffers(1, &b->vbo);
+                    memset(b, 0, sizeof *b); return 0;
+                }
+            } else {
             glGenBuffers(1, &b->vbo); glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
             glBufferData(GL_ARRAY_BUFFER, (long)nv * (long)sizeof(BatchedVertex), g_batch_copy ? NULL : pb->bv, GL_STATIC_DRAW);
             if (g_batch_copy) dv = glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
@@ -1797,6 +1813,7 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
                 glDeleteBuffers(1, &b->vbo); glDeleteBuffers(1, &b->ibo);
                 memset(b, 0, sizeof *b); return 0;
             }
+            }
             if (g_batch_copy) {
                 unsigned long long tp = sceKernelGetProcessTimeWide();
                 g_batch_alloc_us += tp - tg;
@@ -1804,7 +1821,8 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
                 vita_copy_push(di, pb->bi, (unsigned)ni * 2u);
                 /* vitaGL keeps the pointer (unmap only clears its flag); the
                    simulator's desktop GL copied inline and needs it unmapped */
-                glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER); glUnmapBuffer(GL_ARRAY_BUFFER);
+                if (b->ibo != b->vbo) glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
+                glUnmapBuffer(GL_ARRAY_BUFFER);
                 g_batch_push_us += sceKernelGetProcessTimeWide() - tp;
                 g_batch_copied++;
             }
@@ -1812,7 +1830,7 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
             SharedBatchBuffers *q = calloc(1, sizeof *q);
             if (q) {
                 q->hash[0] = pb->hash[0]; q->hash[1] = pb->hash[1];
-                q->nv = nv; q->ni = ni; q->refs = 1; q->vbo = b->vbo; q->ibo = b->ibo;
+                q->nv = nv; q->ni = ni; q->refs = 1; q->vbo = b->vbo; q->ibo = b->ibo; q->ioff = b->ioff;
                 unsigned slot = pb->hash[0] & (SHARED_BATCH_SLOTS-1);
                 sbl_lock(); q->next = g_shared_batches[slot]; g_shared_batches[slot] = q; sbl_unlock();
                 b->shared_buffers = q;
@@ -1844,7 +1862,7 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
         SharedBatchBuffers *p=batch_buffers_find(g_batch_prepared_hash,nv,ni);
         if (p) {
             memset(b,0,sizeof *b); p->refs++;
-            b->vbo=p->vbo; b->ibo=p->ibo; b->shared_buffers=p;
+            b->vbo=p->vbo; b->ibo=p->ibo; b->ioff=p->ioff; b->shared_buffers=p;
             b->index_count=ni; b->tex=tex; b->nmesh=i1-i0; b->emit_idx=bidx;
             b->texkey=s->meshes[ent[i0].idx].texkey;
             b->drawmode=mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
@@ -1934,7 +1952,7 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
         SharedBatchBuffers *p = batch_buffers_find(payload_hash, nv, ni);
         if (p) {
             p->refs++;
-            b->vbo = p->vbo; b->ibo = p->ibo; b->shared_buffers = p;
+            b->vbo = p->vbo; b->ibo = p->ibo; b->ioff = p->ioff; b->shared_buffers = p;
             reused = 1; g_batch_reused++;
             g_batch_reused_bytes += (long)nv * sizeof *bv + (long)ni * sizeof *bi;
         }
@@ -3372,7 +3390,11 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     if (!j->next) g_batch_reused = g_batch_reused_bytes = 0;
     {   static int copy_on = -1;
         if (copy_on < 0) { FILE *f = fopen("ux0:data/NFSU2/nogpucopy.txt", "rb"); copy_on = !f; if (f) fclose(f); }
-        g_batch_copy = copy_on; }
+        g_batch_copy = copy_on;
+        static int one_on = -1;
+        if (one_on < 0) { FILE *f = fopen("ux0:data/NFSU2/twobuf.txt", "rb"); one_on = !f; if (f) fclose(f);
+                          printf("world batches: %s\n", one_on ? "one GL buffer a batch" : "vertex + index buffers"); }
+        g_batch_onebuf = one_on; }
 #endif
 #ifdef __vita__
     /* Count limits alone allow a large resident to monopolise a frame.
@@ -3703,7 +3725,7 @@ void draw_batch(const N2Batch *b) {
     glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(BatchedVertex),
                           (void*)offsetof(BatchedVertex, col));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
-    glDrawElements(GL_TRIANGLES, b->index_count, GL_UNSIGNED_SHORT, 0);
+    glDrawElements(GL_TRIANGLES, b->index_count, GL_UNSIGNED_SHORT, (const void *)(uintptr_t)b->ioff);
 }
 
 /* Build a clean procedural wheel (short cylinder, axle along Y, disc in X-Z) —

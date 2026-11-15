@@ -74,7 +74,7 @@ void render_world_map(const WorldMeshBatch *batches, uint32_t n,
                                   (const void *)offsetof(BatchedVertex, col)); }
 
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
-        glDrawElements(GL_TRIANGLES, (GLsizei)b->index_count, GL_UNSIGNED_SHORT, 0);
+        glDrawElements(GL_TRIANGLES, (GLsizei)b->index_count, GL_UNSIGNED_SHORT, (const void *)(uintptr_t)b->ioff);
     }
 
 #ifndef N2_GLES
