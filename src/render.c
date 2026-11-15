@@ -10,6 +10,9 @@
 
 #include "render.h"
 #include "carfx.h"
+#ifdef __vita__
+void hitch_mark(const char *label);   /* world_resident.c frame-span profiler */
+#endif
 
 #if defined(__APPLE__) && !defined(N2_GLES)
 #define glGenFramebuffers glGenFramebuffersEXT
@@ -2032,6 +2035,7 @@ struct WorldBatchUpload {
     N2Batch *batches;
     int *run0, *run1;
     int meshes, next, count;
+    int tail;   /* smooth finish: stats + texture sort done, mesh map + frees next call */
     struct PreparedBatch *prepared;
     int prepared_count;
     void *arena;   /* the prepared batches' assembled arrays (render_world_plan_fill): a chain of PlanSlab */
@@ -3483,6 +3487,7 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     }
 #endif
     int nb = j->count;
+    if (!j->tail) {
 #ifdef __vita__
     {   unsigned long long cus, cby; vita_copy_stats(&cus, &cby);
         printf("batches: %d built, CPU packing %llu ms, GL buffers %llu ms, %ld KB uploaded"
@@ -3499,8 +3504,18 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
            g_batch_src_verts * (long)sizeof(BatchedVertex) >> 10, g_batch_asm, g_batch_deferred);
     g_batch_reused = g_batch_reused_bytes = 0; g_batch_src_meshes = g_batch_src_verts = 0;
     g_batch_asm = 0; g_batch_deferred = 0;
+    hitch_mark("fin.up_stats");
 #endif
     qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);   /* minimise texture binds */
+#ifdef __vita__
+    hitch_mark("fin.up_sort");
+    /* hwlog69: the completing step was 10-13 ms on every downtown build
+       (fin.batch_upload) against a 4 ms slice -- the tail after the last
+       batch; a smooth finish leaves the mesh map and the frees to the
+       next frame */
+    if (smooth) { j->tail = 1; return 0; }
+#endif
+    }
     /* mesh -> final batch, replayed from each batch's own emission run so it is
        the production partition rather than a second derivation (M133) */
     if (meshbatch) for (int k = 0; k < s->count; k++) meshbatch[k] = -1;
@@ -3509,6 +3524,9 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
             int e = bat[b].emit_idx;
             for (int k = run0[e]; k < run1[e]; k++) meshbatch[ent[k].idx] = b;
         }
+#ifdef __vita__
+    hitch_mark("fin.up_meshmap");
+#endif
     /* "#N" audits the batch the RENDERER calls N, i.e. wbatch[N] after this
        sort. Membership is replayed from that batch's own recorded emission run,
        so it is the production partition, not a second derivation. */
@@ -3522,6 +3540,9 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     *out = bat; *count = nb;
     j->batches = NULL; j->count = 0;
     upload_world_batches_cancel(slot);
+#ifdef __vita__
+    hitch_mark("fin.up_free");
+#endif
     return 1;
 }
 
