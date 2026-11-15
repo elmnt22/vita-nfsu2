@@ -1015,10 +1015,16 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
     return 1; /* one uncached decode/upload attempt, including a miss */
 }
 
+int world_bind_decodes;   /* uncached attempts so far (callers diff it per step) */
 int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
                              unsigned char *modes, int cap,
                              WTextureBind *binding, int max_decodes) {
     if (binding->pass == 2) return binding->count < 0 ? -1 : 1;
+    /* hwlog73/74: the walk itself (a cache lookup per mesh, ~15k meshes when
+       their textures are already cached) reached 13-21 ms in one call; a
+       sliced step stops after WB_VISITS requests and resumes from the cursor */
+    enum { WB_VISITS = 1024 };
+    int visits = 0;
     if (max_decodes <= 0) return 0;
     if (!binding->build) binding->build = ++g_texbind_build;
     int npass = (w->neighborhood.common || w->neighborhood.ads) ? 2 : 1;
@@ -1042,6 +1048,7 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
              * Vistas are not region-tagged: each region gets a chance, and the
              * owning vista (not an ordinary mesh) supplies the audit label. */
             while (binding->request < meshes + light + w->neighborhood.vista.count) {
+                if (max_decodes != INT_MAX && visits++ >= WB_VISITS) return 0;
                 int i = binding->request++;
                 const N2Mesh *owner = i < meshes
                     ? &w->neighborhood.scene.meshes[g->mesh0 + i]
@@ -1052,6 +1059,7 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
                 int decoded = world_bind_key(w, g, key, binding->pass, last,
                     keys, texs, modes, cap, binding, owner);
                 if (binding->count < 0) goto done;
+                world_bind_decodes += decoded;
                 if (decoded && --max_decodes == 0) return 0;
             }
         }

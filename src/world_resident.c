@@ -615,15 +615,27 @@ static int resident_resources_step(WorldResidentResources *resources,
          * individual decode/upload only if one texture is a measured stall. */
         int bound;
 #ifdef __vita__
-        if (sliced && max_batches < 128) {
+        if (sliced) {
             /* smooth: up to 8 uploads, one at a time, until 4 ms are gone
-               (hwlog29: 8 at once reached 9.5 ms with large textures) */
-            Uint64 limit = SDL_GetPerformanceFrequency() * 4 / 1000;
-            int k = 0;
+               (hwlog29: 8 at once reached 9.5 ms with large textures); the
+               near-radius budget (160): up to 16 until 8 ms. Each step also
+               stops after a slice of the mesh walk (world.c WB_VISITS), so
+               a frame of cached textures no longer walks them all. */
+            int smooth_tb = max_batches < 128;
+            Uint64 limit = SDL_GetPerformanceFrequency() * (smooth_tb ? 4 : 8) / 1000;
+            int d0 = world_bind_decodes, dmax = smooth_tb ? 8 : 16, k = 0;
             do bound = world_bind_textures_step(
                     &facade, resources->texture_keys, resources->textures,
                     resources->texture_modes, texture_cap, &resources->texture_binding, 1);
-            while (!bound && ++k < 8 && SDL_GetPerformanceCounter() - texture_begin < limit);
+            while (!bound && world_bind_decodes - d0 < dmax && ++k < 256 &&
+                   SDL_GetPerformanceCounter() - texture_begin < limit);
+            {   static unsigned tb_frames, tb_slow; static double tb_max;
+                double ms = (double)(SDL_GetPerformanceCounter() - texture_begin) * 1000.0 / SDL_GetPerformanceFrequency();
+                tb_frames++; if (ms > 6.0) tb_slow++; if (ms > tb_max) tb_max = ms;
+                if ((tb_frames & 255) == 0) {
+                    printf("stream finish: texture binding %u frames, %u over 6 ms, max %.1f ms\n", tb_frames, tb_slow, tb_max);
+                    tb_max = 0; }
+            }
         } else
 #endif
         bound = world_bind_textures_step(

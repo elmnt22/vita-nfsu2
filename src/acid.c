@@ -215,6 +215,7 @@ void acid_set_cameras(const float (*pos)[3], int n)
     for (int i = 0; i < g_ncam; i++) memcpy(g_cam[i], pos[i], sizeof g_cam[i]);
 }
 void acid_set_enabled(int on) { g_enabled = on; }
+float acid_rate_scale = 1.0f;   /* emission rate factor (main.c: 0.5 unless Full detail) */
 static int g_world_paused;
 void acid_world_pause(int on) { g_world_paused = on; }
 int acid_live_particles(void) { return g_nlive; }
@@ -352,7 +353,7 @@ void acid_emit(AcidEmitter *e, float dt, const AcidOwner *owner)
                 s = xs(last);
                 double rate = xr(s) * ratev + rate0;
                 if (!(rate > 0)) interval = 0.1f;
-                else { interval = (float)(1.0 / rate); if (interval > 240.0f) interval = 240.0f; else if (interval < 0) interval = 0; }
+                else { interval = (float)(1.0 / (rate * acid_rate_scale)); if (interval > 240.0f) interval = 240.0f; else if (interval < 0) interval = 0; }
             } while (interval <= budget);
             e->seed = s;
             if (group_empty(g)) group_free(g);

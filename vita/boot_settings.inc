@@ -14,6 +14,9 @@
                              moves the car to the entry (NFSU2FastTravel mod)
      Trophies    trophies.txt  present = trophies reported to the system; off
                              by default (progress is still kept in the profile)
+     Full detail fulldetail.txt  present = the original road reflection rate,
+                             traffic count and particle rate; off by default
+                             (the Vita's lighter mix for 30 fps downtown)
      Reset caches            deletes ux0:data/NFSU2/cache (converted world
                              tiles, shaders, shop/parts lists); profiles,
                              options and the game data are kept
@@ -41,6 +44,7 @@ enum { STG_UP = 1, STG_DOWN = 2, STG_LEFT = 4, STG_RIGHT = 8, STG_CROSS = 16, ST
 #define BS_FPS60  "ux0:data/NFSU2/fps60.txt"
 #define BS_FTRAV  "ux0:data/NFSU2/fasttravel.txt"
 #define BS_TRP    "ux0:data/NFSU2/trophies.txt"     /* = trophy.h TROPHY_ON_FILE */
+#define BS_FULL   "ux0:data/NFSU2/fulldetail.txt"   /* = main.c full_detail() */
 #define BS_CACHE  "ux0:data/NFSU2/cache"
 
 /* one rasterised glyph: w x h coverage, left = pen to bitmap's left edge,
@@ -256,9 +260,9 @@ static void bs_face_button(float cx, float cy, float r, int cross)
 }
 
 static void boot_settings_run(void) {
-    enum { I_LOGS, I_FPS, I_FTRAV, I_TROPHY, I_RESET, I_START, I_N };
+    enum { I_LOGS, I_FPS, I_FTRAV, I_TROPHY, I_FULL, I_RESET, I_START, I_N };
     int logs = !bs_exists(BS_NOLOG), unlocked = bs_exists(BS_FPS60), ftrav = bs_exists(BS_FTRAV);
-    int trophies = bs_exists(BS_TRP);
+    int trophies = bs_exists(BS_TRP), full = bs_exists(BS_FULL);
     int sel = 0, confirm = 0, quit = 0;
     char status[64] = "";
     unsigned prev = bs_pad();   /* the L+R that opened the screen is not a press */
@@ -273,16 +277,17 @@ static void boot_settings_run(void) {
     if (!fonts) printf("settings: drawing unavailable, keys still work\n");
 
     static const char *names[I_N] = { "Enable logging", "Limit frame rate", "Fast travel", "Enable trophies",
-                                      "Reset caches", "Start game" };
+                                      "Full detail", "Reset caches", "Start game" };
     static const char *help[I_N] = {
         "Save logs for bug reports.",
         "Limit to 30 FPS. Turn off to allow up to 60 FPS.",
         "World Map: choose No on the GPS prompt to jump there.",
         "Earn PS Vita trophies. Needs the NoTrpDrm plugin.",
+        "Original reflections, traffic and particles. Lower frame rate.",
         "Clear converted data and shaders. Your saves are kept.",
         "Start the game with these settings." };
     /* the title bar, then the rows full width, then the button bar */
-    const float hb = 66 * S, rx = 30 * S, ry0 = hb + 12 * S, rh = 44 * S, fb = 40 * S;   /* 6 rows */
+    const float hb = 66 * S, rx = 30 * S, ry0 = hb + 12 * S, rh = 38 * S, fb = 40 * S;   /* 7 rows */
 
     while (!quit) {
         unsigned now = bs_pad(), hit = now & ~prev;
@@ -321,6 +326,11 @@ static void boot_settings_run(void) {
             case I_TROPHY:
                 trophies = !trophies;
                 if (trophies) bs_touch(BS_TRP); else bs_remove(BS_TRP);
+                status[0] = 0;
+                break;
+            case I_FULL:
+                full = !full;
+                if (full) bs_touch(BS_FULL); else bs_remove(BS_FULL);
                 status[0] = 0;
                 break;
             case I_RESET:
@@ -364,8 +374,9 @@ static void boot_settings_run(void) {
                         BSC(255, 255, 255, on ? 1.0f : 0.55f));
                 bs_text(&f_label, names[i], rx + 18 * S, yc, white);
                 float vr = W - rx - 18 * S;
-                if (i == I_LOGS || i == I_FPS || i == I_FTRAV || i == I_TROPHY) {
-                    int checked = i == I_LOGS ? logs : i == I_FTRAV ? ftrav : i == I_TROPHY ? trophies : !unlocked;
+                if (i == I_LOGS || i == I_FPS || i == I_FTRAV || i == I_TROPHY || i == I_FULL) {
+                    int checked = i == I_LOGS ? logs : i == I_FTRAV ? ftrav : i == I_TROPHY ? trophies :
+                                  i == I_FULL ? full : !unlocked;
                     float b = 24 * S, bx = vr - b, by = yc - b * 0.5f;
                     bs_fill(bx, by, b, b, 2 * S, BSC(0, 0, 0, 0.12f), NULL);
                     bs_line(bx, by, b, b, 2 * S, 1.5f * S, white);
@@ -400,6 +411,7 @@ static void boot_settings_run(void) {
         }
         bs_present();
     }
-    vita_mark("settings: closed (logs %s, frame rate %s, fast travel %s, trophies %s), restarting", logs ? "on" : "off",
-              unlocked ? "unlocked" : "30", ftrav ? "on" : "off", trophies ? "on" : "off");
+    vita_mark("settings: closed (logs %s, frame rate %s, fast travel %s, trophies %s, full detail %s), restarting",
+              logs ? "on" : "off", unlocked ? "unlocked" : "30", ftrav ? "on" : "off", trophies ? "on" : "off",
+              full ? "on" : "off");
 }

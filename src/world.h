@@ -263,6 +263,7 @@ int world_predecoded_texture_info(uint32_t key, unsigned char *mode);
 int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
                              unsigned char *modes, int cap,
                              WTextureBind *binding, int max_decodes);
+extern int world_bind_decodes;   /* running count of uncached attempts */
 
 /* The GL names world_bind_textures writes are owned by a process-wide
  * key -> texture cache, not by the caller: a moving-residency swap re-requests

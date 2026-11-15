@@ -6403,6 +6403,26 @@ static void rt_enc_put(int k)
     n2sim_state(c->s, &c->st);
     memset(c->pv, 0, sizeof c->pv);
 }
+/* Full detail (LiveArea Settings, fulldetail.txt; user 11-15): off, the
+   default, is the Vita's lighter mix for 30 fps downtown -- the road
+   reflection redrawn every second frame at locked 30 (as the unlocked mode
+   already does; the blur hides the reuse), 5/8 of the track record's traffic
+   cars (racers unchanged), particles at half the emitters' rate. On = the
+   original rates. hwlog73: reflection 2.7, particles 1.8, traffic + racer
+   drawing 1.3 ms of downtown's frames. */
+static int full_detail(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        FILE *f = fopen("ux0:data/NFSU2/fulldetail.txt", "rb");
+        on = f != NULL;
+        if (f) fclose(f);
+        acid_rate_scale = on ? 1.0f : 0.5f;
+        printf("full detail: %s\n", on ? "on (fulldetail.txt): original reflection rate, traffic, particles"
+                                         : "off: reflection every 2nd frame, 5/8 traffic, half particles");
+    }
+    return on;
+}
 static void rt_traffic_start(const float ppos[3], float pheading, int tdiff)
 {
     const float dt = 1.0f / 60.0f;
@@ -6446,6 +6466,10 @@ static void rt_traffic_start(const float ppos[3], float pheading, int tdiff)
     }
     int cnt = aitraffic_count(g_rt.w), types[RT_TMAX];
     if (cnt > RT_TMAX) cnt = RT_TMAX;
+    if (!full_detail() && cnt > 0) {
+        int full = cnt; cnt = (cnt * 5 + 7) / 8;
+        printf("race traffic: %d of the track record's %d cars (Full detail off)%c", cnt, full, 10);
+    }
     if (cnt <= 0) { printf("race traffic: none (track record count 0)%c", 10); return; }
     /* the region at the start position (TrackLoader 0x57f2d0 step 6) */
     const unsigned char *z = rt_zone16(NULL, ppos);
@@ -16208,6 +16232,7 @@ int main(int argc, char **argv) {
     options_load();
     profile_init();
     trophy_init();                       /* LiveArea Settings: trophies.txt switches them on */
+    full_detail();                       /* LiveArea Settings: fulldetail.txt; sets the particle rate */
     g_manual = g_opt.p[0].manual;
     g_cc_setting = g_opt.p[0].camera;
     SDL_AudioDeviceID adev = audio_init();
@@ -24779,7 +24804,7 @@ int main(int argc, char **argv) {
             /* At locked 30, refresh both outdoor reflections every frame.
                The unlocked mode alternates the road and a cube face. */
             extern int vita_lock30;
-            int refl_every = vita_lock30 > 0;
+            int refl_every = vita_lock30 > 0 && full_detail();
             /* a catch-up frame (3 sim ticks after an overrun, hwlog25: the
                opponents' tick ~3.5 ms each) reuses the last reflection and
                env face, so it fits instead of overrunning again */

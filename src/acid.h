@@ -84,6 +84,7 @@ typedef struct AcidEmitter {             /* 0xd0 bytes in the original */
 void acid_set_cameras(const float (*pos)[3], int n);
 /* g_ParticleSystemEnable (0x870cec); on by default */
 void acid_set_enabled(int on);
+extern float acid_rate_scale;   /* 1 = the original emission rates */
 /* port: hold the world emitters (no spawning, cycles frozen) while the
    front end's showroom stands in room space at the car's world spot */
 void acid_world_pause(int on);

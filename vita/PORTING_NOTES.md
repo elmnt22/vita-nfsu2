@@ -827,6 +827,17 @@ source/vgl.c:
   back to one level. World DXT textures use it with LINEAR_MIPMAP_NEAREST,
   chain stopped at 4x4; ux0:data/NFSU2/nomips.txt turns it off.
 
+Since 11-12 the library is built from E:/armtest/deps/vitaGL_ug2u (vitaGL_ug2 is
+shared with Journey; leave it alone). It also has the uniform dedupe (PERF_1112.md).
+
+- 11-15 GXM state cache (shared.h + custom_shaders.c): shader draws skip
+  sceGxmSetVertexProgram / SetFragmentProgram / SetFragmentTexture when the
+  program pointer or the 16-byte texture descriptor matches what was last set.
+  Every other setter (ffp, clear, blit, scissor test, splash), scene begin/end,
+  precomputed draws and program release go through shared.h macros that forget
+  the cache. Previous lib: vita/lib/libvitaGL_1112_backup.a; source backup
+  E:/armtest/deps/ug2u_source_backup_1115.
+
 `VGL=stock ./vita/build_vita.sh` links the installed library instead.
 boot.txt's "boot logging" line names which one is in the build.
 

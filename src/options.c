@@ -68,7 +68,7 @@ void options_defaults(N2Options *o) {
     o->fe_music = 0.7f;               /* 0x83aa30 = 0x3f333333 (GC AudioSettings [2] 0.7) */
     o->stereo = 1;                    /* 0x83aa50 = 1 (0x515aa0: +0x70 = FUN_0040cb20, the device) */
     o->jump_cam = 1;                  /* 0x83aa20 = 127.5 (on) */
-    o->mirror = 1;                    /* 0x83aa18 = 1 */
+    o->mirror = 0;                    /* 0x83aa18 = 1; Vita default off (user 11-15, perf: bumper/hood views) */
     o->kmh = 0;                       /* 0x83aa1a = (0x7f70d0 != 0): English imperial */
     o->race_map = 2; o->explore_map = 2;   /* 0x83aa1b / 0x83aa1c = 2 Rotate */
     o->career_diff = 1;
