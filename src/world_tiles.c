@@ -1444,6 +1444,11 @@ static void wt_up_drop(int i) {
     __sync_synchronize(); g_wt_upst[i] = 0;
 }
 
+static long g_wt_miss_in, g_wt_miss_out, g_wt_miss_full, g_wt_miss_busy;   /* read-ahead census (wt_take) */
+/* the read-ahead loop's turns by outcome: [0] off/paused, [1] a build's texture
+   fetch, [2] the 24 MB cap, [3] short room (stored bytes path), [4] nothing in
+   reach, [5] prepared a tile */
+static volatile long g_wt_ra_turn[6];
 static volatile int g_wt_ra_work;      /* the read-ahead is on a tile right now */
 static volatile int g_wt_assembling;   /* an assembly is running (the migration keeps off) */
 static volatile int g_wt_thread_up;
@@ -1636,6 +1641,7 @@ static int wt_prefetch_thread(void *arg) {
         g_wt_pf_busy = 1;
         __sync_synchronize();
         if (!g_wt_prefetch_on || !g_wt_aim_set || !g_wt_state || g_wt_paused) {
+            g_wt_ra_turn[0]++;
             /* nothing to prepare for this track (or the front end is up):
                the preload's turn, outside the busy window a reset waits on */
             int paused = g_wt_paused;
@@ -1648,8 +1654,19 @@ static int wt_prefetch_thread(void *arg) {
            work, and pausing for all of it starved the read-ahead whenever
            builds ran back to back at speed. */
         extern int world_resident_texture_fetch(void);
-        if (world_resident_texture_fetch()) continue;
-        float ax = g_wt_aim[0], ay = g_wt_aim[1], reach = g_wt_radius + 60.0f + wt_far_extra();
+        if (world_resident_texture_fetch()) { g_wt_ra_turn[1]++; continue; }
+        /* +a build cell (11-15): the next build may centre a cell off the
+           aim in any direction (the road aim swings); the sim census had the
+           read-ahead idle 88% of its turns while builds read their far ring
+           themselves. raextra.txt sets the metres (0 = the old reach). */
+        static float ra_extra = -1.0f;
+        if (ra_extra < 0) {
+            ra_extra = 80.0f;
+            FILE *f = fopen("ux0:data/NFSU2/raextra.txt", "r");
+            if (f) { float v; if (fscanf(f, "%f", &v) == 1 && v >= 0) ra_extra = v; fclose(f); }
+            printf("world tiles: read-ahead reach +%.0f m\n", (double)ra_extra);
+        }
+        float ax = g_wt_aim[0], ay = g_wt_aim[1], reach = g_wt_radius + 60.0f + wt_far_extra() + ra_extra;
         float object_radius = g_wt_object_radius;
         /* drop prepared tiles that went stale (well away from the aim) */
         for (int i = 0; i < g_wt_nindex; i++) {
@@ -1663,13 +1680,14 @@ static int wt_prefetch_thread(void *arg) {
             if (t) { __sync_fetch_and_sub(&g_wt_ready_bytes, (long long)t->bytes); wt_release(t); free(t); }
             __sync_synchronize(); g_wt_state[i] = 0;
         }
-        if (g_wt_ready_bytes >= WT_PREFETCH_CAP) { g_wt_pf_busy = 0; wt_preload_step(0); continue; }
+        if (g_wt_ready_bytes >= WT_PREFETCH_CAP) { g_wt_ra_turn[2]++; g_wt_pf_busy = 0; wt_preload_step(0); continue; }
         /* only into kernel blocks: a speculative tile that overflows into
            the heap leaves a ~1 MB hole there when it goes stale or is
            replaced, and those holes are what starve the builds (10-11) */
         extern unsigned vita_bigblk_room_mb(void);
         unsigned room = vita_bigblk_room_mb();
         if (room < WT_PREFETCH_ROOM_MB) {
+            g_wt_ra_turn[3]++;
             /* short: the nearest missing tile's stored bytes only (a tile's
                stored size is well under 1 MB; 1 MB of room keeps it in a
                kernel block, out of the heap) */
@@ -1705,7 +1723,8 @@ static int wt_prefetch_thread(void *arg) {
             float d = wt_tile_d2(e, ax, ay);
             if (d < bd) { bd = d; best = i; up = want_up; }
         }
-        if (best < 0) { g_wt_pf_busy = 0; wt_preload_step(0); continue; }   /* all in hand */
+        if (best < 0) { g_wt_ra_turn[4]++; g_wt_pf_busy = 0; wt_preload_step(0); continue; }   /* all in hand */
+        g_wt_ra_turn[5]++;
         g_wt_ra_work = 1;
         const WtIndexEntry *e = &g_wt_index[best];
         if (up) {
@@ -1727,7 +1746,7 @@ static int wt_prefetch_thread(void *arg) {
         } else if (!__sync_bool_compare_and_swap(&g_wt_state[best], 0, 1)) continue;
         WtLoaded *t = (WtLoaded *)calloc(1, sizeof *t);
         int mode = wt_objects_at(e, ax, ay, object_radius) ? 0
-                 : wt_tile_d2(e, ax, ay) > (g_wt_radius + 60.0f) * (g_wt_radius + 60.0f) ? WT_FAR_ONLY : WT_GROUND_ONLY;
+                 : wt_tile_d2(e, ax, ay) > (g_wt_radius + 60.0f + ra_extra) * (g_wt_radius + 60.0f + ra_extra) ? WT_FAR_ONLY : WT_GROUND_ONLY;
         int ok;
         if (rawp) { ok = t && wt_decode(rawp, rawn, e->x, e->y, t, NULL, mode); free(rawp); }
         else ok = t && wt_read_decode_t(g_wt_track, e->x, e->y, t, 0, mode);
@@ -2072,6 +2091,7 @@ void world_tiles_migrate_start(void) {
    the entry owned. A prepared tile may be ground only; the caller upgrades. */
 static int wt_take(const char *track, int idx, int tx, int ty, WtLoaded *out, int mode) {   /* mode: 0 full, WT_GROUND_ONLY, WT_FAR_ONLY */
     if (idx < 0 || !g_wt_state) return wt_read_decode(track, tx, ty, out, mode);
+    int waited = 0;
     for (;;) {
         int st = g_wt_state[idx];
         if (st == 2 && __sync_bool_compare_and_swap(&g_wt_state[idx], 2, 3)) {
@@ -2098,11 +2118,20 @@ static int wt_take(const char *track, int idx, int tx, int ty, WtLoaded *out, in
             return 0;
         }
         if (st == 0 && __sync_bool_compare_and_swap(&g_wt_state[idx], 0, 3)) {
+            {   /* read-ahead census (11-15, PERF_PLAN read-ahead >= 90%): a tile the
+                   build reads itself -- in the read-ahead's reach of its aim
+                   (it did not get to it) or out of it (aimed elsewhere) */
+                float reach = g_wt_radius + 60.0f + wt_far_extra();
+                float d2 = g_wt_aim_set ? wt_tile_d2(&g_wt_index[idx], g_wt_aim[0], g_wt_aim[1]) : 1e30f;
+                if (d2 < reach * reach) g_wt_miss_in++; else g_wt_miss_out++;
+                if (mode == 0) g_wt_miss_full++;
+            }
             if (wt_read_decode(track, tx, ty, out, mode)) { g_wt_owned_ground[idx] = (char)out->ground; return 1; }
             g_wt_state[idx] = 0;
             return 0;
         }
         if (st == 3) return wt_read_decode(track, tx, ty, out, mode);   /* (not expected) */
+        if (st == 1 && !waited) { waited = 1; g_wt_miss_busy++; }
 #ifdef __vita__
         SDL_Delay(2);   /* the read-ahead is preparing it right now */
 #endif
@@ -2573,6 +2602,10 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
            (long long)(g_wt_geo_live >> 10), (unsigned)(kept_bytes >> 10), (long long)(g_wt_ready_bytes >> 10),
            (long long)(g_wt_raw_bytes >> 10),
            (long long)((g_wt_geo_live - (long long)kept_bytes - g_wt_ready_bytes) >> 10));
+    printf("world tiles: read-ahead misses so far: %ld in reach of its aim, %ld out of reach, %ld full decodes among them, %ld waited on mid-prepare; aim (%.0f, %.0f) vs build (%.0f, %.0f)\n",
+           g_wt_miss_in, g_wt_miss_out, g_wt_miss_full, g_wt_miss_busy, (double)g_wt_aim[0], (double)g_wt_aim[1], fx, fy);
+    printf("world tiles: read-ahead turns so far: off %ld, texture fetch %ld, cap %ld, short room %ld, nothing in reach %ld, prepared %ld; %lld KB ready now\n",
+           g_wt_ra_turn[0], g_wt_ra_turn[1], g_wt_ra_turn[2], g_wt_ra_turn[3], g_wt_ra_turn[4], g_wt_ra_turn[5], (long long)(g_wt_ready_bytes >> 10));
     wt_preload_after(track, fx, fy, radius);
     VMARK("  tiles assembled: %d meshes, %ld new tiles", scene->count, loaded_now);
     g_wt_last_count = scene->count;

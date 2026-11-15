@@ -21434,7 +21434,29 @@ int main(int argc, char **argv) {
         /* tile read-ahead: around the cell the next build will use */
         if (resident_enabled) {
             if (resident_wanted) world_tiles_aim(target[0], target[1]);
-            else world_tiles_aim(stream_at[0], stream_at[1]);
+            else {
+                /* 11-15 (PERF_PLAN read-ahead >= 90%): the next build is wanted once
+                   the aim is a cell from the active centre, and centres a cell on;
+                   its new tiles are the ring at ITS far edge, a cell past the read-
+                   ahead's reach from the aim itself -- the sim census: every miss
+                   in reach of the build, the read-ahead idle ("nothing in reach")
+                   5456 turns of 5986. Aim at the next build's likely centre: a cell
+                   from the active centre towards the aim. nextaim.txt 0 = old aim. */
+                static int next_aim = -1;
+                if (next_aim < 0) {
+                    next_aim = 1;
+                    FILE *f = fopen("ux0:data/NFSU2/nextaim.txt", "r");
+                    if (f) { int v = 1; if (fscanf(f, "%d", &v) == 1) next_aim = v != 0; fclose(f); }
+                    printf("stream: read-ahead aims at the %s\n", next_aim ? "next build's centre" : "stream aim");
+                }
+                float ndx = stream_at[0] - active_resident->center[0], ndy = stream_at[1] - active_resident->center[1];
+                float nl = hypotf(ndx, ndy);
+                if (next_aim && nl > 20.0f) {
+                    float k = resident_policy.cell_size / nl;
+                    if (k < 1.0f) k = 1.0f;
+                    world_tiles_aim(active_resident->center[0] + ndx * k, active_resident->center[1] + ndy * k);
+                } else world_tiles_aim(stream_at[0], stream_at[1]);
+            }
         }
         if (resident_enabled && resident_args.scenery_event != active_scenery_event) {
             /* a build still using the old set is useless now */
