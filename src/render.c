@@ -1458,10 +1458,6 @@ static int bsort_cmp(const void *a, const void *b) {
     if (aa->group != bb->group) return aa->group < bb->group ? -1 : 1;
     return aa->idx < bb->idx ? -1 : aa->idx > bb->idx ? 1 : 0;
 }
-static int u64_cmp(const void *a, const void *b) {
-    unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
-    return x < y ? -1 : x > y;
-}
 static int btex_cmp(const void *a, const void *b) {   /* final texture order */
     GLuint ta = ((const N2Batch *)a)->tex, tb = ((const N2Batch *)b)->tex;
     return ta < tb ? -1 : ta > tb ? 1 : 0;
@@ -3511,18 +3507,37 @@ int upload_world_batches_step(WorldBatchUpload **slot, int max_batches,
     hitch_mark("fin.up_stats");
 #endif
     /* minimise texture binds: texture order, emission order within a
-       texture (hwlog72: qsort moving the ~120-byte batches was up to 8.4 ms
-       a build; 8-byte keys, then one permuting copy) */
-    {   unsigned long long *key = nb > 1 ? malloc((size_t)nb * sizeof *key) : NULL;
-        N2Batch *sorted = key ? malloc((size_t)nb * sizeof *sorted) : NULL;
+       texture. hwlog72/73: qsort was 5-9 ms a build on the Vita (moving the
+       ~120-byte batches, then even 8-byte keys: newlib's compare calls); a
+       stable LSD radix sort of the indices by texture name (8-bit digits,
+       a pass skipped when every key shares that digit), then one copy. */
+    {   unsigned *ix = nb > 1 ? malloc((size_t)nb * 2 * sizeof *ix) : NULL;
+        N2Batch *sorted = ix ? malloc((size_t)nb * sizeof *sorted) : NULL;
         if (sorted) {
-            for (int b = 0; b < nb; b++)
-                key[b] = (unsigned long long)bat[b].tex << 32 | (unsigned)b;
-            qsort(key, (size_t)nb, sizeof *key, u64_cmp);
-            for (int b = 0; b < nb; b++) sorted[b] = bat[(unsigned)key[b]];
+            unsigned *a = ix, *t = ix + nb, orv = 0, andv = ~0u;
+            for (int b = 0; b < nb; b++) { a[b] = (unsigned)b; orv |= bat[b].tex; andv &= bat[b].tex; }
+            for (int sh = 0; sh < 32; sh += 8) {
+                if ((((orv ^ andv) >> sh) & 0xffu) == 0) continue;   /* same digit everywhere */
+                int cnt[257]; memset(cnt, 0, sizeof cnt);
+                for (int b = 0; b < nb; b++) cnt[((bat[a[b]].tex >> sh) & 0xffu) + 1]++;
+                for (int d = 0; d < 256; d++) cnt[d + 1] += cnt[d];
+                for (int b = 0; b < nb; b++) t[cnt[(bat[a[b]].tex >> sh) & 0xffu]++] = a[b];
+                unsigned *sw = a; a = t; t = sw;
+            }
+#ifdef __vita__
+            hitch_mark("fin.up_keys");
+#endif
+#ifdef OPENUG2_SIM_PRE_H
+            {   static int bad_said;   /* test aid (simulator): texture order, emission order within one */
+                for (int b = 1; b < nb && !bad_said; b++)
+                    if (bat[a[b-1]].tex > bat[a[b]].tex || (bat[a[b-1]].tex == bat[a[b]].tex && a[b-1] > a[b])) {
+                        bad_said = 1; printf("batches: radix order WRONG at %d%c", b, 10); }
+                static int ok_said; if (!ok_said) { ok_said = 1; printf("batches: radix order checked (%d)%c", nb, 10); } }
+#endif
+            for (int b = 0; b < nb; b++) sorted[b] = bat[a[b]];
             free(bat); bat = j->batches = sorted;   /* the smooth tail reads it back next call */
         } else if (nb > 1) qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);
-        free(key); }
+        free(ix); }
 #ifdef __vita__
     hitch_mark("fin.up_sort");
     /* hwlog69: the completing step was 10-13 ms on every downtown build
