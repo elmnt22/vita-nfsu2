@@ -965,6 +965,9 @@ static float wt_far_extra(void) {
     }
     return v;
 }
+/* decoded tile geometry alive anywhere (the cache, the read-ahead, residents
+   still drawing or retiring): PERF_PLAN P0.2 census */
+static volatile long long g_wt_geo_live;
 static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *out, WtScratch *scr,
                      int ground_only) {
     memset(out, 0, sizeof *out); out->tx = tx; out->ty = ty; out->ground = ground_only;
@@ -1008,6 +1011,8 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
         return 0;
     }
     blk->data = geo; blk->geoms = geoms; blk->refs = 1;   /* the decoder's own hold */
+    blk->acct = &g_wt_geo_live; blk->bytes = (long long)total;
+    __sync_fetch_and_add(&g_wt_geo_live, (long long)total);
     /* pass 2: decode */
     size_t pos = 0, gp = 0;
     for (uint32_t k = 0; k < hdr[4]; k++) {
@@ -1934,6 +1939,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                             float fx, float fy, float radius, float object_radius,
                             int scenery_event, WInstStats *stats);
 static WGSelection sel; static int sel_event = 0x7fffffff, sel_effective;
+static int g_wt_last_count;   /* meshes in the last assembled scene (reserve) */
 static void wt_forget_all(void) {
     for (int i = 0; i < g_wt_nloaded; i++) wt_forget(&g_wt_loaded[i]);
     g_wt_nloaded = 0;
@@ -1997,6 +2003,18 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                             float fx, float fy, float radius, float object_radius,
                             int scenery_event, WInstStats *stats) {
     if (!scene || !vista || !wt_index_load(track)) return 0;
+    /* 11-14 hwlog55: the mesh array doubled by realloc mid-build (6 MB at
+       16k meshes) and failed with 35 MB free in holes, sending the build to
+       the 240 m retry. Reserve the last build's count + 1/8 up front, so the
+       one big block is asked for while the old scene still holds its own. */
+    {
+        int want = g_wt_last_count + g_wt_last_count / 8;
+        if (want < 4096) want = 4096;
+        if (scene->cap < want) {
+            N2Mesh *g = (N2Mesh *)realloc(scene->meshes, (size_t)want * sizeof *g);
+            if (g) { scene->meshes = g; scene->cap = want; }
+        }
+    }
 #ifdef OPENUG2_SIM_PRE_H
     {   /* test aid (simulator): OPENUG2_SKY_CENSUS -- the skyline's candidates over every tile */
         static int done;
@@ -2236,8 +2254,12 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
            (g_wt_bytes_read - read0) >> 10, g_wt_read_ms, g_wt_decode_ms, g_wt_n_pack - npack0,
            g_wt_n_loose - nloose0, g_wt_n_pre - npre0, kept, (unsigned)(kept_bytes >> 10),
            kept_ground, g_wt_up_ready, g_wt_up_now, downgraded, kept_far, (unsigned)(far_bytes >> 10), regraded, hidden, wt_ms() - t0);
+    printf("world tiles: geometry %lld KB live: %u KB this cache, %lld KB read-ahead, %lld KB held by older areas\n",
+           (long long)(g_wt_geo_live >> 10), (unsigned)(kept_bytes >> 10), (long long)(g_wt_ready_bytes >> 10),
+           (long long)((g_wt_geo_live - (long long)kept_bytes - g_wt_ready_bytes) >> 10));
     wt_preload_after(track, fx, fy, radius);
     VMARK("  tiles assembled: %d meshes, %ld new tiles", scene->count, loaded_now);
+    g_wt_last_count = scene->count;
     return scene->count;
 }
 

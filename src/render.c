@@ -1974,6 +1974,14 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     return 1;
 }
 
+/* plan_assemble's slabs (11-14 P0.1): small blocks fit the heap's holes */
+#define PLAN_SLAB_BYTES (256u << 10)
+typedef struct PlanSlab { struct PlanSlab *next; size_t cap, used, pad; } PlanSlab;   /* 16-byte header */
+static long g_plan_slab_fail;
+static void *plan_slab_alloc(size_t n) { return malloc(n); }
+static void plan_slabs_free(void *head) {
+    for (PlanSlab *p = (PlanSlab *)head; p;) { PlanSlab *n = p->next; free(p); p = n; }
+}
 struct WorldBatchUpload {
     PackedMesh *packed;
     float *const *normals;
@@ -1986,14 +1994,14 @@ struct WorldBatchUpload {
     int meshes, next, count;
     struct PreparedBatch *prepared;
     int prepared_count;
-    void *arena;   /* the prepared batches' assembled arrays (render_world_plan_fill) */
+    void *arena;   /* the prepared batches' assembled arrays (render_world_plan_fill): a chain of PlanSlab */
 };
 
 void upload_world_batches_cancel(WorldBatchUpload **slot) {
     if (!slot || !*slot) return;
     WorldBatchUpload *j = *slot;
     render_batch_array_free(&j->batches, &j->count);
-    free(j->prepared); free(j->arena); free(j->ent); free(j->run0); free(j->run1); free(j);
+    plan_slabs_free(j->arena); free(j->prepared); free(j->ent); free(j->run0); free(j->run1); free(j);
     *slot = NULL;
 }
 
@@ -2137,10 +2145,15 @@ WorldBatchUpload *upload_world_batches_prepare_cpu(const N2Scene *s,
    once assembled. */
 #define PLAN_ARENA_MAX (8u << 20)
 static void plan_assemble(WorldBatchUpload *j) {
+    /* 11-14 hwlog55: one 4-8 MB malloc here failed downtown with 35-45 MB
+       free (the heap in small holes). The arrays now go in 256 KB slabs (a
+       batch bigger than that gets a slab of its own size); a slab that
+       cannot be had leaves the rest of the batches to batch_emit's own path. */
     extern int world_build_aborted(void);
     if (!j || !j->prepared || !j->packed) return;
     unsigned char *want = (unsigned char *)calloc((size_t)(j->prepared_count ? j->prepared_count : 1), 1);
     if (!want) return;
+    (void)0;
     size_t total = 0;
     for (int b = 0; b < j->prepared_count; b++) {
         struct PreparedBatch *p = &j->prepared[b];
@@ -2167,19 +2180,28 @@ static void plan_assemble(WorldBatchUpload *j) {
         if (total + need > PLAN_ARENA_MAX) continue;
         want[b] = 1; total += need;
     }
-    unsigned char *arena = total ? (unsigned char *)malloc(total) : NULL;
-    if (arena) {
-        size_t at = 0;
-        for (int b = 0; b < j->prepared_count; b++) {
+    {
+        PlanSlab *cur = NULL;
+        int slab_failed = 0;
+        for (int b = 0; b < j->prepared_count && !slab_failed; b++) {
             if (!want[b]) continue;
             struct PreparedBatch *p = &j->prepared[b];
             int nv = 0, ni = 0;
             for (int k = p->begin; k < p->end; k++) {
                 const N2Mesh *m = &j->scene->meshes[j->ent[k].idx]; nv += m->nverts; ni += m->nidx;
             }
-            BatchedVertex *bv = (BatchedVertex *)(arena + at);
-            uint16_t *bi = (uint16_t *)(arena + at + (size_t)nv * sizeof *bv);
-            at += ((size_t)nv * sizeof *bv + (size_t)ni * 2 + 15) & ~(size_t)15;
+            size_t need = ((size_t)nv * sizeof(BatchedVertex) + (size_t)ni * 2 + 15) & ~(size_t)15;
+            if (!cur || cur->cap - cur->used < need) {
+                size_t cap = need > PLAN_SLAB_BYTES ? need : PLAN_SLAB_BYTES;
+                PlanSlab *ns = (PlanSlab *)plan_slab_alloc(sizeof(PlanSlab) + cap);
+                if (!ns) { slab_failed = 1; g_plan_slab_fail++; printf("world batches: slab of %u KB refused (%ld so far); rest via batch_emit\n", (unsigned)(cap >> 10), g_plan_slab_fail); break; }
+                ns->cap = cap; ns->used = 0; ns->next = (PlanSlab *)j->arena; j->arena = ns;
+                cur = ns;
+            }
+            unsigned char *at = (unsigned char *)(cur + 1) + cur->used;
+            cur->used += need;
+            BatchedVertex *bv = (BatchedVertex *)at;
+            uint16_t *bi = (uint16_t *)(at + (size_t)nv * sizeof *bv);
             int vo = 0, io = 0;
             for (int k = p->begin; k < p->end; k++) {
                 const N2Mesh *m = &j->scene->meshes[j->ent[k].idx];
@@ -2194,7 +2216,6 @@ static void plan_assemble(WorldBatchUpload *j) {
                 if (!pk->borrowed) { free(pk->v); pk->v = NULL; }
             }
         }
-        j->arena = arena;
     }
     free(want);
 }

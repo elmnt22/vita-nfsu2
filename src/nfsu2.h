@@ -45,7 +45,7 @@ static uint32_t n2_sky_remap_key(int profile, uint32_t source_key) {
 }
 /* One allocation holding many meshes' geometry (a prebuilt world tile):
    freed when the last mesh pointing into it is released. */
-typedef struct { unsigned refs; void *data; void *geoms; } N2GeomBlock;
+typedef struct { unsigned refs; void *data; void *geoms; volatile long long *acct; long long bytes; } N2GeomBlock;   /* acct: the owner's live-bytes counter (world_tiles.c) */
 typedef struct {
     unsigned refs;
     void *verts, *idx, *vcol, *packed;
@@ -54,7 +54,10 @@ typedef struct {
     unsigned char packed_hashed;   /* bb/hash valid even after packed was freed (Vita, 11-14) */
     N2GeomBlock *block;   /* non-NULL: verts/idx/vcol and this record live in it */
 } N2SharedGeometry;
-static void n2_block_free(N2GeomBlock *b) { free(b->data); free(b->geoms); free(b); }
+static void n2_block_free(N2GeomBlock *b) {
+    if (b->acct) __sync_fetch_and_sub(b->acct, b->bytes);
+    free(b->data); free(b->geoms); free(b);
+}
 /* Port fix (not in the original): a few L4RA curb faces were missed by the
    retail prelight bake and keep one flat bright cyan, D3DCOLOR 0x82b5d5c7
    (R 181 G 213 B 199 A 130: 263 vertices in STREAML4RA.BUN, e.g. the curbs

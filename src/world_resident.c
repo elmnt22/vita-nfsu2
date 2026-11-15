@@ -1282,6 +1282,62 @@ void world_resident_free(WorldResident *resident) {
     free(resident);
 }
 
+/* PERF_PLAN P1a (11-14): a swapped-out area's meshes let go of their tile
+   geometry on a thread of their own, the moment the swap happens. The retire
+   step released them 256 a frame on the main thread (~3 s for a downtown
+   area of 18k meshes), so with a build every ~3 s at speed two or three old
+   areas held their tiles at once: 40-64 MB of geometry "held by older areas"
+   on top of the ~50 MB tile cache (sim route downtown55), and the Vita ran
+   out (hwlog55). The batches (GL) still retire on the main thread. */
+typedef struct RelItem { struct RelItem *next; N2Mesh *m; int n; } RelItem;
+static RelItem *volatile g_rel_head;
+static volatile int g_rel_lock, g_rel_started, g_rel_busy;
+static volatile long g_rel_meshes;
+static void rel_lock(void) { while (__sync_lock_test_and_set(&g_rel_lock, 1)) SDL_Delay(0); }
+static void rel_unlock(void) { __sync_lock_release(&g_rel_lock); }
+static int rel_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        rel_lock();
+        RelItem *it = g_rel_head; g_rel_head = NULL;
+        if (it) g_rel_busy = 1;
+        rel_unlock();
+        if (!it) { SDL_Delay(15); continue; }
+        while (it) {
+            RelItem *nx = it->next;
+            for (int i = 0; i < it->n; i++) n2_mesh_geometry_release(&it->m[i]);
+            __sync_fetch_and_sub(&g_rel_meshes, (long)it->n);
+            free(it->m); free(it);
+            it = nx;
+        }
+        g_rel_busy = 0;
+    }
+    return 0;
+}
+int world_resident_release_meshes_async(WorldResident *r) {
+    if (!r) return 0;
+    if (!g_rel_started) {
+        g_rel_started = 1;
+        if (!SDL_CreateThread(rel_thread, "area-release", NULL)) g_rel_started = 2;
+    }
+    if (g_rel_started != 1) return 0;   /* no thread: the retire step does it */
+    int moved = 0;
+    N2Scene *scenes[] = { &r->world.scene, &r->world.vista };
+    for (int g = 0; g < 2; g++) {
+        N2Scene *sc = scenes[g];
+        if (!sc->meshes || sc->count <= 0) continue;
+        RelItem *it = (RelItem *)malloc(sizeof *it);
+        if (!it) continue;
+        it->m = sc->meshes; it->n = sc->count;
+        sc->meshes = NULL; sc->count = 0; sc->cap = 0;
+        __sync_fetch_and_add(&g_rel_meshes, (long)it->n);
+        rel_lock(); it->next = g_rel_head; g_rel_head = it; rel_unlock();
+        moved += it->n;
+    }
+    return moved;
+}
+long world_resident_release_pending(void) { return g_rel_meshes; }
+
 int world_resident_retire_step(WorldResident **slot, int max_items) {
     if (!slot || !*slot) return 1;
     if (max_items <= 0) return 0;

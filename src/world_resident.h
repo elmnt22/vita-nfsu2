@@ -159,6 +159,10 @@ void world_resident_free(WorldResident *resident);
  * The partial owner must not be queried/rendered. world_resident_free remains
  * safe for immediate shutdown/cancellation at any step. */
 int world_resident_retire_step(WorldResident **resident, int max_items);
+/* Main thread, at a swap: hand the old area's meshes to the release thread
+   (their tile geometry is freed there); returns the meshes handed over. */
+int world_resident_release_meshes_async(WorldResident *r);
+long world_resident_release_pending(void);
 
 /* Frame-thread hitch profiler: hitch_begin() opens a frame span, hitch_mark()
  * charges the time since the previous mark to a label (string literal), and

@@ -2679,6 +2679,7 @@ static const PerfParts *g_load_pp;   /* an opponent's fitted performance parts, 
 /* a traffic model's skin (RideInfo +7, 0x61bc20): its <CAR>_SKIN1 meshes
    wear <CAR>_SKIN<n>; 0 the model's own */
 static int g_load_skin;
+static int g_route_glide;   /* the route.txt test glide is moving the car (no tyre marks: its physics resets every tick) */
 static const N2CarConfig *g_load_cfg;   /* the RideInfo parts to load with (an opponent's preset), NULL stock */
 static unsigned char *g_shared_cartex; static long g_shared_cartex_len; static int g_shared_cartex_tried;   /* the shared car pack */
 /* The skin keys are the player car's: loading a traffic or opponent car
@@ -11731,6 +11732,46 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         g_n2_dsteer_on = 0;
         airacer_frame(g_rt.pdrv, wdt, &g_n2_aictl);
         g_n2_aion = 1;
+        {   /* test aid (PERF_PLAN P0, 11-14): with autodrive.txt / OPENUG2_AUTODRIVE
+               the test driver is put back on its route when it asks for a reset,
+               drives away from its route point for 4 s (a crash spun it round:
+               2 of 4 HW runs 11-14 then lapped backwards) or sits still for 8 s.
+               The player's own stall reset never fires (the camera is always
+               within 50 m), so unattended runs could not finish. */
+            static int test = -1;
+            static float away_t, still_t;
+            if (test < 0) {
+                FILE *af = fopen("ux0:data/NFSU2/autodrive.txt", "r");
+                test = af || getenv("OPENUG2_AUTODRIVE");
+                if (af) fclose(af);
+            }
+            if (test && g_n2 && !g_rt.pfinished) {
+                N2State st; n2sim_state(g_n2, &st);
+                float rp[3], rh, rv;
+                int want = airacer_want_reset(g_rt.pdrv);
+                if (airacer_route_point(g_rt.pdrv, rp)) {
+                    float dx = rp[0] - st.pos[0], dy = rp[1] - st.pos[1], d = hypotf(dx, dy);
+                    float dot = d > 1.0f ? (dx * cosf(st.heading) + dy * sinf(st.heading)) / d : 1.0f;
+                    away_t = (dot < -0.3f && st.speed > 3.0f) ? away_t + wdt : 0;
+                }
+                still_t = fabsf(st.speed) < 1.0f ? still_t + wdt : 0;
+                if (want || away_t > 4.0f || still_t > 8.0f) {
+                    const char *why = want ? "asked" : away_t > 4.0f ? "wrong way" : "stuck";
+                    away_t = still_t = 0;
+                    if (airacer_reset_pose(g_rt.pdrv, rp, &rh, &rv)) {
+                        WCollCtx gc; wcoll_ctx_init(&gc);
+                        float q[3] = { rp[0], rp[1], rp[2] + 1.0f };
+                        int found = 0;
+                        float gz = g_wcoll ? wcoll_ground(g_wcoll, &gc, q, NULL, NULL, &found) : 0;
+                        if (found) rp[2] = gz;
+                        n2sim_reset(g_n2, rp, rh);
+                        float v[3] = { cosf(rh) * (rv + 0.1f), sinf(rh) * (rv + 0.1f), 0 };
+                        n2sim_set_velocity(g_n2, v);
+                        printf("autodrive: test driver reset onto its route (%s) at (%.0f %.0f)\n", why, rp[0], rp[1]);
+                    }
+                }
+            }
+        }
     } else if (player_n2 && !g_n2_nis) {   /* the player's controller tick (0x42caa0) and pace sampler (0x602650) */
         if (!g_rt.human) {
             g_rt.human = airacer_new_human(g_rt.w, 0, g_n2, g_rt.psuv, player_half_wid);
@@ -21545,6 +21586,12 @@ int main(int argc, char **argv) {
                     if (nvista) vista_far *= 2.5f;
                     hitch_mark("act.lights_vista");
                     if (background) {
+                        /* the old area's tile geometry goes at once, on its
+                           own thread (PERF_PLAN P1a); the GL batches below */
+                        {   long pend = world_resident_release_pending();
+                            int moved = world_resident_release_meshes_async(candidate_resident);
+                            if (moved) printf("resident: %d old meshes to the release thread (%ld still pending)\n", moved, pend);
+                        }
                         /* One retired owner. An unusually rapid second swap
                          * drains it rather than dropping ownership or delaying
                          * the new collision neighborhood. */
@@ -23114,6 +23161,74 @@ int main(int argc, char **argv) {
                 g_n2_live = 0;
             }
         }
+        {   /* test aid (PERF_PLAN P0.3): ux0:data/NFSU2/route.txt = a fixed free-roam
+               drive for A/B runs: "speed <m/s>", then "x y z" per line. The car
+               is put down at the first point (as fast travel) and then glides
+               along the line at that speed, on the ground, so streaming,
+               traffic and drawing see the same drive every run; at the end it
+               logs "autodrive: quit after the route" and the app exits. */
+            static int rg_state = -1, rg_n, rg_seg;
+            static float *rg_p, rg_speed = 25.0f, rg_s;
+            static Uint32 rg_t0;
+            if (rg_state < 0) {
+                rg_state = 9;
+                FILE *rf = fopen("ux0:data/NFSU2/route.txt", "r");
+                if (rf) {
+                    char ln[128]; int cap = 0;
+                    while (fgets(ln, sizeof ln, rf)) {
+                        float a, b, c;
+                        if (ln[0] == '#') continue;
+                        if (sscanf(ln, "speed %f", &a) == 1) { rg_speed = a; continue; }
+                        if (sscanf(ln, "%f %f %f", &a, &b, &c) == 3) {
+                            if (rg_n == cap) { cap = cap ? cap * 2 : 256; rg_p = (float *)realloc(rg_p, (size_t)cap * 3 * sizeof *rg_p); }
+                            if (!rg_p) break;
+                            rg_p[rg_n*3] = a; rg_p[rg_n*3+1] = b; rg_p[rg_n*3+2] = c; rg_n++;
+                        }
+                    }
+                    fclose(rf);
+                    if (rg_n >= 2) { rg_state = 0; printf("route: %d points at %.0f m/s (route.txt)\n", rg_n, (double)rg_speed); }
+                }
+            }
+            if (rg_state < 9 && race_state == 1 && g_rt.roam) {
+                if (rg_state == 0) {
+                    memcpy(g_ft.p, rg_p, 3 * sizeof(float)); g_ft.go = 1; rg_state = 1;
+                } else if (rg_state == 1) {
+                    if (!post_hold && !g_ft.go) { rg_state = 2; rg_seg = 0; rg_s = 0; rg_t0 = SDL_GetTicks(); printf("route: start\n"); }
+                } else if (rg_state == 2) {
+                    g_route_glide = 1;
+                    float step = rg_speed / 60.0f;
+                    rg_s += step;
+                    float dx = 0, dy = 0, len = 0;
+                    while (rg_seg < rg_n - 1) {
+                        dx = rg_p[(rg_seg+1)*3] - rg_p[rg_seg*3]; dy = rg_p[(rg_seg+1)*3+1] - rg_p[rg_seg*3+1];
+                        len = hypotf(dx, dy);
+                        if (rg_s <= len) break;
+                        rg_s -= len; rg_seg++;
+                    }
+                    if (rg_seg >= rg_n - 1) {
+                        rg_state = 3; g_route_glide = 0;
+                        printf("autodrive: quit after the route (%d points, %u s)\n", rg_n, (unsigned)((SDL_GetTicks() - rg_t0) / 1000));
+                        g_autoquit_at = SDL_GetTicks() + 5000;
+                    } else if (len > 0.01f) {
+                        float u = rg_s / len, *a = &rg_p[rg_seg*3];
+                        float x = a[0] + dx * u, y = a[1] + dy * u, z = a[2] + (a[5] - a[2]) * u;
+                        if (g_wcoll) {
+                            WCollCtx gc; wcoll_ctx_init(&gc);
+                            float q[3] = { x, y, z + 2.0f };
+                            int found = 0;
+                            float gz = wcoll_ground(g_wcoll, &gc, q, NULL, NULL, &found);
+                            if (found) z = gz;
+                        }
+                        float h = atan2f(dy, dx);
+                        carpos[0] = x; carpos[1] = y; carpos[2] = z;
+                        if (fabsf(remainderf(h - heading, 6.2831853f)) > 0.5f) cam_snap = 1;
+                        heading = h; speed = rg_speed;
+                        vel[0] = cosf(h) * rg_speed; vel[1] = sinf(h) * rg_speed;
+                        g_n2_live = 0;
+                    }
+                }
+            }
+        }
         if (tick_n < 3) {
             memcpy(tick_pos[tick_n], carpos, sizeof tick_pos[0]);
             tick_fwd[tick_n][0] = fwd[0]; tick_fwd[tick_n][1] = fwd[1];
@@ -23834,7 +23949,7 @@ int main(int argc, char **argv) {
             if (g_rp_jump) { memset(wpen, 0, sizeof wpen); g_rp_jump = 0; }   /* a restore: no mark across the jump */
             float skmax = 0.0f;
             for (int k = 0; k < 4; k++) {
-                float in = (race_state == 1 || rp_up()) && !sstatic ? g_n2s.wheel_skid[k] : 0.0f;
+                float in = (race_state == 1 || rp_up()) && !sstatic && !g_route_glide ? g_n2s.wheel_skid[k] : 0.0f;
                 if (in <= 0.0f) { wpen[k] = 0; continue; }
                 float cur[3] = { g_n2s.wheel_cpt[k][0], g_n2s.wheel_cpt[k][1], g_n2s.wheel_cpt[k][2] + 0.03f };
                 if (in > skmax) skmax = in;

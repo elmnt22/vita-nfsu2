@@ -285,7 +285,7 @@ void sim_heap_report(const char *label, int detail);
 void vita_heap_report(const char *label) {
     static Uint32 last_detail;
     Uint32 now = SDL_GetTicks();
-    int detail = 1;
+    int detail = getenv("OPENUG2_SIM_HEAP_DETAIL") ? 2 : 1;   /* every report in full (P0 census runs) */
     if (!last_detail || now - last_detail >= 60000) { detail = 2; last_detail = now ? now : 1; }
     sim_heap_report(label, detail);
 }
