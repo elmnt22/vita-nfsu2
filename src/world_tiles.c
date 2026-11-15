@@ -146,40 +146,76 @@ static int wt_pw_finish(WtPackW *w, const char *track, int ok) {
 
 /* ---- LZ4 block format (own implementation; the converter verifies every
    tile by decompressing it again, and stores it raw if anything differs) -- */
+/* PERF_PLAN P2 (11-15): hash chains + lazy matching instead of one greedy
+   probe. Same LZ4 block format, so every decoder and every older cache is
+   unchanged; tools/tilepak_bench.c on STREAML4RA: 63.4 -> 49.1 MB at depth
+   16 (the Vita's own conversion), 47.8 MB at 64 (the Prep Tool). The card
+   reads ~10 MB/s while streaming (hwlog67), so a smaller pack is faster
+   reads. Conversion runs one tile at a time on one thread. */
+#ifdef __vita__
+#define WT_LZ4_DEPTH 16
+#else
+#define WT_LZ4_DEPTH 64
+#endif
+#define WT_LZ4_HBITS 16
+static int32_t *g_lz_head, *g_lz_prev;   /* prev: the last 64 KB of positions */
+static int lz4_find(const uint8_t *s, int ip, int mlimit, int *off) {
+    uint32_t seq; memcpy(&seq, s + ip, 4);
+    int best = 0, bo = 0, depth = WT_LZ4_DEPTH;
+    for (int ref = g_lz_head[(seq * 2654435761u) >> (32 - WT_LZ4_HBITS)];
+         ref >= 0 && ip - ref <= 65535 && depth-- > 0; ref = g_lz_prev[ref & 0xffff]) {
+        if (s[ref + best] != s[ip + best]) continue;
+        uint32_t rs; memcpy(&rs, s + ref, 4);
+        if (rs != seq) continue;
+        int ml = 4;
+        while (ip + ml < mlimit && s[ref + ml] == s[ip + ml]) ml++;
+        if (ml > best) { best = ml; bo = ip - ref; if (ip + ml >= mlimit) break; }
+    }
+    *off = bo;
+    return best;
+}
+static void lz4_insert(const uint8_t *s, int ip) {
+    uint32_t seq; memcpy(&seq, s + ip, 4);
+    uint32_t h = (seq * 2654435761u) >> (32 - WT_LZ4_HBITS);
+    g_lz_prev[ip & 0xffff] = g_lz_head[h]; g_lz_head[h] = ip;
+}
+/* one sequence: lit literals then (ml >= 4) a match at off; ml 0 = the last */
+static int lz4_emit(uint8_t *dst, int op, int cap, const uint8_t *lits, int lit, int off, int ml) {
+    if (op + 1 + lit + lit / 255 + 1 + 2 + (ml ? (ml - 4) / 255 + 1 : 0) > cap) return -1;
+    uint8_t *tok = dst + op++;
+    int ln = lit >= 15 ? 15 : lit, mn = ml ? (ml - 4 >= 15 ? 15 : ml - 4) : 0;
+    *tok = (uint8_t)(ln << 4 | mn);
+    if (lit >= 15) { int r = lit - 15; while (r >= 255) { dst[op++] = 255; r -= 255; } dst[op++] = (uint8_t)r; }
+    memcpy(dst + op, lits, (size_t)lit); op += lit;
+    if (!ml) return op;
+    dst[op++] = (uint8_t)(off & 255); dst[op++] = (uint8_t)(off >> 8);
+    if (ml - 4 >= 15) { int r = ml - 4 - 15; while (r >= 255) { dst[op++] = 255; r -= 255; } dst[op++] = (uint8_t)r; }
+    return op;
+}
 static int lz4_compress(const uint8_t *src, int n, uint8_t *dst, int cap) {
-    static int32_t tab[1 << 14];
-    for (int i = 0; i < (1 << 14); i++) tab[i] = -1;
+    if (!g_lz_head) {
+        g_lz_head = (int32_t *)malloc(sizeof(int32_t) << WT_LZ4_HBITS);
+        g_lz_prev = (int32_t *)malloc(sizeof(int32_t) << 16);
+        if (!g_lz_head || !g_lz_prev) { free(g_lz_head); free(g_lz_prev); g_lz_head = g_lz_prev = NULL; return 0; }
+    }
+    for (int i = 0; i < (1 << WT_LZ4_HBITS); i++) g_lz_head[i] = -1;
     int ip = 0, anchor = 0, op = 0;
     const int mflimit = n - 12, mlimit = n - 5;   /* the tail stays literal */
     while (ip < mflimit) {
-        uint32_t seq, rs;
-        memcpy(&seq, src + ip, 4);
-        uint32_t h = (seq * 2654435761u) >> 18;
-        int ref = tab[h]; tab[h] = ip;
-        if (ref < 0 || ip - ref > 65535) { ip++; continue; }
-        memcpy(&rs, src + ref, 4);
-        if (rs != seq) { ip++; continue; }
-        int ml = 4;
-        while (ip + ml < mlimit && src[ref + ml] == src[ip + ml]) ml++;
-        int lit = ip - anchor;
-        if (op + 1 + lit + lit / 255 + 1 + 2 + (ml - 4) / 255 + 1 > cap) return 0;
-        uint8_t *tok = dst + op++;
-        int ln = lit >= 15 ? 15 : lit, mn = ml - 4 >= 15 ? 15 : ml - 4;
-        *tok = (uint8_t)(ln << 4 | mn);
-        if (lit >= 15) { int r = lit - 15; while (r >= 255) { dst[op++] = 255; r -= 255; } dst[op++] = (uint8_t)r; }
-        memcpy(dst + op, src + anchor, (size_t)lit); op += lit;
-        int off = ip - ref;
-        dst[op++] = (uint8_t)(off & 255); dst[op++] = (uint8_t)(off >> 8);
-        if (ml - 4 >= 15) { int r = ml - 4 - 15; while (r >= 255) { dst[op++] = 255; r -= 255; } dst[op++] = (uint8_t)r; }
+        int off, ml = lz4_find(src, ip, mlimit, &off);
+        if (ml < 4) { lz4_insert(src, ip); ip++; continue; }
+        lz4_insert(src, ip);
+        if (ip + 1 < mflimit) {   /* lazy: a longer match one byte on wins */
+            int off2, ml2 = lz4_find(src, ip + 1, mlimit, &off2);
+            if (ml2 > ml + 1) { ip++; ml = ml2; off = off2; }
+        }
+        op = lz4_emit(dst, op, cap, src + anchor, ip - anchor, off, ml);
+        if (op < 0) return 0;
+        for (int k = 1; k < ml && ip + k < mflimit; k++) lz4_insert(src, ip + k);
         ip += ml; anchor = ip;
     }
-    int lit = n - anchor;
-    if (op + 1 + lit + lit / 255 + 1 > cap) return 0;
-    int ln = lit >= 15 ? 15 : lit;
-    dst[op++] = (uint8_t)(ln << 4);
-    if (lit >= 15) { int r = lit - 15; while (r >= 255) { dst[op++] = 255; r -= 255; } dst[op++] = (uint8_t)r; }
-    memcpy(dst + op, src + anchor, (size_t)lit); op += lit;
-    return op;
+    op = lz4_emit(dst, op, cap, src + anchor, n - anchor, 0, 0);
+    return op < 0 ? 0 : op;
 }
 
 static int lz4_decompress(const uint8_t *src, int n, uint8_t *dst, int outn) {
@@ -196,8 +232,17 @@ static int lz4_decompress(const uint8_t *src, int n, uint8_t *dst, int outn) {
         int ml = (tok & 15) + 4;
         if ((tok & 15) == 15) { int b; do { if (ip >= n) return 0; b = src[ip++]; ml += b; } while (b == 255); }
         if (ml > outn - op) return 0;
-        const uint8_t *m = dst + op - off;
-        for (int k = 0; k < ml; k++) dst[op + k] = m[k];   /* may overlap */
+        /* 11-15: word copies (PC bench: 2.3x faster than a byte loop); an
+           overlapping match copies 8 bytes at a time only when each chunk's
+           source is already written (off >= 8) */
+        uint8_t *d = dst + op; const uint8_t *m = d - off;
+        if (off >= ml) memcpy(d, m, (size_t)ml);
+        else if (off == 1) memset(d, m[0], (size_t)ml);
+        else if (off >= 8) {
+            int k = 0;
+            for (; k + 8 <= ml; k += 8) memcpy(d + k, m + k, 8);
+            for (; k < ml; k++) d[k] = m[k];
+        } else for (int k = 0; k < ml; k++) d[k] = m[k];   /* may overlap */
         op += ml;
     }
     return op == outn;
