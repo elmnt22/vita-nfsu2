@@ -2490,6 +2490,22 @@ static int car_body_metrics(const N2Scene *car, float bb[6], float bloom[4][4]);
    models take their textures from it); not owned by the candidates */
 static unsigned char *g_car_global_shared; static long g_car_global_shared_len;
 static N2Tpk g_car_global_tpk;
+/* GLOBALB's car table alone (chunk 0x34600, ~100 KB of the 8 MB block),
+   copied at the first good read and kept for the session: a later car load
+   whose GLOBALB read fails still finds its record in it */
+static unsigned char *g_car_table; static long g_car_table_len;
+static void car_table_keep(const unsigned char *g, long len) {
+    N2GlobalCarTable t;
+    if (g_car_table || !g || !n2_global_car_table(g, len, &t)) return;
+    long beg = t.beg - 16;                       /* the chunk header and its 8 filler bytes */
+    if (beg < 0 || n2_u32(g + beg) != 0x00034600u || t.end <= t.beg) return;
+    unsigned char *c = (unsigned char *)malloc((size_t)(t.end - beg));
+    if (!c) return;
+    memcpy(c, g + beg, (size_t)(t.end - beg));
+    g_car_table = c; g_car_table_len = t.end - beg;
+    printf("car table kept: %ld KB, %ld records\n", g_car_table_len >> 10,
+           (t.end - t.beg) / N2_GLOBAL_CAR_STRIDE);
+}
 /* ... and kept between car loads while menus, the garage or a race's setup
    load cars: every load re-read all 8 MB from the card (~1 s a car switch,
    one per opponent). car_global_drop frees it once driving (main loop). */
@@ -2498,6 +2514,7 @@ static unsigned char *car_global_get(const char *root, long *len) {
         g_car_global_shared = load_global_car_data(root, &g_car_global_shared_len);
         g_car_global_tpk = g_car_global_shared ? n2_tpk_open(g_car_global_shared, g_car_global_shared_len)
                                                : (N2Tpk){0};
+        car_table_keep(g_car_global_shared, g_car_global_shared_len);
     }
     if (len) *len = g_car_global_shared_len;
     return g_car_global_shared;
@@ -2787,6 +2804,13 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
     hitch_mark("car.read");
     LOAD_PUMP();   /* a race / career start: the loading screen keeps moving */
     candidate->globaldata=car_global_get(dataroot,&candidate->globallen);
+#ifdef OPENUG2_SIM_PRE_H
+    /* test aid (simulator): OPENUG2_SIM_NOGLOBALB=<car> -- that car's GLOBALB read fails, as on a
+       fragmented Vita heap (the record then comes from the kept car table) */
+    if (getenv("OPENUG2_SIM_NOGLOBALB") && !strcmp(name, getenv("OPENUG2_SIM_NOGLOBALB"))) {
+        candidate->globaldata = NULL; candidate->globallen = 0;
+    } else
+#endif
     if(!candidate->globaldata){
         /* (11-14 player report, a drag that never started) GLOBALB is one 8 MB
            block: on a fragmented heap it fails with tens of MB free (hwlog48
@@ -2832,11 +2856,18 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
                    WHEEL_SEED_TRACKF, n2_car_brake_radius(candidate->data, 0,
                    candidate->len), &candidate->profile);
     int from_global = 0;
-    candidate->wheel = wheel_config_for(name, &candidate->profile,
-        candidate->globaldata, candidate->globallen, &from_global);
-    candidate->has_physics=n2_global_physics_attr(candidate->globaldata,
-        candidate->globallen,name,&candidate->physics);
-    candidate->has_n2rec=n2_find_record(candidate->globaldata,candidate->globallen,name,candidate->n2rec);
+    /* the car's record from the GLOBALB car table; with GLOBALB unread (the
+       8 MB block failed on a fragmented heap) from the table kept at its
+       first good read -- without it the car lost its stock paint, physics
+       and record ride (a Corolla in the Car Lot floated a hub's height over
+       its wheels, its model origin being at the ground) */
+    const unsigned char *recsrc = candidate->globaldata ? candidate->globaldata : g_car_table;
+    long reclen = candidate->globaldata ? candidate->globallen : g_car_table_len;
+    if (!candidate->globaldata)
+        printf("car: %s record from the kept car table (%s)\n", name, g_car_table ? "GLOBALB unread" : "none kept");
+    candidate->wheel = wheel_config_for(name, &candidate->profile, recsrc, reclen, &from_global);
+    candidate->has_physics=n2_global_physics_attr(recsrc,reclen,name,&candidate->physics);
+    candidate->has_n2rec=n2_find_record(recsrc,reclen,name,candidate->n2rec);
     (void)from_global;
     hitch_mark("car.records");
     /* a car with an empty pack of its own (the traffic models) wears the
