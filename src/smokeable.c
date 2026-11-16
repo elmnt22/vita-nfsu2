@@ -287,6 +287,7 @@ int smk_load(const char *root, const char *stem)
                     const unsigned char *pk = b + pad;
                     int cnt = (int16_t)rd16(pk + 0x0c);
                     npack++;
+                    LOAD_PUMP();   /* the loading screen keeps moving */
                     for (int i = 0; i < cnt && pad + 0x10 + (long)(i + 1) * 0x70 <= (long)sz; i++) {
                         const unsigned char *r = pk + 0x10 + i * 0x70;
                         if (g_nsp == cap) {

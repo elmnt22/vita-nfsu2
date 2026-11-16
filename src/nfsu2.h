@@ -298,7 +298,11 @@ static int n2_world_batch_material_group(const N2Mesh *m, int effective_mode) {
 #include <unistd.h>
 /* newlib's fread trickles large files through a small stdio buffer (~2 MB/s
    from a Vita memory card for the 113 MB STREAM bundles); read() hands each
-   4 MB chunk straight to the filesystem. */
+   4 MB chunk straight to the filesystem. Loads behind the loading screen read
+   0.6-1.8 s files (a car's GEOMETRY.BIN, GLOBALB) on the frame thread: 512 KB
+   pieces with the screen's frame pump between them keep it moving (hwlog
+   play1116b; resource.h g_load_pump, a no-op off the frame thread). */
+extern void (*g_load_pump)(void);
 static unsigned char *n2_read_file(const char *path, long *out_len) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
@@ -307,10 +311,11 @@ static unsigned char *n2_read_file(const char *path, long *out_len) {
     unsigned char *buf = (unsigned char *)malloc(n > 0 ? (size_t)n : 1);
     long got = 0;
     while (buf && got < n) {
-        long want = n - got > (4L << 20) ? (4L << 20) : n - got;
+        long want = n - got > (512L << 10) ? (512L << 10) : n - got;
         long k = (long)read(fd, buf + got, (size_t)want);
         if (k <= 0) break;
         got += k;
+        if (g_load_pump && got < n) g_load_pump();
     }
     close(fd);
     if (buf && got != n) { free(buf); buf = NULL; }

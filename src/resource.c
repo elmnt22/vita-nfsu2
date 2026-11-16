@@ -15,6 +15,8 @@
 
 #include "resource.h"
 
+void (*g_load_pump)(void);   /* resource.h: the loading screen's frame pump */
+
 #ifdef __vita__
 /* No mmap on the Vita: read the whole file into the heap instead. Callers only
    read the mapping and release it through res_unmap_file, so this is

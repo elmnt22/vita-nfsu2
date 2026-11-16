@@ -257,6 +257,7 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
                     w->slot[s] = w->npacks++;
                 } else free(raw);
             }
+            LOAD_PUMP();   /* a pack read: the loading screen keeps moving */
         }
         if (!ix) off += 8 + (long)sz;
     }

@@ -72,4 +72,10 @@ ResChunk *res_chunk_index(const char *path, int *count);
 /* First entry whose header is at offset off, or -1 */
 int res_chunk_find(const ResChunk *ix, int n, long off);
 
+/* Long loads call this between their steps: the game draws a loading-screen
+ * frame when one is up and a frame is due, so it never looks frozen (main.c
+ * sets it on the frame thread; NULL in the tools). */
+extern void (*g_load_pump)(void);
+#define LOAD_PUMP() do { if (g_load_pump) g_load_pump(); } while (0)
+
 #endif

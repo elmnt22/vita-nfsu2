@@ -8,6 +8,7 @@
 #include <assert.h>
 
 #include "physics.h"
+#include "resource.h"   /* LOAD_PUMP */
 
 #if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
 #define HITCH_THREAD 1   /* the frame thread counters in hitch_report */
@@ -926,7 +927,12 @@ int world_resident_resources_build(WorldResidentResources *resources,
                                    WResidentBuildTiming *timing) {
     world_resident_resources_free(resources);
     int status;
-    do { status = resident_resources_step(resources, neighborhood, INT_MAX, include_vista, timing); }
+    /* behind a loading screen (the boot's area: 7.4 s of uploads on the Vita,
+       play1116b): the track switch's 256-batch slices, the screen's frame
+       pump between them, so it keeps moving */
+    int slice = g_load_pump ? 256 : INT_MAX;
+    do { status = resident_resources_step(resources, neighborhood, slice, include_vista, timing);
+         if (!status) LOAD_PUMP(); }
     while (!status);
     return status > 0;
 }

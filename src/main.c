@@ -109,32 +109,66 @@ static Shop *loading_screen(const char *dataroot) {
     if (g_ls_fe) { shop_loading_text(g_ls_fe, NULL, NULL); shop_loading_pick(g_ls_fe, g_career_mode); }
     return g_ls_fe;
 }
+/* loading screen: when it last drew a frame (0: not up); a gap over 150 ms
+   is a visible freeze of its animation -- logged with where it ended */
+static Uint32 g_ls_drawn;
+static int g_ls_frame;          /* this main-loop frame drew the loading screen */
+static SDL_threadID g_ls_tid;   /* the frame thread (the only one that may draw) */
+static void ls_gap(const char *where) {
+    static int thr = -1;
+    if (thr < 0) { const char *e = getenv("OPENUG2_LS_GAP"); thr = e ? atoi(e) : 150; }   /* test aid: the simulator's lower bar */
+    Uint32 now = SDL_GetTicks();
+    if (g_ls_drawn && now - g_ls_drawn > (Uint32)thr)
+        printf("loading screen: %u ms without a frame (to %s)\n", (unsigned)(now - g_ls_drawn), where);
+}
+static void ls_drew(const char *where) {
+    g_ls_tid = SDL_ThreadID();
+    ls_gap(where);
+    g_ls_drawn = SDL_GetTicks();
+}
 static void fe_frame(Shop *fe) {
     if (!fe) return;
+    ls_drew("fe_frame");
     static Uint32 last;
     Uint32 now = SDL_GetTicks();
     float dt = last ? (float)(now - last) / 1000.0f : 0.0f;
     last = now;
     if (dt > 0.1f) dt = 0.1f;
     shop_update(fe, dt);
+    /* drawn between a load's steps (ls_pump): what the load had bound is put
+       back (shop_draw restores depth / blend / cull itself); a value the GL
+       does not report stays -1 and is left alone */
+    GLint prog = -1, abuf = -1, ebuf = -1, tex = -1, vp[4] = { -1, -1, -1, -1 };
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebuf);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    glGetIntegerv(GL_VIEWPORT, vp);
     int W, H; SDL_GL_GetDrawableSize(NULL, &W, &H);
     glViewport(0, 0, W, H);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     shop_draw(fe, NULL, NULL, W, H);
     SDL_GL_SwapWindow(NULL);
+    if (prog >= 0) glUseProgram((GLuint)prog);
+    if (abuf >= 0) glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf);
+    if (ebuf >= 0) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)ebuf);
+    if (tex >= 0) glBindTexture(GL_TEXTURE_2D, (GLuint)tex);
+    if (vp[2] > 0 && vp[3] > 0) glViewport(vp[0], vp[1], vp[2], vp[3]);
 }
 static void boot_frame(void) { fe_frame(g_boot_fe); }
 static int g_restart_ls;   /* the kept loading screen (g_ls_fe) is up (race start / Restart) */
 static Uint32 g_race_ask_ms;   /* when the race start began (log) */
-/* A race's setup loads cars for seconds inside one frame: a loading frame
-   between its steps keeps the screen's circles turning. */
+/* A race's setup, a track switch or a career start loads for seconds inside
+   one frame: while the loading screen is what is on screen, a loading frame
+   between their steps (here, and LOAD_PUMP in the loaders) keeps its bar and
+   circles moving, so a long load never looks like a freeze (player reports
+   11-16: the career start sat on one frame for ~10 s on the Vita). */
 static void ls_pump(void) {
-    static Uint32 last;
     Uint32 now = SDL_GetTicks();
-    if (!g_restart_ls || !g_ls_fe || now - last < 50) return;
-    last = now;
-    fe_frame(g_ls_fe);
+    Shop *fe = g_boot_fe ? g_boot_fe : g_ls_fe;
+    if (!fe || !g_ls_drawn || now - g_ls_drawn < 40 || SDL_ThreadID() != g_ls_tid) return;
+    fe_frame(fe);
 #ifdef OPENUG2_SIM_PRE_H
     {   /* test aid (simulator): OPENUG2_LS_SHOT=1 shoots ls_<n> on each load's third loading frame */
         static Uint32 prev; static int n, f;
@@ -1685,8 +1719,11 @@ static void garage_restore_car(const char *car) {
 #include "reverb.h"
 #ifdef __vita__
 #define VMARK(...) vita_mark(__VA_ARGS__)
+/* a boot step: logged, and the boot loading screen kept moving between steps */
+#define BMARK(...) (vita_mark(__VA_ARGS__), ls_pump())
 #else
 #define VMARK(...) ((void)0)
+#define BMARK(...) ((void)0)
 #endif
 #ifdef OPENUG2_MENU
 #include "frontend/frontend.h"
@@ -2748,6 +2785,7 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
     candidate->nkeys = skin_keys_add(name, candidate->keys, candidate->nkeys, 512);
     if (candidate->nkeys < 512) candidate->keys[candidate->nkeys++] = N2_AUDIO_SKIN;   /* 0x631e20 */
     hitch_mark("car.read");
+    LOAD_PUMP();   /* a race / career start: the loading screen keeps moving */
     candidate->globaldata=car_global_get(dataroot,&candidate->globallen);
     if(!candidate->globaldata){
         /* (11-14 player report, a drag that never started) GLOBALB is one 8 MB
@@ -2760,6 +2798,7 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
         printf("car: GLOBALB %s on the second try\n", candidate->globaldata ? "read" : "could not be read");
     }
     hitch_mark("car.globalb");
+    LOAD_PUMP();
     candidate->globaltpk=g_car_global_tpk;
     if(candidate->globaldata)
         candidate->nkeys+=n2_tpk_keys(candidate->globaldata,candidate->globaltpk,
@@ -6733,7 +6772,9 @@ static int rt_roam_start(const char *troot, const char *dataroot, const char *ca
                 if (v->stock_wheel >= 0 && v->scene.meshes[v->stock_wheel].vcol)
                     g_rt.wheel[k] = make_wheel(v->profile.wheel_r, fmaxf(0.04f, 0.5f * v->profile.wheel_w));
                 g_rt.vcc[k] = carcoll_load_mem_kit(v->data, v->len, o->car, v->config.parts[N2_PART_WIDE]);
-                rt_opp_look(k, dataroot, v, o->car);
+                ls_pump();
+                rt_opp_look(k, dataroot, v, o->car);   /* skin, rims, kit: 0.2-0.4 s on the Vita */
+                ls_pump();
                 free(v->data); v->data = NULL;
                 free(v->texdata); v->texdata = NULL;
                 car_candidate_global_off(v);
@@ -6949,6 +6990,7 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
         pc.crowd = 1;               /* g_CrowdEnable 0x870cd0 */
         g_rt.nis_hash = 0; g_rt.nis_var = 0;
         if (nis_init(dataroot)) nis_pick(&pc, &rng, &g_rt.nis_hash, &g_rt.nis_var);
+        ls_pump();
 #ifdef OPENUG2_SIM_PRE_H
         if (getenv("OPENUG2_SIM_NIS")) {   /* test aid (simulator): OPENUG2_SIM_NIS=<hash hex>:<variant> */
             unsigned hh = 0; int vv = 0;
@@ -6975,7 +7017,9 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
             if (v->stock_wheel >= 0 && v->scene.meshes[v->stock_wheel].vcol)
                 g_rt.wheel[k] = make_wheel(v->profile.wheel_r, fmaxf(0.04f, 0.5f * v->profile.wheel_w));
             g_rt.vcc[k] = carcoll_load_mem_kit(v->data, v->len, o->car, v->config.parts[N2_PART_WIDE]);
-            rt_opp_look(k, dataroot, v, o->car);
+            ls_pump();
+            rt_opp_look(k, dataroot, v, o->car);   /* skin, rims, kit: 0.2-0.4 s on the Vita */
+            ls_pump();
             free(v->data); v->data = NULL;
             free(v->texdata); v->texdata = NULL;
             car_candidate_global_off(v);
@@ -14661,6 +14705,7 @@ int main(int argc, char **argv) {
     if (!getenv("OPENUG2_FLARE_OLDPICK")) aciddraw_world_flares_sections(world_flares_sections);   /* test aid: A/B the old 200 m pick */
 #ifdef __vita__
     vita_mark("main entered");
+    g_load_pump = ls_pump;   /* resource.h: long loads keep the loading screen moving */
     {   /* 11-15: what one timer read costs (the draw loops read it per draw) */
         Uint64 t0 = SDL_GetPerformanceCounter(), x = 0;
         for (int i = 0; i < 20000; i++) x += SDL_GetPerformanceCounter();
@@ -16455,23 +16500,23 @@ int main(int argc, char **argv) {
     /* engine sound, most to least authentic: the car's own Gnsu20 sweep
        recordings (matched by name), else an .abk sample bank (name-hash
        pick), else the procedural synth. */
-    int nsweep = audio_load_ginsu_sweeps(dataroot, carname);
+    int nsweep = audio_load_ginsu_sweeps(dataroot, carname);  LOAD_PUMP();
     int engbank = -1, nloops = 0;
     if (!nsweep) {
         engbank = audio_bank_for_car(carname);
         nloops = audio_load_engine_bank(dataroot, engbank);
         if (!nloops && engbank != 0) { engbank = 0; nloops = audio_load_engine_bank(dataroot, 0); }
     }
-    audio_load_shift_bank(dataroot, carname);
-    audio_load_skid_bank(dataroot);
-    audio_load_collision_bank(dataroot);
-    audio_load_turbo_bank(dataroot, carname);
-    audio_load_env_banks(dataroot);
-    audio_load_fe_banks(dataroot);
-    carsfx_init(dataroot);
-    carsfx_player_car(dataroot, audio_car_row(carname));
-    carsfx_set_slosh_claim(smk_slosh_claim);
-    audio_load_traffic_clip(dataroot);
+    audio_load_shift_bank(dataroot, carname);  LOAD_PUMP();
+    audio_load_skid_bank(dataroot);  LOAD_PUMP();
+    audio_load_collision_bank(dataroot);  LOAD_PUMP();
+    audio_load_turbo_bank(dataroot, carname);  LOAD_PUMP();
+    audio_load_env_banks(dataroot);  LOAD_PUMP();
+    audio_load_fe_banks(dataroot);  LOAD_PUMP();
+    carsfx_init(dataroot);  LOAD_PUMP();
+    carsfx_player_car(dataroot, audio_car_row(carname));  LOAD_PUMP();
+    carsfx_set_slosh_claim(smk_slosh_claim);  LOAD_PUMP();
+    audio_load_traffic_clip(dataroot);  LOAD_PUMP();
     options_load();
     profile_init();
     trophy_init();                       /* LiveArea Settings: trophies.txt switches them on */
@@ -16479,7 +16524,7 @@ int main(int argc, char **argv) {
     g_manual = g_opt.p[0].manual;
     g_cc_setting = g_opt.p[0].camera;
     SDL_AudioDeviceID adev = audio_init();
-    music_init(dataroot);
+    music_init(dataroot);  LOAD_PUMP();
     printf("speech: %s\n", speech_init(dataroot) ? "UG2_Speech + nisaudio indexed" : "no speech data"); career_speech_hook = career_speech_log;
     if (!g_opt.playlist_set) music_default_playlist(g_opt.pl_song, g_opt.pl_mode);
     music_set_playlist(g_opt.pl_song, g_opt.pl_mode, g_opt.shuffle);   /* the profile's playlist */
@@ -16565,7 +16610,7 @@ int main(int argc, char **argv) {
       printf("texture detail: %.0fx anisotropic (max %dx)%s\n", (double)want,
              g_tex_aniso_max, g_tex_aniso_max <= 1 ? " -- extension absent" : ""); }
 #ifdef DEBUG_UI
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
     dbgui_init(win, ctx);
 #endif
 
@@ -17130,7 +17175,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    VMARK("car step main.c:%d", __LINE__);
+    BMARK("car step main.c:%d", __LINE__);
     printf("track textures bound: %d distinct\n", ntmap);
     GLuint district_light_tex = 0;
     for (int j = 0; j < ntmap; j++)
@@ -17192,7 +17237,7 @@ int main(int argc, char **argv) {
     /* Scripted-object entity DEFINITIONS from the district companion L4R*.BUN.
        Read-only decode for the inspector; the data has no world placement or
        mesh (Phase 50), so these are logged as a table, not instantiated. */
-    VMARK("car step main.c:%d", __LINE__);
+    BMARK("car step main.c:%d", __LINE__);
     static ScriptedDef sdefs[256];
     int nsd = world_scripted_defs(&world, troot, sdefs, 256);
     printf("scripted entity defs: %d  [definitions only - no placement in data]\n", nsd);
@@ -17320,7 +17365,7 @@ int main(int argc, char **argv) {
                    n2_scen_name(sc),keyed[sc],unresolved[sc],nokey[sc]);
     }
     /* load a car and drop it on the track (36-byte vertex format) */
-    VMARK("car step main.c:%d", __LINE__);
+    BMARK("car step main.c:%d", __LINE__);
     long clen; unsigned char *cdata = n2_read_file(carp, &clen);
     long ctlen; unsigned char *ctdata = n2_read_file(cartexp, &ctlen);
     /* per-mesh car textures: get the TPK keys, then decode each key referenced
@@ -17352,7 +17397,7 @@ int main(int argc, char **argv) {
     float heading0 = world2 && world2_heading_set
                    ? world2_heading_deg * 3.14159265f / 180.0f : 0.0f;
     if (cdata) {
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         long globlen=0; unsigned char *globdata=car_global_get(dataroot,&globlen);
         if (globdata && !g_ai_have) ai_take_global(globdata, globlen);
         if (globdata && !g_acid_ok && acid_load(globdata, globlen, 1) > 0)   /* 0x35021 / 0x35020 */
@@ -17378,7 +17423,7 @@ int main(int argc, char **argv) {
         printf("car kits: ");
         for (int q = 0; q < nkit_ids; q++) printf("KIT%02d%s", kit_ids[q], q+1<nkit_ids?" ":"");
         puts("");
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         car_sync_upgrades(dataroot, carname, &carcfg, g_kit_brake);
         ncar = n2_load_car_colored(cdata, clen, &car, ckeys, nck, &carcfg,
                                    ctdata && ctlen==0);
@@ -17397,14 +17442,14 @@ int main(int argc, char **argv) {
                 if (tire) { ntv++; for(int a=0;a<3;a++){ if(p[a]<tb0[a])tb0[a]=p[a]; if(p[a]>tb1[a])tb1[a]=p[a]; } }
             }
         }
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         if(!car_body_metrics(&car,carbb,bloomc)) {
             fprintf(stderr,"invalid car geometry\n");return 1;
         }
         car_floor = car_body_floor(&car,carbb[2]);
         stock_wheel = n2_car_prepare_wheels(&car);
         /* Lamp anchors were measured from indexed lens surfaces above. */
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         cgm = upload_scene(&car); g_car_gen++;
         /* size the procedural tyre from the car's own wheel mesh (radius in X-Z,
            width in Y) so a Hummer gets big tyres and a compact gets small ones. */
@@ -17413,7 +17458,7 @@ int main(int argc, char **argv) {
                    wHW = 0.5f*(tb1[1]-tb0[1]); if (wHW<0.04f) wHW=0.04f; }
         /* Build this car's dimension profile from its OWN geometry, and drive
            the wheel/ride numbers from it instead of any absolute constant. */
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         n2_car_profile(&car, carname, WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
                        WHEEL_SEED_TRACKF, n2_car_brake_radius(cdata, 0, clen),
                        &carprof);
@@ -17464,10 +17509,10 @@ int main(int argc, char **argv) {
                carprof.has_tire ? "" : " (no tyre mesh: derived from body length)",
                carprof.hub_z, carprof.ride, carprof.wheelbase, carprof.track_f,
                carprof.clearance);
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         wheelmesh = make_wheel(wR, wHW); have_wheel = 1;
         /* decode + upload each distinct texture actually bound by a mesh */
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         for (int i = 0; i < ncar; i++) {
             uint32_t tk = car.meshes[i].texkey; if (!tk || car.meshes[i].car_decal) continue;
             int seen = 0; for (int j = 0; j < nmap; j++) if (mapkey[j]==tk) seen = 1;
@@ -17490,10 +17535,10 @@ int main(int argc, char **argv) {
                 free(ct.rgb); free(ct.alpha); free(ct.dxt);
             }
         }
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         printf("car textures bound: %d distinct\n", nmap);
         /* CLI and Red shop share the car's own named vinyl catalogue. */
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         if(vinyl_want) {
             load_vinyl_catalog(dataroot,carname);
             if(!strcmp(vinyl_want,"list")) {
@@ -17509,7 +17554,7 @@ int main(int argc, char **argv) {
             if(pick && select_car_vinyl(pick))printf("vinyl: %s over the paint\n",g_vinyl_names[pick-1]);
             else fprintf(stderr,"vinyl: could not load \"%s\" (try --vinyl list)\n",vinyl_want);
         }
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         if (world2 && !world2_spawn_set) {
             float hl=(carbb[3]-carbb[0])*0.5f, hw=(carbb[4]-carbb[1])*0.5f;
             if (hl<0.5f) hl=2.20f;
@@ -17540,7 +17585,7 @@ int main(int argc, char **argv) {
             }
             heading0 = atan2f(cy - spawn[1], cx - spawn[0]);
         }
-        VMARK("car step main.c:%d", __LINE__);
+        BMARK("car step main.c:%d", __LINE__);
         {   long cv = 0, ct = 0;
             for (int i = 0; i < car.count; i++) { cv += car.meshes[i].nverts; ct += car.meshes[i].nidx / 3; }
             printf("car: %d meshes (%ld verts, %ld tris), spawn (%.1f,%.1f) heading %.2f\n",
@@ -17559,7 +17604,7 @@ int main(int argc, char **argv) {
     uint32_t opponent_mapkey[128]; GLuint opponent_maptex[128];
     char opponent_mapalpha[128], opponent_mapmode[128];
     const int opponent_nmap=nmap;
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
     memcpy(opponent_mapkey,mapkey,(size_t)nmap*sizeof *mapkey);
     memcpy(opponent_maptex,maptex,(size_t)nmap*sizeof *maptex);
     memcpy(opponent_mapalpha,mapalpha,(size_t)nmap*sizeof *mapalpha);
@@ -17572,7 +17617,7 @@ int main(int argc, char **argv) {
     float opponent_bloom[4][4];memcpy(opponent_bloom,bloomc,sizeof opponent_bloom);
     g_dbg.body_kit_ids=kit_ids;g_dbg.body_kit_count=nkit_ids;
     static N2PartMenu modification[N2_PART_COUNT];
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
     if(cdata)mod_catalog_cached(dataroot,carname,cdata,clen,&car,modification);
     g_dbg.mod_parts=modification;g_dbg.mod_current=carcfg;
     garage_restore_car(carname);
@@ -17836,7 +17881,7 @@ int main(int argc, char **argv) {
        player's model. Each visual is loaded through the normal car path. */
     char traffic_names[MAXCARS][64]={{0}}, racer_names[MAXCARS][64]={{0}};
     int ntraffic_names=0, nracer_names=0;
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
     for(int i=0;i<ncars;i++) {
         char path[1024];
         snprintf(path,sizeof path,"%s/CARS/%s/TEXTURES.BIN",dataroot,carlist[i]);
@@ -17857,13 +17902,13 @@ int main(int argc, char **argv) {
     char circlist[MAXCIRC][256]; int selcirc = 0;
     int ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
     AiRoadNet roam_roads={0};
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
     /* (the old own-code free-roam traffic: replaced by the retail traffic,
        rt_roam_start; its road net and models are no longer loaded) */
     CarSwitchCandidate traffic[N_ROAM_VISUALS]={0};
     GpuMesh traffic_wheelmesh[N_ROAM_VISUALS]={0};
     int traffic_loaded=world2 && roam_roads.n;
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
     if(traffic_loaded) {
         load_traffic_visuals(dataroot,traffic_names,ntraffic_names,
                              traffic,traffic_wheelmesh,N_AI,"traffic");
@@ -17917,7 +17962,7 @@ int main(int argc, char **argv) {
     memcpy(traffic_world.eye,spawn,sizeof spawn);
     traffic_world.view[0]=cosf(heading0);
     traffic_world.view[1]=sinf(heading0);
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
     for(int k=0;k<N_OPENWORLD_AI;k++) {
         const CarSwitchCandidate *v=&traffic[ai_traffic_visual(k)];
         ais[k].half_length=v->gpu?0.5f*(v->bb[3]-v->bb[0]):2.2f;
@@ -18918,7 +18963,7 @@ int main(int argc, char **argv) {
         g_boot_full = NULL;
         if (g_boot_fe && !g_ls_fe) g_ls_fe = g_boot_fe;   /* kept: every later loading screen */
         else if (g_boot_fe) shop_close(&g_boot_fe);
-        g_boot_fe = NULL;
+        g_boot_fe = NULL; g_ls_drawn = 0;
         if (fe) shop_set_car(fe, carname, &carcfg, modification);
         else if (!nf) fe = shop_open(dataroot, carname, &carcfg, modification,
                                      wheel_brands[wheel_brand], wheel_style);
@@ -18953,7 +18998,7 @@ int main(int argc, char **argv) {
         } else printf("player HUD: initialisation failed; running without it\n");
     }
 
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);   /* coplanar re-draws (last write wins) pass cleanly */
     /* Stock showroom paint: metallic silver (the files carry no chosen
@@ -19158,7 +19203,7 @@ int main(int argc, char **argv) {
     WResidentJob *resident_job = NULL;
     unsigned resident_wait_frames = 0;
     long pf_frame = 0;
-    VMARK("setup reached main.c:%d", __LINE__);
+    BMARK("setup reached main.c:%d", __LINE__);
 #ifdef __vita__
     /* Physics advances a fixed 1/60 s per tick. Below 60 fps the Vita runs
        several ticks per frame (capped) so the game keeps real-time pace
@@ -20162,8 +20207,10 @@ int main(int argc, char **argv) {
             const char *nstem = !strncmp(next_track, "STREAM", 6) ? next_track + 6 : next_track;
             smk_load(troot, nstem);
             vita_mark("  switch: smokeables loaded (%u ms in)", SDL_GetTicks() - sw_t0);
+            ls_pump();   /* the loading screen keeps moving between the steps */
             if (wa_load(troot, nstem)) wa_start(g_rt.ev, g_rt_reverse);
             vita_mark("  switch: world anims loaded (%u ms in)", SDL_GetTicks() - sw_t0);
+            ls_pump();   /* the loading screen keeps moving between the steps */
             int sw_ok = 0;
             float sw_spawn[3] = {0, 0, 0}, sw_heading = 0.0f;
             {
@@ -20222,6 +20269,7 @@ int main(int argc, char **argv) {
                 snprintf(tp, sizeof tp, "%s/%s.BUN", troot, nstem);
                 g_wcoll = wcoll_load(sp, tp);
                 vita_mark("  switch: collision loaded (%u ms in)", SDL_GetTicks() - sw_t0);
+                ls_pump();   /* the loading screen keeps moving between the steps */
                 wcoll_ctx_init(&g_wcc);
                 g_acid_wc_on = 0;
                 wcoll_ctx_init(&g_ccam.wctx);
@@ -20303,18 +20351,22 @@ int main(int argc, char **argv) {
             world_fog_load(troot, trackname);
             rain_load_track(troot, trackname);
             vita_mark("  switch: fog + rain loaded (%u ms in)", SDL_GetTicks() - sw_t0);
+            ls_pump();   /* the loading screen keeps moving between the steps */
             ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
             selcirc = 0;
             if (ncirc) load_roaming_circuit(dataroot, circlist[0], &scene, &aipath, ais, carpos, &start_idx);
+            ls_pump();   /* the loading screen keeps moving between the steps */
             memcpy(traffic_world.eye, carpos, sizeof traffic_world.eye);
             traffic_world.view[0] = cosf(heading); traffic_world.view[1] = sinf(heading);
             nai = ai_traffic_spawn(&roam_roads, &traffic_world, ais, traffic_routes, carpos, heading);
             if (!ncirc) { free(aipath.xy); aipath.xy = NULL; aipath.n = 0; }
             vita_mark("  switch: circuit + traffic spawn (%u ms in)", SDL_GetTicks() - sw_t0);
+            ls_pump();   /* the loading screen keeps moving between the steps */
             nsprint = selsprint = 0;
             for (int i = 0; i < world.city.nev && nsprint < WORLD_MAXEVENT; i++)
                 if (!strcmp(world.city.ev[i].reg, nstem)) sprintev[nsprint++] = i;
             venue_list_build(troot, nstem);
+            ls_pump();   /* the loading screen keeps moving between the steps */
             nsd = world_scripted_defs(&world, troot, sdefs, 256);
             /* back to driving; a venue's event starts once the car is down */
             race_state = 1; garage_race = -1;
@@ -29546,7 +29598,8 @@ int main(int argc, char **argv) {
                     glClear(GL_COLOR_BUFFER_BIT);
                     shop_update(g_ls_fe, dt < 0.0f ? 0.0f : dt > 0.1f ? 0.1f : dt);
                     shop_draw(g_ls_fe, &rp, &quad, W, H);
-                } else g_restart_ls = 0;
+                    ls_drew("main loop"); g_ls_frame = 1;
+                } else { g_restart_ls = 0; g_ls_drawn = 0; }
             }
             {   /* the EA Trax chyron, under the menus */
                 static Uint32 cy_last;
@@ -30502,6 +30555,8 @@ int main(int argc, char **argv) {
         {   Uint64 sw0 = SDL_GetPerformanceCounter();
             static Uint64 swap_end;   /* last frame's swap return: busy = to this swap's start */
             if (swap_end) g_vita_busy_us = (unsigned)((sw0 - swap_end) * 1000000u / SDL_GetPerformanceFrequency());
+            if (!g_ls_frame && g_ls_drawn) { ls_gap("the first game frame"); g_ls_drawn = 0; }   /* a world / menu frame is up: no loading screen to keep moving */
+            g_ls_frame = 0;
             SDL_GL_SwapWindow(win);
             swap_end = SDL_GetPerformanceCounter();
             g_vd_swap_us += (unsigned)((swap_end - sw0) * 1000000u / SDL_GetPerformanceFrequency()); }

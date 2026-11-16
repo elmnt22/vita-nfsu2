@@ -301,6 +301,7 @@ static void solids_load(const char *stream_path)
                 int before = found;
                 found = solids_scan(f, so, ss, found);
                 secs += found > before;
+                LOAD_PUMP();   /* a section read: the loading screen keeps moving */
             }
         q += 8 + (long)sz;
     }

@@ -9,6 +9,7 @@
 #include "vinyl.h"
 #include "n2sim.h"
 #include "profile.h"
+#include "resource.h"   /* LOAD_PUMP */
 #include "savenote.h"
 #include "pcsave.h"
 #include "career.h"
@@ -1740,6 +1741,7 @@ static int load_cache(Shop *s) {
             free(s->pk[i]); s->pk[i] = NULL;
         }
         if (s->pk[i]) help_bar_lift(s->pk[i]);
+        LOAD_PUMP();
     }
     free(bun);
     unsigned char c[12];
@@ -1759,6 +1761,7 @@ static int load_cache(Shop *s) {
         ShopTex *t = &s->tex[s->ntex++];
         t->key = key; t->w = w; t->h = h; t->additive = bl == 6;
         t->tex = upload_rgba(w, h, px);
+        LOAD_PUMP();   /* 348 of them through stdio: 11 s behind the boot screen on the Vita (play1116b) */
     }
     free(px);
     fclose(f);
@@ -2019,11 +2022,15 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
             return NULL;
         }
     }
+    LOAD_PUMP();
     load_strings(s);
+    LOAD_PUMP();
     load_fonts(s);
+    LOAD_PUMP();
     for (int p = 0; p < PK_COUNT; p++) feng_apply_labels(s->pk[p], s->str_hash, s->str_txt, s->nstr, 0);   /* FEString labels */
-    for (int p = 0; p < PK_COUNT; p++) prepare_package(s, p);
+    for (int p = 0; p < PK_COUNT; p++) { prepare_package(s, p); LOAD_PUMP(); }
     load_db(s);
+    LOAD_PUMP();
     if (s->db) vinyl_db_load(s->db, s->dblen);
     /* glyph / sprite quad batch */
     {
