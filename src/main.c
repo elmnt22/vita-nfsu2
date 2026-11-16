@@ -16047,6 +16047,9 @@ int main(int argc, char **argv) {
                 extern void vita_progress_screen_done(void); vita_progress_screen_done();
                 if (g_boot_fe) shop_loading_text(g_boot_fe, NULL, NULL);   /* back to "LOADING" */
             }
+            /* an older release's tile sets (another WTILE_VERSION) off the
+               card once this version's are complete (lowest-priority thread) */
+            world_tiles_drop_old_versions();
             /* tile caches from before the packs: each track's files into one
                (a file open costs ~100-270 ms on the card), once, here with
                the card to itself */

@@ -2125,6 +2125,55 @@ void world_tiles_migrate_start(void) {
 #endif
 }
 
+/* Tile sets of older versions (an update raised WTILE_VERSION; v0.1.0 wrote
+   v5): once this version's index for a track is on the card -- its
+   conversion completed -- that track's older .idx / .pak / .pak.tmp are dead
+   weight (~50-65 MB for the city). Kept until then: a reconversion reads the
+   old index to skip the open sea (wt_mark_from_old_index). */
+static void wt_drop_old_run(void) {
+    DIR *d = opendir(WTILE_DIR);
+    if (!d) return;
+    static char names[64][96]; int nn = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) && nn < 64) {
+        const char *s = de->d_name, *u = strrchr(s, '_');
+        int v = 0; char ext[16] = "";
+        if (!u || (size_t)(u - s) >= 64 || strlen(s) >= sizeof names[0]) continue;
+        if (sscanf(u, "_v%d.%15s", &v, ext) != 2 || v <= 0 || v >= WTILE_VERSION) continue;
+        if (strcmp(ext, "idx") && strcmp(ext, "pak") && strcmp(ext, "pak.tmp")) continue;
+        snprintf(names[nn++], sizeof names[0], "%s", s);
+    }
+    closedir(d);
+    int del = 0;
+    for (int i = 0; i < nn; i++) {
+        char track[64], cur[256], p[256];
+        const char *u = strrchr(names[i], '_');
+        snprintf(track, sizeof track, "%.*s", (int)(u - names[i]), names[i]);
+        wt_index_path(cur, sizeof cur, track);
+        FILE *f = fopen(cur, "rb");
+        if (!f) continue;                   /* this version not complete yet: keep the old set */
+        fclose(f);
+        snprintf(p, sizeof p, "%s/%s", WTILE_DIR, names[i]);
+        if (wt_remove(p)) { del++; printf("tiles: removed %s (older tile version)\n", names[i]); }
+    }
+    if (del) printf("tiles: %d file(s) of older tile versions removed\n", del);
+}
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
+static int wt_drop_old_thread(void *arg) {
+    (void)arg;
+    sceKernelChangeThreadPriority(SCE_KERNEL_THREAD_ID_SELF, 191);   /* the lowest user priority */
+    wt_drop_old_run();
+    return sceKernelExitDeleteThread(0);
+}
+#endif
+void world_tiles_drop_old_versions(void) {
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
+    if (!SDL_CreateThread(wt_drop_old_thread, "tile-old", NULL)) wt_drop_old_run();
+#else
+    wt_drop_old_run();
+#endif
+}
+
 /* The assembler's tile: take a prepared one when it is there (or being
    prepared), else read and decode now (ground only unless `full`). Marks
    the entry owned. A prepared tile may be ground only; the caller upgrades. */

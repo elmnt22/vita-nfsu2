@@ -70,6 +70,7 @@ void world_tiles_preload(const char *track, float x, float y);
    streams, then deletes the loose files. Once per run; the first successful
    assembly starts it, calling it earlier is harmless. */
 void world_tiles_migrate_start(void);
+void world_tiles_drop_old_versions(void);   /* older WTILE_VERSION sets, once the current one is complete */
 /* Boot: pack every track's loose tile files on the calling thread, progress
  * in p (cells = tiles copied + files removed); needed = any loose file left;
  * track = the one being packed now (for the screen). */
