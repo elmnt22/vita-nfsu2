@@ -19251,6 +19251,7 @@ int main(int argc, char **argv) {
 #endif
         pf_mark(PF_FRAME_TOP);
 #ifdef __vita__
+        { extern void vita_step(const char *label); vita_step("frame"); }   /* the hang recorder's frame tick */
         vita_wd_armed = RT_RACE && race_state == 0 && !race_place_pending && !race_start_pending
                         && g_rt.t > 1.0f;
         int vita_ticks = 1;

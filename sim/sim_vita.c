@@ -271,6 +271,7 @@ void vita_mark(const char *fmt, ...) {
     if (g_boot) { fprintf(g_boot, "[%7.2fs] %s\n", t, line); fflush(g_boot); }
 }
 void vita_crumb(const char *fmt, ...) { (void)fmt; }
+void vita_step(const char *label) { (void)label; }
 volatile int vita_wd_armed, vita_wd_sec;   /* the race-hang watchdog (Vita only) */
 volatile int vita_wd_load;                 /* ... and its boot world load arming */
 volatile unsigned vita_wd_beat;

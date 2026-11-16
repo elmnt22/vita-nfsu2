@@ -532,8 +532,43 @@ volatile int vita_wd_load;
    HW is ~20 s (a free-roam start), so 90 s is only ever a real hang -- the
    game then ends with a crumb + core dump instead of freezing for good. */
 #define WD_IDLE_SECONDS 90
+/* Hang recorder (GitHub #17, 11-16: a race froze with nothing in the
+   crumbs -- the player closed the game before the 15 s fault, and the logs
+   stop at a normal frame). The main thread's hitch_mark labels go into a
+   ring here (no I/O, repeats folded); the watchdog writes the ring to
+   crumbs.txt once the loop has gone WD_STALL_SECONDS without a beat, long
+   before it faults, so a player who quits a frozen game still leaves the
+   place it stopped behind (crumbs_prev.txt after a relaunch). */
+#define STEP_RING 64
+typedef struct { const char *label; unsigned ms, n; int sec; } VitaStep;
+static VitaStep g_step[STEP_RING];
+static volatile unsigned g_step_i;
+void vita_step(const char *label) {
+    unsigned i = g_step_i, ms = (unsigned)(sceKernelGetProcessTimeWide() / 1000u);
+    VitaStep *p = i ? &g_step[(i - 1) % STEP_RING] : NULL;
+    if (p && p->label == label) { p->ms = ms; p->n++; p->sec = vita_wd_sec; return; }
+    VitaStep *q = &g_step[i % STEP_RING];
+    q->label = label; q->ms = ms; q->n = 1; q->sec = vita_wd_sec;
+    __sync_synchronize();
+    g_step_i = i + 1;
+}
+static void step_dump(void) {
+    unsigned end = g_step_i, n = end < STEP_RING ? end : STEP_RING;
+    char line[2048]; int len = 0;
+    for (unsigned k = end - n; k != end; k++) {
+        const VitaStep *s = &g_step[k % STEP_RING];
+        len += snprintf(line + len, sizeof line - (size_t)len, " %s@%u.%03u%s", s->label ? s->label : "?",
+                        s->ms / 1000u, s->ms % 1000u, s->n > 1 ? "+" : "");
+        if (len > (int)sizeof line - 96 || k + 1 == end) {
+            vita_crumb("  steps:%s", line);
+            len = 0;
+        }
+    }
+}
+#define WD_STALL_SECONDS 6
 static int wd_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
+    int stall_told = 0;
     unsigned last = vita_wd_beat;
     int last_load = vita_wd_load;
     Uint64 since = sceKernelGetProcessTimeWide(), prev = since;
@@ -550,7 +585,19 @@ static int wd_thread(SceSize args, void *argp) {
            (standby / PS button): the main loop gets its time to beat again */
         int resumed = now - prev > 5000000u;
         prev = now;
-        if (b != last || load != last_load || resumed || b == 0) { last = b; last_load = load; since = now; continue; }
+        if (b != last || load != last_load || resumed || b == 0) {
+            if (stall_told) vita_crumb("stall over after %u s (beat %u)", (unsigned)((now - since) / 1000000u), b);
+            stall_told = 0;
+            last = b; last_load = load; since = now; continue;
+        }
+        if (!stall_told && now - since >= (Uint64)WD_STALL_SECONDS * 1000000u) {
+            stall_told = 1;
+            vita_crumb("STALL: no main-loop beat for %u s after perf mark %d (beat %u, %s); last main-thread steps (s since boot, + = repeated):",
+                       WD_STALL_SECONDS, vita_wd_sec, b,
+                       load ? "boot world load" : armed ? "in a race" : "outside a race");
+            step_dump();
+            vita_log_flush();
+        }
         unsigned lim = load ? WD_LOAD_SECONDS : armed ? WD_SECONDS : WD_IDLE_SECONDS;
         if (now - since < (Uint64)lim * 1000000u) continue;
         vita_crumb("WATCHDOG: main loop stuck %u s after perf mark %d (beat %u, %s) -- "
@@ -564,7 +611,9 @@ static int wd_thread(SceSize args, void *argp) {
     }
 }
 static void wd_start(void) {
-    SceUID uid = sceKernelCreateThread("watchdog", wd_thread, 0x10000100, 0x4000, 0,
+    /* priority 90: above the parallel-for workers (120) and every worker
+       thread (160), so busy cores can never keep it from reporting */
+    SceUID uid = sceKernelCreateThread("watchdog", wd_thread, 90, 0x4000, 0,
                                  SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);   /* off core 0 */
     if (uid >= 0) sceKernelStartThread(uid, 0, NULL);
     vita_mark("race watchdog thread: 0x%08X (%d s)", (unsigned)uid, WD_SECONDS);
