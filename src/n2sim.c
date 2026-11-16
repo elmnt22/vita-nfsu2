@@ -7,6 +7,7 @@
 #include "n2sim.h"
 #include "wcoll.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -2328,6 +2329,7 @@ static void tm_enter(N2Sim *s)                                           /* 0x40
     s->tm_head = (float)(unsigned short)(int)lrintf(atan2f(b->R[1], b->R[0]) * RAD2U16) * U16RAD;   /* car +0x40c */
     s->tm_v = s->cs_speed;                             /* car +0x430 */
     s->tm_s540 = s->tm_v;
+    s->cs_head = (unsigned short)(int)lrintf(s->tm_head * RAD2U16);   /* (port) see n2sim_reset */
 }
 static void tm_frame(N2Sim *s, float dt)                                 /* 0x408820 */
 {
@@ -2802,12 +2804,17 @@ void n2sim_set_mover(N2Sim *s, int mover)                               /* 0x5f4
 {
     if (mover != N2_MOVER_MELLO && mover != N2_MOVER_TRAFFIC && mover != N2_MOVER_NIS && mover != N2_MOVER_FAR) mover = N2_MOVER_PHYSICS;
     if (mover == s->mover) return;
+    float dg_w0 = len3(s->b.w); int dg_m0 = s->mover;   /* 11-15 diag */
     s->mover = mover;
     if (mover == N2_MOVER_MELLO) mello_enter(s);
     else if (mover == N2_MOVER_NIS) nis_enter(s);
     else if (mover == N2_MOVER_TRAFFIC) tm_enter(s);
     else if (mover == N2_MOVER_FAR) far_enter(s);
     else physics_enter(s);
+    {   static int dg_n; float w1 = len3(s->b.w);
+        if ((w1 > 3.0f || dg_w0 > 3.0f) && dg_n < 300) { dg_n++;
+            printf("mover switch %d -> %d: |w| %.2f -> %.2f w (%.2f %.2f %.2f) k160 %.3f yawI %d\n", dg_m0, mover, dg_w0, w1,
+                   s->b.w[0], s->b.w[1], s->b.w[2], PF(0x160), s->b.yawI_on); } }
 }
 int n2sim_mover(const N2Sim *s) { return s->mover; }
 /* 0x402590's shift band: the full simulation's down-shift point (0x5946e0)
@@ -3280,6 +3287,12 @@ void n2sim_reset(N2Sim *s, const float pos[3], float heading)
     memset(b->p, 0, 16); memset(b->L, 0, 16); memset(b->v, 0, 12); memset(b->w, 0, 12);
     memset(b->F, 0, 12); memset(b->T, 0, 12);
     b->settle = 0;
+    /* (port) the car state heading follows the new pose: the movers that
+       derive their yaw rate from it (traffic 0x408820, far route) otherwise
+       read the old place's heading -- a placed traffic car got up to pi/dt
+       (~188 rad/s) of yaw, kept on the switch to the Mellovator near the
+       player, and spun itself into the sky (11-15 play test, hwlog72) */
+    s->cs_head = (unsigned short)(int)lrintf(atan2f(b->R[1], b->R[0]) * RAD2U16);
     s->steer_u16 = 0; s->sliding = 0;
     avg_init(&s->st_in, 0.55f); avg_init(&s->st_flick, 0.15f);    /* 0x405c60 */
     s->st_max = 45.0f; s->st_prev = 0; s->hbtimer = 0; s->rflag = 0; s->hit_time = 0;

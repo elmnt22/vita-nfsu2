@@ -24805,6 +24805,13 @@ int main(int argc, char **argv) {
                The unlocked mode alternates the road and a cube face. */
             extern int vita_lock30;
             int refl_every = vita_lock30 > 0 && full_detail();
+            /* 11-15 user play test: the road updated every second frame showed
+               (cars hid it). Without Full detail the road now updates every
+               frame with a smaller set -- 40 solid + 30 blended batches within
+               90 m instead of 80 + 60 within 130 m -- and only the car's env
+               face alternates (on refl_tick). */
+            int rlite = !refl_every;
+            float rreach = rlite ? 90.0f : 130.0f;
             /* a catch-up frame (3 sim ticks after an overrun, hwlog25: the
                opponents' tick ~3.5 ms each) reuses the last reflection and
                env face, so it fits instead of overrunning again */
@@ -24816,7 +24823,7 @@ int main(int argc, char **argv) {
                     cu_n = cu_frames = 0;
                 }
             }
-            if (refl_wanted && !(catchup && refl_valid) && ((refl_tick++ & 1) == 0 || refl_every)) {
+            if (refl_wanted && !(catchup && refl_valid) && ((refl_tick++ & 1) == 0 || refl_every || rlite)) {
                 float fc[3] = { g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b };
                 if (render_refl_begin(240, 136, fc)) {
                     float h = carpos[2];
@@ -24853,7 +24860,7 @@ int main(int argc, char **argv) {
                     glUniform1f(rp.uVColor, g_dbg.vcolor);
                     float rplanes[6][4]; world_view_planes(MVPr, rplanes);
                     GLuint rlast = (GLuint)-1; int rdraws = 0;
-                    for (int q = 0; q < ncand && rdraws < 80; q++) {
+                    for (int q = 0; q < ncand && rdraws < (rlite ? 40 : 80); q++) {
                         const N2Batch *b = &wbatch[NEAR_K(q)];
                         if (b->unresolved || b->drawmode != N2_DRAW_OPAQUE || b->reflect) continue;
                         if (b->bbox_max[2] < h + 1.5f || b->bbox_max[2] - b->bbox_min[2] < 1.0f)
@@ -24862,7 +24869,7 @@ int main(int argc, char **argv) {
                                  : view_cam[0] > b->bbox_max[0] ? view_cam[0]-b->bbox_max[0] : 0.0f;
                         float dy = view_cam[1] < b->bbox_min[1] ? b->bbox_min[1]-view_cam[1]
                                  : view_cam[1] > b->bbox_max[1] ? view_cam[1]-b->bbox_max[1] : 0.0f;
-                        if (dx*dx + dy*dy > 130.0f * 130.0f) continue;
+                        if (dx*dx + dy*dy > rreach * rreach) continue;
                         if (!world_box_in_view(rplanes, b->bbox_min, b->bbox_max)) continue;
                         if (b->tex != rlast) {
                             if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
@@ -24877,7 +24884,7 @@ int main(int argc, char **argv) {
                         glUniform1f(rp.uTextureAlpha, 1.0f);
                         int lastm = -1, rblend = 0;
                         for (int pass = 0; pass < 2; pass++)
-                            for (int q = 0; q < ncand && rblend < 60; q++) {
+                            for (int q = 0; q < ncand && rblend < (rlite ? 30 : 60); q++) {
                                 const N2Batch *b = &wbatch[NEAR_K(q)];
                                 int want = pass == 0 ? N2_DRAW_BLEND : N2_DRAW_ADD;
                                 if (b->unresolved || b->drawmode != want || !b->tex) continue;
@@ -24886,7 +24893,7 @@ int main(int argc, char **argv) {
                                          : view_cam[0] > b->bbox_max[0] ? view_cam[0]-b->bbox_max[0] : 0.0f;
                                 float dy = view_cam[1] < b->bbox_min[1] ? b->bbox_min[1]-view_cam[1]
                                          : view_cam[1] > b->bbox_max[1] ? view_cam[1]-b->bbox_max[1] : 0.0f;
-                                if (dx*dx + dy*dy > 130.0f * 130.0f) continue;
+                                if (dx*dx + dy*dy > rreach * rreach) continue;
                                 if (!world_box_in_view(rplanes, b->bbox_min, b->bbox_max)) continue;
                                 if (b->drawmode != lastm) {
                                     glBlendFunc(GL_SRC_ALPHA, b->drawmode == N2_DRAW_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
