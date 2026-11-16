@@ -3638,6 +3638,13 @@ void n2sim_nis_target(N2Sim *s, float x, float y, unsigned short heading, int co
            track set (the port's reset re-enters the mover) */
         float fs = s->nis_fspin, sa = s->nis_spinadd, tq0 = s->nis_tq[0], tq1 = s->nis_tq[1];
         n2sim_reset(s, gp, h);
+        /* (port) the mover steers the body's position (the centre of mass)
+           onto its target; the reset stands the car's origin there, the
+           centre of mass ~0.27 m ahead. The next tick read that as a 0.27 m
+           error over 1/60 s: -16 m/s, kept when the scene hands the cars
+           over on the next tick -- a skipped pre-race scene sent the grid
+           backwards (user report 11-16; sim: every car f -12..-17 m/s) */
+        b->pos[0] = x; b->pos[1] = y;
         if (s->mover == N2_MOVER_NIS) {
             s->nis_fspin = fs; s->nis_spinadd = sa; s->nis_tq[0] = tq0; s->nis_tq[1] = tq1;
             s->nis_head = hdeg;

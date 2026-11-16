@@ -5318,6 +5318,7 @@ static struct {
         HudStyle hud;
     } sty;
 } g_rt;
+static int g_rt_watch;   /* race ticks of per-car state logged after a scene skip */
 /* the player's car and race for the jump cams (jumpcam.c) */
 static const AiRacer *jc_fp(void) { return g_rt.human ? g_rt.human : g_rt.pdrag ? g_rt.pdrag : g_rt.pdrv; }
 static void jc_fill(JcCar *c, JcEnv *e)
@@ -7259,6 +7260,9 @@ static void rt_nis_handoff(void)
     airacer_free(g_rt.human);           /* made again on the next tick (0x42caa0) */
     g_rt.human = NULL;
     printf("pre-race scene: hand-off at %.2f s\n", nis_time(g_rt.nis));
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_RACEWATCH") && !g_rt_watch) g_rt_watch = 1200;   /* test aid: the same log without a skip */
+#endif
 }
 /* SCREEN_FLASH: 0x5d7a60, the flash curve 0x800e54 (white, 0x800e6c..) */
 static void flash_cb(void)
@@ -7448,10 +7452,18 @@ static void rt_nis_frame(int racing)
 {
     if (!g_rt.nis || g_rt.post_done) return;
     int r;
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_SIM_NISSKIP=<s> skips the pre-race scene at that scene time */
+        static float at = -2.0f;
+        if (at < -1.0f) { const char *e = getenv("OPENUG2_SIM_NISSKIP"); at = e ? (float)atof(e) : -1.0f; }
+        if (at >= 0.0f && !g_rt.nis_skip && g_rt.nis_on && nis_time(g_rt.nis) >= at) { g_rt.nis_skip = 1; at = -1.0f; }
+    }
+#endif
     if (g_rt.nis_skip) {                /* 0x603bc0 message 6 -> 0x43b460 */
         g_rt.nis_skip = 0;
+        printf("pre-race scene: skipped to the countdown at %.2f s\n", nis_time(g_rt.nis));
         r = nis_skip(g_rt.nis, g_rt.ncar);
-        printf("pre-race scene: skipped to the countdown\n");
+        g_rt_watch = 1200;
     } else r = nis_tick(g_rt.nis, 1.0f / 60.0f, g_rt.ncar);
     rt_nis_events();                    /* the event track ran in the tick (0x4395f0) */
     if (r & NIS_TICK_HANDOFF) rt_nis_handoff();
@@ -11965,6 +11977,23 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
     RT_FCRUMB("tick %d: steps (%d)", g_rt.ticks, steps.n);
     rt_step_batch(&steps);
     hitch_mark("rt.steps");
+    if (g_rt_watch > 0) {   /* after a pre-race scene skip: every car's state (rt_nis_frame sets it) */
+        static float lz[1 + AIRACE_MAX];
+        int t = 1200 - g_rt_watch--, row = t < 3 || !(t % 120);   /* the hand-off, then every 2 s; odd states at most every 10 ticks */
+        char line[900]; int o = snprintf(line, sizeof line, "watch t%4d:", t), odd = 0;
+        for (int k = -1; k < g_rt.n && k < AIRACE_MAX && o < (int)sizeof line - 80; k++) {
+            N2Sim *cs = k < 0 ? g_n2 : g_rt.car[k].s;
+            if (!cs) continue;
+            N2Body bd; n2sim_body(cs, &bd);
+            float fwd = bd.R[0] * bd.v[0] + bd.R[1] * bd.v[1] + bd.R[2] * bd.v[2];
+            float dz = t ? bd.pos[2] - lz[k + 1] : 0.0f; lz[k + 1] = bd.pos[2];
+            int bad = bd.v[2] < -4.0f || bd.v[2] > 4.0f || fwd < -3.0f || dz < -1.0f || dz > 1.0f;
+            odd |= bad;
+            o += snprintf(line + o, sizeof line - o, " %s%s(%.0f,%.0f,%.1f) f%+.1f vz%+.1f m%d w%d", bad ? "!" : "",
+                          k < 0 ? "P" : "o", bd.pos[0], bd.pos[1], bd.pos[2], fwd, bd.v[2], n2sim_mover(cs), bd.wheels_down);
+        }
+        if (row || (odd && !(t % 10))) printf("%s\n", line);
+    }
     RT_FCRUMB("tick %d: contacts", g_rt.ticks);
     int usew = g_wcoll && wcoll_pack_count(g_wcoll) > 0;
     CarCollCar cs[CARCOLL_MAXCARS];
