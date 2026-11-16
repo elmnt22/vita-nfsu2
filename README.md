@@ -240,6 +240,7 @@ game starts. A small menu opens before the game loads:
 | **Frame rate** | **30 FPS** (default, locked and even) or **Unlocked** (up to 60, varies; experimental). |
 | **Fast travel** | Off by default. On: on the World Map, choosing **No** on the GPS prompt takes you straight to that place (`fasttravel.txt`). |
 | **Trophies** | Off by default. On: trophies are reported to the system (`trophies.txt`; needs the NoTrpDrm plugin). Off, progress is still saved in your profile and is reported when you turn them on. |
+| **Full detail** | Off by default: the lighter mix for a steady 30 FPS downtown (road reflection redrawn every second frame, fewer traffic cars, half the particle rate). On: the original rates (`fulldetail.txt`). |
 | **Reset caches** | Deletes `ux0:data/NFSU2/cache`: the converted world data, shaders and shop lists. Your profiles and options are kept. On the next boot the game converts the world again, or you can send it again from the Prep Tool. |
 
 **Start Game** (or START) saves the settings and restarts the game.
