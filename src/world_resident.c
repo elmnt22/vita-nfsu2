@@ -1043,19 +1043,29 @@ int world_resident_finish_step(WorldResident *candidate, float x, float y, float
     if (!candidate || max_batches <= 0) return -1;
     if (!candidate->resources.mesh_count) {
         Uint64 begin = SDL_GetPerformanceCounter();
-        if (!world_resident_validate_cpu(candidate, x, y, z)) return -1;
+        if (!world_resident_validate_cpu(candidate, x, y, z)) {
+            /* play1116: two builds failed with no reason logged */
+            printf("resident finish failed: CPU validate (car %.1f %.1f %.1f, centre %.0f %.0f r %.0f)\n",
+                   x, y, z, candidate->center[0], candidate->center[1], candidate->radius);
+            return -1;
+        }
         if (timing) timing->validate_ms = (uint32_t)(
             (SDL_GetPerformanceCounter() - begin) * 1000 / SDL_GetPerformanceFrequency());
     }
     hitch_mark("fin.validate");
     int status = resident_resources_step(&candidate->resources, &candidate->world,
                                          max_batches, !candidate->omit_vista, timing);
+    if (status < 0) printf("resident finish failed: resources step (upload / room) in the area at %.0f %.0f\n",
+                           candidate->center[0], candidate->center[1]);
     if (status > 0) {
         WGroundHit hit;
         if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
             world_ground_hit_grid(&candidate->world.grid, &candidate->world.scene,
-                                  x, y, z, &hit) == WSURF_NONE)
+                                  x, y, z, &hit) == WSURF_NONE) {
+            printf("resident finish failed: no ground under the car (%.1f %.1f %.1f) in the area at %.0f %.0f\n",
+                   x, y, z, candidate->center[0], candidate->center[1]);
             return -1;
+        }
         hitch_mark("fin.ground_check");
         if (timing) timing->total_ms = timing->neighborhood_ms + timing->validate_ms +
                 timing->textures_ms + timing->batches_ms + timing->collision_ms;

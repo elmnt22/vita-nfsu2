@@ -1178,6 +1178,12 @@ static struct {
 static SDL_Thread *g_pre_thr;
 static volatile int g_pre_run;          /* the worker is running */
 static struct { int n, set; char root[512], bun[HUD_NPRE][64], pkg[HUD_NPRE][64]; } g_pre_want;
+/* screens built once on the worker only to fill the image cache (hic), then
+   dropped: their first open then skips the pack walk (play1116: the first
+   SMS mailbox / message open was ~0.8 s on the frame thread, 650 ms of it
+   the art). Same build as an open, nothing held but the capped cache. */
+#define HUD_NWARM 8
+static struct { volatile int st; int n; char root[512], bun[HUD_NWARM][64], pkg[HUD_NWARM][64]; } g_warm;   /* st: 0 none, 1 queued, 2 running */
 
 static int hud_pre_thread(void *u) {
     (void)u;
@@ -1198,6 +1204,21 @@ static int hud_pre_thread(void *u) {
         g_pre[i].h = h;
         __sync_synchronize();
         g_pre[i].st = PRE_DECODED;
+    }
+    if (__sync_bool_compare_and_swap(&g_warm.st, 1, 2)) {
+        Uint64 t0 = SDL_GetPerformanceCounter();
+        for (int k = 0; k < g_warm.n; k++) {
+            const char *from[1] = { g_warm.bun[k] };
+            Hud *h = hud_build(g_warm.root, from, 1, g_warm.pkg[k], 2, 0, 0.0f, 0.0f, 1);
+            hud_free(&h);                   /* deferred: no GL object was made */
+        }
+        while (__sync_lock_test_and_set(&g_hic_lock, 1)) {}
+        long kb = g_hic_bytes / 1024; int ne = g_hic_n;
+        __sync_lock_release(&g_hic_lock);
+        printf("player HUD: %d screens warmed on the worker in %.0f ms (image cache %d entries, %ld KB)\n", g_warm.n,
+               (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)SDL_GetPerformanceFrequency(), ne, kb);
+        __sync_synchronize();
+        g_warm.st = 0;
     }
     __sync_synchronize();
     g_pre_run = 0;
@@ -1257,9 +1278,28 @@ void hud_screen_prefetch(const char *dataroot, const char *const *bundle, const 
     g_pre_want.set = 1;
     hud_screen_prefetch_pump();         /* now, unless the worker is still busy */
 }
+void hud_screen_warm(const char *dataroot, const char *const *bundle, const char *const *package, int n) {
+    if (g_warm.st || n <= 0) return;
+    if (n > HUD_NWARM) n = HUD_NWARM;
+    snprintf(g_warm.root, sizeof g_warm.root, "%s", dataroot ? dataroot : ".");
+    for (int k = 0; k < n; k++) {
+        snprintf(g_warm.bun[k], sizeof g_warm.bun[k], "%s", bundle[k]);
+        snprintf(g_warm.pkg[k], sizeof g_warm.pkg[k], "%s", package[k]);
+    }
+    g_warm.n = n;
+    __sync_synchronize();
+    g_warm.st = 1;
+    hud_screen_prefetch_pump();
+}
 void hud_screen_prefetch_pump(void) {
     if (g_pre_thr && !g_pre_run) { SDL_WaitThread(g_pre_thr, NULL); g_pre_thr = NULL; }
     if (g_pre_want.set && !g_pre_thr) { g_pre_want.set = 0; hud_pre_apply(); }
+    if (g_warm.st == 1 && !g_pre_thr) {     /* a warm-only job: the same worker */
+        g_pre_run = 1;
+        __sync_synchronize();
+        g_pre_thr = SDL_CreateThread(hud_pre_thread, "hud-prefetch", NULL);
+        if (!g_pre_thr) { g_pre_run = 0; g_warm.st = 0; }
+    }
     /* one slot's images a frame, ~256 KB of pixels (an upload is a copy
        into GPU memory; the screens' art is mostly 64..256 px images) */
     for (int i = 0; i < HUD_NPRE; i++) {
@@ -1568,12 +1608,19 @@ int hud_screen_keys(Hud *h, const char *dataroot, const char *bundle, const uint
     char path[1024];
     snprintf(path, sizeof path, "%s/%s", dataroot ? dataroot : ".", bundle);
     FengImage img[16]; memset(img, 0, sizeof img);
-    if (feng_tpk_load_file(path, want, nw, img) < 0) {
-        long len = 0;
-        unsigned char *d = hud_read_bundle(path, &len);
-        if (!d) { printf("screen: %s missing\n", path); return 0; }
-        feng_tpk_load(d, len, want, nw, img);
-        free(d);
+    /* the image cache as the art (a key's search is this one bundle) */
+    uint32_t src = hic_src(bundle, 3, 0);
+    if (!hic_fill(src, want, nw, img)) {
+        for (int i = 0; i < nw; i++) feng_image_free(&img[i]);
+        memset(img, 0, sizeof img);
+        if (feng_tpk_load_file(path, want, nw, img) < 0) {
+            long len = 0;
+            unsigned char *d = hud_read_bundle(path, &len);
+            if (!d) { printf("screen: %s missing\n", path); return 0; }
+            feng_tpk_load(d, len, want, nw, img);
+            free(d);
+        }
+        hic_store(src, want, nw, img);
     }
     int got = 0;
     for (int i = 0; i < nw; i++) {

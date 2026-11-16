@@ -322,6 +322,9 @@ Hud *hud_init_screen(const char *dataroot, const char *bundle, const char *packa
  * not in the list are freed; n = 0 drops them all. GL thread only. */
 void hud_screen_prefetch(const char *dataroot, const char *const *bundle, const char *const *package, int n);
 void hud_screen_prefetch_pump(void);   /* GL thread, every frame */
+/* GL thread: build these screens once on the prefetch worker only to fill the
+   image cache, then drop them (their first open skips the pack walk) */
+void hud_screen_warm(const char *dataroot, const char *const *bundle, const char *const *package, int n);
 void hud_screen_text(Hud *h, const char *name, const char *text);
 void hud_screen_label(Hud *h, const char *name, uint32_t label);   /* 0x50c900 */
 void hud_screen_label_h(Hud *h, uint32_t obj, uint32_t label);     /* the object by its name hash */

@@ -14429,6 +14429,203 @@ static void sky_begin(void *ctx) {
     c->begun = 1;
 }
 
+/* An area build thrown away (obsolete target, wrong scenery, failed) goes the
+   way a swapped-out area does: its tile geometry to the release thread at
+   once, the rest (GL batches, textures) a slice a frame through the retire
+   slots. play1116: freeing it in one go on the frame thread was 14-26 ms,
+   7 of the free-roam spike frames (stream_tail / stream_policy). With both
+   slots taken it is freed now, its meshes already handed off. */
+/* PERF step 2 (11-16): the opaque world pass's per-batch visibility -- cell
+   cull, section list, distance gate, frustum, fade queue, the blend / add /
+   cutout deferral -- as one function, run on a worker core while the frame
+   thread draws the opaque batches it has published so far (they come out in
+   the same k order, so the draws, binds and deferred lists are what the
+   inline loop made). play1116: the loop was 2.6 ms/frame, half of it these
+   tests; the draws now overlap them. novisjob.txt / OPENUG2_NO_VISJOB =
+   inline (same function). */
+typedef struct {
+    const N2Batch *wb; int nbatch, pb0, pb1;
+    float cam[3], planes[6][4];
+    int cc_use, cc_verify; const int *cc_cell; const unsigned char *cc_vis;
+    int vl_use; const unsigned char *vl_cnt; const uint16_t (*vl_sec)[4]; const unsigned char *vl_bits;
+    int mapaudit; const float *band_lim; long *band_b, *band_m, (*band_sc)[8];
+    float gate0, sik, standin_gate, view_dist, fade_p;
+    int tall_on, dfade, probe2, defcap, fadecap;
+    /* out: opq[0..nopq) published as they are found, done = 1 at the end */
+    int *opq; volatile int nopq, done;
+    int *defcut, *defblend, *defadd, *fadeq; float *defdist, *fadea;
+    int ndefcut, ndefblend, ndefadd, nfadeq, nfade_dist;
+    int far_meshes, far_batches, far_scen[8];
+    long tall_res, tall_far, cc_skipped, cc_tested, cc_bad, vl_skipped, vl_wouldview;
+} WVisJob;
+#define WDFADE_FRAC 0.2f   /* distance fade band: the last 20% of a gate */
+static void wvis_classify(WVisJob *v) {
+    const float *cam = v->cam;
+    int nopq = 0;
+    for (int k = 0; k < v->nbatch; k++) {
+        if (v->pb0 >= 0 && (k < v->pb0 || k > v->pb1)) continue;   /* M79 */
+        const N2Batch *b = &v->wb[k];
+#ifdef __vita__
+        if (v->cc_use && !v->cc_vis[v->cc_cell[k]]) {
+            v->cc_skipped++;
+            if (v->cc_verify && world_box_in_view((const float (*)[4])v->planes, b->bbox_min, b->bbox_max)) v->cc_bad++;
+            continue;
+        }
+        v->cc_tested++;
+        if (v->vl_use && v->vl_cnt[k] != 0xff) {
+            int c = v->vl_cnt[k], seen = 0;
+            for (int j = 0; j < c && !seen; j++) {
+                /* the section, or its district's LOD sections (x98/x99): where
+                   retail would draw the LOD the port has full detail loaded */
+                unsigned sx = v->vl_sec[k][j], lod = sx / 100u * 100u + 98u;
+                seen = ((v->vl_bits[sx >> 3] >> (sx & 7)) & 1) || ((v->vl_bits[lod >> 3] >> (lod & 7)) & 1) ||
+                       ((v->vl_bits[(lod + 1) >> 3] >> ((lod + 1) & 7)) & 1);
+            }
+            if (!seen) {
+                v->vl_skipped++;
+#if defined(OPENUG2_SIM_PRE_H)
+                {   static int vv = -1; if (vv < 0) vv = getenv("OPENUG2_VISLIST_VERIFY") != NULL;
+                    if (vv && world_box_in_view((const float (*)[4])v->planes, b->bbox_min, b->bbox_max)) {
+                        v->vl_wouldview++;
+                        if (g_vl_dbg_n < 4096) g_vl_dbg[g_vl_dbg_n++] = k;
+                    } }
+#endif
+                continue;
+            }
+        }
+#endif
+        /* A batch whose meshes named a texture the resolver could not
+           supply has nothing to draw. Untextured it falls back to a flat
+           grey, and under night ambient that is a solid dark slab: it is
+           how every spotlight cone whose SFX_LIGHT_BEAMA decode was
+           rejected rendered -- the black wedges hanging off the buildings.
+           Skipping it also drops their fill cost. Terrain still gets the
+           baked grass fallback, and a batch that never named a texture
+           keeps the existing flat-colour treatment. */
+        if (b->unresolved) continue;
+        float dx = cam[0] < b->bbox_min[0] ? b->bbox_min[0]-cam[0]
+                 : (cam[0] > b->bbox_max[0] ? cam[0]-b->bbox_max[0] : 0);
+        float dy = cam[1] < b->bbox_min[1] ? b->bbox_min[1]-cam[1]
+                 : (cam[1] > b->bbox_max[1] ? cam[1]-b->bbox_max[1] : 0);
+        if (v->mapaudit) {   /* BAND census: printed only under --map-audit */
+          float dd = sqrtf(dx*dx+dy*dy); int bd = 0;
+          while (bd < 5 && dd >= v->band_lim[bd]) bd++;
+          v->band_b[bd]++; v->band_m[bd] += b->nmesh;
+          for (int sc=0;sc<8;sc++) v->band_sc[bd][sc] += b->scen_count[sc]; }
+#if defined(__vita__) && defined(OPENUG2_SIM_PRE_H)
+        {   /* test aid (simulator): batches in view by distance band, stand-ins apart (pop-in work) */
+            float dd2 = dx*dx + dy*dy;
+            if (world_box_in_view((const float (*)[4])v->planes,b->bbox_min,b->bbox_max)) {
+                int bd = dd2 < 300.0f*300.0f ? 0 : dd2 < 400.0f*400.0f ? 1 : dd2 < 500.0f*500.0f ? 2 : dd2 < 700.0f*700.0f ? 3 : 4;
+                g_simgate[b->tall ? 1 : 0][bd]++;
+            }
+        }
+#endif
+        /* the gate: stand-ins (N2Batch.tall = every far LOD stand-in) reach
+           WORLD_STANDIN_GATE, the rest the view distance */
+        float gate = v->gate0;
+        if (b->tall && v->tall_on) {
+            /* the skyline by height: a stand-in batch reaches SIK x its box
+               height, between the view distance and WORLD_STANDIN_GATE --
+               towers to 650 m, low blocks end with the rest (hwlog51: the
+               650 m gate for every stand-in doubled the missed frames) */
+            float g = v->sik * (b->bbox_max[2] - b->bbox_min[2]);
+            gate = g > v->standin_gate ? v->standin_gate : g > gate ? g : gate;
+        }
+        if (dx*dx + dy*dy > gate*gate) {
+            v->far_meshes += b->nmesh; v->far_batches++;
+            for (int sc=0;sc<8;sc++) v->far_scen[sc] += b->scen_count[sc];
+            continue;
+        }
+        if (b->fade_in == 2) {   /* a stand-in fading out over its tile's new full models (world_tiles.c) */
+        #ifdef __vita__
+            if (v->fade_p >= 1.0f || b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD || !v->probe2 ||
+                v->nfadeq >= v->fadecap) continue;
+        #else
+            continue;
+        #endif
+        }
+        #ifdef __vita__
+        if (!world_box_in_view((const float (*)[4])v->planes,b->bbox_min,b->bbox_max)) continue;
+        if (b->tall) { v->tall_res++; if (dx*dx + dy*dy > v->view_dist*v->view_dist) v->tall_far++; }
+        if (b->drawmode != N2_DRAW_BLEND && b->drawmode != N2_DRAW_ADD && v->probe2 &&
+            v->nfadeq < v->fadecap) {
+            /* Distance fade: the last WDFADE_FRAC of the gate fades out
+               (blended pass below) instead of a hard cut -- the retail
+               fog tops out at 40%, so a cut there showed 60% of the
+               building. Off while DOF writes alpha (fade_p pinned to 1). */
+            float a = 1.0f, fade_p = v->fade_p;
+            if (v->dfade) {
+                float band = gate * WDFADE_FRAC, d = sqrtf(dx*dx + dy*dy);
+                if (d > gate - band) { a = (gate - d) / band; a = a * a * (3.0f - 2.0f * a); }
+            }
+            if (b->fade_in == 2) a *= 1.0f - fade_p * fade_p * (3.0f - 2.0f * fade_p);   /* fading out */
+            else if (b->fade_in && fade_p < 1.0f) a *= fade_p * fade_p * (3.0f - 2.0f * fade_p);
+            if (a < 1.0f) { v->fadea[v->nfadeq] = a; v->fadeq[v->nfadeq++] = k; v->nfade_dist += !b->fade_in; continue; }
+        }
+        #endif
+        if (b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD) {
+            if (v->defcap > 0) {
+                if (b->drawmode == N2_DRAW_BLEND) {
+                    /* bbox-centre distance to camera, squared (only the
+                       ORDER matters, so skip the sqrt): documented choice
+                       for the back-to-front sort below -- true per-vertex
+                       depth would need a second batching pass, which no
+                       observed defect currently justifies. */
+                    float bx = 0.5f*(b->bbox_min[0]+b->bbox_max[0]);
+                    float by = 0.5f*(b->bbox_min[1]+b->bbox_max[1]);
+                    float bz = 0.5f*(b->bbox_min[2]+b->bbox_max[2]);
+                    float ddx = bx-cam[0], ddy = by-cam[1], ddz = bz-cam[2];
+                    v->defdist[k] = ddx*ddx + ddy*ddy + ddz*ddz;
+                    v->defblend[v->ndefblend++] = k;
+                } else {
+                    v->defadd[v->ndefadd++] = k;   /* additive: stable texture-sorted order */
+                }
+            }
+            continue;   /* drawn in the deferred pass below, not here */
+        }
+        /* Opaque first, then cutout: on the Vita's tile GPU a discarding
+           draw can't be hidden-surface removed, and opaque surfaces drawn
+           before it let the hardware reject its covered pixels. */
+        if (b->drawmode == N2_DRAW_CUTOUT && v->defcap > 0) {
+            v->defdist[k] = dx*dx + dy*dy;   /* nearest XY point of the box */
+            v->defcut[v->ndefcut++] = k; continue;
+        }
+        if (!v->probe2) continue;
+        v->opq[nopq++] = k;
+        if ((nopq & 15) == 0) { __sync_synchronize(); v->nopq = nopq; }
+    }
+    __sync_synchronize();
+    v->nopq = nopq;
+    __sync_synchronize();
+    v->done = 1;
+}
+static void wvis_job(int i, void *ctx) { (void)i; wvis_classify((WVisJob *)ctx); }
+
+static int g_hud_warmed;   /* free roam's screens warmed (hud_screen_warm) this load */
+/* the in-game screens free roam opens (SMS, engage dialogs, pause) into the
+   image cache on the prefetch worker, once per load */
+static void hud_warm_free_roam(const char *dataroot) {
+    static const char *const wb[] = { "GLOBAL/InGameCommon.bun", "GLOBAL/InGameCommon.bun",
+        "GLOBAL/InGameCommon.bun", "GLOBAL/InGameCommon.bun", "GLOBAL/InGameCommon.bun",
+        "GLOBAL/InGameCommon.bun", "GLOBAL/InGameCommon.bun" };
+    static const char *const wp[] = { "UI_EngageEventDialog.fng", "UI_EngageRaceDialog.fng",
+        "UI_EngageShopDialog.fng", "UI_SMS_Mailbox.fng", "UI_EngageMessageDialog.fng",
+        "UI_Pause.fng", "UI_InGameDialog.fng" };
+    if (g_hud_warmed) return;
+    g_hud_warmed = 1;
+    hud_screen_warm(dataroot, wb, wp, 7);
+}
+static void resident_discard(WorldResident *r, WorldResident **retired, WorldResident **waiting,
+                             unsigned *frames, unsigned *peak, unsigned *total)
+{
+    if (!r) return;
+    world_resident_release_meshes_async(r);
+    if (!*retired) { *retired = r; *frames = *peak = *total = 0; return; }
+    if (!*waiting) { *waiting = r; return; }
+    world_resident_free(r);
+}
+
 int main(int argc, char **argv) {
     world_region_hook = world_flares_hook;
     wcoll_cache_thread();   /* polygon cache for main-thread gathers */
@@ -19890,6 +20087,7 @@ int main(int argc, char **argv) {
                above while those caches still listed them */
             vita_mark("track switch: %s -> %s (event %d)", trackname, next_track, next_ev);
             vita_heap_report("switch: before");
+            g_hud_warmed = 0;
             /* --- the old track out --- */
             if (resident_job) {
                 world_resident_job_abort(resident_job);
@@ -20461,6 +20659,12 @@ int main(int argc, char **argv) {
                     career_speech_hook = career_speech_log;
                     g_restart_ls = loading_screen(dataroot) != NULL;
                     world_tiles_trim(0);
+                    /* the screens warmed behind the loading screen: the career's
+                       first SMS opens right at the spawn (play1116b: the in-game
+                       trigger waits for the spawn area, the first mailbox /
+                       message / pause opens still paid 1.1-1.8 s each) */
+                    g_hud_warmed = 0;
+                    hud_warm_free_roam(dataroot);
                     printf("career: free roam start (stage %d, owns a car %d, started %d, has spawn %d, start NIS %d)\n",
                            g_career.stage, g_career.b873d, g_career.started, g_career.has_spawn, sa.career_nis);
                 }
@@ -21561,7 +21765,7 @@ int main(int argc, char **argv) {
             candidate_resident->center[0] != target[0] ||
             candidate_resident->center[1] != target[1])) {
             printf("resident partial upload discarded: obsolete target\n");
-            world_resident_free(candidate_resident);
+            resident_discard(candidate_resident, &retired_resident, &retired_waiting, &retire_frames, &retire_peak_ms, &retire_total_ms);
             candidate_resident = NULL;
         }
         WorldResident *prepared = NULL;
@@ -21587,7 +21791,7 @@ int main(int argc, char **argv) {
         if (prepared_status > 0 && job_scenery_event != resident_args.scenery_event) {
             printf("resident CPU result discarded: built with scenery %d, want %d\n",
                    job_scenery_event, resident_args.scenery_event);
-            world_resident_free(prepared);
+            resident_discard(prepared, &retired_resident, &retired_waiting, &retire_frames, &retire_peak_ms, &retire_total_ms);
             prepared = NULL;
             prepared_status = 0;
         }
@@ -21595,7 +21799,7 @@ int main(int argc, char **argv) {
             prepared->center[0] != target[0] || prepared->center[1] != target[1])) {
             printf("resident CPU result discarded: obsolete target (%.0f,%.0f)\n",
                    prepared->center[0], prepared->center[1]);
-            world_resident_free(prepared);
+            resident_discard(prepared, &retired_resident, &retired_waiting, &retire_frames, &retire_peak_ms, &retire_total_ms);
             prepared = NULL;
             prepared_status = 0;
         }
@@ -21717,7 +21921,7 @@ int main(int argc, char **argv) {
 #endif
                 }
                 if (build_status < 0) {
-                    world_resident_free(candidate_resident);
+                    resident_discard(candidate_resident, &retired_resident, &retired_waiting, &retire_frames, &retire_peak_ms, &retire_total_ms);
                     candidate_resident = NULL;
                     failed_resident_cell[0] = target[0];
                     failed_resident_cell[1] = target[1];
@@ -21955,7 +22159,7 @@ int main(int argc, char **argv) {
             }
         }
         /* Includes a ready result whose cell has since been marked failed. */
-        world_resident_free(prepared);
+        resident_discard(prepared, &retired_resident, &retired_waiting, &retire_frames, &retire_peak_ms, &retire_total_ms);
         hitch_mark("stream_tail");
         pf_detail.stream += pf_elapsed(pf_stream);
         if (resident_route_pending) {
@@ -22997,6 +23201,15 @@ int main(int argc, char **argv) {
             if (rt_go && RT_RACE && g_rt.t >= 1.0f && !g_rt.post_pre && !g_rt.post_done) {
                 g_rt.post_pre = 1;
                 post_prefetch(dataroot);
+            }
+            /* free roam: the in-game screens it opens (SMS, engage dialogs,
+               pause) warmed into the image cache once per load, when no area
+               build is reading the card (play1116: a first SMS open ~0.8 s) */
+            {
+                if (world2 && race_state == 1 && !RT_RACE && g_ride_ready && !race_place_pending &&
+                    !resident_job && !candidate_resident && strstr(trackname, "L4RA") &&
+                    !g_hud_warmed)
+                    hud_warm_free_roam(dataroot);
             }
             hud_screen_prefetch_pump();
             if (g_career_mode && g_rt.roam && g_rt.active && race_state == 1 && !race_place_pending) {
@@ -25676,7 +25889,6 @@ int main(int argc, char **argv) {
            and cutout world, blended at that strength with depth writes on. */
         #define WFADE_MS 900u
         static int fadeq[2048]; static float fadea[2048]; int nfadeq = 0, nfade_dist = 0;
-        #define WDFADE_FRAC 0.2f   /* distance fade band: the last 20% of a gate */
         static int dfade_on = -1;   /* test aid: ux0:data/NFSU2/nodistfade.txt (or OPENUG2_NO_DFADE) = hard cut */
         if (dfade_on < 0) {
             FILE *df = fopen("ux0:data/NFSU2/nodistfade.txt", "r");
@@ -25978,163 +26190,97 @@ int main(int argc, char **argv) {
 #endif
         Uint64 oc1 = SDL_GetPerformanceCounter();
         g_wd_oc[0] += oc1 - oc0;
-        for (int k = 0; g_dbg.show_track && (passmode == 0 || passmode == 1) && k < nbatch; k++) {
-            if (passbatch >= 0 && (k < passbatch || k > passbatch2)) continue;   /* M79 */
-            N2Batch *b = &wbatch[k];
+        static long wv_frames, wv_async, wv_waited;   /* the visibility worker, logged with the cell cull */
+        if (g_dbg.show_track && (passmode == 0 || passmode == 1) && nbatch > 0) {
+            /* the per-batch tests (wvis_classify) on a worker core while the
+               opaque batches it has found so far are drawn here, in k order */
+            static WVisJob wv; static int *wv_opq, wv_cap, wv_on = -1;
+            if (wv_on < 0) {
+                FILE *f = fopen("ux0:data/NFSU2/novisjob.txt", "r");
+                wv_on = !f && !getenv("OPENUG2_NO_VISJOB");
+                if (f) fclose(f);
+                printf("world: opaque visibility %s\n", wv_on ? "on a worker core, drawn as found" : "inline (novisjob.txt)");
+            }
+            if (nbatch > wv_cap) {
+                int *n2 = (int *)realloc(wv_opq, (size_t)nbatch * sizeof *n2);
+                if (n2) { wv_opq = n2; wv_cap = nbatch; }
+                else fprintf(stderr, "world render: OOM growing the opaque list to %d batches\n", nbatch);
+            }
+            memset(&wv, 0, sizeof wv);
+            wv.wb = wbatch; wv.nbatch = wv_cap >= nbatch ? nbatch : 0;
+            wv.pb0 = passbatch; wv.pb1 = passbatch2;
+            memcpy(wv.cam, cam, sizeof wv.cam);
+            wv.mapaudit = mapaudit; wv.band_lim = BAND; wv.band_b = band_b; wv.band_m = band_m; wv.band_sc = band_sc;
+            wv.gate0 = VIEW_DIST + view_ext; wv.sik = standin_k(); wv.standin_gate = WORLD_STANDIN_GATE;
+            wv.view_dist = VIEW_DIST; wv.fade_p = 1.0f; wv.tall_on = tall_on; wv.probe2 = VITA_PROBE(2);
+            wv.defcap = defcap; wv.defcut = defcut; wv.defblend = defblend; wv.defadd = defadd; wv.defdist = defdist;
+            wv.opq = wv_opq;
 #ifdef __vita__
-            if (cc_use && !cc_vis[cc_cell[k]]) {
-                cc_skipped++;
-                if (cc_verify && world_box_in_view(world_planes, b->bbox_min, b->bbox_max)) cc_bad++;
-                continue;
-            }
-            cc_tested++;
-            if (vl_use && vl_cnt[k] != 0xff) {
-                int c = vl_cnt[k], seen = 0;
-                for (int j = 0; j < c && !seen; j++) {
-                    /* the section, or its district's LOD sections (x98/x99): where
-                       retail would draw the LOD the port has full detail loaded */
-                    unsigned sx = vl_sec[k][j], lod = sx / 100u * 100u + 98u;
-                    seen = ((vl_bits[sx >> 3] >> (sx & 7)) & 1) || ((vl_bits[lod >> 3] >> (lod & 7)) & 1) ||
-                           ((vl_bits[(lod + 1) >> 3] >> ((lod + 1) & 7)) & 1);
-                }
-                if (!seen) {
-                    vl_skipped++;
-#if defined(OPENUG2_SIM_PRE_H)
-                    {   static int vv = -1; if (vv < 0) vv = getenv("OPENUG2_VISLIST_VERIFY") != NULL;
-                        if (vv && world_box_in_view(world_planes, b->bbox_min, b->bbox_max)) {
-                            vl_wouldview++;
-                            if (g_vl_dbg_n < 4096) g_vl_dbg[g_vl_dbg_n++] = k;
-                        } }
+            memcpy(wv.planes, world_planes, sizeof wv.planes);
+            wv.cc_use = cc_use; wv.cc_verify = cc_verify; wv.cc_cell = cc_cell; wv.cc_vis = cc_vis;
+            wv.vl_use = vl_use; wv.vl_cnt = vl_cnt; wv.vl_sec = (const uint16_t (*)[4])vl_sec; wv.vl_bits = vl_bits;
+            wv.fade_p = fade_p; wv.dfade = dfade_on && !render_dof_writes();
+            wv.fadeq = fadeq; wv.fadea = fadea; wv.fadecap = (int)(sizeof fadeq / sizeof *fadeq);
+            int wv_go = wv_on && !vl_use && !mapaudit && passbatch < 0;
+            if (wv_go) { ai_async_join(); vita_parallel_async(1, wvis_job, &wv); }
+            else wvis_classify(&wv);
+#else
+            int wv_go = 0;
+            wvis_classify(&wv);
 #endif
-                    continue;
+            int wv_wait = 0;
+            for (int q = 0;;) {
+                int fin = wv.done;
+                __sync_synchronize();
+                int avail = wv.nopq;
+                if (q >= avail) {
+                    if (fin) break;
+                    wv_wait = 1;
+                    continue;                    /* the worker is ahead of nothing: wait for it */
                 }
-            }
-#endif
-            /* A batch whose meshes named a texture the resolver could not
-               supply has nothing to draw. Untextured it falls back to a flat
-               grey, and under night ambient that is a solid dark slab: it is
-               how every spotlight cone whose SFX_LIGHT_BEAMA decode was
-               rejected rendered -- the black wedges hanging off the buildings.
-               Skipping it also drops their fill cost. Terrain still gets the
-               baked grass fallback, and a batch that never named a texture
-               keeps the existing flat-colour treatment. */
-            if (b->unresolved) continue;
-            float dx = cam[0] < b->bbox_min[0] ? b->bbox_min[0]-cam[0]
-                     : (cam[0] > b->bbox_max[0] ? cam[0]-b->bbox_max[0] : 0);
-            float dy = cam[1] < b->bbox_min[1] ? b->bbox_min[1]-cam[1]
-                     : (cam[1] > b->bbox_max[1] ? cam[1]-b->bbox_max[1] : 0);
-            if (mapaudit) {   /* BAND census: printed only under --map-audit */
-              float dd = sqrtf(dx*dx+dy*dy); int bd = 0;
-              while (bd < 5 && dd >= BAND[bd]) bd++;
-              band_b[bd]++; band_m[bd] += b->nmesh;
-              for (int sc=0;sc<8;sc++) band_sc[bd][sc] += b->scen_count[sc]; }
-#if defined(__vita__) && defined(OPENUG2_SIM_PRE_H)
-            {   /* test aid (simulator): batches in view by distance band, stand-ins apart (pop-in work) */
-                float dd2 = dx*dx + dy*dy;
-                if (world_box_in_view(world_planes,b->bbox_min,b->bbox_max)) {
-                    int bd = dd2 < 300.0f*300.0f ? 0 : dd2 < 400.0f*400.0f ? 1 : dd2 < 500.0f*500.0f ? 2 : dd2 < 700.0f*700.0f ? 3 : 4;
-                    g_simgate[b->tall ? 1 : 0][bd]++;
-                }
-            }
-#endif
-            /* the gate: stand-ins (N2Batch.tall = every far LOD stand-in) reach
-               WORLD_STANDIN_GATE, the rest the view distance */
-            float gate = VIEW_DIST + view_ext;
-            if (b->tall && tall_on) {
-                /* the skyline by height: a stand-in batch reaches SIK x its box
-                   height, between the view distance and WORLD_STANDIN_GATE --
-                   towers to 650 m, low blocks end with the rest (hwlog51: the
-                   650 m gate for every stand-in doubled the missed frames) */
-                float g = standin_k() * (b->bbox_max[2] - b->bbox_min[2]);
-                gate = g > WORLD_STANDIN_GATE ? WORLD_STANDIN_GATE : g > gate ? g : gate;
-            }
-            if (dx*dx + dy*dy > gate*gate) {
-                far_meshes += b->nmesh; far_batches++;
-                for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
-                continue;
-            }
-            if (b->fade_in == 2) {   /* a stand-in fading out over its tile's new full models (world_tiles.c) */
-            #ifdef __vita__
-                if (fade_p >= 1.0f || b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD || !VITA_PROBE(2) ||
-                    nfadeq >= (int)(sizeof fadeq / sizeof *fadeq)) continue;
-            #else
-                continue;
-            #endif
-            }
-            #ifdef __vita__
-            if (!world_box_in_view(world_planes,b->bbox_min,b->bbox_max)) continue;
-            if (b->tall) { tall_res++; if (dx*dx + dy*dy > VIEW_DIST*VIEW_DIST) tall_far++; }
-            if (b->drawmode != N2_DRAW_BLEND && b->drawmode != N2_DRAW_ADD && VITA_PROBE(2) &&
-                nfadeq < (int)(sizeof fadeq / sizeof *fadeq)) {
-                /* Distance fade: the last WDFADE_FRAC of the gate fades out
-                   (blended pass below) instead of a hard cut -- the retail
-                   fog tops out at 40%, so a cut there showed 60% of the
-                   building. Off while DOF writes alpha (fade_p pinned to 1). */
-                float a = 1.0f;
-                if (dfade_on && !render_dof_writes()) {
-                    float band = gate * WDFADE_FRAC, d = sqrtf(dx*dx + dy*dy);
-                    if (d > gate - band) { a = (gate - d) / band; a = a * a * (3.0f - 2.0f * a); }
-                }
-                if (b->fade_in == 2) a *= 1.0f - fade_p * fade_p * (3.0f - 2.0f * fade_p);   /* fading out */
-                else if (b->fade_in && fade_p < 1.0f) a *= fade_p * fade_p * (3.0f - 2.0f * fade_p);
-                if (a < 1.0f) { fadea[nfadeq] = a; fadeq[nfadeq++] = k; nfade_dist += !b->fade_in; continue; }
-            }
-            #endif
-            if (b->drawmode == N2_DRAW_BLEND || b->drawmode == N2_DRAW_ADD) {
-                if (defcap > 0) {
-                    if (b->drawmode == N2_DRAW_BLEND) {
-                        /* bbox-centre distance to camera, squared (only the
-                           ORDER matters, so skip the sqrt): documented choice
-                           for the back-to-front sort below -- true per-vertex
-                           depth would need a second batching pass, which no
-                           observed defect currently justifies. */
-                        float bx = 0.5f*(b->bbox_min[0]+b->bbox_max[0]);
-                        float by = 0.5f*(b->bbox_min[1]+b->bbox_max[1]);
-                        float bz = 0.5f*(b->bbox_min[2]+b->bbox_max[2]);
-                        float ddx = bx-cam[0], ddy = by-cam[1], ddz = bz-cam[2];
-                        defdist[k] = ddx*ddx + ddy*ddy + ddz*ddz;
-                        defblend[ndefblend++] = k;
-                    } else {
-                        defadd[ndefadd++] = k;   /* additive: stable texture-sorted order */
+                while (q < avail) {
+                    int k = wv.opq[q++];
+                    N2Batch *b = &wbatch[k];
+                    nopaque++;
+                    ndrawn += b->nmesh;
+                    if (b->tex != lasttex) {
+                        if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                        else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                        lasttex = b->tex;
                     }
+                    if (b->drawmode != lastmode) {
+                        glUniform1f(rp.uAlphaTest, b->drawmode == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
+                        lastmode = b->drawmode;
+                    }
+                    #ifdef __vita__
+                    if (b->reflect && g_refl_ready) {   /* one variant switch: drawn as a run below */
+                        if (nreflq < (int)(sizeof reflq / sizeof *reflq)) { reflq[nreflq++] = k; continue; }
+                    }
+                    if (b->reflect) g_refl_batches++;
+                    #endif
+                    /* every 8th draw timed, x8 (11-15 hwlog67: one timer read is
+                       735 ns on the Vita, two a draw were ~0.3 ms/frame) */
+                    if ((++g_wd_tick & 7) == 0) {
+                        Uint64 s0 = SDL_GetPerformanceCounter();
+                        draw_batch(b);
+                        g_wd_submit += (SDL_GetPerformanceCounter() - s0) * 8;
+                    } else draw_batch(b);
+                    for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
+                    g_dbg.drawn++; wbdrawn++;
+                    if (nviskept < 4096) viskept[nviskept++] = k;
                 }
-                continue;   /* drawn in the deferred pass below, not here */
             }
-            /* Opaque first, then cutout: on the Vita's tile GPU a discarding
-               draw can't be hidden-surface removed, and opaque surfaces drawn
-               before it let the hardware reject its covered pixels. */
-            if (b->drawmode == N2_DRAW_CUTOUT && defcap > 0) {
-                defdist[k] = dx*dx + dy*dy;   /* nearest XY point of the box */
-                defcut[ndefcut++] = k; continue;
-            }
-            if (!VITA_PROBE(2)) continue;
-            nopaque++;
-            ndrawn += b->nmesh;
-            if (b->tex != lasttex) {
-                if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
-                else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
-                lasttex = b->tex;
-            }
-            if (b->drawmode != lastmode) {
-                glUniform1f(rp.uAlphaTest, b->drawmode == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
-                lastmode = b->drawmode;
-            }
-            #ifdef __vita__
-            if (b->reflect && g_refl_ready) {   /* one variant switch: drawn as a run below */
-                if (nreflq < (int)(sizeof reflq / sizeof *reflq)) { reflq[nreflq++] = k; continue; }
-            }
-            if (b->reflect) g_refl_batches++;
-            #endif
-            /* every 8th draw timed, x8 (11-15 hwlog67: one timer read is
-               735 ns on the Vita, two a draw were ~0.3 ms/frame) */
-            if ((++g_wd_tick & 7) == 0) {
-                Uint64 s0 = SDL_GetPerformanceCounter();
-                draw_batch(b);
-                g_wd_submit += (SDL_GetPerformanceCounter() - s0) * 8;
-            } else draw_batch(b);
-            for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
-            g_dbg.drawn++; wbdrawn++;
-            if (nviskept < 4096) viskept[nviskept++] = k;
+#ifdef __vita__
+            if (wv_go) vita_parallel_join();
+            nfadeq = wv.nfadeq; nfade_dist = wv.nfade_dist;
+            tall_res += wv.tall_res; tall_far += wv.tall_far;
+            cc_skipped += wv.cc_skipped; cc_tested += wv.cc_tested; cc_bad += wv.cc_bad;
+            vl_skipped += wv.vl_skipped; vl_wouldview += wv.vl_wouldview;
+#endif
+            ndefcut = wv.ndefcut; ndefblend = wv.ndefblend; ndefadd = wv.ndefadd;
+            far_meshes += wv.far_meshes; far_batches += wv.far_batches;
+            for (int sc = 0; sc < 8; sc++) far_scen[sc] += wv.far_scen[sc];
+            wv_frames++; wv_async += wv_go; wv_waited += wv_wait;
         }
         #ifdef __vita__
         if (cc_use && ++cc_frames >= 600) {
@@ -26148,6 +26294,10 @@ int main(int argc, char **argv) {
                        (double)vl_skipped / vl_frames, (double)vl_wouldview / vl_frames);
             vl_skipped = vl_frames = vl_listed = vl_wouldview = 0;
             cc_skipped = cc_tested = cc_bad = cc_frames = 0;
+            if (wv_frames)
+                printf("world: opaque visibility on the worker %ld of %ld frames; the draws caught up with it in %ld\n",
+                       wv_async, wv_frames, wv_waited);
+            wv_frames = wv_async = wv_waited = 0;
         }
         Uint64 oc2 = SDL_GetPerformanceCounter();
         g_wd_oc[1] += oc2 - oc1;
