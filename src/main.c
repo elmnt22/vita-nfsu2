@@ -11797,7 +11797,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                The player's own stall reset never fires (the camera is always
                within 50 m), so unattended runs could not finish. */
             static int test = -1;
-            static float away_t, still_t, anchor[2];
+            static float away_t, still_t, back_t, anchor[2];
             if (test < 0) {
                 FILE *af = fopen("ux0:data/NFSU2/autodrive.txt", "r");
                 test = af || getenv("OPENUG2_AUTODRIVE");
@@ -11812,16 +11812,30 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                     float dot = d > 1.0f ? (dx * cosf(st.heading) + dy * sinf(st.heading)) / d : 1.0f;
                     away_t = (dot < -0.3f && st.speed > 3.0f) ? away_t + wdt : 0;
                 }
+                /* (11-15 hwlog76) after a barrier hit at 3.4 km the driver's own
+                   route turned round with it -- its route point stayed ahead, so
+                   the test above never fired and it lapped backwards for 6 min.
+                   The race route's direction at the car cannot turn round. */
+                {   const float *rd = g_rt.loc[0].dir;
+                    float rdot = rd[0] * cosf(st.heading) + rd[1] * sinf(st.heading);
+                    if (rd[0] * rd[0] + rd[1] * rd[1] > 0.25f && rdot < -0.3f && st.speed > 3.0f) back_t += wdt;
+                    else back_t = 0;
+                }
                 /* stuck = under 5 m from where it was for 8 s (11-15 hwlog67:
                    the car rocked against a wall on lap 2 at 1-2 m/s, so a
                    speed test never fired and the race never finished) */
                 if (hypotf(st.pos[0] - anchor[0], st.pos[1] - anchor[1]) > 5.0f) {
                     anchor[0] = st.pos[0]; anchor[1] = st.pos[1]; still_t = 0;
                 } else still_t += wdt;
-                if (want || away_t > 4.0f || still_t > 8.0f) {
-                    const char *why = want ? "asked" : away_t > 4.0f ? "wrong way" : "stuck";
-                    away_t = still_t = 0; anchor[0] = anchor[1] = 1e9f;
+                if (want || away_t > 4.0f || still_t > 8.0f || back_t > 4.0f) {
+                    const char *why = want ? "asked" : away_t > 4.0f ? "wrong way" : back_t > 4.0f ? "against the race route" : "stuck";
+                    away_t = still_t = back_t = 0; anchor[0] = anchor[1] = 1e9f;
                     if (airacer_reset_pose(g_rt.pdrv, rp, &rh, &rv)) {
+                        /* face along the race route, whatever way the road point points */
+                        const float *rd = g_rt.loc[0].dir;
+                        if (rd[0] * rd[0] + rd[1] * rd[1] > 0.25f && rd[0] * cosf(rh) + rd[1] * sinf(rh) < 0) {
+                            rh += 3.14159265f; if (rh > 3.14159265f) rh -= 6.28318531f;
+                        }
                         WCollCtx gc; wcoll_ctx_init(&gc);
                         float q[3] = { rp[0], rp[1], rp[2] + 1.0f };
                         int found = 0;
