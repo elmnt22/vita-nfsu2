@@ -2542,6 +2542,117 @@ void render_refl_end(int screen_w, int screen_h) {
 }
 GLuint render_refl_texture(void) { return g_refl.failed ? 0 : g_refl.tex; }
 
+/* ---- screen + env road reflection (11-15 prototype, the user's options 1+2) ----
+   Without Full detail the road reflection does not draw the world again.
+   The reflection target is filled by one full-screen pass instead: each
+   texel looks along its own view ray mirrored in the road plane and takes
+   (1) last frame's picture where that mirrored ray lands on screen -- exact
+   for the sky and far lights, near buildings sit a little high (the camera
+   height's parallax) -- and (2) the car's environment cube along it where
+   the mirrored ray leaves the screen. The road shader is unchanged
+   (worldreflect: the target sampled at the pixel's own screen spot). */
+static struct { GLuint fbo, tex, down, prog; GLint down_step, uM, uMi, uEnvK; int w, h, failed, want, valid; } g_prev;
+static const char *PREV_DOWN_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform vec2 uStep;\n"
+    "void main(){ vec3 c=texture2D(uTex,vUV-uStep).rgb+texture2D(uTex,vUV+uStep).rgb\n"
+    "  +texture2D(uTex,vUV+vec2(uStep.x,-uStep.y)).rgb+texture2D(uTex,vUV+vec2(-uStep.x,uStep.y)).rgb;\n"
+    "  gl_FragColor=vec4(c*0.25,1.0); }\n";
+static const char *REFL_SCREEN_FS =
+    GLSL_HEADER
+    "varying vec2 vUV; uniform sampler2D uTex; uniform sampler2D uScene;\n"
+    "uniform mat3 uM; uniform mat3 uMi; uniform float uEnvK;\n"
+    "vec2 cubeuv(vec3 r){\n"
+    "  vec3 a=abs(r); vec2 uv; float fcol; float frow;\n"
+    "  if(a.x>=a.y && a.x>=a.z){ uv=vec2(r.x>0.0?-r.y:r.y, r.z)/a.x; fcol=r.x>0.0?0.0:1.0; frow=0.0; }\n"
+    "  else if(a.y>=a.z){ uv=vec2(r.y>0.0?r.x:-r.x, r.z)/a.y; fcol=r.y>0.0?2.0:0.0; frow=r.y>0.0?0.0:1.0; }\n"
+    "  else { uv=vec2(r.z>0.0?-r.x:r.x, r.y)/a.z; fcol=r.z>0.0?1.0:2.0; frow=1.0; }\n"
+    "  uv=uv*(0.5*62.0/64.0)+0.5;\n"
+    "  return vec2((fcol+uv.x)*(1.0/3.0),(frow+uv.y)*0.5); }\n"
+    "void main(){\n"
+    "  vec3 d=uMi*vec3(vUV*2.0-1.0,1.0);\n"
+    "  vec3 m=vec3(d.x,d.y,-d.z);\n"
+    "  vec3 e=texture2D(uScene,cubeuv(m)).rgb*uEnvK;\n"
+    "  vec3 c=uM*m; float w=0.0; vec3 s=e;\n"
+    "  if(c.z>0.0){ vec2 q=c.xy/c.z*0.5+0.5;\n"
+    "    w=clamp((1.0-q.y)*10.0,0.0,1.0)*clamp(q.y*20.0,0.0,1.0)*clamp(q.x*20.0,0.0,1.0)*clamp((1.0-q.x)*20.0,0.0,1.0);\n"
+    "    s=texture2D(uTex,clamp(q,0.0,1.0)).rgb; }\n"
+    "  gl_FragColor=vec4(mix(e,s,w),1.0); }\n";
+static GLuint bloom_program_vs(const char *vs, const char *fs, const char *name);
+void render_prev_want(int on) { g_prev.want = on; if (!on) g_prev.valid = 0; }
+int render_prev_valid(void) { return g_prev.valid; }
+/* render_scene_end: last frame's picture at reflection size */
+static void prev_capture(GpuMesh *quad) {
+    if (!g_prev.want || g_prev.failed || !quad || !g_scene.tex) return;
+    if (!g_prev.fbo) {
+        g_prev.w = 240; g_prev.h = 136;
+        glGenTextures(1, &g_prev.tex);
+        glBindTexture(GL_TEXTURE_2D, g_prev.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_prev.w, g_prev.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &g_prev.fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_prev.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_prev.tex, 0);
+        g_prev.down = bloom_program_vs(BLIT_VS, PREV_DOWN_FS, "reflection downsample");
+        g_prev.prog = bloom_program_vs(BLIT_VS, REFL_SCREEN_FS, "screen reflection");
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE || !g_prev.down || !g_prev.prog) {
+            printf("screen reflection unavailable\n");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            g_prev.failed = 1;
+            return;
+        }
+        g_prev.down_step = glGetUniformLocation(g_prev.down, "uStep");
+        g_prev.uM = glGetUniformLocation(g_prev.prog, "uM");
+        g_prev.uMi = glGetUniformLocation(g_prev.prog, "uMi");
+        g_prev.uEnvK = glGetUniformLocation(g_prev.prog, "uEnvK");
+        glUseProgram(g_prev.prog);
+        glUniform1i(glGetUniformLocation(g_prev.prog, "uScene"), RENDER_ENV_UNIT);
+        printf("screen reflection: %dx%d last-frame copy + env cube\n", g_prev.w, g_prev.h);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_prev.fbo);
+    glViewport(0, 0, g_prev.w, g_prev.h);
+    glUseProgram(g_prev.down);
+    glUniform2f(g_prev.down_step, 0.75f / (float)g_scene.w, 0.75f / (float)g_scene.h);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_scene.tex);
+    draw_gpumesh(quad);
+    g_prev.valid = 1;
+}
+/* Into the bound reflection target (render_refl_begin). VP = projection x
+   view, column-major; only its rotation part is used (rays, not points). */
+int render_refl_screen(GpuMesh *quad, const float VP[16], float env_k) {
+    if (!g_prev.valid || !g_prev.prog || !quad) return 0;
+    static const int rs[3] = { 0, 1, 3 };   /* clip x, y, w */
+    double M[3][3];   /* M[row][col]: direction (col) -> clip (row) */
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) M[r][c] = VP[c * 4 + rs[r]];
+    double det = M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1]) - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])
+               + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]);
+    if (fabs(det) < 1e-12) return 0;
+    double I[3][3];
+    I[0][0] = (M[1][1]*M[2][2]-M[1][2]*M[2][1])/det; I[0][1] = (M[0][2]*M[2][1]-M[0][1]*M[2][2])/det; I[0][2] = (M[0][1]*M[1][2]-M[0][2]*M[1][1])/det;
+    I[1][0] = (M[1][2]*M[2][0]-M[1][0]*M[2][2])/det; I[1][1] = (M[0][0]*M[2][2]-M[0][2]*M[2][0])/det; I[1][2] = (M[0][2]*M[1][0]-M[0][0]*M[1][2])/det;
+    I[2][0] = (M[1][0]*M[2][1]-M[1][1]*M[2][0])/det; I[2][1] = (M[0][1]*M[2][0]-M[0][0]*M[2][1])/det; I[2][2] = (M[0][0]*M[1][1]-M[0][1]*M[1][0])/det;
+    float mc[9], ic[9];   /* column-major for glUniformMatrix3fv */
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) { mc[c * 3 + r] = (float)M[r][c]; ic[c * 3 + r] = (float)I[r][c]; }
+    GLint cur = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &cur);
+    GLboolean depth = glIsEnabled(GL_DEPTH_TEST), cull = glIsEnabled(GL_CULL_FACE), blend = glIsEnabled(GL_BLEND);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_BLEND);
+    glUseProgram(g_prev.prog);
+    glUniformMatrix3fv(g_prev.uM, 1, GL_FALSE, mc);
+    glUniformMatrix3fv(g_prev.uMi, 1, GL_FALSE, ic);
+    glUniform1f(g_prev.uEnvK, env_k);
+    glActiveTexture(GL_TEXTURE0 + RENDER_ENV_UNIT); glBindTexture(GL_TEXTURE_2D, render_env_texture());
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_prev.tex);
+    draw_gpumesh(quad);
+    if (depth) glEnable(GL_DEPTH_TEST);
+    if (cull) glEnable(GL_CULL_FACE);
+    if (blend) glEnable(GL_BLEND);
+    glUseProgram((GLuint)cur);
+    return 1;
+}
+
 /* Car environment cube (car.fx EnvMapTexture; the game renders a 128 px
    dynamic cube). Here: six 64 px faces in one 192x128 target, laid out
    +X -X +Y / -Y +Z -Z, each face rendered into its own viewport. */
@@ -3323,6 +3434,7 @@ void render_scene_end(const RProg *rp, GpuMesh *quad, int screen_w, int screen_h
     if (g_lb_scissor) { glDisable(GL_SCISSOR_TEST); g_lb_scissor = 0; }
     GLboolean depth = glIsEnabled(GL_DEPTH_TEST), blend = glIsEnabled(GL_BLEND);
     glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND);
+    prev_capture(quad);   /* before the DOF pass writes into the scene */
     if (g_dof.scene) render_dof_scene(0);
     int composited = bloom_wanted() && bloom_composite(quad, screen_w, screen_h);
     g_dof.frame = 0;

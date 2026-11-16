@@ -24826,6 +24826,21 @@ int main(int argc, char **argv) {
                face alternates (on refl_tick). */
             int rlite = !refl_every;
             float rreach = rlite ? 90.0f : 130.0f;
+            /* 11-15 options 1+2 prototype (render_refl_screen): without Full
+               detail, last frame's picture mirrored + the car's env cube
+               instead of drawing the world again. reflscreen.txt (Vita) /
+               OPENUG2_REFL_SCREEN (sim): 1 on (default), 0 off. */
+            static int rscreen_cfg = -1;
+            if (rscreen_cfg < 0) {
+                rscreen_cfg = 1;
+                const char *ev = getenv("OPENUG2_REFL_SCREEN");
+                if (ev) rscreen_cfg = atoi(ev) != 0;
+                FILE *rf = fopen("ux0:data/NFSU2/reflscreen.txt", "r");
+                if (rf) { int v = 0; if (fscanf(rf, "%d", &v) == 1) rscreen_cfg = v != 0; fclose(rf); }
+                printf("road reflection: %s without Full detail\n", rscreen_cfg ? "screen + env cube" : "world redraw");
+            }
+            int rscreen = rlite && rscreen_cfg;
+            render_prev_want(rscreen && refl_wanted);
             /* a catch-up frame (3 sim ticks after an overrun, hwlog25: the
                opponents' tick ~3.5 ms each) reuses the last reflection and
                env face, so it fits instead of overrunning again */
@@ -24839,7 +24854,20 @@ int main(int argc, char **argv) {
             }
             if (refl_wanted && !(catchup && refl_valid) && ((refl_tick++ & 1) == 0 || refl_every || rlite)) {
                 float fc[3] = { g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b };
-                if (render_refl_begin(240, 136, fc)) {
+                if (rscreen && render_prev_valid() && render_refl_begin(240, 136, fc)) {
+                    int rdraws = render_refl_screen(&quad, MVP, 1.0f);
+                    if (g_acid_ok) {   /* the reflection view's flares, as below */
+                        rdraws += aciddraw_reflect_flares(V, MVP, 0.5f * (float)H / tanf(0.5f * cam_fovy),
+                                                          rain_wetness(), refl_flare_ground);
+                        glUseProgram(rp.prog);
+                        glEnable(GL_DEPTH_TEST);
+                    }
+                    glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
+                    g_refl_ready = refl_valid = 1;
+                    pf_detail.road_reflection_updated = 1;
+                    static int rs_logged;
+                    if (!rs_logged++) printf("road reflection: first screen frame (%d)\n", rdraws);
+                } else if (render_refl_begin(240, 136, fc)) {
                     float h = carpos[2];
                     float Rm[16] = { 1,0,0,0, 0,1,0,0, 0,0,-1,0, 0,0,2.0f*h,1 };
                     float MVPr[16]; mat_mul(MVP, Rm, MVPr);
