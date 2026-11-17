@@ -10028,6 +10028,8 @@ static const N2Scene *g_bey_scene;    /* its streamed ground (no wcoll yet) */
 static int g_bey_zone = -1;           /* the event start the car stands in (event index), -1 none */
 static int g_bey_szone = -1;          /* the shop / garage the car stands at (shops.txt index), -1 none */
 static int g_bey_shop_type = -1;      /* the Beyond shop open (its type), -1 none: back to free roam on exit */
+static int g_bey_shop_hold = -2;      /* the shop zone the car came into free roam in: quiet until it is left
+                                         (-2: take it on the next free-roam frame, -1 none) */
 static int bey_shop_indicator(int t)  /* ei_shop_type 80111ca4 */
 {
     switch (t) { case 0: return 0xc; case 1: return 0xf; case 2: return 0xd; case 3: return 0xe; case 5: return 0x10; }
@@ -29111,6 +29113,12 @@ int main(int argc, char **argv) {
                     float dx = p[0] - carpos[0], dy = p[1] - carpos[1], d = dx * dx + dy * dy;
                     if (d < best) { best = d; in = i; }
                 }
+                /* a car put down in a shop's zone (the Free Run start at the garage, a shop just
+                   left) is not offered it again until it drives out (the city's shops put the car
+                   outside their zone) */
+                if (g_bey_shop_hold == -2) g_bey_shop_hold = in;
+                if (in >= 0 && in == g_bey_shop_hold) in = -1;
+                else if (in != g_bey_shop_hold) g_bey_shop_hold = -1;
                 if (in != g_bey_szone) {
                     int t;
                     if (g_bey_szone >= 0 && beyond_shop_at(g_bey_szone, &t, NULL, NULL)) hud_event_remove(bey_shop_indicator(t));
@@ -29120,10 +29128,11 @@ int main(int argc, char **argv) {
                     }
                     g_bey_szone = in;
                 }
-            } else if (!g_bey_roam && g_bey_szone >= 0) {
+            } else if (!g_bey_roam) {
                 int t;
-                if (beyond_shop_at(g_bey_szone, &t, NULL, NULL)) hud_event_remove(bey_shop_indicator(t));
+                if (g_bey_szone >= 0 && beyond_shop_at(g_bey_szone, &t, NULL, NULL)) hud_event_remove(bey_shop_indicator(t));
                 g_bey_szone = -1;
+                g_bey_shop_hold = -2;
             }
             trig_update((live && g_career_mode && g_rt.active && g_rt.roam && n2_active()) ||
                         (live && g_bey_roam && n2_active()));   /* UpdateTriggerEffects */
