@@ -1704,11 +1704,13 @@ static void garage_restore_car(const char *car) {
     N2CarConfig c; char rim[16] = ""; int rs = 0;
     if (garage_load_car(car, &c, rim, &rs)) {
         g_shop_req = c; g_shop_req_pending = 1;
-        if (rim[0]) {
-            memcpy(g_shop_rim_folder, rim, sizeof rim); g_shop_rim_style = rs;
-            g_shop_rim_pending = 1;
-        }
     }
+    /* GitHub #13: a stock car (no tuned slot) or a build without rims wears
+       its own wheel (NFSU style 1 = the car's stock wheel mesh); before, the
+       previous car's rims stayed on every car switched to */
+    if (!rim[0]) { snprintf(rim, sizeof rim, "NFSU"); rs = 1; }
+    memcpy(g_shop_rim_folder, rim, sizeof rim); g_shop_rim_style = rs;
+    g_shop_rim_pending = 1;
 }
 #include "world_capture_policy.h"
 #include "world_scenery.h"
@@ -5217,6 +5219,9 @@ static void career_apply_preset(void) {   /* RideInfo::FillWithPreset: the prese
     if (g_career_preset_rim[0]) {
         memcpy(g_shop_rim_folder, g_career_preset_rim, sizeof g_shop_rim_folder);
         g_shop_rim_style = g_career_preset_rs; g_shop_rim_pending = 1;
+    } else {   /* stock: the car's own wheel, not the last car's rims (GitHub #13) */
+        snprintf(g_shop_rim_folder, sizeof g_shop_rim_folder, "NFSU");
+        g_shop_rim_style = 1; g_shop_rim_pending = 1;
     }
     printf("career: the preset ride on %s (rims %s %d)\n", g_career_preset_car,
            g_career_preset_rim[0] ? g_career_preset_rim : "stock", g_career_preset_rs);
@@ -13904,6 +13909,7 @@ static int select_car_vinyl(int choice) {
    DELETES it (a crash comes back in the city). */
 #define VENUE_FILE "ux0:data/NFSU2/venue.txt"
 static int g_boot_ev;          /* the venue event to start once loaded */
+static int g_boot_restart;     /* one-time boot work done: start over once set up */
 static int g_in_venue;         /* on a venue track (not the city) */
 static const char *g_switch_track;   /* queued in-process track switch */
 static int g_switch_ev;              /* ... and the event to start there */
@@ -16095,7 +16101,7 @@ int main(int argc, char **argv) {
                 { "STREAML4RA", "THE CITY" }, { "STREAML4RB", "DRAG STRIPS 1" },
                 { "STREAML4RC", "DRIFT VENUES" }, { "STREAML4RD", "DRAG STRIPS 2" },
                 { "STREAML4RF", "STREET X TRACKS" }, { "STREAML4RG", "URL TRACKS" } };
-            const char *conv[8], *conv_name[8]; int nconv = 0, boot_listed = 0;
+            const char *conv[8], *conv_name[8]; int nconv = 0, boot_listed = 0, tiles_relaunch = 0;
             for (int q = 0; q < (int)(sizeof k_tile_tracks / sizeof *k_tile_tracks); q++) {
                 if (!strcmp(k_tile_tracks[q][0], trackname)) boot_listed = 1;
                 char bp[1024]; snprintf(bp, sizeof bp, "%s/%s.BUN", troot, k_tile_tracks[q][0]);
@@ -16151,6 +16157,7 @@ int main(int argc, char **argv) {
                 res_unpin(); world_instance_library_release(); world_instance_cache_flush();
                 extern void vita_progress_screen_done(void); vita_progress_screen_done();
                 if (g_boot_fe) shop_loading_text(g_boot_fe, NULL, NULL);   /* back to "LOADING" */
+                tiles_relaunch = 1;
             }
             /* an older release's tile sets (another WTILE_VERSION) off the
                card once this version's are complete (lowest-priority thread) */
@@ -16193,7 +16200,15 @@ int main(int argc, char **argv) {
                 vita_mark("tiles: packing done");
                 extern void vita_progress_screen_done(void); vita_progress_screen_done();
                 if (g_boot_fe) shop_loading_text(g_boot_fe, NULL, NULL);
+                tiles_relaunch = 1;
             }
+            /* user log 11-16: the session after a first-run conversion started its
+               first world build with 54 MB live in the heap and 932 kernel blocks
+               (a normal boot: 23 MB, 442) -- what the conversion left behind
+               fragmented both, and 30 min later builds failed out of memory. The
+               game starts over in a fresh process instead (the venue kept). */
+            /* the restart waits for the shader compile below (one restart) */
+            if (tiles_relaunch) g_boot_restart = 1;
         }
     }
     int nm = 0;
@@ -16648,6 +16663,32 @@ int main(int argc, char **argv) {
     RProg rp = render_program();
 #ifdef __vita__
     render_world_lite_program(&rp);
+    {   /* user log 11-16 (userlogb): a first boot compiles the 27 linked
+           programs on the device (33 s), and the shader compiler leaves the
+           heap and the kernel blocks bloated -- the first world build started
+           with 53 MB live and 939 blocks (a cached boot: 23 MB, 442) and the
+           session ran out of memory 8 min in. Once the programs are saved the
+           game starts over in a fresh process that reads them back. The flag
+           file stops a loop when the cache does not stick. */
+        extern int g_prog_compiles, g_prog_saved;
+        static const char *const flag = "ux0:data/NFSU2/cache/shader_restart.txt";
+        FILE *rf = fopen(flag, "r");
+        if (rf) { fclose(rf); remove(flag); }
+#ifdef OPENUG2_SIM_PRE_H
+        /* test aid (simulator): desktop GL saves no program binaries;
+           OPENUG2_SIM_PROGSAVED=1 counts them as saved to run the restart */
+        if (getenv("OPENUG2_SIM_PROGSAVED")) g_prog_saved = g_prog_compiles;
+#endif
+        int sh = !rf && g_prog_compiles && g_prog_saved == g_prog_compiles;
+        if (sh && (rf = fopen(flag, "w")) != NULL) fclose(rf);
+        if (sh || g_boot_restart) {
+            vita_mark("boot: one-time work done (%d programs compiled%s), restarting the game with a clean heap",
+                      g_prog_compiles, g_boot_restart ? ", tiles converted" : "");
+            venue_relaunch(g_in_venue ? trackname : NULL, g_boot_ev);
+        }
+        if (g_prog_compiles)
+            vita_mark("shaders: %d programs compiled (%d saved), no restart", g_prog_compiles, g_prog_saved);
+    }
 #ifdef __vita__
     boot_frame();
 #endif
