@@ -669,8 +669,9 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
        object away when any one of them was corrupt, which silently deleted 150
        shipped L4RA objects and 14 on L4RB: every XS_WARN* road sign, every
        XS_MEDIANPOLE* median pole, the XS_SPEED* speed signs and the
-       XO_AIRPORT_*SIGN set. They are real geometry at real authored transforms
-       and only a handful of their vertices are broken.
+       XO_AIRPORT_*SIGN set. (11-17: most of those were never broken -- they
+       are 36-byte-vertex solids read at 24; n2_solid_vstride now reads them
+       whole. The per-vertex guard stays for the genuinely bad ones.)
        Mark the broken vertices instead. Triangles that reference one are
        dropped below; the rest of the object is emitted normally, so the sign
        survives and the garbage spike never reaches the GPU. */
@@ -938,8 +939,27 @@ typedef struct {
     float area;
 } N2Geom;
 
+/* A solid's vertex stride. Most carry 24-byte prelit vertices (pos, colour
+ * +12, uv +16); some carry a normal as well -- 36 bytes, pos +0, normal +12,
+ * colour +24, uv +28, the car layout. The 0x134900 vertex-buffer descriptor
+ * says which: its word +0xc is 0x4180 on every 36-byte solid and 0, 0x40 or
+ * 0x1000 on every 24-byte one (census 11-17 over the six L4R* streams: 234
+ * vs ~31,000 solids, no exceptions; the eSolid +0xe & 0x40 "lit" flag does
+ * NOT decide it -- 1,600 lit solids are 24-byte). The 36-byte ones are the
+ * XS_ props (speed/warning/no-parking signs, median poles, ...): read at 24
+ * their vertices were garbage, the size guard dropped most triangles and the
+ * survivors were the stray black triangles players saw beside the road. */
+static int n2_solid_vstride(const unsigned char *d, long beg, long end) {
+    N2Leaf h[2]; int nh = 0;
+    n2_find_leaves(d, beg, end, 0x00134900u, h, &nh, 2);
+    if (nh < 1) return 24;
+    const unsigned char *pp = d + h[0].off; int ss = (int)h[0].size;
+    int pd = n2_skip_filler(pp, ss);
+    return pd + 0x10 <= ss && (n2_u32(pp + pd + 0xc) & 0x4000u) ? 36 : 24;
+}
+
 /* Measure one 0x80134010 object exactly as n2_walk_meshes would build it:
- * every 0x134B01/0x134B03 leaf pair, stride 24, placed by the object matrix. */
+ * every 0x134B01/0x134B03 leaf pair, at the solid's stride, placed by the object matrix. */
 static int n2_obj_geom(const unsigned char *d, long beg, long end,
                        const float *m, N2Geom *g) {
     memset(g, 0, sizeof *g);
@@ -950,20 +970,21 @@ static int n2_obj_geom(const unsigned char *d, long beg, long end,
     n2_find_leaves(d, beg, end, 0x00134B03u, idx, &ni, 64);
     int pairs = nv < ni ? nv : ni;
     if (!pairs) return 0;
+    const int vs = n2_solid_vstride(d, beg, end);
 
     /* two passes over each pair: positions first (bbox), then triangles */
     for (int k = 0; k < pairs; k++) {
         const unsigned char *vb = d + vtx[k].off;
         int pad = n2_skip_filler(vb, (int)vtx[k].size), body = (int)vtx[k].size - pad;
-        if (body <= 0 || body % 24) continue;
-        int n = body / 24; const unsigned char *rec = vb + pad;
+        if (body <= 0 || body % vs) continue;
+        int n = body / vs; const unsigned char *rec = vb + pad;
         float *wp = (float *)malloc((size_t)n * 3 * sizeof(float));
         if (!wp) continue;
         for (int i = 0; i < n; i++) {
             float px, py, pz;
-            memcpy(&px, rec+i*24,   4);
-            memcpy(&py, rec+i*24+4, 4);
-            memcpy(&pz, rec+i*24+8, 4);
+            memcpy(&px, rec+i*vs,   4);
+            memcpy(&py, rec+i*vs+4, 4);
+            memcpy(&pz, rec+i*vs+8, 4);
             wp[i*3+0] = px*m[0]+py*m[4]+pz*m[8] +m[12];
             wp[i*3+1] = px*m[1]+py*m[5]+pz*m[9] +m[13];
             wp[i*3+2] = px*m[2]+py*m[6]+pz*m[10]+m[14];
@@ -1288,6 +1309,8 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
             n2_find_leaves(d, ds, ds + size, 0x00134B01u, vtx, &nv, 64);
             n2_find_leaves(d, ds, ds + size, 0x00134B03u, idx, &ni, 64);
             int pairs = nv < ni ? nv : ni;
+            const int vs = n2_solid_vstride(d, ds, ds + size);   /* 36: solid with normals */
+            const int vuv = vs == 36 ? 28 : 16, vcolo = vs == 36 ? 24 : 12;
             /* the skybox shell is kept now (Phase 21: rendered camera-locked,
                depth-write off) so its absurd span must skip the size-safety
                cull that still guards every other category. */
@@ -1390,7 +1413,7 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                     int exact = sk != 0;
                     if (!sk) { sk = tk; if (n2_m102) n2_m102_rng_unres++; }
                     else if (n2_m102) n2_m102_rng_res++;
-                    n2_add_pair(d, vtx[0], idx[0], cat, scene, 24, 16, 12, cull,
+                    n2_add_pair(d, vtx[0], idx[0], cat, scene, vs, vuv, vcolo, cull,
                                   sk, objm,
                                   (long)sub[a].start, (long)sub[a].count,
                                   (unsigned char)N2_DRAW_OPAQUE);
@@ -1405,7 +1428,7 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                 int exact_single_slot = nslot == 1 && slot[0] != 0;
                 for (int k = 0; k < pairs; k++) {
                     int before = scene->count;
-                    n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, 12, cull,
+                    n2_add_pair(d, vtx[k], idx[k], cat, scene, vs, vuv, vcolo, cull,
                                   tk, objm, 0, -1,
                                   (unsigned char)N2_DRAW_OPAQUE);
                     for (int m2 = before; m2 < scene->count; m2++) {

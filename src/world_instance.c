@@ -405,6 +405,9 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     n2_find_leaves(data, begin, end, 0x00134B01u, vtx, &nv, 64);
     n2_find_leaves(data, begin, end, 0x00134B03u, idx, &ni, 64);
     int pairs = nv < ni ? nv : ni;
+    /* XS_ props carry 36-byte vertices: see n2_solid_vstride */
+    const int vs = n2_solid_vstride(data, begin, end);
+    const int vuv = vs == 36 ? 28 : 16, vcolo = vs == 36 ? 24 : 12;
 
     /* This deliberately mirrors n2_walk_meshes' verified world-material
      * partition gate. A malformed partition falls through to the
@@ -461,7 +464,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
                             ? authored : n2_resolve_key(authored, keys, nkeys);
             int exact = subkey != 0;
             int before = local.count;
-            n2_add_pair(data, vtx[0], idx[0], cat, &local, 24, 16, 12, cat != N2_SKY,
+            n2_add_pair(data, vtx[0], idx[0], cat, &local, vs, vuv, vcolo, cat != N2_SKY,
                         subkey ? subkey : texkey, NULL,
                         (long)sub[i].start, (long)sub[i].count,
                         (unsigned char)N2_DRAW_OPAQUE);
@@ -474,7 +477,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
         int exact_single_slot = nslot == 1 && slot[0] != 0;
         for (int i = 0; i < pairs; i++) {
             int before = local.count;
-            n2_add_pair(data, vtx[i], idx[i], cat, &local, 24, 16, 12, cat != N2_SKY,
+            n2_add_pair(data, vtx[i], idx[i], cat, &local, vs, vuv, vcolo, cat != N2_SKY,
                         texkey, NULL, 0, -1, (unsigned char)N2_DRAW_OPAQUE);
             for (int j = before; j < local.count; j++)
                 local.meshes[j].mat_exact = (unsigned char)exact_single_slot;

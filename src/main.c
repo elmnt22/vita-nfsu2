@@ -24055,6 +24055,30 @@ int main(int argc, char **argv) {
                            m->texkey, m->mat_exact, m->nverts, bb[0], bb[2], bb[1], bb[3],
                            cs[0] / nv, cs[1] / nv, cs[2] / nv, cs[3] / nv, cmin[0], cmin[1], cmin[2], cmin[3],
                            cmax[0], cmax[1], cmax[2], cmax[3], 10);
+                    {   /* indices past the vertex count, and long-edged triangles (stray-triangle hunt) */
+                        int bad = 0, longt = 0, mx = 0;
+                        for (int t = 0; t + 2 < m->nidx; t += 3) {
+                            int a = m->idx[t], b = m->idx[t+1], c = m->idx[t+2];
+                            if (a > mx) mx = a;
+                            if (b > mx) mx = b;
+                            if (c > mx) mx = c;
+                            if (a >= m->nverts || b >= m->nverts || c >= m->nverts) { bad++; continue; }
+                            const float *P[3] = { m->verts + a * 5, m->verts + b * 5, m->verts + c * 5 };
+                            float e = 0;
+                            for (int k = 0; k < 3; k++) {
+                                const float *p = P[k], *q = P[(k + 1) % 3];
+                                float d = sqrtf((p[0]-q[0])*(p[0]-q[0]) + (p[1]-q[1])*(p[1]-q[1]) + (p[2]-q[2])*(p[2]-q[2]));
+                                if (d > e) e = d;
+                            }
+                            if (e > 4.0f && ++longt <= 4)
+                                printf("meshdump:   long tri %d: v%d v%d v%d edge %.1f m%c", t / 3, a, b, c, e, 10);
+                        }
+                        printf("meshdump:   %d indices, max %d of %d verts, %d out of range, %d long%c",
+                               m->nidx, mx, m->nverts, bad, longt, 10);
+                    }
+                    if (getenv("OPENUG2_SIM_MESHDUMP_V"))
+                        for (int t = 0; t + 2 < m->nidx; t += 3)
+                            printf("meshdump:   t%d %d %d %d%c", t / 3, m->idx[t], m->idx[t+1], m->idx[t+2], 10);
                     if (getenv("OPENUG2_SIM_MESHDUMP_V"))
                         for (int v = 0; v < m->nverts; v++) {
                             const float *q = m->verts + v * 5;
