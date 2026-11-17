@@ -14993,6 +14993,11 @@ int main(int argc, char **argv) {
         }
     }
     vita_early_init();
+    if (g_in_venue && beyond_is_track(vita_track) && !beyond_enabled()) {
+        /* a relaunch into the World Expansion whose files have since gone: the city */
+        vita_mark("venue boot: %s without its files -- the city instead", vita_track);
+        argc = 7; g_in_venue = 0; g_boot_ev = 0;
+    }
     {   /* Settings "Logs: off" (nolog.txt): no perf.csv either */
         extern int vita_logs_off(void);
         if (vita_logs_off() && argv == vita_argv) {
