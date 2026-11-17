@@ -1289,6 +1289,9 @@ int world_resident_job_info(const WResidentJob *job, float center[2],
 void world_resident_job_cancel(WResidentJob **slot) {
     if (!slot || !*slot) return;
     WResidentJob *job = *slot;
+    /* ask it to stop first: a cancel no longer waits out a whole streaming
+       build on the calling thread (audit 11-17; cleared again below) */
+    if (!SDL_AtomicGet(&job->done)) SDL_AtomicSet(&g_resident_abort, 1);
     SDL_WaitThread(job->thread, NULL);
     world_resident_free(job->candidate);
     resident_job_free(job);

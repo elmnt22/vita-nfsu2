@@ -143,8 +143,14 @@ int trophy_load(const unsigned char *p, long n)
     uint32_t v = 0, c = 0;
     if (!p || n < 8) return 0;
     memcpy(&v, p, 4); memcpy(&c, p + 4, 4);
-    if (v != 1 || c != TROPHY_N || n < 8 + (long)sizeof g_tr.bit) return 0;
-    memcpy(g_tr.bit, p + 8, sizeof g_tr.bit);
+    /* a save from a build with a different trophy count: the ids are kept in
+       order, so the earned ones that still exist carry over instead of all
+       being reset (and saved over) (audit 11-17) */
+    if (v != 1 || !c || c > 4096 || n < 8 + (long)((c + 7) / 8)) return 0;
+    int keep = c < TROPHY_N ? (int)c : TROPHY_N;
+    for (int i = 0; i < keep; i++)
+        if (p[8 + (i >> 3)] >> (i & 7) & 1) g_tr.bit[i >> 3] |= (uint8_t)(1u << (i & 7));
+    if (c != TROPHY_N) printf("trophy: save has %u trophies, this build %d; %d carried over\n", (unsigned)c, TROPHY_N, keep);
     printf("trophy: %d of %d unlocked in this profile\n", trophy_count(), TROPHY_N);
     return 1;
 }
