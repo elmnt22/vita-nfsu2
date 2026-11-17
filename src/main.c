@@ -16613,6 +16613,9 @@ int main(int argc, char **argv) {
     g_manual = g_opt.p[0].manual;
     g_cc_setting = g_opt.p[0].camera;
     SDL_AudioDeviceID adev = audio_init();
+#ifdef __vita__
+    if (g_boot_fe) audio_pause_game(1);   /* GitHub #10: no engine idle under the boot loading screen */
+#endif
     music_init(dataroot);  LOAD_PUMP();
     printf("speech: %s\n", speech_init(dataroot) ? "UG2_Speech + nisaudio indexed" : "no speech data"); career_speech_hook = career_speech_log;
     if (!g_opt.playlist_set) music_default_playlist(g_opt.pl_song, g_opt.pl_mode);
@@ -19078,6 +19081,7 @@ int main(int argc, char **argv) {
         g_boot_full = NULL;
         if (g_boot_fe && !g_ls_fe) g_ls_fe = g_boot_fe;   /* kept: every later loading screen */
         else if (g_boot_fe) shop_close(&g_boot_fe);
+        if (g_boot_fe) audio_pause_game(0);   /* the loading screen is gone: the game's sounds back */
         g_boot_fe = NULL; g_ls_drawn = 0;
         if (fe) shop_set_car(fe, carname, &carcfg, modification);
         else if (!nf) fe = shop_open(dataroot, carname, &carcfg, modification,
@@ -29720,6 +29724,14 @@ int main(int argc, char **argv) {
 #ifdef __vita__
             if (world2 && race_state == 0 && world.city.race.active && race_place_pending)
                 hud_draw_banner(hud, &rp, &quad, "LOADING", NULL, W, H);
+            {   /* the game's sounds (engine, skids, ambience) stop under the loading
+                   screen; its own menu sounds play (GitHub #10: the engine went on
+                   behind it after a race) */
+                static int ls_mute;
+                int up = g_restart_ls && ((race_state == 3 && (race_start_pending || g_qr_pending || g_career_go || g_switch_track))
+                                          || (race_state == 0 && race_place_pending));
+                if (up != ls_mute) { audio_pause_game(up ? 1 : g_pause.on); ls_mute = up; }
+            }
             if (g_restart_ls) {                  /* RCSTATE LOADING after a Restart */
                 if ((race_state == 3 && (race_start_pending || g_qr_pending || g_career_go || g_switch_track))
                     || (race_state == 0 && race_place_pending)) {
