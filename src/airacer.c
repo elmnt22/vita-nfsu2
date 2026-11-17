@@ -776,6 +776,7 @@ struct AiRacer {
     float far_hold;            /* +0x730 no far mover for this long (2 s after a touch in it, 1 s after a jump ahead) */
     char  far;                 /* the car rides mover 4 (0x5f46a0(4) from the think) */
     char  far_repath;          /* 0x5918a0 asked: hand the plan to mover 4 */
+    char  no_ground;           /* port (Beyond): no ground loaded under it -> stay on mover 4 */
     float drag260;             /* physics P +0x260 (0x4038d0's drag) */
     char  finished;            /* +0x710 */
     char  stop_why;            /* DIAG: why +0x710 was set (log only) */
@@ -5036,6 +5037,7 @@ static int far_ok(const AiRacer *r)
     const AiWorld *w = r->w;
     if (w->drag || w->x890108 || w->drift || w->x890104) return 0;     /* 0x89e7d8 0x890108 0x89e7d9 0x890104 */
     if (r->dplan.n <= 2) return 0;                                      /* driver +0x10 */
+    if (r->no_ground && r->in_race && !r->entry_done && r->act) return 1;   /* port (Beyond): no ground loaded here */
     if (0 < r->far_hold || 0 < r->phys_time) return 0;                 /* 0x401820(+0x730 / +0x734) */
     if (r->car.speed < 5.0f || r->car.wheels <= 0) return 0;            /* car +0x42c (0x783504), +0x424 */
     if (!r->act) return 0;
@@ -6168,8 +6170,10 @@ void airacer_touched_human(AiRacer *r)                                  /* 0x402
 }
 void airacer_far_hold(AiRacer *r, float sec)                            /* 0x591540 */
 {
+    if (r->no_ground) return;                                           /* port: nothing to land on */
     r->far_hold = sec;
 }
+void airacer_set_no_ground(AiRacer *r, int on) { if (r) r->no_ground = (char)(on != 0); }
 int airacer_far_repath(AiRacer *r)
 {
     int k = r->far && r->far_repath;

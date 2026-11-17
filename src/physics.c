@@ -1151,7 +1151,7 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
         if (s->meshes[i].world_role == 2 || s->meshes[i].world_role == 3) continue;   /* 3: a smokeable prop */
         int sc = s->meshes[i].scen, baked_props=embedded_prop_mesh(&s->meshes[i]);
         int prop_check = 0;
-        if (sc == N2_SC_TREE && !g_phys_trees_solid) continue;   /* physics.h */
+        if ((sc == N2_SC_TREE || sc == N2_SC_PROP) && !g_phys_trees_solid) continue;   /* physics.h */
         if (sc != N2_SC_NONE) {                 /* named: decide semantically */
             if (sc == N2_SC_TERRAIN && !baked_props) continue;
             /* props, trees and unclassified: let measured size decide, so a tree

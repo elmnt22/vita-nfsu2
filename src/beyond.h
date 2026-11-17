@@ -28,9 +28,16 @@ int beyond_spawn(float xy[2], float *heading_rad);   /* the first spawn.txt line
 /* textures Beyond borrows from the city (its sky): kept as copies taken while
    the city was loaded; beyond_tex_decode falls back to them */
 void beyond_keep_tex(uint32_t key, const N2Tex *t);
-void beyond_close(void);
+void beyond_close(void);                       /* the pack's file handle + table (track switch away) */
 /* where the race data of region `reg` (a track or a ROUTES stem) lives: the
    Beyond folder (its ROUTESBEYOND/, written by BeyondDev tools/events) for
    Beyond when it is on, else `troot` unchanged */
-const char *beyond_troot(const char *troot, const char *reg);                       /* the pack's file handle + table (track switch away) */
+const char *beyond_troot(const char *troot, const char *reg);
+/* its race events (ROUTESBEYOND/events.txt from the BeyondDev tools): ids
+   7001+, type as airace.h (AIRACE_CIRCUIT ...), length in metres, a name;
+   none unless beyond_enabled() */
+int beyond_event_count(void);
+int beyond_event_at(int i, int *id, int *type, int *len_m);
+int beyond_event_type(int id);                 /* -1: not a Beyond event */
+const char *beyond_event_name(int id);         /* NULL: not a Beyond event */
 #endif

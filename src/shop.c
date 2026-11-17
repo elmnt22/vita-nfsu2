@@ -14,6 +14,7 @@
 #include "pcsave.h"
 #include "career.h"
 #include "airace.h"
+#include "beyond.h"
 #include "movie.h"
 #include "mplay.h"
 #include "beyond.h"
@@ -2911,6 +2912,8 @@ static uint32_t qr_track_icon(int type, const unsigned char *r) {
 }
 
 static const char *qr_track_name(const Shop *s, int ev, int reverse) {
+    const char *bn = beyond_event_name(ev);   /* the World Expansion's events */
+    if (bn) return bn;
     char l[40];
     snprintf(l, sizeof l, reverse ? "REVERSE_TRACK_NAME_%d" : "TRACK_NAME_%d", ev);
     return str_get(s, feng_hash(l));

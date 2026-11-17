@@ -5213,6 +5213,31 @@ static void ai_take_global(const unsigned char *g, long n)
         }
     }
     g_ai_have = got == 7;
+    if (g_ai_races && beyond_event_count() > 0) {   /* the World Expansion's events as track records (Quick Race lists, race setup) */
+        int nb = beyond_event_count();
+        unsigned char *t = (unsigned char *)realloc(g_ai_races, (size_t)(g_ai_nraces + nb) * 0x128);
+        if (t) {
+            g_ai_races = t;
+            for (int k = 0; k < nb; k++) {
+                int id = 0, type = 0, len = 0;
+                beyond_event_at(k, &id, &type, &len);
+                unsigned char *r = g_ai_races + (size_t)(g_ai_nraces + k) * 0x128;
+                memset(r, 0, 0x128);
+                snprintf((char *)r + 0x40, 8, "%s", "BEYOND");               /* the stem (STREAM<stem>) */
+                r[0x7c] = 5;                                                  /* the mode's own icon */
+                r[0x85] = type == AIRACE_SPRINT || type == AIRACE_DRAG;       /* point to point */
+                r[0x8a] = (unsigned char)id; r[0x8b] = (unsigned char)(id >> 8);
+                unsigned bit = type == AIRACE_CIRCUIT ? 0 : type == AIRACE_SPRINT ? 2 : type == AIRACE_DRAG ? 1
+                             : type == AIRACE_DRIFT ? 3 : type == AIRACE_URL ? 13 : 11;   /* the QR mode bits (0x4987c0) */
+                uint32_t m = 1u << bit;
+                memcpy(r + 0x94, &m, 4);
+                uint32_t L = (uint32_t)len; memcpy(r + 0x98, &L, 4);
+                r[0xf6] = 0xff;                                               /* no pre-race scene */
+            }
+            g_ai_nraces += nb;
+            printf("beyond: %d race events added to the track records%c", nb, 10);
+        }
+    }
     int perf = perf_init(g, n), types = airace_types_init(g, n);
     int races = airace_races_init(g, n), moments = style_init(g, n);
     career_init(g, n);
@@ -12055,6 +12080,17 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                 g_rt.nresets++;
                 printf("retail AI: %s reset onto the road at (%.0f %.0f), %.1f m/s\n",
                        g_rt.nopp ? g_rt.opp[k].name : "opponent", rp[0], rp[1], rv);
+            }
+        }
+        if (beyond_is_track(g_rt.reg)) {
+            /* Beyond streams its ground near the player only (the city's
+               collision is all resident): a racer with none loaded under it
+               keeps to the far mover, where retail would wake it (checked
+               every 8 ticks) */
+            static unsigned char tick[AIRACE_MAX + 1];
+            if (k <= AIRACE_MAX && !(tick[k]++ & 7)) {
+                float gz, gn[3]; int gs;
+                airacer_set_no_ground(c->r, !rt_ground(&c->wc, c->st.pos[0], c->st.pos[1], c->st.pos[2] + 2.0f, &gz, gn, &gs));
             }
         }
         if (n2sim_far_take_jump(c->s)) airacer_far_hold(c->r, 1.0f);   /* 0x59ec80 -> 0x591540 */

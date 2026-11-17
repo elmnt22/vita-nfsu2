@@ -1,6 +1,7 @@
 /* airace.c — who races and where they start (see airace.h).
  * Addresses in comments are SPEED2.EXE v1.2. */
 #include "airace.h"
+#include "beyond.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,7 +130,7 @@ int airace_event_type(int event)
             if (r[0x34] == 2) return AIRACE_URL;
             return r[0xf];
         }
-    return -1;
+    return beyond_event_type(event);        /* the World Expansion's own events; -1 otherwise */
 }
 
 /* ---- random ------------------------------------------------------------------- */

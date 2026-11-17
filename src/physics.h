@@ -330,7 +330,9 @@ void phys_wall_index_install(PhysWallIndex *ix);
 void phys_wall_index_drop(PhysWallIndex *ix);
 /* 0 while the World Expansion (beyond.h) is loaded: its trees are merged per
    patch, so a clump of trunks passed the prop test and the canopy acted as a
-   wall (B7 11-16). 1 (the city) otherwise. */
+   wall (B7 11-16); its props likewise (merged per cell: a level crossing's
+   gate arms became a 21 m wall across the road, B10 11-17) -- the map's own
+   collision is its 1WALL meshes, as in Assetto Corsa. 1 (the city) otherwise. */
 extern int g_phys_trees_solid;
 int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max);

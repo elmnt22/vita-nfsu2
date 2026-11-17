@@ -162,6 +162,7 @@ void     airacer_touched_human(AiRacer *r);
    at its speed (0x4038d0 less its grade term; draft = car +0x4dc).
    Returns the point count (up to 20). */
 void     airacer_far_hold(AiRacer *r, float sec);
+void     airacer_set_no_ground(AiRacer *r, int on);   /* port: Beyond, no ground loaded under it */
 int      airacer_far_repath(AiRacer *r);
 int      airacer_far_plan(AiRacer *r, float draft, float (*p)[3], float *len, float *vtarget, float *x234, float *acc);
 /* the mover the car should run on now (N2_MOVER_PHYSICS / _MELLO) */

@@ -180,3 +180,46 @@ void beyond_close(void) {
     g_bx_f = NULL; g_bx_t = NULL; g_bx_n = 0; g_bx_tried = 0;
     bx_unlock();
 }
+
+/* ---- race events (ROUTESBEYOND/events.txt: "id type length_m district n") ---- */
+#define BX_MAXEV 128
+static struct { int id, type, len; char name[40]; } g_bx_ev[BX_MAXEV];
+static int g_bx_nev = -1;
+static void bx_events_load(void) {
+    if (g_bx_nev >= 0) return;
+    g_bx_nev = 0;
+    if (!beyond_enabled()) return;
+    FILE *f = fopen(BEYOND_DIR "/ROUTESBEYOND/events.txt", "r");
+    if (!f) return;
+    char line[160];
+    while (g_bx_nev < BX_MAXEV && fgets(line, sizeof line, f)) {
+        int id, type, len, num = 0, used = 0;
+        if (sscanf(line, "%d %d %d %n", &id, &type, &len, &used) < 3 || id < 4000 || id > 7999) continue;
+        char *nm = line + used, *e = nm + strlen(nm);
+        while (e > nm && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        char *sp = strrchr(nm, ' ');                     /* the trailing number */
+        if (sp && sscanf(sp + 1, "%d", &num) == 1) *sp = 0;
+        g_bx_ev[g_bx_nev].id = id; g_bx_ev[g_bx_nev].type = type; g_bx_ev[g_bx_nev].len = len;
+        snprintf(g_bx_ev[g_bx_nev].name, sizeof g_bx_ev[g_bx_nev].name, num > 0 ? "%s %d" : "%s", nm, num);
+        g_bx_nev++;
+    }
+    fclose(f);
+    printf("beyond: %d race events\n", g_bx_nev);
+}
+int beyond_event_count(void) { bx_events_load(); return g_bx_nev; }
+int beyond_event_at(int i, int *id, int *type, int *len) {
+    bx_events_load();
+    if (i < 0 || i >= g_bx_nev) return 0;
+    if (id) *id = g_bx_ev[i].id;
+    if (type) *type = g_bx_ev[i].type;
+    if (len) *len = g_bx_ev[i].len;
+    return 1;
+}
+static int bx_ev_index(int id) {
+    if (id < 4000) return -1;
+    bx_events_load();
+    for (int i = 0; i < g_bx_nev; i++) if (g_bx_ev[i].id == id) return i;
+    return -1;
+}
+int beyond_event_type(int id) { int i = bx_ev_index(id); return i < 0 ? -1 : g_bx_ev[i].type; }
+const char *beyond_event_name(int id) { int i = bx_ev_index(id); return i < 0 ? NULL : g_bx_ev[i].name; }

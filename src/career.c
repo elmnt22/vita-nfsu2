@@ -6,6 +6,7 @@
  * current event +0x8738. GC <-> PC field pairs are in CAREER.md. */
 #include "career.h"
 #include "airace.h"
+#include "beyond.h"
 #include "perfparts.h"
 #include "trophy.h"
 #include <stdio.h>
@@ -2325,6 +2326,7 @@ int career_qr_car_unlocked(int t)
    completed; no event owns it = locked */
 int career_qr_track_unlocked(int race)
 {
+    if (beyond_event_type(race) >= 0) return 1;   /* the World Expansion's events: always open */
     for (int i = 0; i < career_nevents(); i++) {
         const unsigned char *ev = career_event(i);
         int n = (signed char)ev[0x7e], k = 0;
