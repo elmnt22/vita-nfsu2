@@ -158,5 +158,6 @@ const char *options_port_str(unsigned int hash);
 
 #define STR_REAR_TOUCH 0x0a5e7001u   /* "Rear Touchpad" */
 #define STR_TOUCH_SENS 0x0a5e7002u   /* "Rear Touch Sensitivity" */
+#define STR_CTL_HINT   0x0a5e7003u   /* the Controls screen's instruction line: its buttons (GitHub #24) */
 
 #endif

@@ -3499,7 +3499,7 @@ static void ctl_enter(Shop *s) {
     s->screen = SC_CTL;
     opt_mark(s);
     s->ctl_sel = 0; s->ctl_col = 0; s->ctl_top = 0; s->ctl_cap = 0;
-    s->ctl_instr = STR_CTL_CONFIG;
+    s->ctl_instr = STR_CTL_HINT;   /* port: was STR_CTL_CONFIG "Configure your settings" */
     if (!pk) return;
     if (!s->ctl_anim) s->ctl_anim = (FengAnim *)malloc(sizeof *s->ctl_anim);
     FengAnim *a = s->ctl_anim;
@@ -3522,7 +3522,7 @@ void shop_ctl_button(Shop *s, int vb) {
     if (!s || s->ctl_cap != 2 || s->ctl_sel < 0 || vb <= VB_NONE || vb >= VB_COUNT) return;
     g_opt.ctl[s->ctl_sel][s->ctl_col] = (unsigned char)vb;
     s->ctl_cap = 0;
-    s->ctl_instr = STR_CTL_ASSIGN;
+    s->ctl_instr = STR_CTL_HINT;   /* port: was STR_CTL_ASSIGN */
     audio_fe_play(FE_SND_SELECT);
     printf("controls: %s %s = %s\n", s->ctl_col ? "secondary" : "primary",
            str_get(s, k_ctl_name[s->ctl_sel]), g_vb_name[vb]);

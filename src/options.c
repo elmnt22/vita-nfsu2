@@ -87,6 +87,7 @@ const char *options_port_str(unsigned int hash) {
     switch (hash) {
     case STR_REAR_TOUCH: return "Rear Touchpad";
     case STR_TOUCH_SENS: return "Rear Touch Sensitivity";
+    case STR_CTL_HINT:   return "Square: Clear   Triangle: Reset all";
     default: return NULL;
     }
 }
