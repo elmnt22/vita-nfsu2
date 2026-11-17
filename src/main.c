@@ -20554,7 +20554,12 @@ int main(int argc, char **argv) {
                 /* 0x4d82d0: the stick turns the car (turntable) and moves the
                    eye: y -= in x 0.5 in [-6.5, -0.1], z += in x 0.1 in
                    [1.2, 5.2], per 1/60 s */
-                heading += vita_rstick_x * 0.035f;
+                /* the sign is the pad's (GitHub #19): the PC's mouse drag
+                   (0x4a5d90: +0x248 = dx * 0.5) turns it the other way, the
+                   GC CarOrbiter (HandleJoyEvent 800fa690: -(x - 128) / 128,
+                   HandleTick 800fccbc: +0x294 += that x dt x 60 deg) pushes
+                   right -> the heading goes down */
+                heading -= vita_rstick_x * 0.035f;
                 g_room_eye[1] -= vita_lstick_y * 0.5f;
                 if (g_room_eye[1] < -6.5f) g_room_eye[1] = -6.5f;
                 if (g_room_eye[1] > -0.1f) g_room_eye[1] = -0.1f;
