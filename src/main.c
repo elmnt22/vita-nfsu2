@@ -23128,13 +23128,25 @@ int main(int argc, char **argv) {
              sound plays the scene (idling down, the event track's rev
              patterns) instead of the car; one step a tick (assumed: the
              call rate of the game's audio update is not decoded) */
-          g_rt.rev_on = nis_rev_step(&g_rt.rev, g_rt.active && g_rt.nis && race_state == 0);
+          /* the player's engine (0x484c50, GC SFXCTL_Physics::UpdateParams 800946c0)
+             leaves the scene once its car is activated (Car::Activate 80224ce4 ->
+             SFX message 11 -> +0xd0, the hand-off) and the race stage is 2..4:
+             the countdown revs are the player's own (GitHub #8). Only the AI's
+             (0x47c490, GC SFXCTL_AIPhysics 800950c8) wait for stage 4 = GO. */
+          g_rt.rev_on = nis_rev_step(&g_rt.rev, g_rt.active && g_rt.nis && race_state == 0 && g_rt.nis_on);
           for (int k = 0; k < g_rt.n; k++)
               nis_rev_step(&g_rt.arev[k], g_rt.active && g_rt.nis && race_state == 0);
           if (g_rt.rev_on) {
               g_engine.target_rpm = g_rt.rev.rpm;
               g_engine.load = g_rt.rev.thr * 0.01f;     /* throttle 0..100 */
           }
+#ifdef OPENUG2_SIM_PRE_H
+          {   static int ll;   /* test aid: the start line's gas, tach and engine note */
+              if (getenv("OPENUG2_SIM_LINELOG") && race_state == 0 && g_rt.active && ++ll % 10 == 0)
+                  printf("line: gas %d nis_on %d rev_on %d tach %.0f sound %.0f\n", ks[SDL_SCANCODE_W] != 0,
+                         g_rt.nis_on, g_rt.rev_on, g_n2s.rpm_tach, g_engine.target_rpm);
+          }
+#endif
           /* rpm and throttle already shape the recordings' loudness; speed
              only adds a little on top (0.16 at a standstill was near silent
              next to the shift and skid clips) */
