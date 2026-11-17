@@ -131,12 +131,13 @@ int pcsave_peek(const char *savefile, char name[32]) {
 }
 
 typedef struct { unsigned char *p; long n, cap; } Buf;
+static int g_put_fail;   /* a put lost its data (out of memory): the import writes nothing */
 static void put(Buf *b, const void *p, long n) {
     if (b->n + n > b->cap) {
         long c = b->cap ? b->cap : 4096;
         while (c < b->n + n) c *= 2;
         unsigned char *q = (unsigned char *)realloc(b->p, (size_t)c);
-        if (!q) return;
+        if (!q) { g_put_fail = 1; return; }
         b->p = q; b->cap = c;
     }
     memcpy(b->p + b->n, p, (size_t)n); b->n += n;
@@ -156,6 +157,7 @@ static void options_from(N2Options *o, const unsigned char *p) {
     o->mirror = gp[0]; o->kmh = gp[2]; o->race_map = gp[3]; o->explore_map = gp[4];
     o->jump_cam = rdf(gp + 8) > 0.0f;            /* UP +0x40: 0 / 127.5 */
     o->career_diff = (int)rd32(p + P_DIFF);
+    if (o->career_diff < 0 || o->career_diff > 2) o->career_diff = 0;   /* indexes a 3-entry table (shop.c) */
     o->save_on = p[P_PROMPT]; o->autosave = p[P_AUTOSAVE];
     for (int i = 0; i < 27; i++) { o->pl_song[i] = (unsigned char)rd32(pl + 8 * i); o->pl_mode[i] = pl[8 * i + 4]; }
     o->playlist_set = 1;
@@ -280,8 +282,18 @@ static int write_container(const char *path, const unsigned char *pay, long pn) 
     if (o && fclose(o) != 0) ok = 0;
     free(f);
     if (!ok) { remove(tmp); return 0; }
-    remove(path);
-    return rename(tmp, path) == 0;
+    /* the old profile kept as .bak until the new one is in place (profile.c
+       file_recover puts a left-over .bak back) */
+    char bak[600]; struct stat st;
+    snprintf(bak, sizeof bak, "%s.savebak", path);
+    remove(bak);
+    int had = stat(path, &st) == 0;
+    if ((had && rename(path, bak) != 0) || rename(tmp, path) != 0) {
+        if (had && stat(path, &st) != 0) rename(bak, path);
+        remove(tmp); return 0;
+    }
+    if (had) remove(bak);
+    return 1;
 }
 
 int pcsave_import(const char *savefile, const char *dataroot, const char *profdir, PcSaveInfo *info) {
@@ -298,6 +310,7 @@ int pcsave_import(const char *savefile, const char *dataroot, const char *profdi
         printf("pcsave: unexpected FEPlayerCarDB counts %u %u %u\n", (unsigned)rd32(p + CDB_TUNED - 4),
                (unsigned)rd32(p + CDB_PC - 4), (unsigned)rd32(p + P_CAREER - 4));
     Buf b = {0};
+    g_put_fail = 0;
     char nm[32]; memset(nm, 0, sizeof nm); snprintf(nm, sizeof nm, "%s", info->name);
     put_block_hdr(&b, "NAME", sizeof nm); put(&b, nm, sizeof nm);
     {   N2Options o; options_from(&o, p);
@@ -339,7 +352,8 @@ int pcsave_import(const char *savefile, const char *dataroot, const char *profdi
     snprintf(dir, sizeof dir, "%s/%s", profdir, info->name);
     mkdir(profdir, 0777); mkdir(dir, 0777);
     snprintf(path, sizeof path, "%s/%s", dir, info->name);
-    int ok = b.p && write_container(path, b.p, b.n);
+    if (g_put_fail) printf("pcsave: out of memory while building the profile, not written\n");
+    int ok = b.p && !g_put_fail && write_container(path, b.p, b.n);
     free(b.p); free(f);
     snprintf(info->msg, sizeof info->msg, ok ? "%s: %d tuned cars, %d career cars, %d high scores%s"
                                              : "%s: cannot write the profile",

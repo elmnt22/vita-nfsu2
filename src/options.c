@@ -2,6 +2,7 @@
 #include "options.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifdef __vita__
 #define OPT_FILE "ux0:data/NFSU2/options.bin"
@@ -119,6 +120,10 @@ void options_defaults(N2Options *o) {
 
 void options_load(void) {
     options_defaults(&g_opt);
+    {   /* a save cut off between its renames left the old file as .bak */
+        char bak[300]; struct stat st; snprintf(bak, sizeof bak, "%s.savebak", OPT_FILE);
+        if (stat(OPT_FILE, &st) != 0 && stat(bak, &st) == 0) rename(bak, OPT_FILE);
+    }
     FILE *f = fopen(OPT_FILE, "rb");
     if (!f) { printf("options: defaults (no %s)\n", OPT_FILE); return; }
     char m[8]; unsigned sz = 0;
@@ -141,10 +146,22 @@ void options_load(void) {
 }
 
 void options_save(void) {
-    FILE *f = fopen(OPT_FILE, "wb");
+    /* a temp file renamed in, the old one kept as .bak meanwhile: a power cut
+       mid-save no longer resets every option (audit 11-17) */
+    char tmp[300], bak[300]; struct stat st;
+    snprintf(tmp, sizeof tmp, "%s.tmp", OPT_FILE); snprintf(bak, sizeof bak, "%s.savebak", OPT_FILE);
+    FILE *f = fopen(tmp, "wb");
     if (!f) { printf("options: cannot write %s\n", OPT_FILE); return; }
     unsigned sz = sizeof g_opt;
-    fwrite(OPT_MAGIC, 1, 8, f); fwrite(&sz, 4, 1, f); fwrite(&g_opt, sizeof g_opt, 1, f);
-    fclose(f);
+    int ok = fwrite(OPT_MAGIC, 1, 8, f) == 8 && fwrite(&sz, 4, 1, f) == 1 && fwrite(&g_opt, sizeof g_opt, 1, f) == 1;
+    ok = fclose(f) == 0 && ok;
+    if (!ok) { remove(tmp); printf("options: cannot write %s\n", OPT_FILE); return; }
+    remove(bak);
+    int had = stat(OPT_FILE, &st) == 0;
+    if ((had && rename(OPT_FILE, bak) != 0) || rename(tmp, OPT_FILE) != 0) {
+        if (had && stat(OPT_FILE, &st) != 0) rename(bak, OPT_FILE);
+        remove(tmp); printf("options: cannot write %s\n", OPT_FILE); return;
+    }
+    if (had) remove(bak);
     printf("options: saved\n");
 }

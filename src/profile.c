@@ -63,11 +63,22 @@ static uint32_t rmc_crc(const unsigned char *p, long n) {
 
 /* ------------------------------------------------------------- files */
 
+/* a save cut off between its two renames (write_file) left the old file as
+   <path>.bak: put it back (audit 11-17) */
+static void file_recover(const char *path) {
+    char bak[300]; struct stat st;
+    if (stat(path, &st) == 0) return;
+    snprintf(bak, sizeof bak, "%s.savebak", path);
+    if (stat(bak, &st) == 0 && rename(bak, path) == 0) printf("profile: %s restored from its .savebak\n", path);
+}
 static unsigned char *read_file(const char *path, long *len) {
     *len = 0;
+    file_recover(path);
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    long n = -1;
+    if (fseek(f, 0, SEEK_END) == 0) n = ftell(f);
+    if (n < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }   /* not a length of -1 */
     unsigned char *b = (unsigned char *)malloc(n > 0 ? (size_t)n : 1);
     if (b && n > 0 && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
     fclose(f);
@@ -82,8 +93,20 @@ static int write_file(const char *path, const void *p, long n) {
     int ok = n <= 0 || fwrite(p, 1, (size_t)n, f) == (size_t)n;
     ok = fclose(f) == 0 && ok;
     if (!ok) { remove(tmp); return 0; }
-    remove(path);
-    return rename(tmp, path) == 0;
+    /* the old file stays whole as .bak until the new one is in place: a power
+       cut between the renames leaves .bak, which file_recover puts back */
+    char bak[300]; struct stat st;
+    snprintf(bak, sizeof bak, "%s.savebak", path);
+    remove(bak);
+    int had = stat(path, &st) == 0;
+    if (had && rename(path, bak) != 0) { remove(tmp); return 0; }
+    if (rename(tmp, path) != 0) {
+        if (had) rename(bak, path);
+        remove(tmp);
+        return 0;
+    }
+    if (had) remove(bak);
+    return 1;
 }
 
 static void scores_save(void) { write_file(SCORES_FILE, g_hs, sizeof g_hs); }
@@ -126,7 +149,8 @@ static unsigned char *serialize(long *len) {
     long gl; unsigned char *g = read_file(PROFILE_GARAGE_FILE, &gl);
     /* GitHub #18: a garage file there but unreadable (out of memory) is not
        an empty garage -- saved as one, the next load lost every tuned car */
-    if (!g) { FILE *e = fopen(PROFILE_GARAGE_FILE, "rb"); if (e) { fclose(e); b.fail = 1; } }
+    {   struct stat st;   /* stat, not fopen: the open itself needs memory (garage_read) */
+        if (!g && stat(PROFILE_GARAGE_FILE, &st) == 0) b.fail = 1; }
     put_block(&b, "GRGE", g, g ? gl : 0);
     free(g);
     put_block(&b, "HSCR", g_hs, sizeof g_hs);
@@ -152,7 +176,7 @@ static int apply(const unsigned char *p, long n) {
     long optn = 0, garn = 0, hsn = 0, carn = 0, ccn = 0, trn = 0;
     for (long i = 0; i + 8 <= n; ) {
         uint32_t l; memcpy(&l, p + i + 4, 4);
-        if (i + 8 + (long)l > n) return 0;
+        if (l > (uint32_t)(n - i - 8)) return 0;   /* unsigned: a huge l is no negative length */
         const unsigned char *d = p + i + 8;
         if (!memcmp(p + i, "OPTN", 4)) { opt = d; optn = l; }
         else if (!memcmp(p + i, "GRGE", 4)) { gar = d; garn = l; }
@@ -167,8 +191,10 @@ static int apply(const unsigned char *p, long n) {
     if (opt && sz == sizeof g_opt && optn == (long)(4 + sz)) memcpy(&g_opt, opt + 4, sizeof g_opt);
     else printf("profile: options from another build, kept\n");
     options_save();
-    if (gar && garn > 0) write_file(PROFILE_GARAGE_FILE, gar, garn);
-    else remove(PROFILE_GARAGE_FILE);
+    if (gar && garn > 0) {
+        /* the garage not written: the last profile's cars would be saved into this one */
+        if (!write_file(PROFILE_GARAGE_FILE, gar, garn)) { printf("profile: garage not written, load refused\n"); return 0; }
+    } else remove(PROFILE_GARAGE_FILE);
     memset(g_hs, 0, sizeof g_hs);
     if (hs && hsn == (long)sizeof g_hs) memcpy(g_hs, hs, sizeof g_hs);
     scores_save();
@@ -216,6 +242,7 @@ int profile_file(const char *file, char *out, int cap) {
 }
 int profile_exists(const char *name) {
     char p[300]; profile_path(name, p, sizeof p);
+    file_recover(p);
     FILE *f = fopen(p, "rb");
     if (f) fclose(f);
     return f != NULL;
@@ -243,7 +270,7 @@ static uint32_t get32(const unsigned char *p) { uint32_t v; memcpy(&v, p, 4); re
 int profile_save(void) {
     if (!g_named) return 0;
     long pn; unsigned char *pay = serialize(&pn);
-    if (!pay) return 0;
+    if (!pay) { savenote_failed(); return 0; }   /* said, not silent (audit 11-17) */
     long total = RMC_HDR + pn;
     unsigned char *f = (unsigned char *)malloc((size_t)total);
     if (!f) { free(pay); return 0; }
@@ -263,6 +290,7 @@ int profile_save(void) {
     free(f); free(pay);
     printf("profile: %s %s (%ld bytes)\n", ok ? "saved" : "cannot save", g_name, total);
     if (ok) savenote_saved();   /* the corner note (port addition, savenote.c) */
+    else savenote_failed();
     return ok;
 }
 
@@ -302,9 +330,10 @@ void profile_default(void) {
     options_save();
 }
 
-void profile_snapshot(void) {
+int profile_snapshot(void) {
     free(g_snap);
     g_snap = serialize(&g_snaplen);
+    return g_snap != NULL;
 }
 int profile_dirty(void) {
     if (!g_snap) return 0;

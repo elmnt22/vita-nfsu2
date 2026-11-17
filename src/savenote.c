@@ -22,18 +22,29 @@ const char *shop_rmc_string(const char *dataroot, int id);   /* shop.c */
 #define SN_FADE_OUT_MS 600u
 
 static volatile Uint32 g_sn_at;     /* SDL_GetTicks of the last save, 0 = none */
-static GLuint g_sn_tex, g_sn_prog, g_sn_vbo;
+static volatile int g_sn_kind;      /* 0 "Save complete.", 1 "Unable to save %1." */
+static GLuint g_sn_tex[2], g_sn_prog, g_sn_vbo;
 static GLint g_sn_alpha_loc = -1;
-static int g_sn_w, g_sn_h, g_sn_failed;
+static int g_sn_w[2], g_sn_h[2], g_sn_failed[2];
 
 void savenote_saved(void) {
     Uint32 t = SDL_GetTicks();
+    g_sn_kind = 0;
+    g_sn_at = t ? t : 1;
+}
+/* an autosave that did not go through (memory card full, out of memory):
+   said instead of silence, so the player knows the progress is not on the
+   card yet (audit 11-17; the menus' own save already shows the dialog) */
+void savenote_failed(void) {
+    Uint32 t = SDL_GetTicks();
+    g_sn_kind = 1;
     g_sn_at = t ? t : 1;
 }
 void savenote_cancel(void) { g_sn_at = 0; }
 
 /* the note's picture: a dark rounded panel, the line in the menus' green */
-static int sn_build(const char *dataroot) {
+const char *profile_name(void);   /* profile.c */
+static int sn_build(const char *dataroot, int kind) {
     char path[600];
     long glen = 0;
     snprintf(path, sizeof path, "%s/GLOBAL/GLOBALA.BUN", dataroot);
@@ -46,8 +57,15 @@ static int sn_build(const char *dataroot) {
     free(globa);
     if (!ok || !img.rgba) { printf("save note: no front-end font (%d)\n", ok); feng_image_free(&img); return 0; }
 
-    const char *txt = shop_rmc_string(dataroot, 8);
-    if (!txt || !txt[0]) txt = "Save complete.";
+    const char *txt = shop_rmc_string(dataroot, kind ? 9 : 8);
+    if (!txt || !txt[0]) txt = kind ? "Unable to save %1." : "Save complete.";
+    char tb[160];
+    {   /* %1: the profile's name (realmc's own fill) */
+        const char *pc = strstr(txt, "%1");
+        if (pc) snprintf(tb, sizeof tb, "%.*s%s%s", (int)(pc - txt), txt, profile_name(), pc + 2);
+        else snprintf(tb, sizeof tb, "%s", txt);
+        txt = tb;
+    }
     int tw = (int)(feng_text_width(&font, txt) + 0.5f);
     int lh = font.line > 0 ? font.line : 24;
     int padx = 14, pady = 6;
@@ -110,6 +128,7 @@ static int sn_build(const char *dataroot) {
 #endif
         "varying vec2 vUV; uniform sampler2D uTex; uniform float uAlpha;\n"
         "void main(){ vec4 c=texture2D(uTex,vUV); gl_FragColor=vec4(c.rgb,c.a*uAlpha); }\n";
+    if (!g_sn_prog) {
     GLuint p = glCreateProgram();
     const char *src[2] = { vs, fs };
     GLenum ty[2] = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER };
@@ -128,9 +147,10 @@ static int sn_build(const char *dataroot) {
     g_sn_alpha_loc = glGetUniformLocation(p, "uAlpha");
     glUseProgram(p);
     glUniform1i(glGetUniformLocation(p, "uTex"), 0);
+    }
 
-    glGenTextures(1, &g_sn_tex);
-    glBindTexture(GL_TEXTURE_2D, g_sn_tex);
+    glGenTextures(1, &g_sn_tex[kind]);
+    glBindTexture(GL_TEXTURE_2D, g_sn_tex[kind]);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -138,8 +158,8 @@ static int sn_build(const char *dataroot) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     free(px);
-    glGenBuffers(1, &g_sn_vbo);
-    g_sn_w = w; g_sn_h = h;
+    if (!g_sn_vbo) glGenBuffers(1, &g_sn_vbo);
+    g_sn_w[kind] = w; g_sn_h[kind] = h;
     printf("save note: \"%s\" %dx%d\n", txt, w, h);
     return 1;
 }
@@ -149,8 +169,9 @@ void savenote_draw(const char *dataroot, int sw, int sh) {
     if (!at || sw <= 0 || sh <= 0) return;
     Uint32 dt = SDL_GetTicks() - at;
     if (dt >= SN_SHOW_MS) { g_sn_at = 0; return; }
-    if (!g_sn_tex) {
-        if (g_sn_failed || !sn_build(dataroot)) { g_sn_failed = 1; g_sn_at = 0; return; }
+    int kind = g_sn_kind ? 1 : 0;
+    if (!g_sn_tex[kind]) {
+        if (g_sn_failed[kind] || !sn_build(dataroot, kind)) { g_sn_failed[kind] = 1; g_sn_at = 0; return; }
     }
     float a = 1.0f;
     if (dt < SN_FADE_IN_MS) a = (float)dt / (float)SN_FADE_IN_MS;
@@ -160,7 +181,7 @@ void savenote_draw(const char *dataroot, int sw, int sh) {
        top; the help bar ends short of this corner), 0.8 of its 640x480 size
        scaled to the screen height */
     float s = (float)sh / 480.0f * 0.8f;
-    float w = (float)g_sn_w * s, h = (float)g_sn_h * s;
+    float w = (float)g_sn_w[kind] * s, h = (float)g_sn_h[kind] * s;
     float mx = 12.0f * s, my = 12.0f * s;
     float x1 = (float)sw - mx, x0 = x1 - w, y1 = (float)sh - my, y0 = y1 - h;   /* pixels from the top left */
     float X0 = x0 / (float)sw * 2.0f - 1.0f, X1 = x1 / (float)sw * 2.0f - 1.0f;
@@ -175,7 +196,7 @@ void savenote_draw(const char *dataroot, int sw, int sh) {
     glUseProgram(g_sn_prog);
     glUniform1f(g_sn_alpha_loc, a);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_sn_tex);
+    glBindTexture(GL_TEXTURE_2D, g_sn_tex[kind]);
     glBindBuffer(GL_ARRAY_BUFFER, g_sn_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);

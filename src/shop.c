@@ -7430,7 +7430,7 @@ static void mc_write(Shop *s) {
     if (profile_save()) {
         if (mc_quiet(s)) mc_exit(s, 1);
         else { savenote_cancel(); mc_rmc(s, RM_SAVED, 8, profile_name(), 1); }   /* "Save complete." (the dialog says it, no corner note) */
-    } else mc_rmc(s, RM_SAVE_FAIL, 9, profile_name(), 1);         /* "Unable to save %1." */
+    } else { savenote_cancel(); mc_rmc(s, RM_SAVE_FAIL, 9, profile_name(), 1); }   /* "Unable to save %1." (the dialog says it) */
 }
 /* Save(name) 0x4d9b80 -> realmc 0x6fce82 */
 static void mc_save(Shop *s) {
@@ -7579,7 +7579,10 @@ static void mc_answer(Shop *s, int yes) {
     case MCD_SAVE: if (yes) mc_save(s); else mc_cancel(s); break;
     case MCD_LOSE:
         if (!yes) { mc_exit(s, 0); break; }
-        profile_snapshot(); s->mc_backup = 1;          /* AllocBackupDB(1), then 0x5346f0 */
+        /* no snapshot (out of memory): defaulting now could not be undone on a
+           cancel, so the new profile is refused (audit 11-17) */
+        if (!profile_snapshot()) { printf("memcard: no memory for the backup, new profile refused\n"); mc_exit(s, 0); break; }
+        s->mc_backup = 1;          /* AllocBackupDB(1), then 0x5346f0 */
         if (s->mc_flags & 0x20000) career_default();   /* CSNew: PlayerCareerState::Default(1) only */
         else profile_default();
         s->mc_changed = 1;

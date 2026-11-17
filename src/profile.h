@@ -49,7 +49,7 @@ int  profile_delete(const char *name);
 void profile_default(void);
 
 /* AllocBackupDB 0x52a460 / IsDirty 0x52a4c0 / RestoreFromBackupDB 0x5347c0 */
-void profile_snapshot(void);
+int profile_snapshot(void);   /* 0: out of memory, no snapshot */
 int  profile_dirty(void);           /* the working set differs from the snapshot */
 void profile_restore(void);         /* back to the snapshot (cancel) */
 void profile_drop_snapshot(void);   /* DeallocBackup 0x5032c0 */

@@ -428,6 +428,11 @@ static void garage_id(char *out, size_t cap, const char *car, int slot) {
 }
 static void garage_read(GarageFile *g) {
     memset(g, 0, sizeof *g);
+    {   /* a write cut off between its renames (garage_write) left the old file as .bak */
+        struct stat st; char bak[300]; snprintf(bak, sizeof bak, "%s.savebak", GARAGE_SAVE);
+        if (stat(GARAGE_SAVE, &st) != 0 && stat(bak, &st) == 0 && rename(bak, GARAGE_SAVE) == 0)
+            printf("garage: %s restored from its .savebak\n", GARAGE_SAVE);
+    }
     FILE *f = fopen(GARAGE_SAVE, "r");
     if (!f) f = fopen(GARAGE_SAVE, "r");   /* one retry: the open itself needs memory */
     if (!f) {   /* GitHub #18: there but unreadable (out of memory) is not an empty garage */
@@ -489,8 +494,16 @@ static void garage_write(GarageFile *g) {
     if (g->cur[0]) ok &= fprintf(f, "CURRENT %s\n", g->cur) > 0;
     ok &= fclose(f) == 0;
     if (!ok) { remove(tmp); printf("garage: %s not written\n", GARAGE_SAVE); return; }
-    remove(GARAGE_SAVE);
-    rename(tmp, GARAGE_SAVE);
+    {   /* the old file kept as .bak until the new one is in place (audit 11-17) */
+        char bak[300]; struct stat st; snprintf(bak, sizeof bak, "%s.savebak", GARAGE_SAVE);
+        remove(bak);
+        int had = stat(GARAGE_SAVE, &st) == 0;
+        if ((had && rename(GARAGE_SAVE, bak) != 0) || rename(tmp, GARAGE_SAVE) != 0) {
+            if (had && stat(GARAGE_SAVE, &st) != 0) rename(bak, GARAGE_SAVE);
+            remove(tmp); printf("garage: %s not written (rename)\n", GARAGE_SAVE); return;
+        }
+        if (had) remove(bak);
+    }
     if (g->legacy) printf("garage: old per-type lines moved to tuned slots\n");
     g->legacy = 0;
 }
