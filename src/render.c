@@ -3958,7 +3958,35 @@ void render_batch_reuse_selftest(void) {
 #endif
 }
 
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
+/* PERF_PLAN P4.2 (11-17): the patched vitaGL's world batch fast path
+   (vitaGL_ug2f custom_shaders.c). After one ordinary draw_batch the layout
+   is armed; later batches only swap the VBO / IBO and draw while no
+   attribute setup changed in between. ux0:data/NFSU2/nofastbatch.txt turns
+   it off (A/B); weak, so the stock library still links. */
+extern int  vglUG2BatchDraw(GLuint vbo, GLuint ibo, uint32_t ioff, GLsizei count) __attribute__((weak));
+extern void vglUG2BatchArm(void) __attribute__((weak));
+static int g_fastbatch = -1;
+long g_fastbatch_hits, g_fastbatch_slow;
+int render_fastbatch_on(void) {
+    if (g_fastbatch < 0) {
+        FILE *f = fopen("ux0:data/NFSU2/nofastbatch.txt", "r");
+        g_fastbatch = !f && vglUG2BatchDraw && vglUG2BatchArm;
+        if (f) fclose(f);
+        printf("world batches: %s%s", g_fastbatch ? "vitaGL fast path" :
+               vglUG2BatchDraw ? "ordinary GL path (nofastbatch.txt)" : "ordinary GL path (library has no fast path)", "\n");
+    }
+    return g_fastbatch;
+}
+#endif
 void draw_batch(const N2Batch *b) {
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
+    if (g_fastbatch != 0 && render_fastbatch_on()) {
+        vu_select();   /* the shader variant pick the glDrawElements shim makes */
+        if (vglUG2BatchDraw(b->vbo, b->ibo, b->ioff, (GLsizei)b->index_count)) { g_fastbatch_hits++; return; }
+        g_fastbatch_slow++;
+    }
+#endif
 #ifdef OPENUG2_SIM_PRE_H
     { extern uint32_t g_sim_probe_tag; g_sim_probe_tag = b->texkey; }   /* test aid: "probe" names the batch's texture */
 #endif
@@ -3975,6 +4003,9 @@ void draw_batch(const N2Batch *b) {
                           (void*)offsetof(BatchedVertex, col));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
     glDrawElements(GL_TRIANGLES, b->index_count, GL_UNSIGNED_SHORT, (const void *)(uintptr_t)b->ioff);
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
+    if (g_fastbatch > 0) vglUG2BatchArm();
+#endif
 }
 
 /* Build a clean procedural wheel (short cylinder, axle along Y, disc in X-Z) —

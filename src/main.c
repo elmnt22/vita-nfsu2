@@ -27101,6 +27101,13 @@ int main(int argc, char **argv) {
                        wo/60.0, wc/60.0, wb/60.0, nbatch, g_refl_batches/60.0, nrefl_res,
                        g_refl_ready ? "" : " (reflection off)", tall_res/60.0, tall_far/60.0, VIEW_DIST);
                 g_refl_batches = 0; tall_res = tall_far = 0;
+#if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
+                {   extern long g_fastbatch_hits, g_fastbatch_slow;   /* render.c draw_batch, P4.2 */
+                    if (g_fastbatch_hits || g_fastbatch_slow)
+                        printf("world batches: fast path %.1f/frame, ordinary %.1f/frame%c",
+                               g_fastbatch_hits / 60.0, g_fastbatch_slow / 60.0, 10);
+                    g_fastbatch_hits = g_fastbatch_slow = 0; }
+#endif
 #if defined(OPENUG2_SIM_PRE_H)
                 printf("sim gate census/frame: other <300 %.1f 300-400 %.1f 400-500 %.1f 500-700 %.1f >700 %.1f | stand-in <300 %.1f 300-400 %.1f 400-500 %.1f 500-700 %.1f >700 %.1f\n",
                        g_simgate[0][0]/60.0, g_simgate[0][1]/60.0, g_simgate[0][2]/60.0, g_simgate[0][3]/60.0, g_simgate[0][4]/60.0,

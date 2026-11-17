@@ -856,3 +856,18 @@ are saved per car in ux0:data/NFSU2/garage.txt and restored on load.
 Working: Body Shop bumpers, skirts, spoilers, hoods, roof scoops, lights,
 exhaust tips, rims. Locked (shown as the game shows locked items): mirrors,
 carbon fibre, wide body, Performance, Graphics and Car Specialties.
+
+- 11-17 world batch fast path (PERF_PLAN P4.2), source E:/armtest/deps/vitaGL_ug2f
+  (= vitaGL_ug2u with custom_shaders.c + shared.h from ug2u_source_backup_1115, i.e.
+  the shipped 11-12 state without the reverted 11-15 GXM state cache, plus
+  vglUG2BatchArm / vglUG2BatchDraw at the end of custom_shaders.c). Built with
+  `make PREFIX=E:/vitasdk/bin/arm-vita-eabi NO_DEBUG=1 HAVE_VERTEX_LAYOUT_CACHE=1`.
+  render.c draw_batch arms the packed batch layout after one ordinary draw; later
+  batches swap only VBO/IBO and run the cached-layout draw while the VAO's layout
+  version is unchanged (vu_select still runs first). ux0:data/NFSU2/nofastbatch.txt
+  = off. hwlog77 downtown route, off/on x2: world_draw 8.07 -> 7.60 ms median,
+  p90 10.6 -> 10.0, missed 1.86/1.72% -> 1.50/1.42%; GPU unchanged. Previous lib:
+  vita/lib/libvitaGL_1112_backup.a (identical to the lib shipped before 11-17).
+- Measured 11-17 in the sim (vitaGL layout-cache emulation, removed again): only
+  ~32 of ~1080 draws/frame miss the layout cache, so a content-keyed cache is not
+  worth it; per-draw cost is the hit path itself plus libgxm.
