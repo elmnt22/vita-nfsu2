@@ -20800,7 +20800,7 @@ int main(int argc, char **argv) {
                     for (int a = 0; a < 3; a++) { g_room_tgt[a] = mc[3 + a]; g_room_eye[a] = mc[6 + a]; }
                     g_rv.view = -1; g_rv.dur = 0.0f; g_input_tick = SDL_GetTicks();
                 } else {
-                if (fabsf(vita_rstick_x) + fabsf(vita_rstick_y) + fabsf(vita_lstick_y) > 0.2f) g_input_tick = SDL_GetTicks();
+                if (fabsf(vita_rstick_x) > 0.33f || fabsf(vita_rstick_y) > 0.33f || fabsf(vita_lstick_y) > 0.33f) g_input_tick = SDL_GetTicks();
                 int touring = room_tour_tick(suv, heading);
                 heading = room_view_tick(touring ? -2 : vs ? shop_view(vs) : 0, suv, heading);
                 /* 0x4d82d0: the stick turns the car (turntable) and moves the
@@ -20811,11 +20811,20 @@ int main(int argc, char **argv) {
                    GC CarOrbiter (HandleJoyEvent 800fa690: -(x - 128) / 128,
                    HandleTick 800fccbc: +0x294 += that x dt x 60 deg) pushes
                    right -> the heading goes down */
-                heading -= vita_rstick_x * 0.035f;
-                g_room_eye[1] -= vita_lstick_y * 0.5f;
+                /* per 1/60 s as the original, not per frame (unlocked 50 fps spun it
+                   twice as fast), and a wider dead zone than driving's 24/128: a
+                   drifting stick spun the car and swung the camera (player video 11-17) */
+                static Uint32 st_last; Uint32 st_now = SDL_GetTicks();
+                float st_k = st_last ? (float)(st_now - st_last) * 0.06f : 1.0f; st_last = st_now;
+                if (st_k > 6.0f) st_k = 6.0f;
+                #define ROOM_STICK(v) (fabsf(v) < 0.33f ? 0.0f : ((v) > 0 ? ((v) - 0.33f) : ((v) + 0.33f)) / 0.67f)
+                float srx = ROOM_STICK(vita_rstick_x), sry = ROOM_STICK(vita_rstick_y), sly = ROOM_STICK(vita_lstick_y);
+                #undef ROOM_STICK
+                heading -= srx * 0.035f * st_k;
+                g_room_eye[1] -= sly * 0.5f * st_k;
                 if (g_room_eye[1] < -6.5f) g_room_eye[1] = -6.5f;
                 if (g_room_eye[1] > -0.1f) g_room_eye[1] = -0.1f;
-                g_room_eye[2] -= vita_rstick_y * 0.1f;
+                g_room_eye[2] -= sry * 0.1f * st_k;
                 if (g_room_eye[2] < 1.2f) g_room_eye[2] = 1.2f;
                 if (g_room_eye[2] > 5.2f) g_room_eye[2] = 5.2f;
                 }
