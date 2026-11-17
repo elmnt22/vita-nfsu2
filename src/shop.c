@@ -3533,7 +3533,8 @@ void shop_ctl_button(Shop *s, int vb) {
    title), Left / Right between the Primary and Secondary cells, accept
    starts the capture (0x406415e3: Pulse, "Press a button ..."), back leaves
    for UI_OptionsMain. 0xc519bfbf asks "Reset to default settings?" in a
-   GenericDialog_SMALL (here Triangle): OK (0xefedcba0) resets, Cancel. */
+   GenericDialog_SMALL (here Triangle): OK (0xefedcba0) resets, Cancel.
+   Port addition (GitHub #24): Square clears the highlighted cell's binding. */
 static void ctl_input(Shop *s, int key) {
     if (s->ctl_cap) return;                          /* the next button is the binding */
     if (key == SHOP_KEY_UP) {
@@ -3549,6 +3550,11 @@ static void ctl_input(Shop *s, int key) {
     } else if (key == SHOP_KEY_OK && s->ctl_sel >= 0) {
         s->ctl_cap = 1;
         s->ctl_instr = STR_CTL_PRESS;
+    } else if (key == SHOP_KEY_SQ && s->ctl_sel >= 0) {
+        if (!g_opt.ctl[s->ctl_sel][s->ctl_col]) return;
+        g_opt.ctl[s->ctl_sel][s->ctl_col] = VB_NONE;
+        audio_fe_play(FE_SND_SELECT);
+        printf("controls: %s %s cleared\n", s->ctl_col ? "secondary" : "primary", str_get(s, k_ctl_name[s->ctl_sel]));
     } else if (key == SHOP_KEY_TRI) {
         dialog(s, PK_DLG_S, 2, 0x2bbcca6bu, DA_CTL_RESET, STR_OK, STR_CANCEL);
         return;

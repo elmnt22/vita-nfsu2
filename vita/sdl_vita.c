@@ -1689,7 +1689,7 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_RETURN, (b & SCE_CTRL_START) && !quit);
 
     /* Select+Triangle: next A/B test mode; logs how the one just left
-       performed (the one just left's performance) */
+       performed (Select+Up/Down are taken by the overclock overlay) */
     int mode_combo = (b & SCE_CTRL_SELECT) && (b & SCE_CTRL_TRIANGLE);
     if (mode_combo && !((g_prev_buttons & SCE_CTRL_SELECT) && (g_prev_buttons & SCE_CTRL_TRIANGLE))) {
         Uint64 now = sceKernelGetProcessTimeWide();
@@ -2095,7 +2095,7 @@ const char *vita_user_name(void) {
 }
 
 /* The system language (SCE_SYSTEM_PARAM_LANG_*): the game's language, as the
-   consoles take theirs from the OS (the port's language, nfsu2.h n2_lang). */
+   consoles take theirs from the OS (nfsu2.h n2_lang). */
 int vita_system_lang(void) {
     apputil_init();
     int v = -1;

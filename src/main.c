@@ -24977,7 +24977,11 @@ int main(int argc, char **argv) {
                        views -- not with hydraulics fitted (the stick is theirs,
                        0x4078f2), paused, or on the post-race screens */
                     float ox = 0.0f, oy = 0.0f;
-                    if (g_hyd_level <= 0 && !g_pause.on && !post_up() && !tun_active() &&
+                    int rs_bound = 0;   /* a right stick direction bound to an action (PR #22): the stick is that action's */
+                    for (int a = 0; a < OPT_ACT_COUNT; a++)
+                        for (int k = 0; k < 2; k++)
+                            if (g_opt.ctl[a][k] >= VB_RS_UP && g_opt.ctl[a][k] <= VB_RS_RIGHT) rs_bound = 1;
+                    if (!rs_bound && g_hyd_level <= 0 && !g_pause.on && !post_up() && !tun_active() &&
                         !(g_rt.active && (g_rt.pfinished || g_rt.postrace))) {
                         ox = -vita_rstick_x; oy = vita_rstick_y;   /* right: the view turns right */
                     }
