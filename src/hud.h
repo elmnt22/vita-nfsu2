@@ -404,6 +404,7 @@ int  hud_screen_tex_file(Hud *h, uint32_t obj, const char *path, const char *tex
    FRONTEND/MAGAZINES_STREAMING_{LOW,HIGH}.bin (compressed-index JDLZ TPKs).
    Calling it again for an object already overridden replaces that slot. */
 int  hud_screen_tex_key(Hud *h, uint32_t obj, const char *path, uint32_t key, int opaque);
+int  hud_screen_tex_rgba(Hud *h, uint32_t obj, int w, int ih, const unsigned char *rgba);
 int  hud_screen_strip_tex(Hud *h, uint32_t obj, int i);   /* the object drawn with strip icon i */
 /* FEngSetTextureHash for a screen: hud_screen_keys loads TPK keys from a
    bundle into the screen's own table (up to 16 in all, callable again,

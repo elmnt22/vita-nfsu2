@@ -183,7 +183,7 @@ void beyond_close(void) {
 
 /* ---- race events (ROUTESBEYOND/events.txt: "id type length_m district n") ---- */
 #define BX_MAXEV 128
-static struct { int id, type, len; char name[40]; } g_bx_ev[BX_MAXEV];
+static struct { int id, type, len, has_start; float start[3], head; char name[40]; } g_bx_ev[BX_MAXEV];
 static int g_bx_nev = -1;
 static void bx_events_load(void) {
     if (g_bx_nev >= 0) return;
@@ -204,7 +204,20 @@ static void bx_events_load(void) {
         g_bx_nev++;
     }
     fclose(f);
-    printf("beyond: %d race events\n", g_bx_nev);
+    int ns = 0;
+    if ((f = fopen(BEYOND_DIR "/ROUTESBEYOND/starts.txt", "r")) != NULL) {   /* "id x y z heading_deg" */
+        while (fgets(line, sizeof line, f)) {
+            int id; float x, y, z, hd;
+            if (sscanf(line, "%d %f %f %f %f", &id, &x, &y, &z, &hd) != 5) continue;
+            for (int i = 0; i < g_bx_nev; i++)
+                if (g_bx_ev[i].id == id) {
+                    g_bx_ev[i].start[0] = x; g_bx_ev[i].start[1] = y; g_bx_ev[i].start[2] = z;
+                    g_bx_ev[i].head = hd * 3.14159265f / 180.0f; g_bx_ev[i].has_start = 1; ns++;
+                }
+        }
+        fclose(f);
+    }
+    printf("beyond: %d race events, %d free-roam starts\n", g_bx_nev, ns);
 }
 int beyond_event_count(void) { bx_events_load(); return g_bx_nev; }
 int beyond_event_at(int i, int *id, int *type, int *len) {
@@ -220,6 +233,13 @@ static int bx_ev_index(int id) {
     bx_events_load();
     for (int i = 0; i < g_bx_nev; i++) if (g_bx_ev[i].id == id) return i;
     return -1;
+}
+int beyond_event_start(int i, float p[3], float *head) {
+    bx_events_load();
+    if (i < 0 || i >= g_bx_nev || !g_bx_ev[i].has_start) return 0;
+    memcpy(p, g_bx_ev[i].start, sizeof g_bx_ev[i].start);
+    if (head) *head = g_bx_ev[i].head;
+    return 1;
 }
 int beyond_event_type(int id) { int i = bx_ev_index(id); return i < 0 ? -1 : g_bx_ev[i].type; }
 const char *beyond_event_name(int id) { int i = bx_ev_index(id); return i < 0 ? NULL : g_bx_ev[i].name; }

@@ -3993,6 +3993,22 @@ int hud_screen_tex_key(Hud *h, uint32_t obj, const char *path, uint32_t key, int
     feng_image_free(&img);
     return 1;
 }
+/* hud_screen_tex_key with the picture given as RGBA (port: the World Expansion's track maps) */
+int hud_screen_tex_rgba(Hud *h, uint32_t obj, int iw, int ih, const unsigned char *rgba) {
+    if (!h || !h->dw || !h->pk || !rgba || iw <= 0 || ih <= 0) return 0;
+    struct HudDriftW *w = h->dw;
+    int o = feng_find(h->pk, obj);
+    if (o < 0) return 0;
+    int k = 0;
+    while (k < 2 && w->tov_obj[k] && w->tov_obj[k] - 1 != o) k++;
+    if (k == 2) return 0;
+    FengImage img; memset(&img, 0, sizeof img);
+    img.w = iw; img.h = ih; img.rgba = (unsigned char *)rgba;
+    if (w->tov[k].tex && !w->tov_borrow[k]) glDeleteTextures(1, &w->tov[k].tex);
+    w->tov[k].tex = hud_upload(&img); w->tov[k].w = iw; w->tov[k].h = ih; w->tov[k].additive = 0;
+    w->tov_obj[k] = o + 1; w->tov_borrow[k] = 0;
+    return 1;
+}
 /* 0x50c990 with the IconScroller's icon i (hud_screen_strip): the
    sponsors screen's big decal (uiSponsorsMain::RefreshHeader) */
 int hud_screen_strip_tex(Hud *h, uint32_t obj, int i) {

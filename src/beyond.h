@@ -39,6 +39,7 @@ const char *beyond_troot(const char *troot, const char *reg);
 int beyond_event_count(void);
 int beyond_event_at(int i, int *id, int *type, int *len_m);
 int beyond_event_type(int id);                 /* -1: not a Beyond event */
+int beyond_event_start(int i, float p[3], float *head);   /* event i's free-roam start (starts.txt); 0: none */
 const char *beyond_event_name(int id);         /* NULL: not a Beyond event */
 unsigned char *beyond_trackmap(int id, int *w, int *h);   /* its Quick Race map, RGBA (free it); NULL: none */
 #endif

@@ -8069,6 +8069,7 @@ enum { PR_RESTART, PR_STATS, PR_QUIT, PR_EXPLORE, PR_NEXTRACE, PR_SPONSOR, PR_WO
        PR_QUIT_PAUSE, /* the pause menu's Quit to Main Menu (QuitGame__9PauseMenu 80100a5c: no commit) */
        PR_EXPLORE_ABANDON /* a tournament's "Explore?" OK (0x451e768e -> QuitRaceToFreeRoam 800f30c4: no commit) */ };
 typedef struct { uint32_t icon, label; int act; } PostOpt;
+static int g_bey_freerace;            /* the race running was engaged in World Expansion free roam (port: Explore back) */
 /* EventInProgressState (GC 80127bf8) of a multi-track career event, a
    tournament (only URL events have them): NotifyInitialize 80128044 adds the
    event's tracks (+0x18 + 4 i: s16 track, direction, laps; +0x7e count) and
@@ -8148,7 +8149,7 @@ static const PostOpt *post_opts(int *n)
     const PostOpt *b = k_postrace; int nb = (int)(sizeof k_postrace / sizeof *k_postrace);
     if (g_career_mode && tour_can_advance()) {
         b = k_postrace_career_next; nb = (int)(sizeof k_postrace_career_next / sizeof *k_postrace_career_next);
-    } else if (g_career_mode) { b = k_postrace_career; nb = (int)(sizeof k_postrace_career / sizeof *k_postrace_career); }
+    } else if (g_career_mode || g_bey_freerace) { b = k_postrace_career; nb = (int)(sizeof k_postrace_career / sizeof *k_postrace_career); }
     /* PostRaceMenu 0x4bee10: Replay (icon 0x84d1d864, "Replay" 0x7840428a)
        before Quit when not online (0x850078 != 4), the replay on (+0x50ec)
        and a lap snapshot taken (+0xbc > 0) */
@@ -9160,6 +9161,7 @@ static struct {
     const unsigned char *sc;      /* ENG_SHOWCASE: the showcase (its magazine branch) */
     int wcfail;                   /* the shop dialog in its failed-challenge form (its dtor: ResetPostFailure) */
     int mv_shop;                  /* the pre-shop movie has played: LaunchEngagedShop */
+    int bev;                      /* ENG_RACE of a World Expansion event (port): its id, ev NULL */
 } g_eng;
 static int g_eng_auto;            /* RC message 0x11: an engage dialog pops by itself (a challenge's goal / failure) */
 /* ShowcaseMagazineDialog (UI_ShowCase_Preview.fng, GC 800e8a08 / PC 0x4ce770):
@@ -9586,7 +9588,7 @@ static int eng_race_open(const char *dataroot, const unsigned char *ev)
 {
     Hud *h = hud_init_screen(dataroot, "GLOBAL/InGameCommon.bun", "UI_EngageRaceDialog.fng");
     if (!h) { printf("engage: UI_EngageRaceDialog.fng not loaded\n"); return 0; }
-    g_eng.h = h; g_eng.kind = ENG_RACE; g_eng.ev = ev; g_eng.shop = NULL; g_eng.done = 0;
+    g_eng.h = h; g_eng.kind = ENG_RACE; g_eng.ev = ev; g_eng.shop = NULL; g_eng.done = 0; g_eng.bev = 0;
     career_speech_engage(ev, NULL);                                   /* CareerSpeech::HandleEngageRequest */
     hud_screen_wrap(h, 1);                    /* the FEng string layout: lines break at Sw */
     int tid = eng_track_id(ev);
@@ -9617,6 +9619,48 @@ static int eng_race_open(const char *dataroot, const unsigned char *ev)
     audio_fe_play(15);
     printf("engage: race dialog %s (track %d, %s, $%d)\n", career_string((uint16_t)(ev[0] | ev[1] << 8)), tid, b,
            career_event_purse(ev));
+    return 1;
+}
+/* The race dialog for a World Expansion event (port): RaceEngageDialog::Setup's
+   fields from the Beyond event -- its length, a non-career event's random
+   body / subject / race type (stage > 0, no sponsor), a random sender, its
+   generated track map; no purse (Beyond pays nothing yet) */
+static int eng_beyond_open(const char *dataroot, int idx)
+{
+    int id, type, len;
+    if (!beyond_event_at(idx, &id, &type, &len)) return 0;
+    Hud *h = hud_init_screen(dataroot, "GLOBAL/InGameCommon.bun", "UI_EngageRaceDialog.fng");
+    if (!h) { printf("engage: UI_EngageRaceDialog.fng not loaded\n"); return 0; }
+    g_eng.h = h; g_eng.kind = ENG_RACE; g_eng.ev = NULL; g_eng.shop = NULL; g_eng.done = 0; g_eng.bev = id;
+    hud_screen_wrap(h, 1);
+    unsigned char fev[0x100]; memset(fev, 0, sizeof fev);   /* the event fields the text reads */
+    fev[0xf] = (unsigned char)(type == 6 ? 0 : type); fev[0x37] = 1; fev[0x34] = type == 6 ? 2 : 0;
+    char num[48], b[256];
+    eng_fmt_f(num, sizeof num, (float)len * 0.000625f);
+    snprintf(b, sizeof b, "%s %s", num, hud_screen_string(h, g_opt.kmh ? 0xb5d640b1u : 0xac3a4f4cu));
+    hud_screen_text_h(h, 0x080c9daau, b);
+    hud_screen_text_h(h, 0xb54b81a7u, "");
+    hud_screen_label_h(h, 0xde075b62u, career_engage_body(fev, eng_rand));
+    uint32_t sub, typ;
+    fev[0xd] = type != 6;                     /* the labels: the per-type table (a stage event leaves Circuit's) */
+    career_engage_race_type(fev, &sub, &typ);
+    fev[0xd] = 0;
+    eng_fmt_s(b, sizeof b, hud_screen_string(h, 0x17ea64f8u), hud_screen_string(h, sub));
+    hud_screen_text_h(h, 0x2c167533u, b);
+    hud_screen_label_h(h, 0x15e1351bu, typ);
+    const char *nm[1];
+    AiRng rng = { (unsigned)SDL_GetTicks() * 2654435761u + 7u };
+    airace_names(&rng, nm, 1);
+    eng_fmt_s(b, sizeof b, hud_screen_string(h, 0x9f29d70du), nm[0]);
+    hud_screen_text_h(h, 0xfeced617u, b);
+    int mw = 0, mh = 0;
+    unsigned char *px = beyond_trackmap(id, &mw, &mh);
+    if (!px || !hud_screen_tex_rgba(h, 0x0f365871u, mw, mh, px)) hud_screen_hide_h(h, 0x0f365871u, 1);
+    free(px);
+    hud_screen_script_all(h, "FadeIn");
+    g_eng.focus = 1; eng_focus();
+    audio_fe_play(15);
+    printf("engage: Beyond race dialog %s (event %d, type %d, %d m, %s)\n", beyond_event_name(id), id, type, len, nm[0]);
     return 1;
 }
 /* EngageShopDialog::Setup 800e7e74; open sound: MakeFrontendSound(10). A world
@@ -9951,10 +9995,35 @@ static const struct { int mode, type; const char *name; } k_trig_map[12] = {
     { 0, 8, "XEE_DVD" }, { 1, 0, "XEE_GAME_TIP" }, { 2, 0, "XEE_BANK" } };
 static AcidTrigger g_trig[12]; static int g_trig_init;
 static float rdf(const unsigned char *p) { float f; memcpy(&f, p, 4); return f; }
+/* The World Expansion's free-roam race starts (port, beyond.h starts.txt): no
+   career there, so every Beyond event stands open in its Free Run as the
+   career's unlocked events do in Bayview -- the event's trigger glow at the
+   route's start, the in-zone engage icon, and the Engage binding's race
+   dialog (UI_EngageRaceDialog.fng) starting the race on the loaded map */
+static int g_bey_roam;                /* this frame: Beyond free roam, no race */
+static const N2Scene *g_bey_scene;    /* its streamed ground (no wcoll yet) */
+static int g_bey_zone = -1;           /* the event start the car stands in (event index), -1 none */
+static float g_trig_zref;             /* the zone's height, for the scene ground under its emitters */
+static int bey_trig_k(int type)       /* airace type -> k_trig_map */
+{
+    switch (type) { case 0: return 0; case 1: return 4; case 2: return 2; case 4: return 1; case 5: return 3; case 6: return 5; }
+    return -1;
+}
+static int bey_indicator(int type)    /* -> the HUD's zone icon (ei_event_type) */
+{
+    switch (type) { case 0: return 1; case 1: return 4; case 4: return 2; case 5: return 3; case 6: return 7; }
+    return 5;
+}
 static int trig_ground(float x, float y, float *z)
 {
     /* GetElevation (TopologyCoordinate); here the collision ground under
        the point, from the player's height + 50 m (port) */
+    if (!g_wcoll && g_bey_roam && g_bey_scene) {                      /* Beyond: the streamed tiles */
+        WGroundHit gh;
+        if (world_ground_hit(g_bey_scene, x, y, g_trig_zref + 3.0f, &gh) == WSURF_NONE) return 0;
+        *z = gh.z;
+        return 1;
+    }
     if (!g_wcoll || !g_n2) return 0;
     N2Body bd; n2sim_body(g_n2, &bd);
     static WCollCtx c; static int c_on;
@@ -9979,13 +10048,31 @@ static void trig_update(int free_run)
         for (int k = 0; k < 12; k++) acid_trigger_init(&g_trig[k], k_trig_map[k].name);
         g_trig_init = 1;
     }
-    if (g_sc.h || !free_run || !g_n2 || !g_rt.zones) {                /* TriggerEffectsOn, IsFreeRun */
+    if (g_sc.h || !free_run || !g_n2 || (!g_rt.zones && !g_bey_roam)) {   /* TriggerEffectsOn, IsFreeRun */
         for (int k = 0; k < 12; k++) acid_trigger_off(&g_trig[k]);
         return;
     }
     N2Body bd; n2sim_body(g_n2, &bd);
     const unsigned char *use[12] = { 0 }; float d2[12] = { 0 };
-    for (int i = 0; i < 64; i++) {                                    /* GetNextUnlockedTriggerZone */
+    if (g_bey_roam) {                                                 /* Beyond: every event's start (port) */
+        static unsigned char bz[64][0x18]; static int bzn = -1;
+        if (bzn < 0) {
+            bzn = 0;
+            for (int i = 0; i < beyond_event_count() && i < 64; i++) {
+                float p[3]; if (!beyond_event_start(i, p, NULL)) continue;
+                memcpy(bz[i] + 4, &p[0], 4); memcpy(bz[i] + 8, &p[1], 4); memcpy(bz[i] + 0x14, &p[2], 4);
+                bzn++;
+            }
+            printf("beyond: %d free-roam race starts\n", bzn);
+        }
+        for (int i = 0; i < beyond_event_count() && i < 64; i++) {
+            int id, type, len, k;
+            float p[3];
+            if (!beyond_event_at(i, &id, &type, &len) || !beyond_event_start(i, p, NULL) || (k = bey_trig_k(type)) < 0) continue;
+            trig_consider(use, d2, k, bz[i], bd.pos);
+        }
+    }
+    for (int i = 0; i < 64 && g_rt.zones && !g_bey_roam; i++) {      /* GetNextUnlockedTriggerZone */
         const CareerZone *z = career_unlocked_zone(i);
         if (!z || !z->zone) continue;
         /* keyed on the load generation, not the pointer: after a race the zones are freed and reloaded,
@@ -10003,7 +10090,7 @@ static void trig_update(int free_run)
         for (int k = 0; k < 12; k++)
             if (k_trig_map[k].mode == 0 && k_trig_map[k].type == type) { trig_consider(use, d2, k, q, bd.pos); break; }
     }
-    for (const unsigned char *q = racepath_zone_next(g_rt.zones, NULL); q; q = racepath_zone_next(g_rt.zones, q)) {
+    for (const unsigned char *q = g_bey_roam ? NULL : racepath_zone_next(g_rt.zones, NULL); q; q = racepath_zone_next(g_rt.zones, q)) {
         uint32_t t = n2_u32(q), h = n2_u32(q + 0x30);
         if (t == 18 && career_help_zone_active(h)) trig_consider(use, d2, 10, q, bd.pos);
         else if (t == 19 && career_bank_claimable(h)) trig_consider(use, d2, 11, q, bd.pos);
@@ -10032,7 +10119,7 @@ static void trig_update(int free_run)
     }
     for (int k = 0; k < 12; k++) {
         float at[3];
-        if (use[k]) { at[0] = rdf(use[k] + 4); at[1] = rdf(use[k] + 8); at[2] = rdf(use[k] + 0x14); }
+        if (use[k]) { at[0] = rdf(use[k] + 4); at[1] = rdf(use[k] + 8); at[2] = rdf(use[k] + 0x14); g_trig_zref = at[2]; }
         int was = g_trig[k].on;
         if (!use[k] || !acid_trigger_place(&g_trig[k], at, trig_ground)) acid_trigger_off(&g_trig[k]);
         if (g_trig[k].on && !was)
@@ -11062,6 +11149,16 @@ static void eng_key(int key)
         if (key == PK_LEFT || key == PK_RIGHT) {                     /* 0x9120409e / 0xb5971bf1 */
             int f = key == PK_RIGHT;
             if (f != g_eng.focus) { g_eng.focus = f; eng_focus(); audio_fe_play(f ? FE_SND_RIGHT : FE_SND_LEFT); }
+        } else if (key == PK_OK && g_eng.focus == 0 && g_eng.bev) {  /* a World Expansion event (port) */
+            g_eng.done = 1;
+            hud_screen_hide_h(g_eng.h, 0x0f365871u, 1);
+            g_eng.act = ENG_ACT_RACE;
+            pause_close();
+        } else if ((key == PK_OK || key == PK_BACK) && g_eng.bev) {
+            g_eng.done = 1; g_eng.bev = 0;
+            hud_screen_hide_h(g_eng.h, 0x0f365871u, 1);
+            printf("engage: Beyond race declined\n");
+            pause_close();
         } else if (key == PK_OK && g_eng.focus == 0) {               /* AcceptRace 800e81e4 */
             const unsigned char *ev = g_eng.ev;
 #ifdef OPENUG2_SIM_PRE_H
@@ -19817,6 +19914,14 @@ int main(int argc, char **argv) {
                 else if (k == SDLK_KP_9 && !e.key.repeat && race_state == 1 && g_rt.roam && g_rt.w && g_career_mode &&
                          !post_up() && career_current_zone() && career_can_engage() && eng_open(dataroot)) {
                 }
+                /* ... at a World Expansion event's start (port): its race dialog */
+                else if (k == SDLK_KP_9 && !e.key.repeat && g_bey_roam && g_bey_zone >= 0 && !post_up() && !g_eng.h) {
+                    pause_close();
+                    if (eng_beyond_open(dataroot, g_bey_zone)) {
+                        g_pause.on = 1; g_pause.race = 0; g_pause.eat_start = 0;
+                        audio_pause_game(1); music_pause(1);
+                    }
+                }
 #ifdef OPENUG2_SIM_PRE_H
                 /* test aid (simulator): OPENUG2_SIM_EVENT + OPENUG2_SIM_ENGAGE=dialog -- Engage
                    anywhere in career free roam opens that event's engage dialog */
@@ -20637,6 +20742,18 @@ int main(int argc, char **argv) {
             int q = -1;
             for (int k = 0; k < nsprint; k++) if (sprintev[k] == world.city.race.ev) q = k;
             post_close();
+            if (g_bey_freerace && !g_career_mode && act != PR_RESTART && act != PR_STATS && act != PR_REPLAY) g_bey_freerace = 0;
+            if (act == PR_EXPLORE && !g_career_mode) {
+                /* a World Expansion race engaged in its free roam (port): back to
+                   driving there from the finish, as the career's Explore */
+                rt_end();
+                world_set_mode(&world, MODE_FREEROAM, -1);
+                world.city.race.active = 0;
+                resident_args.scenery_event = runtime_scenery_event;   /* the free roam's (as a venue boot's) */
+                vel[0] = vel[1] = 0; speed = 0;
+                race_state = 1; g_ride_ready = 0;
+                printf("beyond: Explore -- free roam from the finish (%.0f %.0f)\n", carpos[0], carpos[1]);
+            } else
             if (act == PR_EXPLORE || act == PR_EXPLORE_ABANDON) {
                 /* 0x3411395c: a won event saves to the memory card first (EnterMemcard
                    0x441 -> 0x35e413dd), then QuitRaceToFreeRoamRaceDone 800f30fc:
@@ -21113,6 +21230,25 @@ int main(int argc, char **argv) {
 #endif
                 career_race_start(ev, carpos, h16, dataroot);
                 g_career_from_wmap = 0;              /* StartCareerEvent clears 0x85ba67 */
+            } else if (act == ENG_ACT_RACE && g_eng.bev) {
+                /* a World Expansion event (port): on the loaded map as a same-track
+                   quick race, the Quick Race defaults (0x52a220: 3 opponents,
+                   medium, light traffic, catch up, 3 laps) */
+                int id = g_eng.bev, q = -1;
+                g_eng.bev = 0;
+                for (int k = 0; k < nsprint; k++) if (world.city.ev[sprintev[k]].id == id) q = k;
+                if (q >= 0 && race_state == 1) {
+                    if (g_bey_zone >= 0) { int zi, zt, zl; if (beyond_event_at(g_bey_zone, &zi, &zt, &zl)) hud_event_remove(bey_indicator(zt)); }
+                    g_bey_zone = -1;
+                    g_rt_opponents = 3; g_rt_difficulty = 1; g_rt_traffic = 1; g_rt_catchup = 1;
+                    g_rt_reverse = 0; g_rt_lapko = 0; want_laps = 3;
+                    g_bey_freerace = 1;
+                    race_state = 3;
+                    vel[0] = vel[1] = 0; speed = 0;
+                    garage_race = q; race_start_pending = 1;
+                    g_restart_ls = loading_screen(dataroot) != NULL;
+                    printf("beyond: free-roam race %d (%s) starting\n", id, beyond_event_name(id));
+                } else printf("beyond: event %d is not in the loaded track's events\n", id);
             } else if (act == ENG_ACT_WC && g_eng.wc) {
                 /* NotifyEnter 8012d284: ExitTriggerZone, the heading kept for a retry, the clock */
                 gps_stop();                                          /* NotifyEnterWorldChallenge 0x541120 */
@@ -23841,6 +23977,23 @@ int main(int argc, char **argv) {
                             printf("meshdump:   v%d %.1f %.1f %.2f uv %.3f %.3f col %d %d %d %d%c", v, q[0], q[1], q[2],
                                    q[3], q[4], c[0], c[1], c[2], c[3], 10);
                         }
+                }
+            }
+        }
+#endif
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_BEYOND_AT=<event id> puts the car on that Beyond event's start once its free roam stands */
+            static int bat_done; static Uint32 bat_t;
+            const char *ba = getenv("OPENUG2_SIM_BEYOND_AT");
+            if (ba && !bat_done && g_bey_roam && g_ride_ready && !bat_t) bat_t = SDL_GetTicks();
+            if (ba && !bat_done && bat_t && SDL_GetTicks() - bat_t > 3000) {
+                bat_done = 1;
+                for (int i = 0; i < beyond_event_count(); i++) {
+                    int id, t, l; float p[3], hd;
+                    if (beyond_event_at(i, &id, &t, &l) && id == atoi(ba) && beyond_event_start(i, p, &hd)) {
+                        memcpy(g_ft.p, p, sizeof p); g_ft.go = 1; heading = hd;
+                        printf("sim: OPENUG2_SIM_BEYOND_AT %d -> (%.0f %.0f %.1f)\n", id, p[0], p[1], p[2]);
+                    }
                 }
             }
         }
@@ -28841,7 +28994,33 @@ int main(int argc, char **argv) {
                     g_acid_rpst = NULL;
                 } else if (g_acid_t[i].c) acid_slot_drop(&g_acid_t[i]);
             }
-            trig_update(live && g_career_mode && g_rt.active && g_rt.roam && n2_active());   /* UpdateTriggerEffects */
+            /* the World Expansion's race starts (port): free roam there, the zone the car is in */
+            g_bey_roam = beyond_enabled() && beyond_is_track(trackname) && race_state == 1 && !RT_RACE && !g_fe && !g_shop;
+            g_bey_scene = &scene;
+            if (g_bey_roam && !g_pause.on) {
+                int in = -1; float best = 15.0f * 15.0f;                  /* a career zone's size */
+                for (int i = 0; i < beyond_event_count(); i++) {
+                    float p[3];
+                    if (!beyond_event_start(i, p, NULL) || fabsf(p[2] - carpos[2]) > 8.0f) continue;
+                    float dx = p[0] - carpos[0], dy = p[1] - carpos[1], d = dx * dx + dy * dy;
+                    if (d < best) { best = d; in = i; }
+                }
+                if (in != g_bey_zone) {                                   /* Enter/ExitTriggerZone: the HUD's icon */
+                    int id, t, l;
+                    if (g_bey_zone >= 0 && beyond_event_at(g_bey_zone, &id, &t, &l)) hud_event_remove(bey_indicator(t));
+                    if (in >= 0 && beyond_event_at(in, &id, &t, &l)) {
+                        hud_event_add(bey_indicator(t), 0);
+                        printf("beyond: at the start of %s (event %d, type %d)\n", beyond_event_name(id), id, t);
+                    }
+                    g_bey_zone = in;
+                }
+            } else if (!g_bey_roam && g_bey_zone >= 0) {
+                int id, t, l;
+                if (beyond_event_at(g_bey_zone, &id, &t, &l)) hud_event_remove(bey_indicator(t));
+                g_bey_zone = -1;
+            }
+            trig_update((live && g_career_mode && g_rt.active && g_rt.roam && n2_active()) ||
+                        (live && g_bey_roam && n2_active()));   /* UpdateTriggerEffects */
             {   /* The showroom stands in room space at the car's world spot (DISC01 under the
                    car), so a shop zone's marker (and any other world particle there) would
                    be drawn inside it, round the camera. The front end draws no world
@@ -29323,8 +29502,8 @@ int main(int argc, char **argv) {
             int event_race = wr->active && !wr->finished;
             hs.racing = event_race ? 1 : 0;
             hs.wrong_way = g_rt.active && g_rt.pwrong;          /* player +0x248 */
-            hs.roam = g_rt.roam && g_rt.w;                       /* the EventIndicator / GetAwayMeter */
-            if (hs.roam) {
+            hs.roam = (g_rt.roam && g_rt.w) || g_bey_roam;                      /* the EventIndicator / GetAwayMeter */
+            if (hs.roam && g_rt.w) {
                 hs.engage = aienc_candidate(g_rt.w) != NULL;
                 hs.outrun = aienc_outrun(g_rt.w, &hs.outrun_d, &hs.outrun_limit, &hs.outrun_rank);
             }
@@ -29348,6 +29527,15 @@ int main(int argc, char **argv) {
             hs.wc_on = g_career_mode && career_wc_countdown();
             static HudMapZone map_zones[64];
             hs.map_zone_n = 0; hs.map_zones = NULL;
+            if (g_bey_roam) {   /* the World Expansion's race starts (port): every event's icon */
+                for (int i = 0; i < beyond_event_count() && hs.map_zone_n < 64; i++) {
+                    int id, t, l, k; float p[3];
+                    if (!beyond_event_at(i, &id, &t, &l) || !beyond_event_start(i, p, NULL) || (k = bey_trig_k(t)) < 0) continue;
+                    HudMapZone *m = &map_zones[hs.map_zone_n++];
+                    m->x = p[0]; m->y = p[1]; m->type = map_zone_type(k); m->cross = 0; m->blink = 0;
+                }
+                hs.map_zones = map_zones;
+            } else
             if (g_career_mode && g_rt.roam && g_rt.active && g_rt.zones) {
                 hs.map_zone_n = career_map_zones(map_zones, 64);
                 hs.map_zones = map_zones;
@@ -29523,7 +29711,7 @@ int main(int argc, char **argv) {
                race over mask from the player's finish (FinishCar 6 / 7 ->
                0x5ea530 player +0x50) to EndGetAway 3 s later (mode 0: past
                3 s 0x5fca90 clears it) */
-            if (hs.roam && !g_rt.pfinished) {
+            if (hs.roam && g_rt.w && !g_rt.pfinished) {
                 int orr = 0, oft = 0;
                 if (aienc_over(g_rt.w, &orr, &oft)) {
                     hs.race_over = 1;
