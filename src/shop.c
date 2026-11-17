@@ -2908,6 +2908,9 @@ static uint32_t qr_track_icon(int type, const unsigned char *r) {
         case QR_URL: return feng_tex_key("Track_Icon_U_Racing_League");
         case QR_STREETX: return feng_tex_key("Track_Icon_Short_Track");
         }
+    if (beyond_event_type((int)(int16_t)(r[0x8a] | r[0x8b] << 8)) >= 0)   /* a World Expansion circuit/sprint: */
+        for (int i = 0; i < NELEM(k_qr_modes); i++)                         /* its mode's own icon, not Debug */
+            if (k_qr_modes[i].group == type) return k_qr_modes[i].tex;
     return K_TRACK_DEFAULT;
 }
 
@@ -7232,7 +7235,10 @@ static void qr_update(Shop *s, float dt) {
             uint32_t key = feng_tex_key(nm);
             FengImage img; memset(&img, 0, sizeof img);
             if (s->map_tex) { glDeleteTextures(1, &s->map_tex); s->map_tex = 0; }
-            if (d && feng_tpk_load(d, len, &key, 1, &img) && img.rgba) {
+            int bw = 0, bh = 0;
+            unsigned char *bpx = d ? NULL : beyond_trackmap(s->map_want, &bw, &bh);   /* a World Expansion event */
+            if (bpx) { s->map_tex = upload_rgba(bw, bh, bpx); free(bpx); }
+            else if (d && feng_tpk_load(d, len, &key, 1, &img) && img.rgba) {
                 /* TRACKMAP's DXT3 alpha is all zero and its record's blend
                    code is 5, not the FE's 1: the map is drawn opaque */
                 for (long q = 0; q < (long)img.w * img.h; q++) img.rgba[q * 4 + 3] = 255;

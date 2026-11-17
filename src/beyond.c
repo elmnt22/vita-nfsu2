@@ -223,3 +223,22 @@ static int bx_ev_index(int id) {
 }
 int beyond_event_type(int id) { int i = bx_ev_index(id); return i < 0 ? -1 : g_bx_ev[i].type; }
 const char *beyond_event_name(int id) { int i = bx_ev_index(id); return i < 0 ? NULL : g_bx_ev[i].name; }
+/* the Quick Race track map of a Beyond event: ROUTESBEYOND/TRACKMAP<id>.bin
+   (BeyondDev tools/events/trackmaps.py, the minimap's BMAP format), RGBA,
+   malloc'd; NULL when none */
+unsigned char *beyond_trackmap(int id, int *w, int *h) {
+    if (bx_ev_index(id) < 0) return NULL;
+    char p[160]; snprintf(p, sizeof p, BEYOND_DIR "/ROUTESBEYOND/TRACKMAP%d.bin", id);
+    FILE *f = fopen(p, "rb");
+    if (!f) return NULL;
+    unsigned char hd[28]; uint32_t W = 0, H = 0;
+    unsigned char *px = NULL;
+    if (fread(hd, 1, 28, f) == 28 && !memcmp(hd, "BMAP", 4)) {
+        memcpy(&W, hd + 4, 4); memcpy(&H, hd + 8, 4);
+        if (W && H && W <= 1024 && H <= 1024 && (px = (unsigned char *)malloc((size_t)W * H * 4)) &&
+            fread(px, 4, (size_t)W * H, f) != (size_t)W * H) { free(px); px = NULL; }
+    }
+    fclose(f);
+    if (px) { *w = (int)W; *h = (int)H; }
+    return px;
+}
