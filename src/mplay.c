@@ -21,6 +21,7 @@ struct MPlay {
     Movie *m;
     GLuint tex;
     int w, h, rate, ch, shown, vdone, newpic;
+    float tail;   /* seconds since the pictures ran out */
     float fps, t;
     /* the decoder thread's queue: slots q[n % MV_Q]; it writes qw, the main thread qr */
     unsigned char *q[MV_Q];
@@ -222,8 +223,11 @@ int mplay_update(MPlay *v, float dt) {
             v->dec_us = v->cvt_us = 0; v->nstat = 0; v->waits = 0;
         }
     }
-    /* over when the pictures ran out and the sound played out */
-    return v->vdone && (v->rate <= 0 || (movie_audio_buffered(v->m) == 0 && v->have < 2));
+    /* over when the pictures ran out and the sound played out -- or 3 s after
+       the pictures if the sound never drains (no audio device, a held mixer):
+       a movie can no longer hold the game for good (audit 11-17) */
+    if (v->vdone) v->tail += dt > 0.1f ? 0.1f : dt;
+    return v->vdone && (v->rate <= 0 || (movie_audio_buffered(v->m) == 0 && v->have < 2) || v->tail > 3.0f);
 }
 
 GLuint mplay_tex(const MPlay *v, int *w, int *h) {

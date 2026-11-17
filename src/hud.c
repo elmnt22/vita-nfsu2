@@ -1322,7 +1322,10 @@ static Hud *hud_pre_take(const char *dataroot, const char *bundle, const char *p
             strcmp(g_pre[i].root, dataroot ? dataroot : ".") || g_pre[i].style != g_hud_style) continue;
         Uint64 t0 = SDL_GetPerformanceCounter();
         if (__sync_bool_compare_and_swap(&g_pre[i].st, PRE_QUEUED, PRE_FREE)) return NULL;   /* not begun */
-        while (g_pre[i].st == PRE_DECODING) SDL_Delay(1);   /* the worker is on it: the rest of its build */
+        for (int wt = 0; g_pre[i].st == PRE_DECODING; wt++) {   /* the worker is on it: the rest of its build */
+            SDL_Delay(1);
+            if (wt == 3000) printf("player HUD: %s still decoding after 3 s (worker stuck?)\n", package);   /* audit 11-17 */
+        }
         __sync_synchronize();
         Hud *h = g_pre[i].h;
         int was = g_pre[i].st;

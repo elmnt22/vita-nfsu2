@@ -2231,6 +2231,9 @@ static int wt_take(const char *track, int idx, int tx, int ty, WtLoaded *out, in
         if (st == 1 && !waited) { waited = 1; g_wt_miss_busy++; }
 #ifdef __vita__
         SDL_Delay(2);   /* the read-ahead is preparing it right now */
+        /* a wait this long means the read-ahead itself is stuck (audit 11-17):
+           said once, so a hang report shows where */
+        if (++waited == 1500) printf("wt_take: tile %d still being prepared after 3 s (state %d)\n", idx, g_wt_state[idx]);
 #endif
     }
 }
@@ -2239,6 +2242,7 @@ static int wt_take(const char *track, int idx, int tx, int ty, WtLoaded *out, in
    full decode when prepared (waiting if it is being prepared), else read now. */
 static int wt_upgrade(const char *track, int idx, WtLoaded *t) {
     WtLoaded full;
+    int upwait = 0; (void)upwait;
     if (idx < 0 || !g_wt_upst) {
         if (!wt_read_decode(track, t->tx, t->ty, &full, 0)) return 0;
         g_wt_up_now++;
@@ -2261,6 +2265,7 @@ static int wt_upgrade(const char *track, int idx, WtLoaded *t) {
         }
 #ifdef __vita__
         SDL_Delay(2);
+        if (++upwait == 1500) printf("wt_upgrade: tile %d still being prepared after 3 s\n", idx);
 #endif
     }
     wt_release(t);            /* meshes a resident still uses live on in it */

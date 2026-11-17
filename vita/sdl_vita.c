@@ -983,6 +983,7 @@ int sceNpTrophyGetTrophyUnlockState(int ctx, int handle, VtUnlockState *state, u
 int sceNpTrophySetupDialogInit(VtSetupParam *param);
 SceCommonDialogStatus sceNpTrophySetupDialogGetStatus(void);
 int sceNpTrophySetupDialogTerm(void);
+int sceNpTrophySetupDialogAbort(void);
 static int vt_ctx;
 static int vt_skip;                   /* the Settings screen's own context: no trophies there */
 static VtUnlockState vt_state;          /* what the system has; main thread marks queued ones */
@@ -1031,9 +1032,14 @@ static void vita_trophy_setup(void) {
     sp.context = vt_ctx;
     r = sceNpTrophySetupDialogInit(&sp);
     if (r >= 0) {
+        /* capped at ~30 s of swaps: a dialog that never finishes no longer
+           holds the boot on a black screen for good (audit 11-17) */
+        int frames = 0, aborted = 0;
         while (sceNpTrophySetupDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_RUNNING) {
             glClear(GL_COLOR_BUFFER_BIT);
             vglSwapBuffers(GL_TRUE);
+            if (++frames == 1800 && !aborted) { aborted = 1; printf("trophy: setup dialog still running after 30 s, aborted\n"); sceNpTrophySetupDialogAbort(); }
+            if (frames > 2400) break;
         }
         sceNpTrophySetupDialogTerm();
     }
