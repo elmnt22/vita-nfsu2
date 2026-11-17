@@ -21,6 +21,7 @@
                                     5: that flag read with the right bit (0x40);
                                     6: n2_skip_filler keeps a 0x11 first vertex byte (L4RA road hole at -1200,275);
                                     7: 36-byte-vertex solids (0x134900 +0xc & 0x4000: XS_ signs) read at their stride (black triangles) */
+#define WTILE_BEYOND_VERSION 6   /* the World Expansion tile set (BeyondDev b6tiles): its own version, see wt_ver */
 #define WTILE_DIR      "ux0:data/NFSU2/cache/tiles"
 
 typedef struct {

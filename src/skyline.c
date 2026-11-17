@@ -210,7 +210,7 @@ static void trim_budget(long budget) {
 }
 static void cache_path(char *out, size_t n) {
     if (sky_beyond())   /* the budget is in the name: another budget builds again */
-        snprintf(out, n, "%s/%s_sky_v%d_%d_h%d_b%ld.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER,
+        snprintf(out, n, "%s/%s_sky_v%d_%d_h%d_b%ld.bin", WTILE_DIR, S.track, WTILE_BEYOND_VERSION, SKYLINE_FILE_VER,
                  (int)sky_min_h(), SKYLINE_BEYOND_BUDGET >> 10);
     else if (sky_min_h() == SKYLINE_MIN_H) snprintf(out, n, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER);
     else snprintf(out, n, "%s/%s_sky_v%d_%d_h%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER, (int)sky_min_h());

@@ -1,6 +1,7 @@
 /* beyond.c -- the optional Beyond world: its switch, texture pack and start
  * point (see beyond.h). Everything here is unused unless beyond_enabled(). */
 #include "beyond.h"
+#include "world_tiles.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,8 @@ typedef struct {
 } BxEntry;
 typedef struct { char magic[4]; uint32_t version, count, table, names, names_bytes, data, flags; } BxHeader;
 
+#define BX_STR2(x) #x
+#define BX_STR(x) BX_STR2(x)
 static int g_bx_enabled = -1;
 int g_beyond_pick;
 static FILE *g_bx_f;
@@ -38,8 +41,8 @@ int beyond_enabled(void) {
     if (g_bx_enabled < 0) {
         int sw = bx_exists(BEYOND_DIR "/enable.txt");
         int files = bx_exists(BEYOND_DIR "/BEYOND.ug2x") &&
-                    bx_exists("ux0:data/NFSU2/cache/tiles/STREAMBEYOND_v6.idx") &&
-                    bx_exists("ux0:data/NFSU2/cache/tiles/STREAMBEYOND_v6.pak");
+                    bx_exists(WTILE_DIR "/STREAMBEYOND_v" BX_STR(WTILE_BEYOND_VERSION) ".idx") &&
+                    bx_exists(WTILE_DIR "/STREAMBEYOND_v" BX_STR(WTILE_BEYOND_VERSION) ".pak");
         g_bx_enabled = sw && files;
         if (sw) printf("beyond: %s\n", files ? "on -- Quick Race Free Run offers the World Expansion"
                                              : "enable.txt found but the converted files are missing; off");

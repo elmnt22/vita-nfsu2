@@ -93,8 +93,12 @@ static int g_wt_enabled = -1;
 typedef struct { int16_t x, y; uint32_t off, len; } WtPackEnt;
 #define WTPACK_MAGIC 0x50324755u   /* "UG2P" */
 #define WTPACK_HDR   16u
+/* the tile set version a track's files carry: the World Expansion's come from the
+   BeyondDev converter and keep its version (the city bumps -- conversion fixes -- do
+   not touch them, the format is the same) */
+static int wt_ver(const char *track) { return beyond_is_track(track) ? WTILE_BEYOND_VERSION : WTILE_VERSION; }
 static void wt_pack_path(char *out, size_t cap, const char *track, int tmp) {
-    snprintf(out, cap, "%s/%.63s_v%d.pak%s", WTILE_DIR, track, WTILE_VERSION, tmp ? ".tmp" : "");
+    snprintf(out, cap, "%s/%.63s_v%d.pak%s", WTILE_DIR, track, wt_ver(track), tmp ? ".tmp" : "");
 }
 
 typedef struct { WtPackEnt *e; int n; } WtPackTab;
@@ -104,7 +108,7 @@ typedef struct { FILE *f; WtPackEnt *e; int n, cap; uint32_t pos; } WtPackW;
 static int wt_pw_open(WtPackW *w, const char *track) {
     char path[256]; wt_pack_path(path, sizeof path, track, 1);
     memset(w, 0, sizeof *w);
-    uint32_t hdr[4] = { WTPACK_MAGIC, WTILE_VERSION, 0, 0 };   /* count + table offset at the end */
+    uint32_t hdr[4] = { WTPACK_MAGIC, (uint32_t)wt_ver(track), 0, 0 };   /* count + table offset at the end */
     if (!(w->f = fopen(path, "wb"))) return 0;
     if (fwrite(hdr, sizeof hdr, 1, w->f) != 1) { fclose(w->f); w->f = NULL; wt_remove(path); return 0; }
     w->pos = WTPACK_HDR;
@@ -133,7 +137,7 @@ static int wt_pw_finish(WtPackW *w, const char *track, int ok) {
     wt_pack_path(tmp, sizeof tmp, track, 1); wt_pack_path(fin, sizeof fin, track, 0);
     if (!w->f) ok = 0;
     if (ok) {
-        uint32_t hdr[4] = { WTPACK_MAGIC, WTILE_VERSION, (uint32_t)w->n, w->pos };
+        uint32_t hdr[4] = { WTPACK_MAGIC, (uint32_t)wt_ver(track), (uint32_t)w->n, w->pos };
         ok = (!w->n || fwrite(w->e, sizeof *w->e, (size_t)w->n, w->f) == (size_t)w->n) &&
              fflush(w->f) == 0 && fseek(w->f, 0, SEEK_SET) == 0 && fwrite(hdr, sizeof hdr, 1, w->f) == 1;
     }
@@ -452,7 +456,7 @@ static void wt_index_path_v(char *out, size_t cap, const char *track, int versio
     snprintf(out, cap, "%s/%s_v%d.idx", WTILE_DIR, track, version);
 }
 static void wt_index_path(char *out, size_t cap, const char *track) {
-    wt_index_path_v(out, cap, track, WTILE_VERSION);
+    wt_index_path_v(out, cap, track, wt_ver(track));
 }
 
 int world_tiles_ready(const char *trackname) {
@@ -460,7 +464,7 @@ int world_tiles_ready(const char *trackname) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     uint32_t hdr[2] = {0};
-    int ok = fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x49324755u && hdr[1] == WTILE_VERSION;
+    int ok = fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x49324755u && hdr[1] == (uint32_t)wt_ver(trackname);
     fclose(f);
     return ok;
 }
@@ -634,7 +638,7 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
     if (ok) {   /* the index goes last: its presence means the set is complete */
         char path[256]; wt_index_path(path, sizeof path, trackname);
         FILE *f = fopen(path, "wb");
-        uint32_t hdr[3] = { 0x49324755u /* "UG2I" */, WTILE_VERSION, 0 };
+        uint32_t hdr[3] = { 0x49324755u /* "UG2I" */, (uint32_t)wt_ver(trackname), 0 };
         float size = WTILE_SIZE;
         hdr[2] = (uint32_t)icount;
         ok = f && fwrite(hdr, 4, 2, f) == 2 && fwrite(&size, 4, 1, f) == 1 &&
@@ -685,7 +689,7 @@ static int wt_index_read(const char *track, WtIndexEntry **out, int *nout) {
     if (!f) return 0;
     uint32_t hdr[2], count = 0; float size = 0, bb[4];
     WtIndexEntry *ix = NULL;
-    int ok = fread(hdr, 4, 2, f) == 2 && hdr[0] == 0x49324755u && hdr[1] == WTILE_VERSION &&
+    int ok = fread(hdr, 4, 2, f) == 2 && hdr[0] == 0x49324755u && hdr[1] == (uint32_t)wt_ver(track) &&
              fread(&size, 4, 1, f) == 1 && size == WTILE_SIZE && fread(&count, 4, 1, f) == 1 &&
              count < 100000 && fread(bb, sizeof bb, 1, f) == 1;
     if (ok && (ix = (WtIndexEntry *)malloc((count ? count : 1) * sizeof *ix)))
@@ -716,7 +720,7 @@ static WtPackTab *wt_pack_load(const char *track) {
     uint32_t hdr[4];
     long size = 0;
     WtPackTab *t = NULL;
-    int ok = fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == WTPACK_MAGIC && hdr[1] == WTILE_VERSION &&
+    int ok = fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == WTPACK_MAGIC && hdr[1] == (uint32_t)wt_ver(track) &&
              hdr[2] < 100000 && hdr[3] >= WTPACK_HDR &&
              fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) > 0 &&
              (unsigned long)size == hdr[3] + (unsigned long)hdr[2] * sizeof(WtPackEnt);   /* whole */
@@ -1145,7 +1149,7 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
     if (ok) memcpy(hdr, data, sizeof hdr);
     if (ok && hdr[0] == 0x54324755u && hdr[1] == WTILE_READY_VERSION)
         return wt_decode_ready(data, len, hdr, tx, ty, out, scr, ground_only);
-    ok = ok && hdr[0] == 0x54324755u && hdr[1] == WTILE_VERSION && hdr[4] < 200000 &&
+    ok = ok && hdr[0] == 0x54324755u && (hdr[1] == WTILE_VERSION || hdr[1] == WTILE_BEYOND_VERSION) && hdr[4] < 200000 &&
          hdr[6] == (uint32_t)(len - (long)sizeof hdr) && hdr[5] < (256u << 20);
     unsigned char *payload = NULL;
     if (ok) {
@@ -2143,7 +2147,7 @@ static void wt_drop_old_run(void) {
         const char *s = de->d_name, *u = strrchr(s, '_');
         int v = 0; char ext[16] = "";
         if (!u || (size_t)(u - s) >= 64 || strlen(s) >= sizeof names[0]) continue;
-        if (sscanf(u, "_v%d.%15s", &v, ext) != 2 || v <= 0 || v >= WTILE_VERSION) continue;
+        if (sscanf(u, "_v%d.%15s", &v, ext) != 2 || v <= 0) continue;
         if (strcmp(ext, "idx") && strcmp(ext, "pak") && strcmp(ext, "pak.tmp")) continue;
         snprintf(names[nn++], sizeof names[0], "%s", s);
     }
@@ -2153,6 +2157,7 @@ static void wt_drop_old_run(void) {
         char track[64], cur[256], p[256];
         const char *u = strrchr(names[i], '_');
         snprintf(track, sizeof track, "%.*s", (int)(u - names[i]), names[i]);
+        { int v = 0; char e[16]; if (sscanf(u, "_v%d.%15s", &v, e) != 2 || v >= wt_ver(track)) continue; }
         wt_index_path(cur, sizeof cur, track);
         FILE *f = fopen(cur, "rb");
         if (!f) continue;                   /* this version not complete yet: keep the old set */
