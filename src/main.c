@@ -22,6 +22,7 @@
 #include <math.h>
 #include <assert.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <limits.h>
 #include <SDL.h>
 #if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
@@ -408,7 +409,7 @@ static int garage_parse_line(const char *line, const char *car, N2CarConfig *cfg
 #define GARAGE_NSLOT 20
 static int g_gslot = -1;        /* the current car's tuned slot, -1 = the stock car */
 static int g_garage_gen;        /* bumped by every garage write (the tunings cache) */
-typedef struct { char *line[GARAGE_NSLOT]; char cur[64]; int legacy; } GarageFile;
+typedef struct { char *line[GARAGE_NSLOT]; char cur[64]; int legacy, bad; } GarageFile;
 static void garage_free(GarageFile *g) { for (int i = 0; i < GARAGE_NSLOT; i++) { free(g->line[i]); g->line[i] = NULL; } }
 static int garage_line_is(const char *line, const char *car) {
     char name[64];
@@ -427,7 +428,12 @@ static void garage_id(char *out, size_t cap, const char *car, int slot) {
 static void garage_read(GarageFile *g) {
     memset(g, 0, sizeof *g);
     FILE *f = fopen(GARAGE_SAVE, "r");
-    if (!f) return;
+    if (!f) f = fopen(GARAGE_SAVE, "r");   /* one retry: the open itself needs memory */
+    if (!f) {   /* GitHub #18: there but unreadable (out of memory) is not an empty garage */
+        struct stat st;
+        if (stat(GARAGE_SAVE, &st) == 0) { g->bad = 1; printf("garage: %s unreadable now\n", GARAGE_SAVE); }
+        return;
+    }
     static char line[4096];
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
@@ -446,9 +452,21 @@ static void garage_read(GarageFile *g) {
             if (slot < 0) { printf("garage: no free slot for %s's line, dropped\n", name); continue; }
             g->legacy = 1;
         }
-        g->line[slot] = strdup(body);
+        if (!(g->line[slot] = strdup(body))) g->bad = 1;
+#ifdef OPENUG2_SIM_PRE_H
+        /* test aid (simulator): OPENUG2_SIM_GARAGE_SHORT=1 -- every read misses
+           its last tuned line, as an out-of-memory strdup would */
+        else if (getenv("OPENUG2_SIM_GARAGE_SHORT")) {
+            long at = ftell(f); int more = 0; char peek[64];
+            while (fgets(peek, sizeof peek, f)) if (peek[0] == '#') { more = 1; break; }
+            fseek(f, at, SEEK_SET);
+            if (!more) { free(g->line[slot]); g->line[slot] = NULL; g->bad = 1; }
+        }
+#endif
     }
+    if (ferror(f)) g->bad = 1;
     fclose(f);
+    if (g->bad) printf("garage: %s read short (out of memory), its cars kept as they are\n", GARAGE_SAVE);
     if (g->legacy && g->cur[0] && !strchr(g->cur, '#'))   /* an old CURRENT: its car's line, when it has one */
         for (int i = 0; i < GARAGE_NSLOT; i++)
             if (garage_line_is(g->line[i], g->cur)) {
@@ -457,13 +475,21 @@ static void garage_read(GarageFile *g) {
                 break;
             }
 }
+/* never writes back a short read (it would drop the tuned cars it missed,
+   GitHub #18); a temp file renamed over the old one, so a failed write leaves it */
 static void garage_write(GarageFile *g) {
-    FILE *f = fopen(GARAGE_SAVE, "w");
+    if (g->bad) { printf("garage: %s not rewritten (it was read short)\n", GARAGE_SAVE); return; }
+    char tmp[300]; snprintf(tmp, sizeof tmp, "%s.tmp", GARAGE_SAVE);
+    FILE *f = fopen(tmp, "w");
     g_garage_gen++;
     if (!f) { printf("garage: %s not written\n", GARAGE_SAVE); return; }
-    for (int i = 0; i < GARAGE_NSLOT; i++) if (g->line[i]) fprintf(f, "#%d %s\n", i, g->line[i]);
-    if (g->cur[0]) fprintf(f, "CURRENT %s\n", g->cur);
-    fclose(f);
+    int ok = 1;
+    for (int i = 0; i < GARAGE_NSLOT; i++) if (g->line[i]) ok &= fprintf(f, "#%d %s\n", i, g->line[i]) > 0;
+    if (g->cur[0]) ok &= fprintf(f, "CURRENT %s\n", g->cur) > 0;
+    ok &= fclose(f) == 0;
+    if (!ok) { remove(tmp); printf("garage: %s not written\n", GARAGE_SAVE); return; }
+    remove(GARAGE_SAVE);
+    rename(tmp, GARAGE_SAVE);
     if (g->legacy) printf("garage: old per-type lines moved to tuned slots\n");
     g->legacy = 0;
 }
@@ -566,10 +592,21 @@ static void cust_open_mark(const N2CarConfig *cfg, const char *rim, int rs) {
 /* the Customize car select's tuned entries (FEPlayerCarDB's tuned list):
    n = how many, folders + slots out */
 static int garage_list(char car[][32], int slot[], int cap) {
+    /* the last full read stands in for a short one: the list does not lose
+       its tuned cars for a moment (GitHub #18) */
+    static char kcar[GARAGE_NSLOT][32]; static int kslot[GARAGE_NSLOT], kn = -1;
     GarageFile g; garage_read(&g);
     int n = 0;
+    if (g.bad && kn >= 0) {
+        for (; n < kn && n < cap; n++) { memcpy(car[n], kcar[n], 32); slot[n] = kslot[n]; }
+        garage_free(&g);
+        return n;
+    }
     for (int i = 0; i < GARAGE_NSLOT && n < cap; i++)
         if (g.line[i] && sscanf(g.line[i], "%31s", car[n]) == 1) slot[n++] = i;
+    if (!g.bad) {
+        for (kn = 0; kn < n && kn < GARAGE_NSLOT; kn++) { memcpy(kcar[kn], car[kn], 32); kslot[kn] = slot[kn]; }
+    }
     garage_free(&g);
     return n;
 }

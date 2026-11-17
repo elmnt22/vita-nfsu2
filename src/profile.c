@@ -99,13 +99,13 @@ static void scores_load(void) {
 /* tagged blocks: NAME, OPTN (N2Options, its size first), GRGE (garage.txt),
    HSCR (the score table), CCAR (the career cars: FEPlayerCarDB, which
    UserProfile 0x52a280 saves just before the career), CARR (the career) */
-typedef struct { unsigned char *p; long n, cap; } Buf;
+typedef struct { unsigned char *p; long n, cap; int fail; } Buf;
 static void put(Buf *b, const void *p, long n) {
     if (b->n + n > b->cap) {
         long c = b->cap ? b->cap : 4096;
         while (c < b->n + n) c *= 2;
         unsigned char *q = (unsigned char *)realloc(b->p, (size_t)c);
-        if (!q) return;
+        if (!q) { b->fail = 1; return; }
         b->p = q; b->cap = c;
     }
     memcpy(b->p + b->n, p, (size_t)n); b->n += n;
@@ -124,18 +124,25 @@ static unsigned char *serialize(long *len) {
         memcpy(o, &sz, sizeof sz); memcpy(o + sizeof sz, &g_opt, sizeof g_opt);
         put_block(&b, "OPTN", o, sizeof o); }
     long gl; unsigned char *g = read_file(PROFILE_GARAGE_FILE, &gl);
+    /* GitHub #18: a garage file there but unreadable (out of memory) is not
+       an empty garage -- saved as one, the next load lost every tuned car */
+    if (!g) { FILE *e = fopen(PROFILE_GARAGE_FILE, "rb"); if (e) { fclose(e); b.fail = 1; } }
     put_block(&b, "GRGE", g, g ? gl : 0);
     free(g);
     put_block(&b, "HSCR", g_hs, sizeof g_hs);
     {   long cl = career_cars_save(NULL, 0);        /* FEPlayerCarDB 0x5166b0 (the career slots) */
         unsigned char *cb = (unsigned char *)malloc((size_t)cl);
-        if (cb) { career_cars_save(cb, cl); put_block(&b, "CCAR", cb, cl); free(cb); } }
+        if (cb) { career_cars_save(cb, cl); put_block(&b, "CCAR", cb, cl); free(cb); } else b.fail = 1; }
     {   long cl = career_save(NULL, 0);             /* PlayerCareerState 0x514530 */
         unsigned char *cb = (unsigned char *)malloc((size_t)cl);
-        if (cb) { career_save(cb, cl); put_block(&b, "CARR", cb, cl); free(cb); } }
+        if (cb) { career_save(cb, cl); put_block(&b, "CARR", cb, cl); free(cb); } else b.fail = 1; }
     {   unsigned char tb[64];                        /* the port's trophies (trophy.c), not the original's */
         long tl = trophy_save(tb, sizeof tb);
         if (tl > 0) put_block(&b, "TRPH", tb, tl); }
+    if (b.fail) {   /* a part missing: no save beats a save that loses it */
+        printf("profile: out of memory while gathering the profile, not saved\n");
+        free(b.p); *len = 0; return NULL;
+    }
     *len = b.n;
     return b.p;
 }
