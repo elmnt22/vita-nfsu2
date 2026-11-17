@@ -173,6 +173,7 @@ static long pin_tpk(int fd, long off, uint32_t size, unsigned char *out, long cu
     while (o + 8 <= end) {
         if (!pin_pread(fd, o, h, 8)) return -1;
         uint32_t cid = pin_u32(h), cs = pin_u32(h + 4);
+        if ((unsigned long)cs > (unsigned long)(end - o - 8)) return -1;   /* runs past its parent (audit 11-17) */
         if (cid != 0xb3320000u) {                 /* copied verbatim */
             if (out && !pin_pread(fd, o, out + cur + w, 8 + (long)cs)) return -1;
             w += 8 + (long)cs;
@@ -182,6 +183,7 @@ static long pin_tpk(int fd, long off, uint32_t size, unsigned char *out, long cu
                 unsigned char g[8];
                 if (!pin_pread(fd, q, g, 8)) return -1;
                 uint32_t gid = pin_u32(g), gs = pin_u32(g + 4);
+                if ((unsigned long)gs > (unsigned long)(qe - q - 8)) return -1;
                 if (gid == 0x33320002u) {
                     if (out) { pin_w32(out + inner_hdr + iw, gid); pin_w32(out + inner_hdr + iw + 4, 0); }
                     if (stub) {
@@ -218,8 +220,8 @@ static long pin_build(int fd, long flen, unsigned char *out, ResPixStub *stub, i
     while (off + 8 <= flen) {
         if (!pin_pread(fd, off, h, 8)) return -1;
         uint32_t cid = pin_u32(h), cs = pin_u32(h + 4);
+        if ((unsigned long)cs > (unsigned long)(flen - off - 8)) return -1;   /* no signed wrap / zero-step loop */
         long next = off + 8 + (long)cs;
-        if (next > flen) return -1;
         if (cid == 0) {
             /* padding: shrink to the size that keeps the next chunk at its
                original offset modulo 128 */
@@ -309,7 +311,7 @@ static void pin_strip(void) {
     long len = g_pin.len, keep = 0;
     for (long p = 0; p + 8 <= len; ) {
         uint32_t m = pin_u32(d + p), sz = pin_u32(d + p + 4);
-        if (p + 8 + (long)sz > len) { keep += len - p; break; }
+        if ((unsigned long)sz > (unsigned long)(len - p - 8)) { keep += len - p; break; }
         if (m != 0x80134000u && m != 0x80034100u && m != 0x80034130u) keep += 8 + (long)sz;
         p += 8 + (long)sz;
     }
@@ -319,8 +321,7 @@ static void pin_strip(void) {
     long q = 0; int si = 0, kept_stubs = 0;
     for (long p = 0; p + 8 <= len; ) {
         uint32_t m = pin_u32(d + p), sz = pin_u32(d + p + 4);
-        long end = p + 8 + (long)sz;
-        if (end > len) end = len;
+        long end = (unsigned long)sz > (unsigned long)(len - p - 8) ? len : p + 8 + (long)sz;
         int drop = m == 0x80134000u || m == 0x80034100u || m == 0x80034130u;
         /* stubs are in buffer order: move the ones inside this chunk along */
         while (si < g_pin.nstub && g_pin.stub[si].coff < end) {
@@ -587,6 +588,9 @@ static ResChunk *cix_build(const char *path, long flen, int *count) {
         c[n].id = (uint32_t)h[0] | (uint32_t)h[1] << 8 | (uint32_t)h[2] << 16 | (uint32_t)h[3] << 24;
         c[n].size = sz; c[n].off = (uint32_t)off;
         n++;
+        /* a size that would wrap (or not move on): the walk ends here, not
+           loop growing the index until memory runs out (audit 11-17) */
+        if (sz > 0x7fffffffu - 8u - (uint32_t)off) break;
         off += 8 + (long)sz;
     }
     fclose(f);

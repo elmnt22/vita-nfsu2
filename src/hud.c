@@ -734,6 +734,9 @@ static unsigned char *hud_read_bundle(const char *path, long *len) {
 static struct { uint32_t src, key; FengImage im; unsigned age; } g_hic[HIC_MAX];
 static int g_hic_n; static long g_hic_bytes; static unsigned g_hic_clock;
 static volatile int g_hic_lock;
+/* the holder copies pictures under it: a waiter backs off after a short spin,
+   so a higher-priority thread on the same core cannot starve it (audit 11-17) */
+static void hic_lock(void) { for (int n = 0; __sync_lock_test_and_set(&g_hic_lock, 1); n++) if (n > 64) SDL_Delay(1); }
 static uint32_t hic_src(const char *own, int screen, int style) {
     uint32_t h = 2166136261u;
     for (const char *c = own ? own : ""; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
@@ -742,7 +745,7 @@ static uint32_t hic_src(const char *own, int screen, int style) {
 /* fill the empty slots whose key is cached; 1 when every wanted key was answered */
 static int hic_fill(uint32_t src, const uint32_t *keys, int nk, FengImage *img) {
     int all = 1;
-    while (__sync_lock_test_and_set(&g_hic_lock, 1)) {}
+    hic_lock();
     for (int i = 0; i < nk; i++) {
         if (!keys[i] || img[i].rgba) continue;
         int e = -1;
@@ -761,7 +764,7 @@ static int hic_fill(uint32_t src, const uint32_t *keys, int nk, FengImage *img) 
 }
 /* remember what the full search found for each wanted key */
 static void hic_store(uint32_t src, const uint32_t *keys, int nk, const FengImage *img) {
-    while (__sync_lock_test_and_set(&g_hic_lock, 1)) {}
+    hic_lock();
     for (int i = 0; i < nk; i++) {
         if (!keys[i]) continue;
         int dup = 0;
@@ -1214,7 +1217,7 @@ static int hud_pre_thread(void *u) {
             Hud *h = hud_build(g_warm.root, from, 1, g_warm.pkg[k], 2, 0, 0.0f, 0.0f, 1);
             hud_free(&h);                   /* deferred: no GL object was made */
         }
-        while (__sync_lock_test_and_set(&g_hic_lock, 1)) {}
+        hic_lock();
         long kb = g_hic_bytes / 1024; int ne = g_hic_n;
         __sync_lock_release(&g_hic_lock);
         printf("player HUD: %d screens warmed on the worker in %.0f ms (image cache %d entries, %ld KB)\n", g_warm.n,

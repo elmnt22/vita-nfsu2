@@ -58,8 +58,10 @@ static void hull_scan(CarColl *c, const unsigned char *d, long sz, long base, co
                 long vs = end, vsz = rd32(d + vs + 4);
                 long va = ((base + vs + 0x17) & ~15L) - base;
                 int n = (int)((vs + 8 + vsz - va) / 48);
+                if (vsz > sz - vs - 8) n = 0;   /* vertices past the chunk: damaged (audit 11-17) */
                 if (n > 0 && n < 4096) {
                     c->hv = (float (*)[3])malloc((size_t)n * sizeof *c->hv);
+                    if (!c->hv) return;   /* out of memory: the box stand-in */
                     for (int i = 0; i < n; i++)
                         for (int k = 0; k < 3; k++)
                             c->hv[i][k] = rdf(d + va + i * 48 + 0x10 + k * 4);
@@ -77,6 +79,7 @@ static CarColl *hull_finish(CarColl *c, const char *car)
         /* 0x5aec20 fallback: a box from (-2.2165,-0.971,-0.2) to (2.165,0.971,0.624) */
         static const float lo[3] = { -2.2165f, -0.971f, -0.2f }, hi[3] = { 2.165f, 0.971f, 0.624f };
         c->hv = (float (*)[3])malloc(8 * sizeof *c->hv);
+        if (!c->hv) { free(c); printf("carcoll: %s out of memory, no hull\n", car); return NULL; }
         for (int i = 0; i < 8; i++)
             for (int k = 0; k < 3; k++) c->hv[i][k] = (i >> k & 1) ? hi[k] : lo[k];
         c->nv = 8;
@@ -102,6 +105,7 @@ CarColl *carcoll_load_kit(const char *geometry_bin, const char *car, int wide)
         hull_name(want, sizeof want, car, wide);
         FILE *f = fopen(geometry_bin, "rb");
         CarColl *c = (CarColl *)calloc(1, sizeof *c);
+        if (!c) { if (f) fclose(f); return NULL; }
         snprintf(c->name, sizeof c->name, "%s", want);
         long off = 0;
         unsigned char h[8];
@@ -136,6 +140,7 @@ CarColl *carcoll_load(const char *geometry_bin, const char *car)
     snprintf(want, sizeof want, "%s_CV", car);
     FILE *f = fopen(geometry_bin, "rb");
     CarColl *c = (CarColl *)calloc(1, sizeof *c);
+    if (!c) { if (f) fclose(f); return NULL; }
     snprintf(c->name, sizeof c->name, "%s", want);
     if (f) {
         long off = 0;
@@ -160,6 +165,7 @@ CarColl *carcoll_load_mem(const unsigned char *geo, long len, const char *car)
     char want[48];
     snprintf(want, sizeof want, "%s_CV", car);
     CarColl *c = (CarColl *)calloc(1, sizeof *c);
+    if (!c) return NULL;
     snprintf(c->name, sizeof c->name, "%s", want);
     for (long off = 0; geo && off + 8 <= len && !c->nv; ) {
         uint32_t id = rd32(geo + off), sz = rd32(geo + off + 4);
@@ -173,6 +179,7 @@ CarColl *carcoll_load_mem(const unsigned char *geo, long len, const char *car)
 CarColl *carcoll_load_named(const unsigned char *bun, long len, const char *name)
 {
     CarColl *c = (CarColl *)calloc(1, sizeof *c);
+    if (!c) return NULL;
     snprintf(c->name, sizeof c->name, "%s", name);
     for (long off = 0; bun && off + 8 <= len && !c->nv; ) {
         uint32_t id = rd32(bun + off), sz = rd32(bun + off + 4);

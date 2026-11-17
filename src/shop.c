@@ -889,6 +889,7 @@ static long find_chunk_in_file(FILE *f, uint32_t want, uint32_t *size) {
     while (fseek(f, o, SEEK_SET) == 0 && fread(h, 1, 8, f) == 8) {
         uint32_t id = n2_u32(h), sz = n2_u32(h + 4);
         if (id == want) { *size = sz; return o + 8; }
+        if (sz > 0x7fffffffu - 8u - (uint32_t)o) break;   /* wrap / no step: damaged file (audit 11-17) */
         o += 8 + (long)sz;
     }
     return -1;

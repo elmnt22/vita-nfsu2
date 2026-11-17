@@ -27,7 +27,9 @@ static FILE *g_bx_f;
 static BxEntry *g_bx_t;
 static int g_bx_n, g_bx_tried;
 static volatile int g_bx_lock;
-static void bx_lock(void) { while (__sync_lock_test_and_set(&g_bx_lock, 1)) {} }
+/* the holder may be reading the file: a waiter backs off after a short spin,
+   so a higher-priority thread on the same core cannot starve it (audit 11-17) */
+static void bx_lock(void) { for (int n = 0; __sync_lock_test_and_set(&g_bx_lock, 1); n++) if (n > 64) SDL_Delay(1); }
 static void bx_unlock(void) { __sync_lock_release(&g_bx_lock); }
 
 static int bx_exists(const char *p) {

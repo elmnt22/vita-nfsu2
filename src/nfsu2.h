@@ -3960,9 +3960,13 @@ static const unsigned char *n2_tpk_slots(const unsigned char *d, long len, uint3
     for (long i = 0; i + 4 < len; i++)
         if (d[i]==0 && d[i+1]==0 && d[i+2]==0x31 && d[i+3]==0xb3) { hoff = i + 8; break; }
     if (hoff < 0) return NULL;
-    uint32_t hsz = n2_u32(d + hoff - 4); long hend = hoff + hsz, o = hoff;
+    uint32_t hsz = n2_u32(d + hoff - 4);
+    /* the header and its slots stay inside the file (audit 11-17) */
+    if ((unsigned long)hsz > (unsigned long)(len - hoff)) hsz = (uint32_t)(len - hoff);
+    long hend = hoff + (long)hsz, o = hoff;
     while (o + 8 <= hend) {
         uint32_t m = n2_u32(d + o), s = n2_u32(d + o + 4);
+        if ((unsigned long)s > (unsigned long)(hend - o - 8)) break;
         if (m == 0x33310003u) { *outsz = s; return d + o + 8; }
         o += 8 + s;
     }

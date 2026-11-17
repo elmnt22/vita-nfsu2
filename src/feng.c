@@ -166,8 +166,8 @@ static void parse_object(const unsigned char *d, long o, long end,
     /* FOb chunk: sub-chunks; ObjD carries the tag stream */
     while (o + 8 <= end) {
         uint32_t sz = n2_u32(d + o + 4);
+        if ((unsigned long)sz > (unsigned long)(end - o - 8)) break;   /* no signed wrap (audit 11-17) */
         long body = o + 8, bend = body + (long)sz;
-        if (bend > end) break;
         if (!memcmp(d + o, "ObjD", 4)) {
             long t = body;
             while (t + 4 <= bend) {
@@ -265,8 +265,8 @@ static int parse_feng(const unsigned char *d, long len, FengPackage *p) {
     long o = 8;
     while (o + 8 <= end) {
         uint32_t sz = n2_u32(d + o + 4);
+        if ((unsigned long)sz > (unsigned long)(end - o - 8)) break;   /* no signed wrap (audit 11-17) */
         long body = o + 8, bend = body + (long)sz;
-        if (bend > end) break;
         if (!memcmp(d + o, "PkHd", 4) && sz > 0x18) {
             /* six u32 header words, then the package name */
             int n = 0;
@@ -278,6 +278,7 @@ static int parse_feng(const unsigned char *d, long len, FengPackage *p) {
             long r = body;
             while (r + 8 <= bend) {               /* RsNm first, RsRq after */
                 uint32_t rs = n2_u32(d + r + 4);
+                if ((unsigned long)rs > (unsigned long)(bend - r - 8)) break;   /* runs past its parent */
                 if (!memcmp(d + r, "RsNm", 4)) { names = d + r + 8; nlen = rs; }
                 else if (!memcmp(d + r, "RsRq", 4) && names) {
                     uint32_t cnt = n2_u32(d + r + 8);
@@ -311,6 +312,7 @@ static int parse_feng(const unsigned char *d, long len, FengPackage *p) {
             long r = body;
             while (r + 8 <= bend) {
                 uint32_t rs = n2_u32(d + r + 4);
+                if ((unsigned long)rs > (unsigned long)(bend - r - 8)) break;   /* runs past its parent */
                 if (!memcmp(d + r, "FOb\xea", 4)) parse_object(d, r + 8, r + 8 + rs, p);
                 r += 8 + rs;
             }
@@ -367,8 +369,8 @@ int feng_load_package(const unsigned char *bun, long len, const char *name,
     long o = 0;
     while (t_scr && t_trk && t_keyw && t_ev && t_tg && t_rsp && o + 8 <= len) {
         uint32_t id = n2_u32(bun + o), sz = n2_u32(bun + o + 4);
+        if ((unsigned long)sz > (unsigned long)(len - o - 8)) break;   /* no signed wrap (audit 11-17) */
         long body = o + 8, bend = body + (long)sz;
-        if (bend > len) break;
         if (id == 0x00030203u || id == 0x00030210u) {
             const unsigned char *pk = NULL; long pklen = 0;
             unsigned char *unpacked = NULL;
@@ -865,8 +867,8 @@ int feng_tpk_load(const unsigned char *d, long len, const uint32_t *keys,
             }
         for (long o = hbeg; o + 8 <= hend; ) {
             uint32_t id = n2_u32(d + o), sz = n2_u32(d + o + 4);
+            if ((unsigned long)sz > (unsigned long)(hend - o - 8)) break;   /* no signed wrap (audit 11-17) */
             long body = o + 8, bend = body + (long)sz;
-            if (bend > hend) break;
             if (id == 0x33310004u && pix >= 0) {              /* plain records */
                 for (long r = body; r + 0x7c <= bend; r += 0x7c) {
                     const unsigned char *rec = d + r + 0x0c;
@@ -951,8 +953,8 @@ static int tpkf_header(FILE *f, long flen, long hbeg, long hend, const uint32_t 
     int filled = 0;
     for (long o = 0; o + 8 <= hl && pix >= 0; ) {
         uint32_t id = n2_u32(h + o), sz = n2_u32(h + o + 4);
+        if ((unsigned long)sz > (unsigned long)(hl - o - 8)) break;   /* no signed wrap (audit 11-17) */
         long body = o + 8, bend = body + (long)sz;
-        if (bend > hl) break;
         if (id == 0x33310003u) *comp = 1;            /* compressed: the whole-bundle path */
         if (id == 0x33310004u) {
             for (long r = body; r + 0x7c <= bend; r += 0x7c) {
@@ -994,8 +996,8 @@ static int tpkf_walk(FILE *f, long flen, long beg, long end, const uint32_t *key
         unsigned char hd[8];
         if (!tpkf_read(f, o, hd, 8)) break;
         uint32_t id = n2_u32(hd), sz = n2_u32(hd + 4);
+        if ((unsigned long)sz > (unsigned long)(end - o - 8)) break;   /* no signed wrap (audit 11-17) */
         long body = o + 8, bend = body + (long)sz;
-        if (bend > end) break;
         if (id == 0xb3310000u) filled += tpkf_header(f, flen, body, bend, keys, nkeys, out, comp);
         else if ((id & 0x80000000u) && depth < 4)
             filled += tpkf_walk(f, flen, body, bend, keys, nkeys, out, depth + 1, comp);
@@ -1023,8 +1025,8 @@ int feng_load_font(const unsigned char *lang, long len, const char *resname,
     char want[40]; base_lower(resname, want, sizeof want);
     for (long o = 0; o + 8 <= len; ) {
         uint32_t id = n2_u32(lang + o), sz = n2_u32(lang + o + 4);
+        if ((unsigned long)sz > (unsigned long)(len - o - 8)) break;   /* no signed wrap (audit 11-17) */
         long body = o + 8, bend = body + (long)sz;
-        if (bend > len) break;
         if (id == 0x00030201u && sz > 0x220) {
             char nm[40]; int n = 0;
             while (n < 39 && lang[body + n]) { nm[n] = (char)tolower(lang[body + n]); n++; }

@@ -146,7 +146,8 @@ AiNet *ainet_load(const char *path)
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    AiNet *net = (AiNet *)calloc(1, sizeof *net);
+    AiNet *net = n > 0 ? (AiNet *)calloc(1, sizeof *net) : NULL;   /* audit 11-17: empty file / no memory */
+    if (!net) { fclose(f); return NULL; }
     net->data = (unsigned char *)malloc((size_t)n + 16);
     if (!net->data || fread(net->data, 1, (size_t)n, f) != (size_t)n) {
         fclose(f); free(net->data); free(net); return NULL;
@@ -156,10 +157,11 @@ AiNet *ainet_load(const char *path)
     for (long o = 0; o + 8 <= n; ) {                                   /* 0x5deb80 */
         uint32_t id = rd32(net->data + o), sz = rd32(net->data + o + 4);
         const unsigned char *c = net->data + o + 8;
-        if (o + 8 + (long)sz > n) break;
+        if ((unsigned long)sz > (unsigned long)(n - o - 8)) break;   /* no signed wrap */
         if (id == 0x34121) {                                            /* 0x5de1c0 */
             for (const unsigned char *s = c; s + 0x8c <= c + sz; ) {
                 int np = rds16(s + 0x34);
+                if (np < 0) break;   /* damaged: a negative count would walk backwards for good */
                 unsigned sid = rdu16(s + 10);
                 if (sid < SEC_MAX) net->sec[sid] = s;
                 if (net->norder < SEC_MAX) net->order[net->norder++] = s;
@@ -548,6 +550,7 @@ static void fl_start(FList *L, int sec, int idx, const float *shift0, const floa
 {
     if (L->n >= FL_MAX) return;
     FPoint *f = fp_new(back);
+    if (!f) return;   /* pool out of memory: the line stops here (audit 11-17) */
     f->off = off; f->dist = dist; f->link = link;
     f->sec = (short)sec; f->pt = (short)idx;
     f->shift[0] = *shift0;
@@ -1188,6 +1191,7 @@ static void fl_interp(FList *L, const FPoint *f)
         if (L->n >= FL_MAX) return;
         a += 8.0f;
         FPoint *g = fp_new(back);
+        if (!g) return;
         g->sec = sec; g->pt = pt;
         g->off = a + o0; g->dist = d0 + a;
         fl_append(L, g);
@@ -1256,7 +1260,7 @@ static void fl_junction(AiRacer *r, FList *L, FPoint *nw)
         int idx = pt_index(n, q), dir = !nw->back;
         Lk *lk = NULL;
         if (!route_step(r, L, &sec, &q, &idx, &lk, &dir)) break;
-        if (dir != !nw->back) { int pdir = dir; fp_free(nw); nw = fp_new(pdir == 0); }
+        if (dir != !nw->back) { int pdir = dir; fp_free(nw); nw = fp_new(pdir == 0); if (!nw) return; }
         nw->dist = nw->off = 0;
         nw->sec = (short)rdu16(sec + 10); nw->pt = (short)pt_index(n, q);
         nw->link = lk;
@@ -1340,6 +1344,7 @@ static void fl_extend(AiRacer *r, FList *L, float upto)
             seg = v2len(pt_x(prevpt) - pt_x(pt), pt_y(prevpt) - pt_y(pt));
         }
         FPoint *g = fp_new(dir == 0);
+        if (!g) return;
         g->sec = (short)rdu16(sec + 10);
         g->pt = (short)pt_index(n, pt);
         g->link = link;

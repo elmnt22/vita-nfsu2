@@ -40,6 +40,7 @@ static unsigned char *read_top_chunk(const char *path, unsigned id, unsigned *le
             if (out) *len = sz;
             break;
         }
+        if (sz > 0x7fffffffu - 8u - (unsigned)at) break;   /* wrap / no step: damaged file (audit 11-17) */
         at += 8 + (long)sz;
     }
     fclose(f);
@@ -82,7 +83,8 @@ int nis_init(const char *dataroot)
     }
     for (unsigned q = 0; q + 8 <= T.common_len;) {
         unsigned cid = rd32(T.common + q), sz = rd32(T.common + q + 4);
-        if (cid == 0x37070u && q + 8 + sz <= T.common_len) { T.sel = T.common + q + 8; T.sel_len = sz; }
+        if (sz > T.common_len - q - 8) break;   /* runs past the chunk: no wrap */
+        if (cid == 0x37070u) { T.sel = T.common + q + 8; T.sel_len = sz; }
         q += 8 + sz;
     }
     if (!T.sel || T.sel_len < 0x91c) {
@@ -1071,7 +1073,7 @@ NisBanks *nis_banks_load(const unsigned char *d, long len)
     if (!k) return NULL;
     for (long q = 0; q + 8 <= len;) {
         unsigned cid = rd32(d + q), sz = rd32(d + q + 4);
-        if (q + 8 + (long)sz > len) break;
+        if ((unsigned long)sz > (unsigned long)(len - q - 8)) break;   /* no wrap (audit 11-17) */
         if (cid == 0xe34010u)
             for (unsigned j = 0; j + 4 <= sz; j++)
                 if (!memcmp(d + q + 8 + j, "\x7f" "ELF", 4)) {
@@ -1360,7 +1362,7 @@ static void walk_bundle(Nis *n, const unsigned char *b, unsigned len, const unsi
 {
     for (unsigned q = 0; q + 8 <= len;) {
         unsigned cid = rd32(b + q), sz = rd32(b + q + 4);
-        if (q + 8 + sz > len) break;
+        if (sz > len - q - 8) break;   /* no wrap (audit 11-17) */
         const unsigned char *d = b + q + 8;
         if (cid & 0x80000000u) walk_bundle(n, d, sz, hdr);
         else if (cid == 0x37030u && sz >= 0x34) *hdr = d;
@@ -1455,7 +1457,7 @@ Nis *nis_load(const char *dataroot, unsigned hash, int variant)
     for (unsigned q = 0; q + 16 <= T.cams_len && !n->track;) {
         unsigned sz = rd32(T.cams + q + 4);
         const unsigned char *d = T.cams + q + 8;
-        if (q + 8 + sz > T.cams_len) break;
+        if (sz > T.cams_len - q - 8) break;   /* no wrap (audit 11-17) */
         if (rd32(d) == hash) {
             const unsigned char *t = d + 8, *e = d + sz;
             for (unsigned i = 0; i < rd32(d + 4) && t + 0x20 <= e; i++) {
