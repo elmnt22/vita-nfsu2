@@ -5245,6 +5245,7 @@ static int g_rt_crumbs;
    free roam 3 and the career setting (0x5404a0), Quick Race Free Run its
    options (0x53f580) */
 static int g_roam_level = 3, g_roam_diff = 1, g_roam_fail;
+static unsigned g_rt_zones_gen;   /* bumped on every free/load of g_rt.zones: a reload can reuse the same address */
 /* career free roam (StartCareerFreeRoam 8011cbac): the career game mode (off:
    Quick Race / the port's free roam exactly as before); the start waiting for
    its ride (g_career_go); the career start scene (CareerNis1) once free roam
@@ -6239,7 +6240,7 @@ static void rt_end(void)
     gps_drop_pf();
     ainet_free(g_rt.net);
     racepath_free(g_rt.rp);
-    racepath_free(g_rt.zones);
+    racepath_free(g_rt.zones); g_rt_zones_gen++;
     rt_keep_park();
     rt_free_visuals();
     nisdraw_free(g_rt.nisd);
@@ -6801,7 +6802,7 @@ static int rt_roam_start(const char *troot, const char *dataroot, const char *ca
     g_rt.net = ainet_load(path);
     if (!g_rt.net) { printf("free roam: %s missing, no traffic%c", path, 10); g_roam_fail = 1; return 0; }
     snprintf(path, sizeof path, "%s/ROUTESL4RA/PathsFreeRoam.bin", troot);
-    g_rt.zones = racepath_load_zones(path);
+    g_rt.zones = racepath_load_zones(path); g_rt_zones_gen++;
     snprintf(g_rt.troot, sizeof g_rt.troot, "%s", troot);
     snprintf(g_rt.dataroot, sizeof g_rt.dataroot, "%s", dataroot);
     snprintf(g_rt.reg, sizeof g_rt.reg, "L4RA");
@@ -9961,8 +9962,10 @@ static void trig_update(int free_run)
     for (int i = 0; i < 64; i++) {                                    /* GetNextUnlockedTriggerZone */
         const CareerZone *z = career_unlocked_zone(i);
         if (!z || !z->zone) continue;
-        static const RacePath *qz; static uint32_t qh[64]; static const unsigned char *qr[64];
-        if (qz != g_rt.zones) { qz = g_rt.zones; memset(qh, 0, sizeof qh); }
+        /* keyed on the load generation, not the pointer: after a race the zones are freed and reloaded,
+           often at the same address, and the old record pointers in qr[] then pointed into freed memory */
+        static unsigned qg; static uint32_t qh[64]; static const unsigned char *qr[64];
+        if (qg != g_rt_zones_gen) { qg = g_rt_zones_gen; memset(qh, 0, sizeof qh); }
         if (qh[i] != z->zone) {                                       /* the zone's record, looked up once */
             const unsigned char *q = racepath_zone_next(g_rt.zones, NULL);
             while (q && n2_u32(q + 0x30) != z->zone) q = racepath_zone_next(g_rt.zones, q);
