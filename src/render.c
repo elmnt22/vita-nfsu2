@@ -647,9 +647,14 @@ static GLuint program_cached(const char *vs, const char *fs) {
     GLsizei len = 0; GLenum fmt = 0;
     if (buf) glGetProgramBinary(p, PROG_CACHE_MAX, &len, &fmt, buf);
     mkdir("ux0:data/NFSU2/cache", 0777);   /* usually exists already */
-    if (buf && len > 0 && len <= PROG_CACHE_MAX && (f = fopen(path, "wb"))) {
-        if (fwrite(buf, 1, (size_t)len, f) == (size_t)len) g_prog_saved++;
-        fclose(f);
+    /* a temp file renamed in: a write cut off (power, a full card) leaves no
+       short binary for glProgramBinary at every later boot (audit 11-17) */
+    char tmp[104]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (buf && len > 0 && len <= PROG_CACHE_MAX && (f = fopen(tmp, "wb"))) {
+        int wok = fwrite(buf, 1, (size_t)len, f) == (size_t)len;
+        wok = fclose(f) == 0 && wok;
+        if (wok) { remove(path); wok = rename(tmp, path) == 0; }
+        if (wok) g_prog_saved++; else remove(tmp);
     }
     free(buf);
     return p;

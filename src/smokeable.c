@@ -290,9 +290,11 @@ int smk_load(const char *root, const char *stem)
                     LOAD_PUMP();   /* the loading screen keeps moving */
                     for (int i = 0; i < cnt && pad + 0x10 + (long)(i + 1) * 0x70 <= (long)sz; i++) {
                         const unsigned char *r = pk + 0x10 + i * 0x70;
-                        if (g_nsp == cap) {
-                            cap = cap ? cap * 2 : 256;
-                            g_sp = (SmkSpawner *)realloc(g_sp, (size_t)cap * sizeof *g_sp);
+                        if (g_nsp == cap) {   /* out of memory: the props found so far stay (audit 11-17) */
+                            int nc = cap ? cap * 2 : 256;
+                            SmkSpawner *ns = (SmkSpawner *)realloc(g_sp, (size_t)nc * sizeof *g_sp);
+                            if (!ns) break;
+                            g_sp = ns; cap = nc;
                         }
                         SmkSpawner *S = &g_sp[g_nsp];
                         memset(S, 0, sizeof *S);
@@ -325,6 +327,11 @@ int smk_load(const char *root, const char *stem)
     g_keys = (uint32_t *)malloc((size_t)g_nsp * sizeof *g_keys);
     g_keyidx = (int *)malloc((size_t)g_nsp * sizeof *g_keyidx);
     g_gpu = (SmkGpu **)calloc((size_t)g_nsp, sizeof *g_gpu);
+    if (!g_keys || !g_keyidx || !g_gpu) {
+        printf("smokeables: %s: out of memory, none\n", stem);
+        smk_free();
+        return 0;
+    }
     for (int i = 0; i < g_nsp; i++) { g_keys[i] = (uint32_t)g_sp[i].section << 16 | g_sp[i].instance; g_keyidx[i] = i; }
     qsort(g_keyidx, (size_t)g_nsp, sizeof *g_keyidx, cmp_u32);
     smk_world_reset();

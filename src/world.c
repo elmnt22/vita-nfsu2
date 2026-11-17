@@ -1556,6 +1556,7 @@ int world_load_nav(World *w, const char *troot) {
     w->city.nav = (float *)malloc((size_t)cap * 2 * sizeof(float));
     w->city.navedge = (int *)malloc((size_t)ecap * 2 * sizeof(int));
     w->city.nnav = w->city.nnavedge = 0;
+    int oom = !w->city.nav || !w->city.navedge;   /* audit 11-17: no graph, not a NULL write */
     w->city.navbb[0] = w->city.navbb[2] = 1e30f; w->city.navbb[1] = w->city.navbb[3] = -1e30f;
 
     static unsigned char present[4000];
@@ -1563,7 +1564,7 @@ int world_load_nav(World *w, const char *troot) {
         const char *rn = w->neighborhood.rgn[r].name;
         const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
         world_paths_present(troot, stem, present);
-        for (int fi = 0; fi < 4000; fi++) {          /* Paths<id>.bin ids are sparse */
+        for (int fi = 0; fi < 4000 && !oom; fi++) {  /* Paths<id>.bin ids are sparse */
             if (!present[fi]) continue;
             char p[1024];
             snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", troot, stem, 4000 + fi);
@@ -1575,16 +1576,18 @@ int world_load_nav(World *w, const char *troot) {
             if (evi >= 0) w->city.ev[evi].node0 = w->city.nnav;
             N2Leaf leaf[8]; int nl = 0;
             n2_find_leaves(d, 0, len, 0x00034148u, leaf, &nl, 8);
-            for (int L = 0; L < nl; L++) {
+            for (int L = 0; L < nl && !oom; L++) {
                 int n = (int)leaf[L].size / 24, prev = -1;
-                for (int i = 0; i < n; i++) {
+                for (int i = 0; i < n && !oom; i++) {
                     float x, y;
                     memcpy(&x, d + leaf[L].off + i*24,     4);
                     memcpy(&y, d + leaf[L].off + i*24 + 4, 4);
                     if (!(x == x && y == y) || x < -1e5f || x > 1e5f ||
                         y < -1e5f || y > 1e5f) { prev = -1; continue; }
-                    if (w->city.nnav == cap) { cap *= 2;
-                        w->city.nav = (float *)realloc(w->city.nav, (size_t)cap*2*sizeof(float)); }
+                    if (w->city.nnav == cap) {
+                        float *nv = (float *)realloc(w->city.nav, (size_t)cap*4*sizeof(float));
+                        if (!nv) { oom = 1; break; }
+                        w->city.nav = nv; cap *= 2; }
                     int id = w->city.nnav++;
                     w->city.nav[id*2] = x; w->city.nav[id*2+1] = y;
                     if (x < w->city.navbb[0]) w->city.navbb[0] = x;
@@ -1594,8 +1597,10 @@ int world_load_nav(World *w, const char *troot) {
                     if (prev >= 0) {
                         float dx = x - w->city.nav[prev*2], dy = y - w->city.nav[prev*2+1];
                         if (dx*dx + dy*dy <= NAV_LINK_MAX*NAV_LINK_MAX) {
-                            if (w->city.nnavedge == ecap) { ecap *= 2;
-                                w->city.navedge = (int *)realloc(w->city.navedge, (size_t)ecap*2*sizeof(int)); }
+                            if (w->city.nnavedge == ecap) {
+                                int *ne = (int *)realloc(w->city.navedge, (size_t)ecap*4*sizeof(int));
+                                if (!ne) { oom = 1; break; }
+                                w->city.navedge = ne; ecap *= 2; }
                             w->city.navedge[w->city.nnavedge*2]   = prev;
                             w->city.navedge[w->city.nnavedge*2+1] = id;
                             w->city.nnavedge++;
@@ -1610,6 +1615,14 @@ int world_load_nav(World *w, const char *troot) {
     }
     w->city.navev   = (int  *)malloc((size_t)(w->city.nnav ? w->city.nnav : 1) * sizeof(int));
     w->city.navopen = (char *)malloc((size_t)(w->city.nnav ? w->city.nnav : 1));
+    if (oom || !w->city.navev || !w->city.navopen) {
+        printf("nav graph: out of memory, no routing\n");
+        free(w->city.nav); free(w->city.navedge); free(w->city.navev); free(w->city.navopen);
+        w->city.nav = NULL; w->city.navedge = NULL; w->city.navev = NULL; w->city.navopen = NULL;
+        w->city.nnav = w->city.nnavedge = 0;
+        for (int e = 0; e < w->city.nev; e++) w->city.ev[e].node0 = w->city.ev[e].node1 = 0;
+        return 0;
+    }
     for (int i = 0; i < w->city.nnav; i++) { w->city.navev[i] = -1; w->city.navopen[i] = 1; }
     for (int e = 0; e < w->city.nev; e++)
         for (int i = w->city.ev[e].node0; i < w->city.ev[e].node1; i++) w->city.navev[i] = e;
@@ -1660,10 +1673,16 @@ const char *world_district_name(const char *tok) {
 static void nav_build_adj(World *w) {
     int cap = w->city.nnavedge * 2 + 64, ne = w->city.nnavedge;
     int *ea = (int *)malloc((size_t)cap * 2 * sizeof(int));
+    int nb0 = w->city.nnav * 2 + 7;
+    int *head = (int *)malloc((size_t)nb0 * sizeof(int));
+    int *next = (int *)malloc((size_t)(w->city.nnav ? w->city.nnav : 1) * sizeof(int));
+    if (!ea || !head || !next) {   /* out of memory: no adjacency, routing reports "none" (audit 11-17) */
+        free(ea); free(head); free(next);
+        printf("routing graph: out of memory, none\n");
+        return;
+    }
     for (int e = 0; e < ne; e++) { ea[e*2] = w->city.navedge[e*2]; ea[e*2+1] = w->city.navedge[e*2+1]; }
-    {   int nb = w->city.nnav * 2 + 7;
-        int *head = (int *)malloc((size_t)nb * sizeof(int));
-        int *next = (int *)malloc((size_t)w->city.nnav * sizeof(int));
+    {   int nb = nb0;
         for (int i = 0; i < nb; i++) head[i] = -1;
         for (int i = 0; i < w->city.nnav; i++) {
             int cx = (int)floorf(w->city.nav[i*2]/NAV_WELD), cy = (int)floorf(w->city.nav[i*2+1]/NAV_WELD);
@@ -1678,19 +1697,30 @@ static void nav_build_adj(World *w) {
                     if (j <= i) continue;
                     float ddx = w->city.nav[i*2]-w->city.nav[j*2], ddy = w->city.nav[i*2+1]-w->city.nav[j*2+1];
                     if (ddx*ddx + ddy*ddy > NAV_WELD*NAV_WELD) continue;
-                    if (ne == cap) { cap *= 2; ea = (int *)realloc(ea, (size_t)cap*2*sizeof(int)); }
+                    if (ne == cap) {
+                        int *na = (int *)realloc(ea, (size_t)cap*4*sizeof(int));
+                        if (!na) continue;   /* out of memory: this weld is skipped */
+                        ea = na; cap *= 2; }
                     ea[ne*2] = i; ea[ne*2+1] = j; ne++;
                 }
             }
         }
         free(head); free(next);
     }
-    w->city.adjstart = (int *)calloc((size_t)w->city.nnav + 1, sizeof(int));
+    int *as = (int *)calloc((size_t)w->city.nnav + 1, sizeof(int));
+    if (!as) { free(ea); printf("routing graph: out of memory, none\n"); return; }
+    w->city.adjstart = as;
     for (int e = 0; e < ne; e++) { w->city.adjstart[ea[e*2]+1]++; w->city.adjstart[ea[e*2+1]+1]++; }
     for (int i = 0; i < w->city.nnav; i++) w->city.adjstart[i+1] += w->city.adjstart[i];
     w->city.nadj = w->city.adjstart[w->city.nnav];
     w->city.adjlist = (int *)malloc((size_t)w->city.nadj * sizeof(int));
-    int *fill = (int *)malloc((size_t)w->city.nnav * sizeof(int));
+    int *fill = (int *)malloc((size_t)(w->city.nnav ? w->city.nnav : 1) * sizeof(int));
+    if (!w->city.adjlist || !fill) {
+        free(w->city.adjlist); free(fill); free(ea); free(w->city.adjstart);
+        w->city.adjlist = NULL; w->city.adjstart = NULL; w->city.nadj = 0;
+        printf("routing graph: out of memory, none\n");
+        return;
+    }
     for (int i = 0; i < w->city.nnav; i++) fill[i] = w->city.adjstart[i];
     for (int e = 0; e < ne; e++) {
         int a = ea[e*2], b = ea[e*2+1];
@@ -2021,8 +2051,12 @@ int world_route(const World *w, int start, int goal, int *out, int cap, float *o
     float *g = (float *)malloc((size_t)w->city.nnav * sizeof(float));
     int *came = (int *)malloc((size_t)w->city.nnav * sizeof(int));
     char *closed = (char *)calloc((size_t)w->city.nnav, 1);
-    for (int i = 0; i < w->city.nnav; i++) { g[i] = 1e30f; came[i] = -1; }
     HeapIt *heap = (HeapIt *)malloc((size_t)(w->city.nadj + 16) * sizeof(HeapIt));
+    if (!g || !came || !closed || !heap) {   /* out of memory: no route this time, asked again later (audit 11-17) */
+        free(g); free(came); free(closed); free(heap);
+        return 0;
+    }
+    for (int i = 0; i < w->city.nnav; i++) { g[i] = 1e30f; came[i] = -1; }
     int hn = 0;
     float gx = w->city.nav[goal*2], gy = w->city.nav[goal*2+1];
     g[start] = 0.0f;

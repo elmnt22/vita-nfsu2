@@ -488,7 +488,13 @@ static int n2_load_light_sources(const unsigned char *d, long len,
 static void n2_push_mesh(N2Scene *s, N2Mesh m) {
     if (s->count == s->cap) {
         s->cap = s->cap ? s->cap * 2 : 64;
-        s->meshes = (N2Mesh *)realloc(s->meshes, s->cap * sizeof(N2Mesh));
+        N2Mesh *nm = (N2Mesh *)realloc(s->meshes, s->cap * sizeof(N2Mesh));
+        if (!nm) {   /* out of memory: the mesh is dropped, not written through NULL (audit 11-17) */
+            s->cap /= 2; if (!s->meshes) s->cap = 0;
+            n2_mesh_geometry_release(&m);
+            return;
+        }
+        s->meshes = nm;
     }
     s->meshes[s->count++] = m;
 }
@@ -1228,6 +1234,12 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
     while (o + 8 <= end) {
         uint32_t magic = n2_u32(d + o), size = n2_u32(d + o + 4);
         long ds = o + 8;
+        /* a chunk running past its parent (a truncated / damaged file): stop,
+           not read past the buffer or loop on a wrapped size (audit 11-17) */
+        if ((unsigned long long)size > (unsigned long long)(end - ds)) {
+            static int told; if (!told++) printf("n2_walk_meshes: chunk %08x of %u bytes runs past its parent (damaged file?), rest skipped\n", magic, size);
+            break;
+        }
         if (magic == 0x80134010u) {
             N2Scene *scene = scene0;   /* redirected below for vista impostors */
             n2_obj_seen++;
@@ -3827,16 +3839,20 @@ static int n2_jdlz(const unsigned char *s, int slen, unsigned char *out, int out
     if (usize > out_cap) usize = out_cap;
     int op = 0, ip = 16, flags1 = 1, flags2 = 1;
     while (ip < slen && op < usize) {
-        if (flags1 == 1) flags1 = s[ip++] | 0x100;
-        if (flags2 == 1) flags2 = s[ip++] | 0x100;
+        /* the reads stay in the stream, a copy only from bytes already out
+           (damaged data: stop, not read outside either buffer; audit 11-17) */
+        if (flags1 == 1) { if (ip >= slen) break; flags1 = s[ip++] | 0x100; }
+        if (flags2 == 1) { if (ip >= slen) break; flags2 = s[ip++] | 0x100; }
         if (flags1 & 1) {
             int len, dist;
+            if (ip + 2 > slen) break;
             if (flags2 & 1) { len = (s[ip+1] | ((s[ip] & 0xF0) << 4)) + 3; dist = (s[ip] & 0x0F) + 1; }
             else            { dist = (s[ip+1] | ((s[ip] & 0xE0) << 3)) + 17; len = (s[ip] & 0x1F) + 3; }
             ip += 2;
+            if (dist > op) break;
             for (int k = 0; k < len && op < usize; k++) { out[op] = out[op - dist]; op++; }
             flags2 >>= 1;
-        } else out[op++] = s[ip++];
+        } else { if (ip >= slen) break; out[op++] = s[ip++]; }
         flags1 >>= 1;
     }
     return op;
@@ -4024,6 +4040,8 @@ static int n2_car_tex_name_by_key(const unsigned char *d, long len, uint32_t key
 }
 
 /* Decode ONE car texture through its offset-slot table and embedded header. */
+/* out of memory part way: nothing half-built handed back (audit 11-17) */
+#define N2_CT_OOM(c) do { if (!(c)) { free(raw); free(t->rgb); free(t->alpha); free(t->dxt); t->rgb = t->alpha = t->dxt = NULL; return 0; } } while (0)
 static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key, N2Tex *t) {
     memset(t, 0, sizeof *t);   /* all outputs defined on success AND failure */
     uint32_t sz; const unsigned char *p = n2_tpk_slots(d, len, &sz);
@@ -4064,6 +4082,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
                     if (!n2_car_dxt1(raw,t)) { free(raw); return 0; }
                     t->dxtlen = (int)blocks; t->dxtfmt = 1;        /* base-level blocks */
                     t->dxt = (unsigned char *)malloc(t->dxtlen);
+                    N2_CT_OOM(t->dxt);
                     memcpy(t->dxt, raw, t->dxtlen);
                     free(raw); return 1;
                 }
@@ -4071,9 +4090,11 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
                     t->w = w; t->h = h;
                     t->rgb = (unsigned char *)malloc(n * 3);
                     t->alpha = (unsigned char *)malloc(n);
+                    N2_CT_OOM(t->rgb && t->alpha);
                     n2_dxt3(raw, w, h, t->rgb, t->alpha);
                     t->dxtlen = (int)n; t->dxtfmt = 3;
                     t->dxt = (unsigned char *)malloc(t->dxtlen);
+                    N2_CT_OOM(t->dxt);
                     memcpy(t->dxt, raw, t->dxtlen);
                     free(raw); return 1;
                 }
@@ -4089,6 +4110,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
                     t->w = w; t->h = h;
                     t->rgb = (unsigned char *)malloc(n * 3);
                     t->alpha = (unsigned char *)malloc(n);
+                    N2_CT_OOM(t->rgb && t->alpha);
                     for (long i = 0; i < n; i++) {
                         int ix = raw[i];
                         unsigned char v = (unsigned char)(20 + (ix & 15) * 8);
@@ -4127,6 +4149,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
         if (n*4 > P) { free(raw); return 0; }
         t->rgb = (unsigned char *)malloc(n*3);
         t->alpha = (unsigned char *)malloc(n);
+        N2_CT_OOM(t->rgb && t->alpha);
         for (long q = 0; q < n; q++) {    /* B,G,R,A -> RGB + alpha plane */
             t->rgb[q*3]   = raw[q*4+2]; t->rgb[q*3+1] = raw[q*4+1];
             t->rgb[q*3+2] = raw[q*4];   t->alpha[q]   = raw[q*4+3];
@@ -4138,10 +4161,14 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
             { free(raw); return 0; }
         t->dxtfmt = 1;
     } else if (fmt == 0x24) {             /* DXT3 */
+        if ((long)((tw+3)/4)*((th+3)/4)*16 > P) { free(raw); return 0; }   /* as DXT1: the blocks fit */
         t->rgb = (unsigned char *)malloc(n*3); t->alpha = (unsigned char *)malloc(n);
+        N2_CT_OOM(t->rgb && t->alpha);
         n2_dxt3(raw, tw, th, t->rgb, t->alpha); t->dxtfmt = 3;
     } else if (fmt == 0x26) {             /* DXT5 */
+        if ((long)((tw+3)/4)*((th+3)/4)*16 > P) { free(raw); return 0; }
         t->rgb = (unsigned char *)malloc(n*3); t->alpha = (unsigned char *)malloc(n);
+        N2_CT_OOM(t->rgb && t->alpha);
         n2_dxt5(raw, tw, th, t->rgb, t->alpha); t->dxtfmt = 5;
     } else {                              /* palettised (0x08/0x80/0x81) / unknown */
         fprintf(stderr, "car tex %08x: unhandled format 0x%02x (%dx%d) skipped\n", key, fmt, tw, th);
@@ -4153,6 +4180,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
     t->dxtlen = n2_mipbytes2(tw, th, bpb);
     if (t->dxtlen > (int)P) t->dxtlen = (int)P;
     t->dxt = (unsigned char *)malloc(t->dxtlen);
+    N2_CT_OOM(t->dxt);
     memcpy(t->dxt, raw, t->dxtlen);
     free(raw);
     return 1;
@@ -4413,7 +4441,15 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             int is_dxt1 = fmt == N2_TEXFMT_DXT1 && palsz <  1024;
             int is_dxt3 = fmt == N2_TEXFMT_DXT3 && palsz <  1024;
             if (!is_p8 && !is_dxt1 && !is_dxt3) continue;   /* unknown/contradictory tag */
-            tex->w = w; tex->h = hh; tex->rgb = (unsigned char *)malloc((long)w*hh*3);
+            /* the Vita's kept-DXT path never decodes: no w*h*3 + w*h buffers to
+               allocate and free again (they fragmented the heap); elsewhere a
+               failed allocation skips the texture instead of writing through
+               NULL (audit 11-17) */
+            int nodec = 0;
+#ifdef __vita__
+            nodec = n2_tpk_keep_dxt && n2_tpk_skip_pixels && !is_p8;
+#endif
+            tex->w = w; tex->h = hh; tex->rgb = nodec ? NULL : (unsigned char *)malloc((long)w*hh*3);
             tex->dxt = NULL; tex->dxtlen = 0; tex->dxtfmt = 0;
             /* order/usage/blend/wz: the last field read is wz at +0x4b, so a
              * full 0x4c-byte record prefix must be present before touching any
@@ -4429,7 +4465,8 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                RETAINED when it says something -- an all-255 plane is freed, so
                every opaque road and building keeps the exact RGB upload and the
                exact rendering it had before. */
-            unsigned char *alf = (unsigned char *)malloc((long)w*hh);
+            unsigned char *alf = nodec ? NULL : (unsigned char *)malloc((long)w*hh);
+            if (!nodec && (!tex->rgb || !alf)) { free(tex->rgb); tex->rgb = NULL; free(alf); continue; }
             tex->alpha = NULL;
             tex->afmt = 0;
             if (is_p8) {

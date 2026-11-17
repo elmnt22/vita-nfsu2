@@ -141,13 +141,14 @@ static unsigned char *read_at(FILE *f, long off, long n)
     return b;
 }
 
+static int g_wc_oom;   /* an allocation failed in wcoll_load / load_bounds */
 static void load_bounds(WColl *w, const unsigned char *d, long len)
 {
     int cap = 0;
     for (long o = 0; o + 8 <= len; ) {
         uint32_t id = rd32(d + o), sz = rd32(d + o + 4);
+        if ((unsigned long)sz > (unsigned long)(len - o - 8)) break;   /* no signed wrap on a huge size */
         long end = o + 8 + (long)sz;
-        if (end > len) break;
         if (id == 0x34152) {
             long q = o + 8;
             while (q + 0x24 <= end) {
@@ -158,13 +159,17 @@ static void load_bounds(WColl *w, const unsigned char *d, long len)
                    x98, x99 boundaries are scenery and region outlines. */
                 if (sec % 100 < 20) {
                     if (w->nbnd == cap) {
-                        cap = cap ? cap * 2 : 256;
-                        w->bnd = (Bound *)realloc(w->bnd, (size_t)cap * sizeof *w->bnd);
+                        int nc = cap ? cap * 2 : 256;
+                        Bound *nb = (Bound *)realloc(w->bnd, (size_t)nc * sizeof *w->bnd);
+                        if (!nb) { g_wc_oom = 1; break; }
+                        w->bnd = nb; cap = nc;
                     }
-                    Bound *b = &w->bnd[w->nbnd++];
+                    Bound *b = &w->bnd[w->nbnd];
                     b->section = sec; b->n = n;
                     for (int k = 0; k < 4; k++) b->bb[k] = rdf(d + q + 0xc + (k & 1) * 4 + (k >> 1) * 8);
                     b->xy = (float *)malloc((size_t)n * 8);
+                    if (!b->xy) { g_wc_oom = 1; break; }
+                    w->nbnd++;
                     for (int k = 0; k < 2 * n; k++) b->xy[k] = rdf(d + q + 0x24 + k * 4);
                 }
                 q += 0x24 + n * 8;
@@ -192,6 +197,7 @@ static void load_bounds(WColl *w, const unsigned char *d, long len)
             int cnt = (int)(sz >> 5);
             free(w->groups);
             w->groups = (Group *)calloc((size_t)(cnt > 0 ? cnt : 1), sizeof *w->groups);
+            if (!w->groups) { g_wc_oom = 1; cnt = 0; }
             w->ngroups = cnt;
             for (int i = 0; i < cnt; i++) {
                 const unsigned char *r = d + o + 8 + 32 * i;
@@ -207,7 +213,9 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
 {
     FILE *f = fopen(stream_bun, "rb");
     if (!f) return NULL;
+    g_wc_oom = 0;
     WColl *w = (WColl *)calloc(1, sizeof *w);
+    if (!w) { fclose(f); printf("wcoll: out of memory, no collision for %s\n", stream_bun); return NULL; }
     for (int i = 0; i < WC_NSLOT; i++) w->slot[i] = -1;
     int cap = 0;
     long off = 0;
@@ -227,11 +235,12 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
                found by aligning its absolute offset */
             long base = off + 8, pad = base & 15;
             unsigned char *raw = read_at(f, base - pad, (long)sz + pad);
+            if (raw && w->npacks == cap) {
+                int nc = cap ? cap * 2 : 64;
+                Pack *np = (Pack *)realloc(w->packs, (size_t)nc * sizeof *w->packs);
+                if (np) { w->packs = np; cap = nc; } else { free(raw); raw = NULL; g_wc_oom = 1; }
+            }
             if (raw) {
-                if (w->npacks == cap) {
-                    cap = cap ? cap * 2 : 64;
-                    w->packs = (Pack *)realloc(w->packs, (size_t)cap * sizeof *w->packs);
-                }
                 Pack *p = &w->packs[w->npacks];
                 /* 0x5d8140; raw starts on a 16-byte file boundary */
                 memset(p, 0, sizeof *p);
@@ -279,7 +288,8 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
         return NULL;
     }
     w->order = (int *)malloc((size_t)w->nbnd * sizeof *w->order);
-    for (int i = 0; i < w->nbnd; i++) w->order[i] = i;
+    if (!w->order) g_wc_oom = 1;
+    else for (int i = 0; i < w->nbnd; i++) w->order[i] = i;
     if (w->nvis) {   /* each record's boundary (FindBoundary(section) at load) */
         w->vorder = (int *)malloc((size_t)w->nvis * sizeof *w->vorder);
         for (int i = 0; i < w->nvis; i++) {
@@ -290,6 +300,13 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
         if (!w->vorder) w->nvis = 0;
     }
     w->enabled = (unsigned char *)calloc((size_t)(w->ngroups > 256 ? w->ngroups : 256), 1);
+    /* out of memory part way (a track switch late in a session): no collision
+       rather than a half-built one read through NULL every frame (audit 11-17) */
+    if (g_wc_oom || !w->enabled) {
+        printf("wcoll: out of memory while loading %s, no collision\n", stream_bun);
+        wcoll_free(w);
+        return NULL;
+    }
     printf("wcoll: %d collision packs, %d drivable section boundaries, %d barrier groups\n",
            w->npacks, w->nbnd, w->ngroups);
     return w;

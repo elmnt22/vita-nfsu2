@@ -1648,7 +1648,11 @@ static int build_cache(const char *dataroot) {
     if (got < nk && gb) got += feng_tpk_load(gb, glen, keys, nk, img);   /* SHOP_ICON_*, PC_load ... */
     free(gb);
     printf("shop: cache build: %d of %d textures\n", got, nk);
-    FILE *f = fopen(SHOP_CACHE, "wb");
+    /* written to a temp file and renamed in: a build cut off part way (the
+       game closed, a full card) no longer leaves a short cache that loads
+       without its textures for good (audit 11-17) */
+    char ctmp[300]; snprintf(ctmp, sizeof ctmp, "%s.tmp", SHOP_CACHE);
+    FILE *f = fopen(ctmp, "wb");
     int ok = 0;
     if (f) {
         fwrite("OUSHOP02", 1, 8, f);
@@ -1666,7 +1670,10 @@ static int build_cache(const char *dataroot) {
             put32(f, img[i].blend);
             fwrite(img[i].rgba, 4, (size_t)img[i].w * img[i].h, f);
         }
-        ok = fclose(f) == 0;
+        ok = !ferror(f);
+        ok = fclose(f) == 0 && ok;
+        if (ok) { remove(SHOP_CACHE); ok = rename(ctmp, SHOP_CACHE) == 0; }
+        if (!ok) remove(ctmp);
     }
     for (int i = 0; i < nk; i++) feng_image_free(&img[i]);
     free(img);
