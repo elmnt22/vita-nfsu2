@@ -1121,8 +1121,13 @@ static int tr_tele_near(AiWorld *w, AiRacer *r, const AiSeen *h, float dist)
     TrPos e[3] = { { hs, hp, dir } };
     int cnt = tr_parallel(w, e, 3);
     w->tele_rot = (w->tele_rot + 1) % cnt;
+    if (w->tele_oneway) {   /* port: the next start place running the way `same` wants */
+        int k = w->tele_rot;
+        for (int t = 0; t < cnt; t++, k = (k + 1) % cnt)
+            if ((e[k].dir == e[0].dir) == same) { w->tele_rot = k; break; }
+    }
     TrPos cur = e[w->tele_rot];
-    int ok = tr_walk(w, &cur, 1, cur.pt, 250.0f, cur.dir, 0);          /* 0x7e9720 */
+    int ok = tr_walk(w, &cur, 1, cur.pt, w->tele_first, cur.dir, 0);   /* 0x7e9720 (250) */
     if (ok != 1) return 0;
     Pt *prev = NULL, *p = cur.pt;
     for (int it = 0; ok == 1; it++) {
@@ -1303,6 +1308,8 @@ void aitraffic_setup(AiWorld *w, const AiTrafficSetup *s)
     /* the teleporter's ctor 0x4179f0 */
     w->tele_period = (w->drag || w->x890108) ? 0.3f : 1.0f;            /* 0x783ba4 / 0x783ba0 */
     w->tele_rr = 0; w->tele_on = 1; w->tele_rot = 0;
+    w->tele_first = s->tele_first > 0 ? s->tele_first : 250.0f;
+    w->tele_oneway = s->tele_oneway;
     w->tele_points = 0;
     for (int i = 0; i < n->norder; i++)                                 /* 0x409900(.., 1) */
         if (sec_haslanes(n->order[i], 1)) w->tele_points += sec_npts(n->order[i]);

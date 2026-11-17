@@ -223,6 +223,12 @@ typedef struct {
     const unsigned char *(*zone)(void *user, const float pos[2]);
     void *zone_user;
     int   tdiff;                      /* 0x89e7f4: the traffic cars' skill 0 -> 9, 1 -> 4, 2 -> 0 */
+    float tele_first;                 /* port: the near teleport's first walk along the road (0 = retail's
+                                         250 m; the World Expansion's curving roads end it under 250 m
+                                         straight from the eye, which the clear test turns down) */
+    int   tele_oneway;                /* port: the net's sections are one-way (the World Expansion): an
+                                         oncoming car goes on an alongside section running the other way,
+                                         not on the forward lane of the human's (which drives away) */
 } AiTrafficSetup;
 void     aitraffic_setup(AiWorld *w, const AiTrafficSetup *s);
 /* the track record's traffic count at the world's traffic level (0x4fe9f0) */

@@ -924,6 +924,8 @@ struct AiWorld {
     int   tele_rr;             /* +4 the round-robin index */
     char  tele_on;             /* +8 */
     int   tele_rot;            /* +0xc the search rotation */
+    float tele_first;          /* port: AiTrafficSetup.tele_first */
+    int   tele_oneway;         /* port: AiTrafficSetup.tele_oneway */
     int   tele_points;         /* +0x14 the route points with forward lanes */
     float go_in;               /* 0x5ef2e0: seconds to GO (the countdown), negative after */
     AiRem rem;                 /* free roam's random encounters (aiencounter.c) */
