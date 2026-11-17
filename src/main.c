@@ -29166,6 +29166,10 @@ int main(int argc, char **argv) {
             hs.have_rpm = 1;
             hs.rpm = g_engine.target_rpm;
             hs.rpm_redline = ENG_REDLINE_RPM;   /* the gearbox's own limit */
+            if (g_n2 && g_n2rec_ok) {   /* GitHub #15: the tach's dial and needle scale by the engine (0x5ed9b0) */
+                hs.tach_red = n2sim_param(g_n2, 0x1f4);
+                hs.tach_lim = n2sim_param(g_n2, 0x1f8);
+            }
             /* manual shows the selected gear (N, R); automatic shows R
                while rolling backwards */
             hs.gear = g_manual ? gear : speed < -0.005f ? -1 : gear;

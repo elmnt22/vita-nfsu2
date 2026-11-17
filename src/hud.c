@@ -196,6 +196,8 @@ struct Hud {
     /* smoothed display state: a needle that snaps looks broken, and a dial fed
        straight from a 60 Hz sample jitters on every gear change. */
     float   needle_rpm, needle_speed, nos_glow, arrow_angle;
+    int     tach_cls;              /* the dial art loaded (0x60fe10 class + 1; 0 = the package default) */
+    float   tach_sweep, tach_lim;  /* Tachometer +0xc4: limiter / scale * 235 deg; the limiter */
     int     arrow_primed;
     /* street map: luminance texture over [map_x0, map_x0+map_ext] etc. and a
        circular fan whose texture coordinates are rewritten every frame */
@@ -4429,6 +4431,67 @@ static void strip_draw(Hud *h, const HudDC *dc) {
         if (w->strip_add[i]) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
 }
+/* GitHub #15: the regular tach's dial by the player's engine. 0x5ed9b0's
+   non-drag branch (GC Tachometer ctor 80108d1c): the 0x60fe10 class picks
+   3RDPERSON_<10500|9500|8500|7500>LINES_CUSTOM_<style> for the rev scale and
+   3RDPERSON_REDLINE_<9000..5500> for the red zone, and the needle sweeps
+   limiter / scale * 235 degrees (+0xc4) over rpm / limiter clamped to 0..1
+   (CalcAngleForRPM 801094b0 / 0x4aa0e0). The package's default art is the
+   10500 dial; swapped on the GL thread once the Hud's own uploads are done. */
+static void tach_dial(Hud *h, const HudState *s) {
+    if (h->defer || !h->pk || !(s->tach_lim > 0.0f && s->tach_red > 0.0f)) return;
+    static const float SCALE[8] = { 10500, 10500, 9500, 9500, 8500, 8500, 7500, 7500 };
+    static const int RED[8] = { 9000, 8500, 8000, 7500, 7000, 6500, 6000, 5500 };
+    int cls = drag_tach_class(s->tach_red, s->tach_lim);
+    h->tach_lim = s->tach_lim;
+    h->tach_sweep = s->tach_lim / SCALE[cls] * 235.0f;
+    if (h->tach_cls == cls + 1) return;
+    h->tach_cls = cls + 1;
+    int on = feng_find(h->pk, feng_hash_upper("3rdPersonTachRPMNumbers"));
+    int orl = feng_find(h->pk, feng_hash_upper("RPM_Redline"));
+    int rn = on >= 0 ? h->pk->obj[on].res : -1, rr = orl >= 0 ? h->pk->obj[orl].res : -1;
+    char nl[64], nlp[48], nr[48];
+    snprintf(nl, sizeof nl, "3RDPERSON_%.0fLINES_CUSTOM_%02d", (double)SCALE[cls], g_hud_style);
+    snprintf(nlp, sizeof nlp, "3RDPERSON_%.0fLINES", (double)SCALE[cls]);
+    snprintf(nr, sizeof nr, "3RDPERSON_REDLINE_%d", RED[cls]);
+    uint32_t keys[3] = { feng_tex_key(nl), feng_tex_key(nlp), feng_tex_key(nr) };
+    FengImage img[3]; memset(img, 0, sizeof img);
+    for (int f = 0; f < HUD_NPACK; f++) {
+        char path[1024], pack[64];
+        snprintf(pack, sizeof pack, HUD_PACKS[f], g_hud_style);
+        snprintf(path, sizeof path, "%s/%s", h->dataroot, pack);
+        if (feng_tpk_load_file(path, keys, 3, img) >= 0) continue;
+        long len = 0;
+        unsigned char *d = hud_read_bundle(path, &len);
+        if (!d) continue;
+        feng_tpk_load(d, len, keys, 3, img);
+        free(d);
+    }
+    FengImage *ln = img[0].rgba ? &img[0] : img[1].rgba ? &img[1] : NULL;
+    if (ln && rn >= 0 && rn < h->pk->nres) {
+        if (h->rt[rn].tex) glDeleteTextures(1, &h->rt[rn].tex);
+        h->rt[rn].tex = hud_upload(ln); h->rt[rn].w = ln->w; h->rt[rn].h = ln->h;
+        h->rt[rn].additive = ln->blend == 6;
+    }
+    if (img[2].rgba && rr >= 0 && rr < h->pk->nres) {
+        if (h->rt[rr].tex) glDeleteTextures(1, &h->rt[rr].tex);
+        h->rt[rr].tex = hud_upload(&img[2]); h->rt[rr].w = img[2].w; h->rt[rr].h = img[2].h;
+        h->rt[rr].additive = img[2].blend == 6;
+    }
+    printf("player HUD: tach dial %s / %s (class %d, redline %.0f, limiter %.0f, sweep %.1f deg)%s%s\n",
+           ln == &img[0] ? nl : nlp, nr, cls, (double)s->tach_red, (double)s->tach_lim, (double)h->tach_sweep,
+           ln ? "" : " -- scale art missing", img[2].rgba ? "" : " -- redline art missing");
+    for (int i = 0; i < 3; i++) feng_image_free(&img[i]);
+}
+/* the needle's angle in degrees: the engine's sweep, else the default dial */
+static float tach_angle(const Hud *h) {
+    if (h->tach_cls && h->tach_lim > 0.0f) {
+        float f = h->needle_rpm / h->tach_lim;
+        if (f < 0.0f) f = 0.0f; else if (f > 1.0f) f = 1.0f;
+        return f * h->tach_sweep;
+    }
+    return h->needle_rpm / 1000.0f * RPM_DEG_PER_1000;
+}
 static void hud_draw_screen(Hud *h, const HudDC *dc, const HudState *s) {
     const FengPackage *p = h->pk;
     unsigned char gate_on[G_COUNT];
@@ -4441,6 +4504,7 @@ static void hud_draw_screen(Hud *h, const HudDC *dc, const HudState *s) {
     gate_on[G_BANK]   = (unsigned char)hud_shows_money(s);
     gate_on[G_SMS]    = !s->racing && s->message_waiting;
 
+    tach_dial(h, s);
     float rpm = s->have_rpm ? s->rpm : 0.0f;
     if (rpm < 0.0f) rpm = 0.0f;
     if (rpm > RPM_SCALE_MAX) rpm = RPM_SCALE_MAX;
@@ -4472,7 +4536,7 @@ static void hud_draw_screen(Hud *h, const HudDC *dc, const HudState *s) {
         case R_RPM_NEEDLE:
             if (s->have_rpm)
                 fe_sprite_at(h, dc, i, o->ax, o->ay,
-                             h->needle_rpm / 1000.0f * RPM_DEG_PER_1000 * (float)M_PI / 180.0f,
+                             tach_angle(h) * (float)M_PI / 180.0f,
                              o->rgba);
             break;
         case R_TURBO_NEEDLE: {
