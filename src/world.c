@@ -305,6 +305,11 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         /* decide on world tiles BEFORE taking the pinned bundle: switching
            them on strips (reallocates) it */
         if (nreg == 1) (void)world_tiles_enabled(regs[r]);
+        if (beyond_is_track(regs[r])) {   /* the World Expansion has no bundle: tiles only (hwlog80: a failed open per build) */
+            g->data = NULL; g->len = 0; g->pinned = 0;
+            g->mesh0 = g->mesh1 = w->neighborhood.scene.count;
+            continue;
+        }
         g->data = res_bundle(trackp, &g->len);    /* pinned, shared by every build */
         g->pinned = g->data != NULL;
         if (!g->data)
