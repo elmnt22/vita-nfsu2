@@ -1936,6 +1936,42 @@ int hud_set_trackmap(Hud *h, const char *dataroot, int event,
     return 1;
 }
 
+/* The World Expansion's minimap (beyond.h): a converted square map in the
+   TRACKMAP layout. "BMAP", u32 w, u32 h, f32 x0, y0 (top-left), size, zoom,
+   then w*h RGBA. Kept under the pseudo event -2 so the city's TRACKMAP
+   reloads when the track switches back. */
+int hud_set_trackmap_file(Hud *h, const char *path) {
+    if (!h) return 0;
+    if (h->tm_event == -2 && h->tm_tex) return 1;
+    if (!h->pk || feng_find(h->pk, FE_MAP_SLOT) < 0) return 0;
+    static int failed;
+    if (failed) return 0;
+    long len = 0;
+    unsigned char *d = n2_read_file(path, &len);
+    uint32_t w = 0, hh = 0; float fl[4] = { 0 };
+    if (d && len >= 28 && !memcmp(d, "BMAP", 4)) { memcpy(&w, d + 4, 4); memcpy(&hh, d + 8, 4); memcpy(fl, d + 12, 16); }
+    if (!d || !w || w > 4096 || hh != w || (long)(28 + (size_t)w * hh * 4) > len || !(fl[2] > 0) || !(fl[3] > 0)) {
+        printf("minimap: %s missing or unreadable\n", path);
+        free(d); failed = 1; return 0;
+    }
+    if (!h->tm_tex) glGenTextures(1, &h->tm_tex);
+    glBindTexture(GL_TEXTURE_2D, h->tm_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (int)w, (int)hh, 0, GL_RGBA, GL_UNSIGNED_BYTE, d + 28);
+    free(d);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    hud_map_fan(h);
+    h->tm_x0 = fl[0]; h->tm_y0 = fl[1]; h->tm_size = fl[2]; h->tm_zoom = fl[3];
+    h->tm_event = -2;
+    printf("minimap: %s, %ux%u, %.0f m from (%.0f, %.0f), zoom %.2f\n", path, (unsigned)w, (unsigned)hh,
+           (double)fl[2], (double)fl[0], (double)fl[1], (double)fl[3]);
+    return 1;
+}
+
 void hud_set_preview(Hud *h, int on) { if (h) h->preview = on ? 1 : 0; }
 int  hud_preview(const Hud *h) { return h ? h->preview : 0; }
 const char *hud_missing(const Hud *h) { return h ? h->missing : ""; }

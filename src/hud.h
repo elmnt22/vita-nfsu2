@@ -455,6 +455,8 @@ void hud_map_build(Hud *h, const float *xy, const int *next,
  * metres, +0xc0 the zoom: a 0.3 / zoom window of it across the panel).
  * Free roam uses the region's record (4000 ...). Loads once per event;
  * 0 when the file is missing (the street map then stays). */
+/* the World Expansion's converted minimap (beyond.h), in place of a TRACKMAP */
+int hud_set_trackmap_file(Hud *h, const char *path);
 int hud_set_trackmap(Hud *h, const char *dataroot, int event,
                      float x0, float y0, float size, float zoom);
 

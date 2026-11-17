@@ -1143,6 +1143,7 @@ void collide_walls_selftest(void) {
 static int scen_is_wall(int sc) {
     return sc == N2_SC_BUILDING || sc == N2_SC_WALL || sc == N2_SC_STRUCT;
 }
+int g_phys_trees_solid = 1;
 int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max) {
     int nobst = 0;
@@ -1150,6 +1151,7 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
         if (s->meshes[i].world_role == 2 || s->meshes[i].world_role == 3) continue;   /* 3: a smokeable prop */
         int sc = s->meshes[i].scen, baked_props=embedded_prop_mesh(&s->meshes[i]);
         int prop_check = 0;
+        if (sc == N2_SC_TREE && !g_phys_trees_solid) continue;   /* physics.h */
         if (sc != N2_SC_NONE) {                 /* named: decide semantically */
             if (sc == N2_SC_TERRAIN && !baked_props) continue;
             /* props, trees and unclassified: let measured size decide, so a tree

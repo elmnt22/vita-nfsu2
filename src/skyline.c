@@ -1,6 +1,7 @@
 /* Always-resident skyline: see skyline.h. */
 #include "skyline.h"
 #include "world_tiles.h"
+#include "beyond.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,9 +15,15 @@
 #define SKYLINE_OUTER_M 1500.0f
 #define SKYLINE_FILE_VER 1
 #define SKYLINE_MAXV    65535
+/* the World Expansion (beyond.h) is ~12x the city: a higher cut, then the
+   tallest stand-ins up to the city's own GPU size (7.8 MB at 30 m) */
+#define SKYLINE_BEYOND_MIN_H  45.0f
+#define SKYLINE_BEYOND_BUDGET (6L << 20)   /* cache bytes; the GPU copy is ~1.3x (10.8 MB at 8 MB) */
 /* ux0:data/NFSU2/skyminh.txt "<m>" or OPENUG2_SKYMINH: the height cut (A/B runs;
    another height has its own cache file) */
+static int sky_beyond(void);
 static float sky_min_h(void) {
+    if (sky_beyond()) return SKYLINE_BEYOND_MIN_H;   /* (own cache file name, by the height) */
     static float v = -1.0f;
     if (v < 0.0f) {
         v = SKYLINE_MIN_H;
@@ -162,8 +169,50 @@ static void collect(void *ctx, const N2Mesh *m) {
     S.nv += m->nverts; S.ni += m->nidx;
     free(nor);
 }
+static int sky_beyond(void) { return beyond_is_track(S.track); }
+/* keep the tallest stand-ins whose vertices + indices fit `budget` bytes (in their collected order) */
+static float *g_trim_h;
+static int trim_cmp(const void *a, const void *b) {
+    float x = g_trim_h[*(const int *)a], y = g_trim_h[*(const int *)b];
+    return x > y ? -1 : x < y ? 1 : *(const int *)a - *(const int *)b;
+}
+static void trim_budget(long budget) {
+    long total = S.nv * (long)sizeof(SkyV) + S.ni * 2;
+    if (total <= budget || S.nmesh <= 0) return;
+    int *ord = (int *)malloc((size_t)S.nmesh * sizeof *ord);
+    float *h = (float *)malloc((size_t)S.nmesh * sizeof *h);
+    unsigned char *keep = (unsigned char *)calloc((size_t)S.nmesh, 1);
+    if (!ord || !h || !keep) { free(ord); free(h); free(keep); return; }
+    for (int i = 0; i < S.nmesh; i++) { ord[i] = i; h[i] = S.mesh[i].bb[5] - S.mesh[i].bb[2]; }
+    g_trim_h = h;
+    qsort(ord, (size_t)S.nmesh, sizeof *ord, trim_cmp);
+    long used = 0; float cut = 0.0f;
+    for (int k = 0; k < S.nmesh; k++) {
+        const SkyMesh *m = &S.mesh[ord[k]];
+        long b = (long)m->nv * (long)sizeof(SkyV) + (long)m->ni * 2;
+        if (used + b > budget) continue;
+        used += b; keep[ord[k]] = 1; cut = h[ord[k]];
+    }
+    int nm = 0; long vo = 0, io = 0, wv = 0, wi = 0;
+    for (int i = 0; i < S.nmesh; i++) {
+        const SkyMesh m = S.mesh[i];
+        if (keep[i]) {
+            memmove(S.v + wv, S.v + vo, (size_t)m.nv * sizeof *S.v);
+            memmove(S.ix + wi, S.ix + io, (size_t)m.ni * 2);
+            S.mesh[nm++] = m; wv += m.nv; wi += m.ni;
+        }
+        vo += m.nv; io += m.ni;
+    }
+    printf("skyline: %d of %d stand-ins kept for a %ld KB budget (%ld KB before; shortest kept %.0f m)\n",
+           nm, S.nmesh, budget >> 10, total >> 10, (double)cut);
+    S.nmesh = nm; S.nv = wv; S.ni = wi;
+    free(ord); free(h); free(keep);
+}
 static void cache_path(char *out, size_t n) {
-    if (sky_min_h() == SKYLINE_MIN_H) snprintf(out, n, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER);
+    if (sky_beyond())   /* the budget is in the name: another budget builds again */
+        snprintf(out, n, "%s/%s_sky_v%d_%d_h%d_b%ld.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER,
+                 (int)sky_min_h(), SKYLINE_BEYOND_BUDGET >> 10);
+    else if (sky_min_h() == SKYLINE_MIN_H) snprintf(out, n, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER);
     else snprintf(out, n, "%s/%s_sky_v%d_%d_h%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER, (int)sky_min_h());
 }
 static int cache_read(void) {
@@ -262,6 +311,7 @@ static int loader(void *arg) {
     if (!ok && !SDL_AtomicGet(&S.abort)) {
         int tiles = world_tiles_each_standin(S.track, sky_min_h(), collect, NULL, &S.abort);
         ok = tiles > 0 && S.nmesh > 0 && !SDL_AtomicGet(&S.abort);
+        if (ok && sky_beyond()) trim_budget(SKYLINE_BEYOND_BUDGET);
         printf("skyline: built from %d tiles: %d stand-ins >= %.0f m, %ld verts, %ld KB\n", tiles, S.nmesh,
                (double)sky_min_h(), S.nv, (S.nv * (long)sizeof(SkyV) + S.ni * 2) >> 10);
         if (ok) { cache_write(); S.built = 1; }

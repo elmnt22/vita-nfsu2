@@ -1,0 +1,179 @@
+/* beyond.c -- the optional Beyond world: its switch, texture pack and start
+ * point (see beyond.h). Everything here is unused unless beyond_enabled(). */
+#include "beyond.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define BEYOND_DIR "ux0:data/NFSU2/beyond"
+
+/* BeyondDev converter/ug2x.h, version 1 */
+typedef struct {
+    uint32_t key;
+    uint16_t w, h;
+    uint8_t mips, fmt, alpha, cls;
+    uint32_t offset, size, name, hash;
+    uint8_t src, pad[3];
+} BxEntry;
+typedef struct { char magic[4]; uint32_t version, count, table, names, names_bytes, data, flags; } BxHeader;
+
+static int g_bx_enabled = -1;
+int g_beyond_pick;
+static FILE *g_bx_f;
+static BxEntry *g_bx_t;
+static int g_bx_n, g_bx_tried;
+static volatile int g_bx_lock;
+static void bx_lock(void) { while (__sync_lock_test_and_set(&g_bx_lock, 1)) {} }
+static void bx_unlock(void) { __sync_lock_release(&g_bx_lock); }
+
+static int bx_exists(const char *p) {
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+int beyond_enabled(void) {
+    if (g_bx_enabled < 0) {
+        int sw = bx_exists(BEYOND_DIR "/enable.txt");
+        int files = bx_exists(BEYOND_DIR "/BEYOND.ug2x") &&
+                    bx_exists("ux0:data/NFSU2/cache/tiles/STREAMBEYOND_v6.idx") &&
+                    bx_exists("ux0:data/NFSU2/cache/tiles/STREAMBEYOND_v6.pak");
+        g_bx_enabled = sw && files;
+        if (sw) printf("beyond: %s\n", files ? "on -- Quick Race Free Run offers the World Expansion"
+                                             : "enable.txt found but the converted files are missing; off");
+    }
+    return g_bx_enabled;
+}
+
+int beyond_is_track(const char *t) {
+    return t && (!strcmp(t, BEYOND_TRACK) || !strcmp(t, "BEYOND"));
+}
+
+/* the table, once (under the lock) */
+static int bx_open(void) {
+    if (g_bx_t) return 1;
+    if (g_bx_tried) return 0;
+    g_bx_tried = 1;
+    FILE *f = fopen(BEYOND_DIR "/BEYOND.ug2x", "rb");
+    BxHeader h;
+    if (!f || fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, "UG2X", 4) || h.version != 1 ||
+        !h.count || h.count > 65536) {
+        printf("beyond: BEYOND.ug2x missing or not a version 1 pack\n");
+        if (f) fclose(f);
+        return 0;
+    }
+    BxEntry *t = (BxEntry *)malloc(sizeof *t * h.count);
+    if (!t || fseek(f, (long)h.table, SEEK_SET) || fread(t, sizeof *t, h.count, f) != h.count) {
+        free(t); fclose(f);
+        printf("beyond: BEYOND.ug2x table unreadable\n");
+        return 0;
+    }
+    g_bx_f = f; g_bx_t = t; g_bx_n = (int)h.count;
+    printf("beyond: texture pack, %d textures\n", g_bx_n);
+    return 1;
+}
+
+static const BxEntry *bx_find(uint32_t key) {
+    int lo = 0, hi = g_bx_n;
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_bx_t[m].key < key) lo = m + 1; else hi = m; }
+    return lo < g_bx_n && g_bx_t[lo].key == key ? &g_bx_t[lo] : NULL;
+}
+
+#define BX_KEEP 8
+static struct { uint32_t key; N2Tex t; } g_bx_keep[BX_KEEP];
+static int g_bx_nkeep;
+static unsigned char *bx_dup(const unsigned char *p, size_t n) {
+    if (!p || !n) return NULL;
+    unsigned char *q = (unsigned char *)malloc(n);
+    if (q) memcpy(q, p, n);
+    return q;
+}
+static void bx_copy(N2Tex *d, const N2Tex *s) {
+    size_t px = (size_t)s->w * s->h;
+    *d = *s;
+    d->rgb = bx_dup(s->rgb, px * 3);
+    d->alpha = bx_dup(s->alpha, px);
+    d->dxt = bx_dup(s->dxt, s->dxt ? (size_t)s->dxtlen : 0);
+}
+void beyond_keep_tex(uint32_t key, const N2Tex *t) {
+    bx_lock();
+    int have = 0;
+    for (int i = 0; i < g_bx_nkeep; i++) have |= g_bx_keep[i].key == key;
+    if (!have && key && g_bx_nkeep < BX_KEEP && t && (t->rgb || t->dxt)) {
+        g_bx_keep[g_bx_nkeep].key = key;
+        bx_copy(&g_bx_keep[g_bx_nkeep].t, t);
+        g_bx_nkeep++;
+        printf("beyond: kept the city's texture %08x (%dx%d) for the sky%s", (unsigned)key, t->w, t->h, "\n");
+    }
+    bx_unlock();
+}
+static int bx_keep_get(uint32_t key, N2Tex *t) {
+    int ok = 0;
+    bx_lock();
+    for (int i = 0; i < g_bx_nkeep && !ok; i++)
+        if (g_bx_keep[i].key == key) { bx_copy(t, &g_bx_keep[i].t); ok = 1; }
+    bx_unlock();
+    return ok;
+}
+
+int beyond_tex_decode(uint32_t key, N2Tex *t) {
+    if (!key) return 0;
+    bx_lock();
+    BxEntry e; int have = 0;
+    unsigned char *dxt = NULL;
+    if (bx_open()) {
+        const BxEntry *p = bx_find(key);
+        if (p && (p->fmt == 1 || p->fmt == 3 || p->fmt == 5) && p->w >= 4 && p->h >= 4 && p->size) {
+            e = *p;
+            dxt = (unsigned char *)malloc(e.size);
+            have = dxt && fseek(g_bx_f, (long)e.offset, SEEK_SET) == 0 && fread(dxt, 1, e.size, g_bx_f) == e.size;
+        }
+    }
+    bx_unlock();
+    if (!have) { free(dxt); return bx_keep_get(key, t); }
+    size_t px = (size_t)e.w * e.h;
+    unsigned char *rgb = (unsigned char *)malloc(px * 3);
+    unsigned char *alpha = e.alpha ? (unsigned char *)malloc(px) : NULL;   /* opaque: the alpha bits hold other data */
+    if (!rgb || (e.alpha && !alpha)) { free(rgb); free(alpha); free(dxt); return 0; }
+    if (e.fmt == 1) n2_dxt1(dxt, e.w, e.h, rgb, alpha);
+    else if (e.fmt == 3) n2_dxt3(dxt, e.w, e.h, rgb, alpha);
+    else n2_dxt5(dxt, e.w, e.h, rgb, alpha);
+    memset(t, 0, sizeof *t);
+    t->w = e.w; t->h = e.h; t->rgb = rgb; t->alpha = alpha;
+    t->dxt = dxt; t->dxtlen = (int)e.size; t->dxtfmt = e.fmt;
+    t->afmt = e.alpha ? e.fmt : 0;
+    /* the map's material: 1 alpha test, 2 blend, 3 additive glow */
+    if (e.alpha == 1) { t->usage = 1; t->wz = 1; }
+    else if (e.alpha == 2) { t->usage = 2; t->blend = 1; t->order = 5; }
+    else if (e.alpha == 3) { t->blend = 2; t->order = 6; }
+    else t->wz = 1;
+    return 1;
+}
+
+int beyond_spawn(float xy[2], float *heading_rad) {
+    FILE *f = fopen(BEYOND_DIR "/spawn.txt", "r");
+    if (!f) return 0;
+    char line[256]; int ok = 0;
+    while (!ok && fgets(line, sizeof line, f)) {
+        float x, y, hd = 0.0f;
+        if (line[0] == '#') continue;
+        int n = sscanf(line, "%f %f %f", &x, &y, &hd);
+        if (n >= 2 && isfinite(x) && isfinite(y)) {
+            xy[0] = x; xy[1] = y;
+            if (heading_rad) *heading_rad = n >= 3 ? hd * 3.14159265f / 180.0f : NAN;
+            ok = 1;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+void beyond_close(void) {
+    bx_lock();
+    if (g_bx_f) fclose(g_bx_f);
+    free(g_bx_t);
+    g_bx_f = NULL; g_bx_t = NULL; g_bx_n = 0; g_bx_tried = 0;
+    bx_unlock();
+}

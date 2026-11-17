@@ -122,7 +122,7 @@ typedef struct {
                               source vertices were excluded (M133) */
     char aname[28];        /* instance asset name (27 chars + terminator) */
     unsigned char inst;    /* mesh was placed from an instance matrix */
-    unsigned char world_role; /* 0 shared, 1 collision only, 2 rendering only */
+    unsigned char world_role; /* 0 shared, 1 collision only, 2 rendering only (3 smokeable, 4 collision only + never drawn: Beyond walls) */
     unsigned char world_bounds_valid; /* placed world XYZ was checked; invalidate after edits */
     float world_bounds[6]; /* min XYZ, max XYZ; world placement only */
     unsigned char terrain_biased; /* 5 cm world-space adjustment applied exactly once */

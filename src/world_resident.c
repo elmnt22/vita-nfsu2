@@ -365,7 +365,7 @@ static int resident_worker_precompute(WorldResident *candidate) {
         for (int i = 0; i < n; i++) {
             if ((i & 31) == 0 && world_build_aborted()) return 0;
             const N2Mesh *m = &scene->meshes[i];
-            if (m->world_role == 1 || m->world_role == 3 || m->cat == N2_SKY || m->cat == N2_GLOW) {
+            if (m->world_role == 1 || m->world_role == 3 || m->world_role == 4 || m->cat == N2_SKY || m->cat == N2_GLOW) {
                 /* not world batches (3: smokeable.c draws it) -- but a prop can
                    share a geometry another build packed: the trim frees it */
                 if (r->trim_list && m->shared_geometry && m->shared_geometry->packed)
@@ -398,7 +398,7 @@ static int resident_worker_precompute(WorldResident *candidate) {
                 t->key=m->texkey; t->resolved=(unsigned char)(resolved!=0);
                 t->raw=mode; t->mode=modes[i]; t->pad=(unsigned char)((m->cat==N2_TERRAIN) |
                     /* 2: not in the plan (upload_world_batches_begin's filter) */
-                    ((m->world_role==1 || m->world_role==3 || m->cat==N2_SKY || m->cat==N2_GLOW) << 1));
+                    ((m->world_role==1 || m->world_role==3 || m->world_role==4 || m->cat==N2_SKY || m->cat==N2_GLOW) << 1));
             }
         }
         if (r->mesh_tex) r->mesh_tex_n=n;
@@ -1142,7 +1142,7 @@ static void resident_memory_report(const WorldResident *r) {
             if (m->vcol) { b += (long)m->nverts * 4; vcol_bytes += (long)m->nverts * 4; }
             int k = pass ? VISTA
                   : (m->cat == N2_ROAD || m->cat == N2_TERRAIN) ? GROUND
-                  : m->world_role == 1 ? COLL : m->world_role == 2 ? STANDIN
+                  : (m->world_role == 1 || m->world_role == 4) ? COLL : m->world_role == 2 ? STANDIN
                   : (wall && wall[i]) ? WALL : DRAWN;
             if (m->shared_geometry) shared[k] += b; else own[k] += b;
         }

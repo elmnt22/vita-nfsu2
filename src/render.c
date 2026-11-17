@@ -1273,7 +1273,7 @@ GpuMesh *upload_scene(N2Scene *s) {
     if (!gm) return NULL;
     for (int i = 0; i < s->count; i++) {
         N2Mesh *m = &s->meshes[i];
-        if (m->world_role == 1) continue;
+        if (m->world_role == 1 || m->world_role == 4) continue;   /* 4: collision only (Beyond walls) */
         N2Mesh rounded={0};
         if (n2_round_wheel_tyre(m,&rounded)) m=&rounded;
         float *nor = (float *)calloc(m->nverts * 3, sizeof(float));
@@ -2087,7 +2087,7 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
     for (int i = 0; i < n; i++) {
         const N2Mesh *mesh = &s->meshes[i];
         /* role 3: a smokeable prop, drawn by smokeable.c */
-        if (mesh->world_role == 1 || mesh->world_role == 3 || mesh->cat == N2_SKY || mesh->cat == N2_GLOW) continue;
+        if (mesh->world_role == 1 || mesh->world_role == 3 || mesh->world_role == 4 || mesh->cat == N2_SKY || mesh->cat == N2_GLOW) continue;
         GLuint tex = mtex[i];
         if (!tex && mesh->cat == N2_TERRAIN) tex = texTerr;   /* fallback baked in */
         float cx = (mbb[i][0]+mbb[i][2])*0.5f, cy = (mbb[i][1]+mbb[i][3])*0.5f;
@@ -3724,6 +3724,26 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
     int cap = 8, nb = 0;
     N2Batch *bat = (N2Batch *)malloc((size_t)cap * sizeof *bat);
     if (!bat) { free(ent); return -1; }
+#ifdef __vita__
+    /* hwlog78 (11-16): every rebuild repacked the whole sky here, normals
+       and all, on the frame thread: 81 ms for the Beyond panorama (57
+       meshes, 64 k triangles), 20 ms for its glow. The buffers were already
+       shared by content hash, but only found after that packing. Each
+       mesh's hash is kept in its shared geometry (render_pack_mesh), so a
+       batch of the same meshes is found by hash first and reused unpacked. */
+    PackedMesh *pk = NULL;
+    int reuse_was = g_batch_reuse, found = 0;
+    g_batch_reuse = 1;   /* only the world upload had it on: register these too */
+    if (m > 0) {
+        pk = (PackedMesh *)calloc((size_t)n, sizeof *pk);
+        for (int k = 0; pk && k < m; k++) {
+            int idx = ent[k].idx;
+            if (!s->meshes[idx].shared_geometry || !render_pack_mesh(&s->meshes[idx], &pk[idx]) ||
+                !pk[idx].hash_valid) { free(pk); pk = NULL; }
+            else pk[idx].v = NULL;   /* only the hash and box are wanted here */
+        }
+    }
+#endif
     int i0 = 0, verts = 0;
     for (int i = 0; i <= m; i++) {
         int flush = (i == m) || (i > i0 && (ent[i].key != ent[i0].key ||
@@ -3736,17 +3756,66 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
                 if (!grown) goto fail;
                 bat = grown;
             }
-            if (!batch_emit(s, ent, i0, i, (GLuint)ent[i0].key,
-                            &bat[nb], nb, NULL, mtexmode)) goto fail;
+            int done = 0;
+#ifdef __vita__
+            if (pk) {
+                int nv = 0, ni = 0;
+                for (int k = i0; k < i; k++) { nv += s->meshes[ent[k].idx].nverts; ni += s->meshes[ent[k].idx].nidx; }
+                uint64_t h[2];
+                batch_fingerprint(s, ent, i0, i, pk, NULL, h);
+                SharedBatchBuffers *p = batch_buffers_find(h, nv, ni);
+                if (p) {
+                    N2Batch *b = &bat[nb]; const N2Mesh *m0 = &s->meshes[ent[i0].idx];
+                    memset(b, 0, sizeof *b); p->refs++;
+                    b->vbo = p->vbo; b->ibo = p->ibo; b->ioff = p->ioff; b->shared_buffers = p;
+                    b->index_count = ni; b->tex = (GLuint)ent[i0].key; b->nmesh = i - i0; b->emit_idx = nb;
+                    b->texkey = m0->texkey;
+                    b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
+                    b->reflect = m0->reflect; b->fade_in = m0->fade_in; b->tall = batch_tall(m0);
+                    for (int c = 0; c < 3; c++) { b->bbox_min[c] = 1e30f; b->bbox_max[c] = -1e30f; }
+                    int named = 0;
+                    for (int k = i0; k < i; k++) {
+                        const PackedMesh *q = &pk[ent[k].idx]; const N2Mesh *mk = &s->meshes[ent[k].idx];
+                        for (int c = 0; c < 3; c++) {
+                            if (q->bb[c] < b->bbox_min[c]) b->bbox_min[c] = q->bb[c];
+                            if (q->bb[c+3] > b->bbox_max[c]) b->bbox_max[c] = q->bb[c+3];
+                        }
+                        if (mk->scen < 8) b->scen_count[mk->scen]++;
+                        if (mk->texkey) named++;
+                    }
+                    b->unresolved = (unsigned char)(!b->tex && named == i - i0);
+                    g_batch_reused++; g_batch_reused_bytes += (long)nv * (long)sizeof(BatchedVertex) + (long)ni * 2;
+                    done = 1; found++;
+                }
+            }
+#endif
+            if (!done && !batch_emit(s, ent, i0, i, (GLuint)ent[i0].key,
+                                     &bat[nb], nb, NULL, mtexmode)) goto fail;
             nb++;
             i0 = i; verts = 0;
         }
         if (i < m) verts += s->meshes[ent[i].idx].nverts;
     }
+#ifdef __vita__
+    {
+        static int logged;
+        if (cat == N2_SKY && logged < 12) {
+            logged++;
+            printf("sky batches: %d (%d meshes), %d found by hash%s\n", nb, m, found,
+                   pk ? "" : " (no mesh hashes)");
+        }
+    }
+    free(pk);
+    g_batch_reuse = reuse_was;
+#endif
     free(ent);
     *out = bat;
     return nb;
 fail:
+#ifdef __vita__
+    free(pk);
+    g_batch_reuse = reuse_was;
+#endif
     free(ent); render_batch_array_free(&bat, &nb); return -1;
 }
 

@@ -3,6 +3,7 @@
 #include "world_instance.h"
 #include "nfsu2.h"
 #include "smokeable.h"
+#include "beyond.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -669,6 +670,9 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
 typedef struct { int tx, ty; N2Mesh *m; int n; size_t bytes; int ground; } WtLoaded;
 static WtLoaded *g_wt_loaded; static int g_wt_nloaded, g_wt_capload;
 static WtLoaded g_wt_global; static int g_wt_have_global;
+/* the World Expansion (beyond.h) has no sky of its own: the city's dome and
+   cap from STREAML4RA's global tile (1 read, -1 none on the card) */
+static WtLoaded g_wt_donor; static int g_wt_have_donor;
 static WtIndexEntry *g_wt_index; static int g_wt_nindex;
 static char g_wt_track[64];
 static long long g_wt_bytes_read;
@@ -2390,6 +2394,8 @@ void world_tiles_reset(void) {
     wt_trim(1, 1);                          /* read-ahead tiles + decode scratch; the preload is for the next track */
     wt_forget_all();
     if (g_wt_have_global) { wt_release(&g_wt_global); g_wt_have_global = 0; }
+    if (g_wt_have_donor > 0) wt_release(&g_wt_donor);
+    g_wt_have_donor = 0;
     free(g_wt_loaded); g_wt_loaded = NULL; g_wt_capload = 0;
     for (int i = 0; g_wt_state && i < g_wt_nindex; i++) wt_up_drop(i);
     free((void *)g_wt_state); g_wt_state = NULL;
@@ -2527,6 +2533,20 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         g_wt_have_global = wt_read_decode(track, -32768, -32768, &g_wt_global, 0);
         if (!g_wt_have_global) return 0;
     }
+    if (!g_wt_have_donor && beyond_is_track(track)) {
+        wt_pack_probe("STREAML4RA", 0);
+        g_wt_have_donor = wt_read_decode("STREAML4RA", -32768, -32768, &g_wt_donor, 0) ? 1 : -1;
+        int ns = 0; float bb[6] = { 1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f };
+        for (int i = 0; g_wt_have_donor > 0 && i < g_wt_donor.n; i++) {
+            const N2Mesh *m = &g_wt_donor.m[i];
+            if (m->cat != N2_SKY) continue;
+            ns++;
+            for (int a = 0; a < 3; a++) { if (m->world_bounds[a] < bb[a]) bb[a] = m->world_bounds[a];
+                                          if (m->world_bounds[a+3] > bb[a+3]) bb[a+3] = m->world_bounds[a+3]; }
+        }
+        printf("world tiles: %s sky borrowed from STREAML4RA: %d meshes, (%.0f %.0f %.0f)-(%.0f %.0f %.0f)\n",
+               track, ns, bb[0], bb[1], bb[2], bb[3], bb[4], bb[5]);
+    }
     /* scenery selection for this event, kept between builds */
     if (sel_event != scenery_event) {
         free(sel.items); memset(&sel, 0, sizeof sel);
@@ -2551,6 +2571,8 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         if (!(m->cat == N2_SKY ? wt_push(scene, m, m->world_role, 0) : wt_push(vista, m, m->world_role, 0)))
             return 0;
     }
+    for (int i = 0; g_wt_have_donor > 0 && i < g_wt_donor.n; i++)   /* (beyond.h) */
+        if (g_wt_donor.m[i].cat == N2_SKY && !wt_push(scene, &g_wt_donor.m[i], g_wt_donor.m[i].world_role, 0)) return 0;
     float reach = radius + 60.0f;   /* ground is placed out to radius + 60 */
     float far_reach = reach + wt_far_extra();   /* stand-ins only from here (the far ring) */
     /* Release the cache's references before acquiring any more tiles.
@@ -2642,7 +2664,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
             }
             /* a smokeable's scenery instance: kept (textures, its meshes) but
                drawn by smokeable.c, not batched */
-            if (role != 1 && m->scen_has && smk_is_prop(m->scen_region, m->scen_index)) role = 3;
+            if (role != 1 && role != 4 && m->scen_has && smk_is_prop(m->scen_region, m->scen_index)) role = 3;
             if (!wt_push(scene, m, role, drop_vcol)) return 0;
             if (fresh && !ground && role != 3) { scene->meshes[scene->count - 1].fade_in = 1; faded++; }
         }

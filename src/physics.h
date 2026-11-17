@@ -328,6 +328,10 @@ typedef struct PhysWallIndex PhysWallIndex;
 PhysWallIndex *phys_wall_index_make(const float (*obst)[4], const float (*obz)[2], int nobst);
 void phys_wall_index_install(PhysWallIndex *ix);
 void phys_wall_index_drop(PhysWallIndex *ix);
+/* 0 while the World Expansion (beyond.h) is loaded: its trees are merged per
+   patch, so a clump of trunks passed the prop test and the canopy acted as a
+   wall (B7 11-16). 1 (the city) otherwise. */
+extern int g_phys_trees_solid;
 int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max);
 

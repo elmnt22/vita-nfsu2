@@ -16,6 +16,7 @@
 #include "airace.h"
 #include "movie.h"
 #include "mplay.h"
+#include "beyond.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -777,6 +778,7 @@ struct Shop {
     int dlg_pk, dlg_nbtn, dlg_sel, dlg_act, dlg_act2;   /* act2: the second button's, when it does something */
     int dlg_back;                                /* the cancel message's, when it does something */
     uint32_t dlg_b1, dlg_b2;
+    const char *dlg_l1, *dlg_l2;                 /* plain button labels instead of dlg_b1 / dlg_b2 (the World Expansion choice) */
     char dlg_text[1024];
     /* options: the save settings when the category opened (0x4b6010, 0x49c690) */
     unsigned char opt_save0, opt_auto0;
@@ -1850,7 +1852,7 @@ enum { DA_NONE, DA_PAINT_ADD, DA_PART, DA_RIM, DA_PERF_PKG, DA_PERF_STOCK, DA_PE
        DA_LOT_BUY, DA_LOT_TRADE, DA_LOT_BROWSE, DA_LOT_EXIT,
        DA_CRIB_PLAY, DA_CRIB_MAIN, DA_CRIB_TEST, DA_CRIB_SWITCH,
        DA_PART_BUY, DA_RIM_BUY, DA_SHOP_LEAVE, DA_PERF_PKG_BUY, DA_PERF_PART_BUY, DA_GEN_BUY,
-       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_MAG_SAVE, DA_MAG_NOSAVE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY, DA_QR_DELETE };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
+       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_MAG_SAVE, DA_MAG_NOSAVE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY, DA_QR_DELETE, DA_QR_BAYVIEW, DA_QR_BEYOND };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
 static void dlg_act(Shop *s, int act);
 static void dialog(Shop *s, int pk, int nbtn, uint32_t msg, int act, uint32_t b1, uint32_t b2);
 /* PartSelectionScreen 801615f8 in the career: a part to buy -- too little
@@ -1912,6 +1914,7 @@ static void dialog_text(Shop *s, int pk, int nbtn, const char *t, int act, uint3
     anim_fadein(a);
     s->dlg_pk = pk; s->dlg_nbtn = nbtn; s->dlg_act = act; s->dlg_act2 = DA_NONE; s->dlg_back = DA_NONE;
     s->dlg_b1 = nbtn == 1 ? STR_OK : b1 ? b1 : STR_YES; s->dlg_b2 = b2 ? b2 : STR_NO;
+    s->dlg_l1 = s->dlg_l2 = NULL;
     s->dlg_sel = 1;
     int o;
     if (nbtn == 2) {
@@ -7091,7 +7094,14 @@ static void qr_input(Shop *s, int key) {
             /* 0x4b2c00: the mode, one human, the opponents (URL 5, else 3) */
             s->qr_type = k_qr_modes[s->qr_mode.sel].group;
             s->set[s->qr_type].opp = s->qr_type == QR_URL ? 5 : 3;
-            if (s->qr_type == QR_FREERUN) { s->set[QR_FREERUN].ev = 4000; qr_enter_cars(s); }
+            if (s->qr_type == QR_FREERUN && beyond_enabled()) {
+                /* the World Expansion (beyond.h) is on the card: where to drive. Bayview is
+                   the first button and the default; Back stays on this screen. */
+                dialog_text(s, DLG_AUTO, 2, "Where do you want to drive?", DA_QR_BAYVIEW, STR_YES, STR_NO);
+                s->dlg_l1 = "Bayview"; s->dlg_l2 = "World Expansion";
+                s->dlg_act2 = DA_QR_BEYOND;
+                s->dlg_sel = 0; dlg_focus(s);
+            } else if (s->qr_type == QR_FREERUN) { g_beyond_pick = 0; s->set[QR_FREERUN].ev = 4000; qr_enter_cars(s); }
             else { qr_build_tracks(s); s->screen = SC_QR_TRACK; }
         } else if (key == SHOP_KEY_BACK) s->screen = SC_MAIN;
         break;
@@ -9554,6 +9564,11 @@ static void dlg_act(Shop *s, int act) {
         break;
     case DA_PERF_PART: perf_part_yes(s); break;
     case DA_CTL_RESET: options_ctl_preset(&g_opt, 0); break;
+    case DA_QR_BAYVIEW: case DA_QR_BEYOND:   /* Free Run: the city or the World Expansion */
+        g_beyond_pick = act == DA_QR_BEYOND;
+        printf("quick race: Free Run in %s\n", g_beyond_pick ? "the World Expansion" : "Bayview");
+        s->set[QR_FREERUN].ev = 4000; qr_enter_cars(s);
+        break;
     case DA_QR_DELETE: {   /* 0x51123592: DeleteCurrentCar 800e081c */
         if (!s->qr_ncar) break;
         int sel = s->qr_car_sel, idx = s->qr_car_list[sel], slot = s->cars[idx].slot;
@@ -11941,8 +11956,8 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
         memset(otxt, 0, sizeof otxt);
         int o;
         if ((o = feng_find(pk, O_DLG_BLURB)) >= 0) otxt[o] = s->dlg_text;
-        if ((o = feng_find(pk, O_DLG_TEXT)) >= 0) otxt[o] = s->dlg_nbtn == 2 ? str_get(s, s->dlg_b1) : "";
-        if ((o = feng_find(pk, O_DLG_TEXT + 1)) >= 0) otxt[o] = s->dlg_nbtn == 2 ? str_get(s, s->dlg_b2) : "";
+        if ((o = feng_find(pk, O_DLG_TEXT)) >= 0) otxt[o] = s->dlg_nbtn == 2 ? (s->dlg_l1 ? s->dlg_l1 : str_get(s, s->dlg_b1)) : "";
+        if ((o = feng_find(pk, O_DLG_TEXT + 1)) >= 0) otxt[o] = s->dlg_nbtn == 2 ? (s->dlg_l2 ? s->dlg_l2 : str_get(s, s->dlg_b2)) : "";
         if ((o = feng_find(pk, O_DLG_TEXT + 2)) >= 0) otxt[o] = s->dlg_nbtn == 1 ? str_get(s, s->dlg_b1) : "";
         Texts dt; memset(&dt, 0, sizeof dt);
         memcpy(keep, s->qr_rowobj, sizeof keep);

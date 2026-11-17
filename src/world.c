@@ -15,6 +15,7 @@
 #include "world_tiles.h"
 #include "physics.h"
 #include "resource.h"
+#include "beyond.h"
 
 #ifdef __vita__
 void vita_mark(const char *fmt, ...);
@@ -640,6 +641,8 @@ static int world_texture_decode(const World *w, const WRegion *g,
         }
         return ok;
     }
+    if (!g->data)   /* the Beyond world: its own texture pack, no bundle */
+        return beyond_is_track(g->name) && beyond_tex_decode(key, tex);
     int ok = n2_tpk_decode(g->data, g->len, g->tpk, key, tex);
     if (!ok && w->neighborhood.loc4) {
         ok = n2_load_car_tex_by_key(w->neighborhood.loc4, w->neighborhood.loc4len, key, tex);
@@ -701,6 +704,28 @@ static WTexCacheEntry *world_texcache_slot(uint32_t key) {
 #ifdef __vita__
 static void world_predecode_free(void);
 #endif
+int world_beyond_keep_tex(const World *w, uint32_t key) {
+    const WorldNeighborhood *nb = &w->neighborhood;
+    N2Tex t; int ok = 0;
+    for (int r = 0; r < nb->nreg && !ok; r++) {
+        memset(&t, 0, sizeof t);
+        if (nb->rgn[r].data) ok = world_texture_decode(w, &nb->rgn[r], key, &t, 0);
+    }
+    if (!ok && nb->nreg > 0 && (nb->common || nb->ads)) { memset(&t, 0, sizeof t); ok = world_texture_decode(w, &nb->rgn[0], key, &t, 1); }
+    if (!ok && nb->loc4) {   /* the night/sunset sky pairs are LOC4's (n2_sky_remap_key) */
+        memset(&t, 0, sizeof t);
+        ok = n2_load_car_tex_by_key(nb->loc4, nb->loc4len, key, &t);
+        if (ok) t.order = t.usage = t.blend = t.wz = 0;
+    }
+    if (!ok) {
+        int c = 0;
+        for (int r = 0; r < nb->nreg; r++) c += nb->rgn[r].data != NULL;
+        printf("beyond: city texture %08x not found (%d regions, %d with data, loc4 %s)\n", (unsigned)key,
+               nb->nreg, c, nb->loc4 ? "yes" : "no");
+    }
+    if (ok) { beyond_keep_tex(key, &t); free(t.rgb); free(t.alpha); free(t.dxt); }
+    return ok;
+}
 void world_texture_cache_clear(void) {
 #ifdef __vita__
     /* the worker's predecoded textures are keyed by name too, and another
@@ -837,7 +862,7 @@ void world_predecode_textures(const WorldNeighborhood *nb) {
     for (int i = 0; i < cap; i++) {
         const N2Mesh *owner = i < nb->scene.count ? &nb->scene.meshes[i]
             : i < nb->scene.count + nb->vista.count ? &nb->vista.meshes[i - nb->scene.count] : NULL;
-        if (owner && owner->world_role == 1) continue;
+        if (owner && (owner->world_role == 1 || owner->world_role == 4)) continue;
         uint32_t key = i < nb->scene.count ? nb->scene.meshes[i].texkey
                      : i < nb->scene.count + nb->vista.count
                        ? nb->vista.meshes[i - nb->scene.count].texkey
@@ -856,7 +881,7 @@ void world_predecode_textures(const WorldNeighborhood *nb) {
         int known = render_world_dxt_enabled() && texclass_has(key);
         unsigned long long t0 = sceKernelGetProcessTimeWide();
         n2_tpk_skip_pixels = known;
-        if (g->data && world_texture_decode(&facade, g, key, &p->tex, 0)) p->pass_ok = 0;
+        if ((g->data || beyond_is_track(g->name)) && world_texture_decode(&facade, g, key, &p->tex, 0)) p->pass_ok = 0;
         else if ((nb->common || nb->ads) && world_texture_decode(&facade, g, key, &p->tex, 1)) p->pass_ok = 1;
         n2_tpk_skip_pixels = 0;
         if (p->pass_ok >= 0 && known && !p->tex.rgb &&
@@ -868,7 +893,7 @@ void world_predecode_textures(const WorldNeighborhood *nb) {
         }
         t_fetch += sceKernelGetProcessTimeWide() - t0;
         if (p->pass_ok >= 0) {
-            p->noise = (unsigned char)(p->tex.rgb ? n2_tex_noise(&p->tex) : 0);
+            p->noise = (unsigned char)(p->tex.rgb && g->data ? n2_tex_noise(&p->tex) : 0);   /* (Beyond: checked when converted) */
             p->mode = (unsigned char)n2_tex_mode(&p->tex);
             if (!p->noise && render_world_dxt_enabled() &&
                 render_dxt_base_plan(&p->tex, &dw, &dh, &offset, &bytes)) {
@@ -943,7 +968,7 @@ static int world_bind_key(World *w, const WRegion *g, uint32_t tk, int pass,
             noisy = pn; if (ok) premode = pm;
         } else {
             ok = world_texture_decode(w, g, tk, &tt, pass);
-            noisy = ok && n2_tex_noise(&tt);
+            noisy = ok && g->data && n2_tex_noise(&tt);   /* (Beyond's pack: checked when converted) */
         }
     }
 #else
@@ -1038,7 +1063,7 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
             continue;
         }
         WRegion *g = &w->neighborhood.rgn[binding->region];
-        if (g->data) {
+        if (g->data || beyond_is_track(g->name)) {
             if (!binding->source) binding->source = ++g_texbind_pass;
             int last = binding->pass == npass - 1 &&
                        binding->region == w->neighborhood.nreg - 1;
@@ -1055,7 +1080,7 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
                     : i < meshes + light ? NULL
                     : &w->neighborhood.vista.meshes[i - meshes - light];
                 uint32_t key = owner ? owner->texkey : N2_TEX_SFX_FLARE_GLOWA;
-                if (owner && owner->world_role == 1) continue;
+                if (owner && (owner->world_role == 1 || owner->world_role == 4)) continue;
                 int decoded = world_bind_key(w, g, key, binding->pass, last,
                     keys, texs, modes, cap, binding, owner);
                 if (binding->count < 0) goto done;

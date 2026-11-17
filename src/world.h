@@ -274,6 +274,8 @@ extern int world_bind_decodes;   /* running count of uncached attempts */
  * GL thread, and before pointing the loader at different archives in the same
  * process (the Vita venue track switch does). */
 void world_texture_cache_clear(void);
+/* the World Expansion (beyond.h): decode `key` from this (city) world and keep a copy for Beyond. 1 = kept */
+int world_beyond_keep_tex(const World *w, uint32_t key);
 /* A texture the cache holds, by key (0 = not bound); mode: its N2_DRAW_* */
 GLuint world_texture_lookup(uint32_t key, unsigned char *mode);
 

@@ -57,6 +57,7 @@
 #include "chasecam.h"
 #include "jumpcam.h"
 #include "skyline.h"
+#include "beyond.h"
 static int n2_find_record(const unsigned char *g, long len, const char *name, unsigned char *out);
 #include "ai.h"
 #include "audio.h"
@@ -14052,6 +14053,7 @@ static int switch_thread(void *a) {
     if (g_sw.ok) g_sw.ok = world_resident_precompute(g_sw.cand);
     /* as the boot's world_load_ex: the city data reads the ground of this area */
     if (g_sw.ok) world_ground_grid_activate(&g_sw.cand->world.grid);
+    if (beyond_is_track(g_sw.args.trackname)) { g_sw.done = 1; return 0; }   /* no events / nav: free roam only */
     g_sw.ok = g_sw.ok &&
               world_city_load(&g_sw.city, &g_sw.cand->world, g_sw.args.track_root, g_sw.args.trackname) > 0;
     g_sw.done = 1;
@@ -20214,6 +20216,10 @@ int main(int argc, char **argv) {
             resident_args.scenery_event = next_ev > 0 ? next_ev : runtime_scenery_event;
             nai = 0;
             if (aipath.xy) { free(aipath.xy); aipath.xy = NULL; aipath.n = 0; }
+            if (beyond_is_track(next_track) && !beyond_is_track(trackname)) {   /* the city is still loaded: its sky for Beyond */
+                int k1 = world_beyond_keep_tex(&world, sky_dome_key), k2 = world_beyond_keep_tex(&world, sky_cap_key);
+                if (!k1 || !k2) printf("beyond: the city sky textures were not found (dome %d, cap %d)\n", k1, k2);
+            }
             world_resident_free(active_resident); active_resident = NULL;
             world_city_free(&world.city);
             memset(&world, 0, sizeof world);
@@ -20236,15 +20242,21 @@ int main(int argc, char **argv) {
             switch_frame(sw_ls, &rp, &quad);
             /* --- the new track in: authored focus from the pinned bundle --- */
             const char *nstem = !strncmp(next_track, "STREAM", 6) ? next_track + 6 : next_track;
-            smk_load(troot, nstem);
+            const int sw_beyond = beyond_is_track(next_track);   /* tiles + its own texture pack only */
+            g_phys_trees_solid = !sw_beyond;   /* before the worker collects the walls (physics.h) */
+            float sw_beyond_hd = NAN;
+            if (!sw_beyond) smk_load(troot, nstem);
             vita_mark("  switch: smokeables loaded (%u ms in)", SDL_GetTicks() - sw_t0);
             ls_pump();   /* the loading screen keeps moving between the steps */
-            if (wa_load(troot, nstem)) wa_start(g_rt.ev, g_rt_reverse);
+            if (!sw_beyond && wa_load(troot, nstem)) wa_start(g_rt.ev, g_rt_reverse);
             vita_mark("  switch: world anims loaded (%u ms in)", SDL_GetTicks() - sw_t0);
             ls_pump();   /* the loading screen keeps moving between the steps */
             int sw_ok = 0;
             float sw_spawn[3] = {0, 0, 0}, sw_heading = 0.0f;
-            {
+            if (sw_beyond) {
+                sw_ok = beyond_spawn(g_sw.focus, &sw_beyond_hd);
+                if (!sw_ok) vita_mark("track switch: no start point in beyond/spawn.txt");
+            } else {
                 sw_ok = track_focus_cached(troot, next_track, g_sw.focus);
                 /* a venue event loads around its own start line */
                 if (sw_ok) event_start_focus(troot, next_track, next_ev, g_sw.focus);
@@ -20284,7 +20296,8 @@ int main(int argc, char **argv) {
                 vita_mark("track switch: %s could not be loaded; relaunching", next_track);
                 world_resident_free(g_sw.cand); g_sw.cand = NULL;
                 world_city_free(&g_sw.city);
-                venue_relaunch(strcmp(next_track, "STREAML4RA") ? next_track : NULL, next_ev);
+                /* (Beyond: back to the city -- its boot path needs the original bundles) */
+                venue_relaunch(strcmp(next_track, "STREAML4RA") && !sw_beyond ? next_track : NULL, next_ev);
                 /* only here when the relaunch itself failed: there is no world to
                    go on with (a NULL area below) -- end cleanly, not on a fault */
                 printf("track switch: the relaunch failed; quitting\n");
@@ -20298,7 +20311,7 @@ int main(int argc, char **argv) {
                 char sp[1100], tp[1100];
                 snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, nstem);
                 snprintf(tp, sizeof tp, "%s/%s.BUN", troot, nstem);
-                g_wcoll = wcoll_load(sp, tp);
+                g_wcoll = sw_beyond ? NULL : wcoll_load(sp, tp);   /* Beyond: ground + walls from its tiles */
                 vita_mark("  switch: collision loaded (%u ms in)", SDL_GetTicks() - sw_t0);
                 ls_pump();   /* the loading screen keeps moving between the steps */
                 wcoll_ctx_init(&g_wcc);
@@ -20354,7 +20367,7 @@ int main(int argc, char **argv) {
             world2_spawn_xy[0] = sw_spawn[0]; world2_spawn_xy[1] = sw_spawn[1];
             world2_spawn_z = world2_support_ref = sw_spawn[2];
             world2_support_cat = WSURF_ROAD;
-            heading0 = heading = sw_heading;
+            heading0 = heading = sw_beyond && isfinite(sw_beyond_hd) ? sw_beyond_hd : sw_heading;
             if (g_career_spawn_on) {   /* StartCareerFreeRoam: on the career's spawn, on the ground there */
                 g_career_spawn_on = 0;
                 float z = sw_spawn[2];
@@ -20389,7 +20402,7 @@ int main(int argc, char **argv) {
             ls_pump();   /* the loading screen keeps moving between the steps */
             memcpy(traffic_world.eye, carpos, sizeof traffic_world.eye);
             traffic_world.view[0] = cosf(heading); traffic_world.view[1] = sinf(heading);
-            nai = ai_traffic_spawn(&roam_roads, &traffic_world, ais, traffic_routes, carpos, heading);
+            nai = sw_beyond ? 0 : ai_traffic_spawn(&roam_roads, &traffic_world, ais, traffic_routes, carpos, heading);
             if (!ncirc) { free(aipath.xy); aipath.xy = NULL; aipath.n = 0; }
             vita_mark("  switch: circuit + traffic spawn (%u ms in)", SDL_GetTicks() - sw_t0);
             ls_pump();   /* the loading screen keeps moving between the steps */
@@ -21072,7 +21085,11 @@ int main(int argc, char **argv) {
             if (g_qr.type == QR_FREERUN) {
                 g_roam_level = g_qr.traffic; g_roam_diff = g_qr.difficulty;   /* 0x53f580: R+4, R+2 */
                 if (g_rt.roam) rt_end();
-                if (strcmp(stem, "L4RA")) { venue_go(NULL, 0); }
+                if (beyond_enabled() && g_beyond_pick) {   /* the World Expansion (beyond.h), chosen at Free Run */
+                    if (!beyond_is_track(trackname)) venue_go(BEYOND_TRACK, 0);
+                    else { race_state = 1; g_ride_ready = 0; }
+                }
+                else if (strcmp(stem, "L4RA")) { venue_go(NULL, 0); }
                 else { race_state = 1; g_ride_ready = 0; }
             } else if (strcmp(stem, g_qr.stem)) {
                 static char qtrack[16];
@@ -23109,6 +23126,24 @@ int main(int argc, char **argv) {
                            wc[q].nx, wc[q].ny, wc[q].pen, wc[q].dist, wc[q].span,
                            vpre[0], vpre[1], vel[0], vel[1], corr);
             } }
+        /* The World Expansion (beyond.h): the AC map has patches with no
+           ground and no wall (off-road gaps under its scenery). Its edge acts
+           as a wall: a step that leaves every ground layer is taken back. */
+        if (!g_wcoll && race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion &&
+            beyond_is_track(trackname)) {
+            static float bg_last[2]; static int bg_have, bg_logged;
+            WGroundHit bgh; memset(&bgh, 0, sizeof bgh);
+            int bc = world_ground_hit(&scene, carpos[0], carpos[1], carpos[2] + 50.0f, &bgh);
+            if (bc != WSURF_NONE) { bg_last[0] = carpos[0]; bg_last[1] = carpos[1]; bg_have = 1; }
+            else if (bg_have && hypotf(carpos[0] - bg_last[0], carpos[1] - bg_last[1]) < 20.0f) {
+                if (bg_logged++ < 8)
+                    printf("beyond: map edge (no ground) at (%.1f, %.1f) -- held at (%.1f, %.1f), %.0f km/h\n",
+                           carpos[0], carpos[1], bg_last[0], bg_last[1], PHYS_KMH(hypotf(vel[0], vel[1])));
+                carpos[0] = bg_last[0]; carpos[1] = bg_last[1];
+                vel[0] *= -0.3f; vel[1] *= -0.3f;
+                g_hit = 0.5f;
+            }
+        }
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
         { WRailHit rh; rh.mesh = -1;
           int rpushed = (race_state == 1 && !race_auto && !sstatic && !capture_policy.freeze_motion && !retail_walls) &&
@@ -23660,7 +23695,7 @@ int main(int argc, char **argv) {
 #endif
         if (g_ft.go) {   /* fast travel (the World Map): held on the zone like a post-race marker */
             g_ft.go = 0;
-            if (race_state == 1 && g_rt.roam) {
+            if (race_state == 1 && (g_rt.roam || beyond_is_track(trackname))) {   /* (Beyond: free roam without the city's AI world) */
                 memcpy(post_hold_pos, g_ft.p, sizeof g_ft.p); post_hold_pos[3] = heading;
                 memcpy(carpos, g_ft.p, sizeof g_ft.p);
                 vel[0] = vel[1] = 0; speed = 0;
@@ -23669,7 +23704,7 @@ int main(int argc, char **argv) {
             }
         }
         if (post_hold) {   /* the post-race marker: stood there once the resident covers it */
-            if (ft_hold && !(race_state == 1 && g_rt.roam)) post_hold = ft_hold = 0;
+            if (ft_hold && !(race_state == 1 && (g_rt.roam || beyond_is_track(trackname)))) post_hold = ft_hold = 0;
             else if (!ft_hold && (!g_rt.active || !g_rt.post_done)) post_hold = 0;
             else if (active_resident && hypotf(post_hold_pos[0] - active_resident->center[0],
                                                post_hold_pos[1] - active_resident->center[1]) <
@@ -23704,6 +23739,7 @@ int main(int argc, char **argv) {
             static int rg_state = -1, rg_n, rg_seg;
             static float *rg_p, rg_speed = 25.0f, rg_s;
             static Uint32 rg_t0;
+            static int rg_gn, rg_gmiss, rg_goff, rg_gtick; static float rg_gworst, rg_gw[2];
             if (rg_state < 0) {
                 rg_state = 9;
                 FILE *rf = fopen("ux0:data/NFSU2/route.txt", "r");
@@ -23723,7 +23759,7 @@ int main(int argc, char **argv) {
                     if (rg_n >= 2) { rg_state = 0; printf("route: %d points at %.0f m/s (route.txt)\n", rg_n, (double)rg_speed); }
                 }
             }
-            if (rg_state < 9 && race_state == 1 && g_rt.roam) {
+            if (rg_state < 9 && race_state == 1 && (g_rt.roam || beyond_is_track(trackname))) {
                 if (rg_state == 0) {
                     memcpy(g_ft.p, rg_p, 3 * sizeof(float)); g_ft.go = 1; rg_state = 1;
                 } else if (rg_state == 1) {
@@ -23741,11 +23777,25 @@ int main(int argc, char **argv) {
                     }
                     if (rg_seg >= rg_n - 1) {
                         rg_state = 3; g_route_glide = 0;
+                        if (rg_gn) printf("route: Beyond ground under the lanes: %d samples, %d no ground, %d off by > 0.5 m (worst %.2f m at %.0f %.0f)\n",
+                                          rg_gn, rg_gmiss, rg_goff, (double)rg_gworst, (double)rg_gw[0], (double)rg_gw[1]);
                         printf("autodrive: quit after the route (%d points, %u s)\n", rg_n, (unsigned)((SDL_GetTicks() - rg_t0) / 1000));
                         g_autoquit_at = SDL_GetTicks() + 5000;
                     } else if (len > 0.01f) {
                         float u = rg_s / len, *a = &rg_p[rg_seg*3];
                         float x = a[0] + dx * u, y = a[1] + dy * u, z = a[2] + (a[5] - a[2]) * u;
+                        if (!g_wcoll && beyond_is_track(trackname) && (++rg_gtick % 6) == 0) {
+                            /* Beyond (no wcoll yet): is there tile ground where the lane is? */
+                            WGroundHit gh; rg_gn++;
+                            if (world_ground_hit(&scene, x, y, z + 2.0f, &gh) == WSURF_NONE) {
+                                rg_gmiss++;
+                                if (rg_gmiss <= 8) printf("route: no Beyond ground at (%.1f %.1f %.1f)\n", (double)x, (double)y, (double)z);
+                            } else {
+                                float off = fabsf(gh.z - z);
+                                if (off > 0.5f) rg_goff++;
+                                if (off > rg_gworst) { rg_gworst = off; rg_gw[0] = x; rg_gw[1] = y; }
+                            }
+                        }
                         if (g_wcoll) {
                             WCollCtx gc; wcoll_ctx_init(&gc);
                             float q[3] = { x, y, z + 2.0f };
@@ -29251,7 +29301,9 @@ int main(int argc, char **argv) {
                    the event's track record (race table +0xac..+0xc0) */
                 int mev = g_rt.active ? g_rt.ev
                         : strstr(trackname, "L4RB") ? 4200 : strstr(trackname, "L4RC") ? 4300 : 4000;
-                for (int i = 0; i < g_ai_nraces; i++) {
+                const int map_beyond = beyond_is_track(trackname);   /* its own map, no TRACKMAP */
+                if (map_beyond) hud_set_trackmap_file(hud, "ux0:data/NFSU2/beyond/minimap.bin");
+                for (int i = 0; !map_beyond && i < g_ai_nraces; i++) {
                     const unsigned char *r = g_ai_races + i * 0x128;
                     if ((int)(int16_t)(r[0x8a] | r[0x8b] << 8) != mev) continue;
                     float x0, y0, sz, zm;
