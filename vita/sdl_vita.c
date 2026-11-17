@@ -66,7 +66,7 @@ static unsigned g_boot_head,g_boot_tail,g_boot_dropped;
 static int g_boot_stop;
 /* log.txt background writer (see async_put) */
 static SceUID g_async_thread = -1;
-static unsigned g_async_waits, g_async_writes;
+static unsigned g_async_waits, g_async_writes, g_async_dropped;   /* dropped: the ring stayed full 200 ms */
 
 static void boot_write_line(const char *line,int len) {
     if (g_boot_lock_ready) sceKernelLockLwMutex(&g_boot_lock,1,NULL);
@@ -220,7 +220,7 @@ void vita_mark_stats(void) {
     printf("boot diagnostics: %u markers, %u ms total, %u ms disk writes (cumulative)\n",count,total,writes);
     printf("boot queue: %u pending, %u dropped\n",queued,dropped);
     printf("log queue: %s, %u card writes, %u producer waits\n",
-           g_async_thread>=0?"background":"synchronous",g_async_writes,g_async_waits);
+           g_async_thread>=0?"background":"synchronous",g_async_writes,g_async_waits,g_async_dropped);
 }
 
 #define VITA_W 960
@@ -280,7 +280,9 @@ _ssize_t __real__write_r(struct _reent *r, int fd, const void *buf, size_t n);
    write bigger than the ring once everything before it is on the card). */
 static int async_put(AsyncRing *q, const char *buf, unsigned n) {
     if (!n) return 1;
-    for (;;) {
+    /* bounded (audit 11-17): every printf waits here holding stdout's lock,
+       so a writer stuck on the card no longer stops the frame thread for good */
+    for (int tries = 0;; tries++) {
         if (g_async_thread < 0) return 0;
         sceKernelLockLwMutex(&g_async_lock, 1, NULL);
         unsigned used = q->head - q->tail;
@@ -297,6 +299,7 @@ static int async_put(AsyncRing *q, const char *buf, unsigned n) {
         g_async_waits++;
         sceKernelUnlockLwMutex(&g_async_lock, 1);
         if (empty) return 0;
+        if (tries >= 200) { g_async_dropped++; return 1; }
         sceKernelDelayThread(1000);
     }
 }
@@ -498,9 +501,13 @@ void vita_log_flush(void) {
    (open, write, close), so the last step before a crash survives where the
    queued log loses its tail. Truncated at boot. */
 void vita_crumb(const char *fmt, ...) {
-    char line[256];
-    int len = snprintf(line, sizeof line, "[%8.3fs brk %3u MB] ",
-                       (double)sceKernelGetProcessTimeWide() / 1e6, vita_heap_top_mb());
+    /* 1 KB: the hang recorder's step lines are ~700 chars (256 cut off the
+       newest steps). Integers only: float printing can take the heap, and the
+       watchdog writes crumbs while the main thread may hold it (audit 11-17) */
+    char line[1024];
+    Uint64 us = sceKernelGetProcessTimeWide();
+    int len = snprintf(line, sizeof line, "[%4u.%03us brk %3u MB] ",
+                       (unsigned)(us / 1000000u), (unsigned)(us / 1000u % 1000u), vita_heap_top_mb());
     va_list ap;
     va_start(ap, fmt);
     len += vsnprintf(line + len, sizeof line - (size_t)len - 1, fmt, ap);
@@ -554,18 +561,23 @@ void vita_step(const char *label) {
 }
 static void step_dump(void) {
     unsigned end = g_step_i, n = end < STEP_RING ? end : STEP_RING;
-    char line[2048]; int len = 0;
+    char line[768]; int len = 0;
     for (unsigned k = end - n; k != end; k++) {
         const VitaStep *s = &g_step[k % STEP_RING];
         len += snprintf(line + len, sizeof line - (size_t)len, " %s@%u.%03u%s", s->label ? s->label : "?",
                         s->ms / 1000u, s->ms % 1000u, s->n > 1 ? "+" : "");
-        if (len > (int)sizeof line - 96 || k + 1 == end) {
+        if (len > (int)sizeof line - 160 || k + 1 == end) {
             vita_crumb("  steps:%s", line);
             len = 0;
         }
     }
 }
 #define WD_STALL_SECONDS 6
+/* the watchdog's flush: up to 1 s for the log writer to empty the ring,
+   without fflush (stdout's lock may be held by the hung thread, audit 11-17) */
+static void wd_log_drain(void) {
+    for (int i = 0; i < 100 && g_ring_log.head != g_ring_log.tail; i++) sceKernelDelayThread(10 * 1000);
+}
 static int wd_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
     int stall_told = 0;
@@ -596,7 +608,7 @@ static int wd_thread(SceSize args, void *argp) {
                        WD_STALL_SECONDS, vita_wd_sec, b,
                        load ? "boot world load" : armed ? "in a race" : "outside a race");
             step_dump();
-            vita_log_flush();
+            wd_log_drain();
         }
         unsigned lim = load ? WD_LOAD_SECONDS : armed ? WD_SECONDS : WD_IDLE_SECONDS;
         if (now - since < (Uint64)lim * 1000000u) continue;
@@ -604,8 +616,7 @@ static int wd_thread(SceSize args, void *argp) {
                    "faulting for a core dump", (unsigned)((now - since) / 1000000u), vita_wd_sec, b,
                    load ? "in the boot world load, step in the crumbs above"
                    : armed ? "armed in a race" : "outside a race (front end / shop / free roam / load)");
-        vita_log_flush();
-        sceKernelDelayThread(1000 * 1000);          /* let the log writer drain */
+        wd_log_drain();                             /* let the log writer drain */
         *(volatile int *)0 = 0x57d;                 /* the core dump */
         return 0;
     }
