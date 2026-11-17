@@ -4365,6 +4365,7 @@ int carsfx_player_car(const char *dataroot, int row)
     int code = ae_i(md + 4), tmpl = ae_i(md + 8), size = ae_i(md + 0xc);
     if (code <= 0 || tmpl <= 0 || size <= 0x60 || tmpl + size > g_sp.flen) return 0;
     g_sp.mem = (unsigned char *)malloc((size_t)size);
+    if (!g_sp.mem) { printf("[sputter] %s: out of memory\n", path); return 0; }   /* audit 11-17 */
     memcpy(g_sp.mem, d + tmpl, (size_t)size);
     g_sp.msize = size;
     g_sp.nply = md[0] < 2 ? md[0] : 2;

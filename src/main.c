@@ -2799,6 +2799,20 @@ static int g_vl_dbg[4096], g_vl_dbg_n;   /* visible-list skips in the frustum (O
 static int g_route_glide;   /* the route.txt test glide is moving the car (no tyre marks: its physics resets every tick) */
 static const N2CarConfig *g_load_cfg;   /* the RideInfo parts to load with (an opponent's preset), NULL stock */
 static unsigned char *g_shared_cartex; static long g_shared_cartex_len; static int g_shared_cartex_tried;   /* the shared car pack */
+/* read once; "tried" only latches when the file is missing -- a read that
+   failed for memory is tried again at the next car (audit 11-17: one bad
+   moment no longer left every later car without its shared textures) */
+static void shared_cartex_load(const char *dataroot) {
+    if (g_shared_cartex || g_shared_cartex_tried) return;
+    char sp[1024];
+    snprintf(sp, sizeof sp, "%s/CARS/TEXTURES.BIN", dataroot);
+    g_shared_cartex = n2_read_file(sp, &g_shared_cartex_len);
+    if (!g_shared_cartex) {
+        struct stat st;
+        if (stat(sp, &st) != 0) g_shared_cartex_tried = 1;
+        else printf("car textures: %s not read (memory?), tried again later\n", sp);
+    }
+}
 /* The skin keys are the player car's: loading a traffic or opponent car
    (or a car to switch to) uses its own while it loads, then puts the
    player's back, or the player's body kit parts lose their skin. */
@@ -2928,11 +2942,7 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
     unsigned char *shared = NULL; long sharedlen = 0;
     int own_pack = candidate->texdata && candidate->texlen > 0;
     if (!own_pack) {
-        if (!g_shared_cartex && !g_shared_cartex_tried) {   /* 1.9 MB, kept: every traffic model wears it */
-            char sp[1024]; g_shared_cartex_tried = 1;
-            snprintf(sp, sizeof sp, "%s/CARS/TEXTURES.BIN", dataroot);
-            g_shared_cartex = n2_read_file(sp, &g_shared_cartex_len);
-        }
+        shared_cartex_load(dataroot);   /* 1.9 MB, kept: every traffic model wears it */
         shared = g_shared_cartex; sharedlen = g_shared_cartex_len;
     }
     char sk[96];
@@ -3411,11 +3421,7 @@ static int prepare_body_kit(BodyKitCandidate *kit,
         N2Tex t={0};int loaded=texdata && n2_load_car_tex_by_key(texdata,texlen,tk,&t);
         if(!loaded) {   /* not in the car's pack: the shared CARS/TEXTURES.BIN */
             free(t.rgb);free(t.alpha);free(t.dxt);memset(&t,0,sizeof t);
-            if(!g_shared_cartex_tried) {
-                char sp[1024]; g_shared_cartex_tried=1;
-                snprintf(sp,sizeof sp,"%s/CARS/TEXTURES.BIN",dataroot);
-                g_shared_cartex=n2_read_file(sp,&g_shared_cartex_len);
-            }
+            shared_cartex_load(dataroot);
             loaded=g_shared_cartex && n2_load_car_tex_by_key(g_shared_cartex,g_shared_cartex_len,tk,&t);
         }
         if(!loaded) {   /* ... and the shared part materials in GLOBALB */
@@ -4513,11 +4519,7 @@ static GLuint decal_tex(const char *dataroot, const N2CarConfig *cfg, unsigned c
     uint32_t key = n2_bstr(suf, nm);
     for (int c = 0; c < g_ndecal_cache; c++) if (g_decal_cache[c].key == key) return g_decal_cache[c].tex;
     if (g_ndecal_cache >= 64) return 0;
-    if (!g_shared_cartex_tried) {
-        char sp[1024]; g_shared_cartex_tried = 1;
-        snprintf(sp, sizeof sp, "%s/CARS/TEXTURES.BIN", dataroot);
-        g_shared_cartex = n2_read_file(sp, &g_shared_cartex_len);
-    }
+    shared_cartex_load(dataroot);
     N2Tex t; memset(&t, 0, sizeof t);
     GLuint id = 0;
     if (g_shared_cartex && n2_load_car_tex_by_key(g_shared_cartex, g_shared_cartex_len, key, &t) && t.rgb) {

@@ -3342,7 +3342,8 @@ static int n2_load_path(const unsigned char *d, long len, N2Path *p) {
     n2_find_leaves(d, 0, len, 0x00034148u, leaf, &nl, 8);
     if (!nl) return 0;
     int n = (int)leaf[0].size / 24;
-    p->xy = (float *)malloc((size_t)n * 2 * sizeof(float));
+    p->xy = (float *)malloc((size_t)(n > 0 ? n : 1) * 2 * sizeof(float));
+    if (!p->xy) return 0;   /* out of memory: no path (audit 11-17) */
     int c = 0;
     for (int i = 0; i < n; i++) {
         float x, y;
@@ -4327,8 +4328,11 @@ static N2Tpk n2_tpk_open(const unsigned char *d, long len) {
         } else if (ph >= 0 && d[i]==0x02 && d[i+1]==0x00 && d[i+2]==0x32 && d[i+3]==0x33) {
             long pbase = i + 8, room = len - pbase;       /* pixels 0x33320002 */
             if (room > 0x40000000) room = 0x40000000;
-            if (t.nblk == cap) { cap = cap ? cap*2 : 64;
-                t.blk = (N2TpkBlk *)realloc(t.blk, (size_t)cap*sizeof(N2TpkBlk)); }
+            if (t.nblk == cap) {   /* out of memory: the blocks found so far (audit 11-17) */
+                int nc = cap ? cap*2 : 64;
+                N2TpkBlk *nb = (N2TpkBlk *)realloc(t.blk, (size_t)nc*sizeof(N2TpkBlk));
+                if (!nb) break;
+                t.blk = nb; cap = nc; }
             t.blk[t.nblk].hbeg = ph; t.blk[t.nblk].hsize = phs;
             t.blk[t.nblk].fbase = -1; t.blk[t.nblk].flen = 0;
 #ifdef __vita__

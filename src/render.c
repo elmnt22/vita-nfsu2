@@ -4021,7 +4021,9 @@ GpuMesh make_wheel(float R, float halfW) {
     const int N = 24;
     int nv = N*2 + 2, nt = N*4;         /* 2 rings + 2 hub centres; sides + 2 caps */
     N2Mesh m; memset(&m, 0, sizeof m);
-    m.nverts = nv; m.verts = (float *)malloc(nv*5*sizeof(float));
+    /* fixed per-thread buffers (2.6 KB): no allocation to fail late in a session (audit 11-17) */
+    static __thread float vbuf[(24*2 + 2)*5]; static __thread uint16_t ibuf[24*4*3];
+    m.nverts = nv; m.verts = vbuf;
     for (int i = 0; i < N; i++) {
         float a = 2.0f*(float)M_PI*i/N, cx = R*cosf(a), cz = R*sinf(a);
         float u = cosf(a)*0.5f+0.5f, v = sinf(a)*0.5f+0.5f;
@@ -4031,7 +4033,7 @@ GpuMesh make_wheel(float R, float halfW) {
     int c0 = 2*N, c1 = 2*N+1;
     float *h0=m.verts+c0*5; h0[0]=0;h0[1]= halfW;h0[2]=0;h0[3]=0.5f;h0[4]=0.5f;
     float *h1=m.verts+c1*5; h1[0]=0;h1[1]=-halfW;h1[2]=0;h1[3]=0.5f;h1[4]=0.5f;
-    m.idx = (uint16_t *)malloc(nt*3*sizeof(uint16_t)); int k=0;
+    m.idx = ibuf; int k=0; (void)nt;
     for (int i = 0; i < N; i++) {
         int j = (i+1)%N;
         m.idx[k++]=i;    m.idx[k++]=j;    m.idx[k++]=N+j;      /* tread quad */
@@ -4041,8 +4043,9 @@ GpuMesh make_wheel(float R, float halfW) {
     }
     m.nidx = k; m.cat = N2_CAR_TIRE;
     N2Scene s; s.meshes = &m; s.count = 1; s.cap = 1;
-    GpuMesh *g = upload_scene(&s); GpuMesh out = *g;
-    free(g); free(m.verts); free(m.idx);
+    GpuMesh *g = upload_scene(&s); GpuMesh out;
+    if (g) out = *g; else memset(&out, 0, sizeof out);
+    free(g);
     return out;
 }
 
