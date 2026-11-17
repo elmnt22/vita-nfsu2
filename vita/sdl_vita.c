@@ -532,8 +532,43 @@ volatile int vita_wd_load;
    HW is ~20 s (a free-roam start), so 90 s is only ever a real hang -- the
    game then ends with a crumb + core dump instead of freezing for good. */
 #define WD_IDLE_SECONDS 90
+/* Hang recorder (GitHub #17, 11-16: a race froze with nothing in the
+   crumbs -- the player closed the game before the 15 s fault, and the logs
+   stop at a normal frame). The main thread's hitch_mark labels go into a
+   ring here (no I/O, repeats folded); the watchdog writes the ring to
+   crumbs.txt once the loop has gone WD_STALL_SECONDS without a beat, long
+   before it faults, so a player who quits a frozen game still leaves the
+   place it stopped behind (crumbs_prev.txt after a relaunch). */
+#define STEP_RING 64
+typedef struct { const char *label; unsigned ms, n; int sec; } VitaStep;
+static VitaStep g_step[STEP_RING];
+static volatile unsigned g_step_i;
+void vita_step(const char *label) {
+    unsigned i = g_step_i, ms = (unsigned)(sceKernelGetProcessTimeWide() / 1000u);
+    VitaStep *p = i ? &g_step[(i - 1) % STEP_RING] : NULL;
+    if (p && p->label == label) { p->ms = ms; p->n++; p->sec = vita_wd_sec; return; }
+    VitaStep *q = &g_step[i % STEP_RING];
+    q->label = label; q->ms = ms; q->n = 1; q->sec = vita_wd_sec;
+    __sync_synchronize();
+    g_step_i = i + 1;
+}
+static void step_dump(void) {
+    unsigned end = g_step_i, n = end < STEP_RING ? end : STEP_RING;
+    char line[2048]; int len = 0;
+    for (unsigned k = end - n; k != end; k++) {
+        const VitaStep *s = &g_step[k % STEP_RING];
+        len += snprintf(line + len, sizeof line - (size_t)len, " %s@%u.%03u%s", s->label ? s->label : "?",
+                        s->ms / 1000u, s->ms % 1000u, s->n > 1 ? "+" : "");
+        if (len > (int)sizeof line - 96 || k + 1 == end) {
+            vita_crumb("  steps:%s", line);
+            len = 0;
+        }
+    }
+}
+#define WD_STALL_SECONDS 6
 static int wd_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
+    int stall_told = 0;
     unsigned last = vita_wd_beat;
     int last_load = vita_wd_load;
     Uint64 since = sceKernelGetProcessTimeWide(), prev = since;
@@ -550,7 +585,19 @@ static int wd_thread(SceSize args, void *argp) {
            (standby / PS button): the main loop gets its time to beat again */
         int resumed = now - prev > 5000000u;
         prev = now;
-        if (b != last || load != last_load || resumed || b == 0) { last = b; last_load = load; since = now; continue; }
+        if (b != last || load != last_load || resumed || b == 0) {
+            if (stall_told) vita_crumb("stall over after %u s (beat %u)", (unsigned)((now - since) / 1000000u), b);
+            stall_told = 0;
+            last = b; last_load = load; since = now; continue;
+        }
+        if (!stall_told && now - since >= (Uint64)WD_STALL_SECONDS * 1000000u) {
+            stall_told = 1;
+            vita_crumb("STALL: no main-loop beat for %u s after perf mark %d (beat %u, %s); last main-thread steps (s since boot, + = repeated):",
+                       WD_STALL_SECONDS, vita_wd_sec, b,
+                       load ? "boot world load" : armed ? "in a race" : "outside a race");
+            step_dump();
+            vita_log_flush();
+        }
         unsigned lim = load ? WD_LOAD_SECONDS : armed ? WD_SECONDS : WD_IDLE_SECONDS;
         if (now - since < (Uint64)lim * 1000000u) continue;
         vita_crumb("WATCHDOG: main loop stuck %u s after perf mark %d (beat %u, %s) -- "
@@ -564,7 +611,9 @@ static int wd_thread(SceSize args, void *argp) {
     }
 }
 static void wd_start(void) {
-    SceUID uid = sceKernelCreateThread("watchdog", wd_thread, 0x10000100, 0x4000, 0,
+    /* priority 90: above the parallel-for workers (120) and every worker
+       thread (160), so busy cores can never keep it from reporting */
+    SceUID uid = sceKernelCreateThread("watchdog", wd_thread, 90, 0x4000, 0,
                                  SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);   /* off core 0 */
     if (uid >= 0) sceKernelStartThread(uid, 0, NULL);
     vita_mark("race watchdog thread: 0x%08X (%d s)", (unsigned)uid, WD_SECONDS);
@@ -1362,7 +1411,7 @@ void *SDL_GL_GetProcAddress(const char *name) { return vglGetProcAddress(name); 
 static SDL_Event evq[EVQ];
 static int evq_head, evq_tail;
 static Uint8 g_keys[SDL_NUM_SCANCODES];
-static uint32_t g_prev_buttons;
+static uint64_t g_prev_buttons;
 #define GFX_MODES 4
 static const char *const g_mode_name[GFX_MODES] = {
     "normal", "GPU probe (passes switched off in turn, flickers)",
@@ -1373,16 +1422,26 @@ static float g_steer;
    The garage CONTROLS row applies it as a preset to the controller setup's
    bindings (options.h), which are what the pad reads. */
 int vita_ctrl_scheme = 0;
-/* bits the pad never reports, for the left stick past half and the rear
-   touchpad's corner zones (options_touch_zone) */
-#define PB_LS_LEFT  0x01000000u
-#define PB_LS_RIGHT 0x02000000u
-#define PB_RT_UL    0x04000000u
-#define PB_RT_UR    0x08000000u
-#define PB_RT_LL    0x10000000u
-#define PB_RT_LR    0x20000000u
+/* bits the pad never reports, for the left/right sticks and touch zones */
+#define PB_LS_LEFT  (1ull << 24)
+#define PB_LS_RIGHT (1ull << 25)
+#define PB_RT_UL    (1ull << 26)
+#define PB_RT_UR    (1ull << 27)
+#define PB_RT_LL    (1ull << 28)
+#define PB_RT_LR    (1ull << 29)
+#define PB_LS_UP    (1ull << 30)
+#define PB_LS_DOWN  (1ull << 31)
+#define PB_RS_UP    (1ull << 32)
+#define PB_RS_DOWN  (1ull << 33)
+#define PB_RS_LEFT  (1ull << 34)
+#define PB_RS_RIGHT (1ull << 35)
+#define PB_FT_UL    (1ull << 36)
+#define PB_FT_UR    (1ull << 37)
+#define PB_FT_LL    (1ull << 38)
+#define PB_FT_LR    (1ull << 39)
+
 /* VB_* -> pad bits */
-static uint32_t vb_mask(int vb) {
+static uint64_t vb_mask(int vb) {
     switch (vb) {
     case VB_CROSS: return SCE_CTRL_CROSS;     case VB_CIRCLE: return SCE_CTRL_CIRCLE;
     case VB_SQUARE: return SCE_CTRL_SQUARE;   case VB_TRIANGLE: return SCE_CTRL_TRIANGLE;
@@ -1394,16 +1453,24 @@ static uint32_t vb_mask(int vb) {
     case VB_LS_LEFT: return PB_LS_LEFT;       case VB_LS_RIGHT: return PB_LS_RIGHT;
     case VB_RT_UL: return PB_RT_UL;           case VB_RT_UR: return PB_RT_UR;
     case VB_RT_LL: return PB_RT_LL;           case VB_RT_LR: return PB_RT_LR;
+    case VB_LS_UP: return PB_LS_UP;           case VB_LS_DOWN: return PB_LS_DOWN;
+    case VB_RS_UP: return PB_RS_UP;           case VB_RS_DOWN: return PB_RS_DOWN;
+    case VB_RS_LEFT: return PB_RS_LEFT;       case VB_RS_RIGHT: return PB_RS_RIGHT;
+    case VB_FT_UL: return PB_FT_UL;           case VB_FT_UR: return PB_FT_UR;
+    case VB_FT_LL: return PB_FT_LL;           case VB_FT_LR: return PB_FT_LR;
     default: return 0;
     }
 }
-static int act_down(uint32_t b, int act) {
+
+static int act_down(uint64_t b, int act) {
     return (b & vb_mask(g_opt.ctl[act][0])) || (b & vb_mask(g_opt.ctl[act][1]));
 }
+
 /* buttons newly pressed since the last take (the controller screen's capture) */
-static uint32_t g_new_buttons;
+static uint64_t g_new_buttons;
+
 int vita_take_new_button(void) {
-    uint32_t n = g_new_buttons;
+    uint64_t n = g_new_buttons;
     g_new_buttons = 0;
     for (int vb = 1; vb < VB_COUNT; vb++) if (n & vb_mask(vb)) return vb;
     return 0;
@@ -1450,7 +1517,7 @@ static void set_key(SDL_Scancode sc, int down) {
     SDL_PushEvent(&e);
 }
 
-static void pad_button(uint32_t now, uint32_t vita, SDL_GameControllerButton b) {
+static void pad_button(uint64_t now, uint64_t vita, SDL_GameControllerButton b) {
     if ((now & vita) && !(g_prev_buttons & vita)) {
         SDL_Event e; memset(&e, 0, sizeof e);
         e.type = SDL_CONTROLLERBUTTONDOWN; e.cbutton.button = (Uint8)b; e.cbutton.state = SDL_PRESSED;
@@ -1459,12 +1526,13 @@ static void pad_button(uint32_t now, uint32_t vita, SDL_GameControllerButton b) 
 }
 
 float vita_rstick_x, vita_rstick_y, vita_lstick_y;
+
 /* the rear touchpad's zone bits. A finger counts once it has stayed in its
    zone for two samples, so a brush while holding the Vita does nothing */
-static uint32_t rear_touch_bits(void) {
+static uint64_t rear_touch_bits(void) {
     static int init;
     static float x0, y0, xw = 1.0f, yh = 1.0f;
-    static uint32_t last;
+    static uint64_t last;
     if (!g_opt.rear_touch) { last = 0; return 0; }
     if (!init) {
         init = 1;
@@ -1475,11 +1543,63 @@ static uint32_t rear_touch_bits(void) {
         } else { x0 = 0; y0 = 108; xw = 1919; yh = 781; }   /* the rear panel's usual active area */
     }
     SceTouchData td; memset(&td, 0, sizeof td);
-    uint32_t now = 0;
+    uint64_t now = 0;
     if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &td, 1) >= 0)
         for (uint32_t i = 0; i < td.reportNum && i < SCE_TOUCH_MAX_REPORT; i++)
             now |= vb_mask(options_touch_zone(&g_opt, (td.report[i].x - x0) / xw, (td.report[i].y - y0) / yh));
-    uint32_t held = now & last;
+    uint64_t held = now & last;
+    last = now;
+    return held;
+}
+
+/* Front touch screen: four held quadrants.
+   A zone becomes active after two consecutive samples and stays active
+   while the finger remains in that quadrant. */
+static uint64_t front_touch_bits(void) {
+    static int init;
+    static float x0, y0, xw = 1.0f, yh = 1.0f;
+    static uint64_t last;
+
+    if (!init) {
+        init = 1;
+        sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+
+        SceTouchPanelInfo pi;
+        memset(&pi, 0, sizeof pi);
+
+        if (sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &pi) >= 0 &&
+            pi.maxAaX > pi.minAaX && pi.maxAaY > pi.minAaY) {
+            x0 = pi.minAaX;
+            y0 = pi.minAaY;
+            xw = (float)(pi.maxAaX - pi.minAaX);
+            yh = (float)(pi.maxAaY - pi.minAaY);
+        } else {
+            x0 = 0;
+            y0 = 0;
+            xw = 1919;
+            yh = 1087;
+        }
+    }
+
+    SceTouchData td;
+    memset(&td, 0, sizeof td);
+
+    uint64_t now = 0;
+
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) >= 0) {
+        for (uint32_t i = 0; i < td.reportNum && i < SCE_TOUCH_MAX_REPORT; i++) {
+            float u = (td.report[i].x - x0) / xw;
+            float v = (td.report[i].y - y0) / yh;
+
+            int vb = (v < 0.5f)
+                ? (u < 0.5f ? VB_FT_UL : VB_FT_UR)
+                : (u < 0.5f ? VB_FT_LL : VB_FT_LR);
+
+            now |= vb_mask(vb);
+        }
+    }
+
+    uint64_t held = now & last;
     last = now;
     return held;
 }
@@ -1487,28 +1607,43 @@ static uint32_t rear_touch_bits(void) {
 static void poll_pad(void) {
     SceCtrlData pad; memset(&pad, 0, sizeof pad);
     sceCtrlPeekBufferPositive(0, &pad, 1);
-    uint32_t b = pad.buttons & 0x00ffffffu;
+
+    uint64_t b = pad.buttons & 0x00ffffffu;
     const uint32_t L = SCE_CTRL_LTRIGGER | SCE_CTRL_L1, R = SCE_CTRL_RTRIGGER | SCE_CTRL_R1;
 
+    int lx = (int)pad.lx - 128;
+    int ly = (int)pad.ly - 128;
+    int rx = (int)pad.rx - 128;
+    int ry = (int)pad.ry - 128;
+
     {   /* right stick, -1..1 with a dead zone (showroom turntable / camera) */
-        int rx = (int)pad.rx - 128, ry = (int)pad.ry - 128;
         vita_rstick_x = (rx > 24 || rx < -24) ? (float)rx / 127.0f : 0.0f;
         vita_rstick_y = (ry > 24 || ry < -24) ? (float)ry / 127.0f : 0.0f;
-        int ly = (int)pad.ly - 128;
         vita_lstick_y = (ly > 24 || ly < -24) ? (float)ly / 127.0f : 0.0f;
     }
-    int lx = (int)pad.lx - 128;
+
     /* +1 = left, like A; the dead zone is cut out of the range, so the
        wheel starts from zero at its edge instead of jumping to 0.19 */
     g_steer = lx > 24 ? -(float)(lx - 24) / 103.0f : lx < -24 ? -(float)(lx + 24) / 103.0f : 0.0f;
     if (g_steer > 1.0f) g_steer = 1.0f;
     if (g_steer < -1.0f) g_steer = -1.0f;
+
     if (lx < -64) b |= PB_LS_LEFT;
     if (lx > 64) b |= PB_LS_RIGHT;
+    if (ly < -64) b |= PB_LS_UP;
+    if (ly > 64) b |= PB_LS_DOWN;
+
+    if (rx < -64) b |= PB_RS_LEFT;
+    if (rx > 64) b |= PB_RS_RIGHT;
+    if (ry < -64) b |= PB_RS_UP;
+    if (ry > 64) b |= PB_RS_DOWN;
+
     b |= rear_touch_bits();
+    b |= front_touch_bits();
 
     int quit = (b & SCE_CTRL_SELECT) && (b & SCE_CTRL_START);
     g_new_buttons |= b & ~g_prev_buttons;
+
     /* the game's actions through the controller setup's bindings: W gas,
        S brake/reverse, E / Q shift, A / D steer (the left stick always),
        Space handbrake, N nitrous, C camera, B look back, keypad 7 / 8 hydraulics, Pause. Engage,
@@ -1518,6 +1653,7 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_S, act_down(b, OPT_ACT_BACK));
     set_key(SDL_SCANCODE_E, act_down(b, OPT_ACT_SHIFT_UP));
     set_key(SDL_SCANCODE_Q, act_down(b, OPT_ACT_SHIFT_DOWN));
+
     /* the stick as left / right keys (also the drag lane change's analog
        events 0xba / 0xbb, handler 0x571d50 table 0x7fe238): retail presses
        left when the 0..255 axis byte goes below 0x40 (0x7fdd08) and right
@@ -1535,10 +1671,12 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_KP_7, act_down(b, OPT_ACT_HYD_PRESSURE));   /* hydraulics (hyd_player) */
     set_key(SDL_SCANCODE_KP_8, act_down(b, OPT_ACT_HYD_BOUNCE));
     set_key(SDL_SCANCODE_PAUSE, act_down(b, OPT_ACT_PAUSE) && !quit);
+
     /* the menus' fixed buttons: Cross accepts, Circle backs out */
     set_key(SDL_SCANCODE_KP_ENTER, (b & SCE_CTRL_CROSS) != 0);
     set_key(SDL_SCANCODE_BACKSPACE, (b & SCE_CTRL_CIRCLE) != 0);
     set_key(SDL_SCANCODE_DELETE, (b & SCE_CTRL_SQUARE) != 0);   /* menus: Square */
+
     /* the d-pad, or the left stick past half (the menus' PAD_*_ALTERNATE;
        nothing reads the arrows while driving) */
     set_key(SDL_SCANCODE_LEFT, (b & SCE_CTRL_LEFT) || lx < -64);
@@ -1549,6 +1687,7 @@ static void poll_pad(void) {
     set_key(SDL_SCANCODE_RIGHTBRACKET, (b & R) != 0);
     set_key(SDL_SCANCODE_F, (b & SCE_CTRL_TRIANGLE) && !(b & SCE_CTRL_SELECT));   /* menus: Triangle */
     set_key(SDL_SCANCODE_RETURN, (b & SCE_CTRL_START) && !quit);
+
     /* Select+Triangle: next A/B test mode; logs how the one just left
        performed (Select+Up/Down are taken by the overclock overlay) */
     int mode_combo = (b & SCE_CTRL_SELECT) && (b & SCE_CTRL_TRIANGLE);
@@ -1562,7 +1701,9 @@ static void poll_pad(void) {
         vita_mark("gfx mode %d: %s", vita_gfx_mode, g_mode_name[vita_gfx_mode]);
         g_mode_t0 = now; g_mode_frames = 0;
     }
+
     set_key(SDL_SCANCODE_1, (b & SCE_CTRL_SELECT) && !quit && !mode_combo);
+
     {   /* Reset (Player::HandleReset, main.c): on a clean release of its
            button -- nothing else pressed while it was held -- so the Select
            combos (quit, gfx mode, overclock) never reset the car */
@@ -1573,6 +1714,7 @@ static void poll_pad(void) {
         set_key(SDL_SCANCODE_KP_1, !rd && rheld && rclean);
         rheld = rd;
     }
+
     set_key(SDL_SCANCODE_ESCAPE, quit);
 
     pad_button(b, SCE_CTRL_UP, SDL_CONTROLLER_BUTTON_DPAD_UP);
@@ -1580,6 +1722,7 @@ static void poll_pad(void) {
     pad_button(b, SCE_CTRL_CROSS, SDL_CONTROLLER_BUTTON_A);
     pad_button(b, SCE_CTRL_CIRCLE, SDL_CONTROLLER_BUTTON_B);
     pad_button(b, SCE_CTRL_START, SDL_CONTROLLER_BUTTON_START);
+
     g_prev_buttons = b;
 }
 

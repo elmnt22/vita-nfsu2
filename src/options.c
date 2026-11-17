@@ -11,10 +11,42 @@
 #define OPT_MAGIC "OUOPT004"
 
 N2Options g_opt;
-const char *const g_vb_name[VB_COUNT] = { "", "CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "L", "R",
-                                          "UP", "DOWN", "LEFT", "RIGHT", "START", "SELECT",
-                                          "L STICK LEFT", "L STICK RIGHT", "REAR TOP LEFT",
-                                          "REAR TOP RIGHT", "REAR BOTTOM LEFT", "REAR BOTTOM RIGHT" };
+const char *const g_vb_name[VB_COUNT] = {
+    "",
+    "CROSS",
+    "CIRCLE",
+    "SQUARE",
+    "TRIANGLE",
+    "L",
+    "R",
+    "UP",
+    "DOWN",
+    "LEFT",
+    "RIGHT",
+    "START",
+    "SELECT",
+
+    "L STICK LEFT",
+    "L STICK RIGHT",
+
+    "REAR TOP LEFT",
+    "REAR TOP RIGHT",
+    "REAR BOTTOM LEFT",
+    "REAR BOTTOM RIGHT",
+
+    "L STICK UP",
+    "L STICK DOWN",
+
+    "R STICK UP",
+    "R STICK DOWN",
+    "R STICK LEFT",
+    "R STICK RIGHT",
+
+    "FRONT TOP LEFT",
+    "FRONT TOP RIGHT",
+    "FRONT BOTTOM LEFT",
+    "FRONT BOTTOM RIGHT"
+};
 
 void options_ctl_preset(N2Options *o, int scheme) {
     memset(o->ctl, 0, sizeof o->ctl);
@@ -55,6 +87,7 @@ const char *options_port_str(unsigned int hash) {
     switch (hash) {
     case STR_REAR_TOUCH: return "Rear Touchpad";
     case STR_TOUCH_SENS: return "Rear Touch Sensitivity";
+    case STR_CTL_HINT:   return "Square: Clear   Triangle: Reset all";
     default: return NULL;
     }
 }

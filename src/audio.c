@@ -882,7 +882,13 @@ void audio_camera_snapshot(void) {
     g_fev[v].c = &g_camsnap;
 }
 
-void audio_pause_game(int on) { g_game_mute = on; }
+void audio_pause_game(int on)
+{
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_MUTELOG") && !g_game_mute != !on) printf("audio: game sounds %s\n", on ? "off" : "on");   /* test aid */
+#endif
+    g_game_mute = on;
+}
 static volatile float g_lv_master = 1.0f, g_lv_sfx = 1.0f, g_lv_engine = 1.0f, g_lv_tire = 1.0f,
                       g_lv_music = 1.0f;
 static volatile int g_lv_stereo = 1;

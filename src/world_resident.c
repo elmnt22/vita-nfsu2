@@ -456,7 +456,13 @@ void hitch_begin(void) {
 #endif
 }
 
+#ifdef __vita__
+extern void vita_step(const char *label);   /* the hang recorder (sdl_vita.c) */
+#endif
 void hitch_mark(const char *label) {
+#ifdef __vita__
+    vita_step(label);
+#endif
     if (g_hitch_n < 0 || g_hitch_n >= HITCH_MAX) return;
     g_hitch[g_hitch_n].label = label;
     g_hitch[g_hitch_n].t = SDL_GetPerformanceCounter();

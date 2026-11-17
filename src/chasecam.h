@@ -108,6 +108,9 @@ typedef struct {
     float cam_eye[3], cam_tgt[3], cam_fov, cam_veye[3], cam_vtgt[3], cam_vfov;
     int cam_valid;
     int handover;                  /* the next start takes over from the camera */
+    /* port addition (user request, not in retail: its OrbitCarCameraMover is only
+       the zone / debug camera): the right stick orbits the chase views */
+    float orbit_yaw, orbit_pitch, orbit_idle;
 } ChaseCam;
 
 /* Reads the camera entries from the car's 0x34600 record (0x890 bytes). */
@@ -118,6 +121,9 @@ int  chasecam_load(ChaseCam *c, const unsigned char *rec);
 void chasecam_set(ChaseCam *c, int setting, const CcCar *car);
 /* Jump straight to the ideal (teleport / first frame). */
 void chasecam_snap(ChaseCam *c);
+/* The right stick (-1..1, 0 = released) orbits the chase views around the car;
+ * released, the camera eases back behind it. Call every frame before update. */
+void chasecam_orbit(ChaseCam *c, float sx, float sy, float dt);
 /* Another mover drew this frame (the NIS camera): remember its camera for a
  * later hand-over. car_pos = the followed car (camera +0xb0 distance). */
 void chasecam_observe(ChaseCam *c, const CcOut *o, const float car_pos[3], float dt);

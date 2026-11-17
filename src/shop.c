@@ -2175,14 +2175,21 @@ static const struct { int act; uint32_t str; int career; } k_lsc_act[LSC_N] = { 
 static void lsc_anchor(int vb, float *x, float *y) {
     static const float a[VB_COUNT][2] = {
         { 0, 0 },
-        { 216, 124 }, { 226, 114 }, { 206, 114 }, { 216, 104 },   /* cross circle square triangle */
-        { 40, 80 }, { 216, 80 },                                   /* L R */
-        { 40, 105 }, { 40, 123 }, { 31, 114 }, { 49, 114 },        /* d-pad */
-        { 222, 166 }, { 207, 166 },                                /* start select */
-        { 54, 146 }, { 54, 146 },                                  /* left stick */
-        { 114, 211 }, { 142, 211 }, { 114, 223 }, { 142, 223 },    /* rear touch corners (inset) */
+        { 216, 124 }, { 226, 114 }, { 206, 114 }, { 216, 104 },
+        { 40, 80 }, { 216, 80 },
+        { 40, 105 }, { 40, 123 }, { 31, 114 }, { 49, 114 },
+        { 222, 166 }, { 207, 166 },
+        { 54, 146 }, { 54, 146 },
+        { 114, 211 }, { 142, 211 }, { 114, 223 }, { 142, 223 },
+        { 54, 136 }, { 54, 156 },
+        { 202, 136 }, { 202, 156 },
+        { 192, 146 }, { 212, 146 },
+        { 97, 113 }, { 159, 113 },
+        { 97, 149 }, { 159, 149 }
     };
-    *x = a[vb][0]; *y = a[vb][1];
+
+    *x = a[vb][0];
+    *y = a[vb][1];
 }
 
 typedef struct { int k; float a, b, c, d, e, w; } LscShp;   /* 0 rrect (cx cy hw hh r; w > 0: its outline), 1 segment (x0 y0 x1 y1, half width w) */
@@ -3495,7 +3502,7 @@ static void ctl_enter(Shop *s) {
     s->screen = SC_CTL;
     opt_mark(s);
     s->ctl_sel = 0; s->ctl_col = 0; s->ctl_top = 0; s->ctl_cap = 0;
-    s->ctl_instr = STR_CTL_CONFIG;
+    s->ctl_instr = STR_CTL_HINT;   /* port: was STR_CTL_CONFIG "Configure your settings" */
     if (!pk) return;
     if (!s->ctl_anim) s->ctl_anim = (FengAnim *)malloc(sizeof *s->ctl_anim);
     FengAnim *a = s->ctl_anim;
@@ -3518,7 +3525,7 @@ void shop_ctl_button(Shop *s, int vb) {
     if (!s || s->ctl_cap != 2 || s->ctl_sel < 0 || vb <= VB_NONE || vb >= VB_COUNT) return;
     g_opt.ctl[s->ctl_sel][s->ctl_col] = (unsigned char)vb;
     s->ctl_cap = 0;
-    s->ctl_instr = STR_CTL_ASSIGN;
+    s->ctl_instr = STR_CTL_HINT;   /* port: was STR_CTL_ASSIGN */
     audio_fe_play(FE_SND_SELECT);
     printf("controls: %s %s = %s\n", s->ctl_col ? "secondary" : "primary",
            str_get(s, k_ctl_name[s->ctl_sel]), g_vb_name[vb]);
@@ -3529,7 +3536,8 @@ void shop_ctl_button(Shop *s, int vb) {
    title), Left / Right between the Primary and Secondary cells, accept
    starts the capture (0x406415e3: Pulse, "Press a button ..."), back leaves
    for UI_OptionsMain. 0xc519bfbf asks "Reset to default settings?" in a
-   GenericDialog_SMALL (here Triangle): OK (0xefedcba0) resets, Cancel. */
+   GenericDialog_SMALL (here Triangle): OK (0xefedcba0) resets, Cancel.
+   Port addition (GitHub #24): Square clears the highlighted cell's binding. */
 static void ctl_input(Shop *s, int key) {
     if (s->ctl_cap) return;                          /* the next button is the binding */
     if (key == SHOP_KEY_UP) {
@@ -3545,6 +3553,11 @@ static void ctl_input(Shop *s, int key) {
     } else if (key == SHOP_KEY_OK && s->ctl_sel >= 0) {
         s->ctl_cap = 1;
         s->ctl_instr = STR_CTL_PRESS;
+    } else if (key == SHOP_KEY_SQ && s->ctl_sel >= 0) {
+        if (!g_opt.ctl[s->ctl_sel][s->ctl_col]) return;
+        g_opt.ctl[s->ctl_sel][s->ctl_col] = VB_NONE;
+        audio_fe_play(FE_SND_SELECT);
+        printf("controls: %s %s cleared\n", s->ctl_col ? "secondary" : "primary", str_get(s, k_ctl_name[s->ctl_sel]));
     } else if (key == SHOP_KEY_TRI) {
         dialog(s, PK_DLG_S, 2, 0x2bbcca6bu, DA_CTL_RESET, STR_OK, STR_CANCEL);
         return;

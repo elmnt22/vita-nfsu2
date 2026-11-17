@@ -300,6 +300,29 @@ void chasecam_set(ChaseCam *c, int setting, const CcCar *car)
 
 void chasecam_snap(ChaseCam *c) { c->started = 0; c->handover = 0; }
 
+/* port addition: right stick orbit (yaw about the car's vertical, pitch over
+   it); 0.5 s after release the camera eases back behind the car */
+void chasecam_orbit(ChaseCam *c, float sx, float sy, float dt)
+{
+    const float PI = 3.14159265f;
+    if (dt <= 0.0f || dt > 0.25f) dt = 1.0f / 30.0f;
+    if (sx != 0.0f || sy != 0.0f) {
+        c->orbit_yaw += sx * 3.0f * dt;                 /* rad/s at full tilt */
+        c->orbit_pitch = clampf(c->orbit_pitch - sy * 1.5f * dt, -0.15f, 1.1f);
+        while (c->orbit_yaw > PI) c->orbit_yaw -= 2.0f * PI;
+        while (c->orbit_yaw < -PI) c->orbit_yaw += 2.0f * PI;
+        c->orbit_idle = 0.0f;
+    } else {
+        c->orbit_idle += dt;
+        if (c->orbit_idle > 0.5f) {
+            float k = 1.0f - expf(-5.0f * dt);
+            c->orbit_yaw -= c->orbit_yaw * k; c->orbit_pitch -= c->orbit_pitch * k;
+            if (fabsf(c->orbit_yaw) < 1e-3f) c->orbit_yaw = 0.0f;
+            if (fabsf(c->orbit_pitch) < 1e-3f) c->orbit_pitch = 0.0f;
+        }
+    }
+}
+
 /* 0x444530 / 0x444190 (CameraMover::MinGapTopology): keep the eye out of
    the world -- pulled in along the line from the car, pushed off nearby
    faces, never inside the car's own sphere */
@@ -669,6 +692,18 @@ void chasecam_update(ChaseCam *c, const CcCar *car, float dt,
     if (chase) { up[0] = c->up[0].val; up[1] = c->up[1].val; up[2] = 1.0f; }
     else memcpy(up, cup, sizeof up);
     c->fov_u16 = (unsigned short)clampf(c->fov.val, 0x800, 0x7000);
+    if (chase && sg > 0.0f && (c->orbit_yaw != 0.0f || c->orbit_pitch != 0.0f)) {
+        /* port addition: the right stick orbit, about the look point (over the
+           car); the wall / traffic passes below then apply to the orbited eye */
+        float d[3] = { eye[0] - look[0], eye[1] - look[1], eye[2] - look[2] };
+        float cy = cosf(c->orbit_yaw), sy = sinf(c->orbit_yaw);
+        float dx = d[0] * cy - d[1] * sy, dy = d[0] * sy + d[1] * cy;
+        float h = sqrtf(dx * dx + dy * dy), rr = sqrtf(h * h + d[2] * d[2]);
+        float a = clampf(atan2f(d[2], h) + c->orbit_pitch, -0.2f, 1.4f);
+        float nh = rr * cosf(a), s = h > 1e-4f ? nh / h : 0.0f;
+        eye[0] = look[0] + dx * s; eye[1] = look[1] + dy * s; eye[2] = look[2] + rr * sinf(a);
+        up[0] = up[1] = 0.0f; up[2] = 1.0f;
+    }
     ea_lookat(eye, look, up, c->V);
 
     float ext[3] = { car->bbmax[0]-ctr[0], car->bbmax[1]-ctr[1], car->bbmax[2]-ctr[2] };

@@ -604,6 +604,9 @@ static GLuint compile(GLenum type, const char *src) {
    Editing a shader changes the hash, so stale entries are simply never read. */
 #include <sys/stat.h>
 #define PROG_CACHE_MAX (256 * 1024)
+/* programs compiled this boot (cache misses) and how many of them were saved:
+   main.c restarts the game after a first-run compile (see shader_restart) */
+int g_prog_compiles, g_prog_saved;
 static GLuint program_cached(const char *vs, const char *fs) {
     uint32_t h = 2166136261u;
     for (const char *s = vs; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
@@ -630,6 +633,7 @@ static GLuint program_cached(const char *vs, const char *fs) {
             glDeleteProgram(p); p = glCreateProgram();
         } else free(buf);
     }
+    g_prog_compiles++;
     glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
     glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
     glBindAttribLocation(p, 0, "aPos");
@@ -644,7 +648,7 @@ static GLuint program_cached(const char *vs, const char *fs) {
     if (buf) glGetProgramBinary(p, PROG_CACHE_MAX, &len, &fmt, buf);
     mkdir("ux0:data/NFSU2/cache", 0777);   /* usually exists already */
     if (buf && len > 0 && len <= PROG_CACHE_MAX && (f = fopen(path, "wb"))) {
-        fwrite(buf, 1, (size_t)len, f);
+        if (fwrite(buf, 1, (size_t)len, f) == (size_t)len) g_prog_saved++;
         fclose(f);
     }
     free(buf);

@@ -22,6 +22,7 @@
 #include <math.h>
 #include <assert.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <limits.h>
 #include <SDL.h>
 #if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
@@ -409,7 +410,7 @@ static int garage_parse_line(const char *line, const char *car, N2CarConfig *cfg
 #define GARAGE_NSLOT 20
 static int g_gslot = -1;        /* the current car's tuned slot, -1 = the stock car */
 static int g_garage_gen;        /* bumped by every garage write (the tunings cache) */
-typedef struct { char *line[GARAGE_NSLOT]; char cur[64]; int legacy; } GarageFile;
+typedef struct { char *line[GARAGE_NSLOT]; char cur[64]; int legacy, bad; } GarageFile;
 static void garage_free(GarageFile *g) { for (int i = 0; i < GARAGE_NSLOT; i++) { free(g->line[i]); g->line[i] = NULL; } }
 static int garage_line_is(const char *line, const char *car) {
     char name[64];
@@ -428,7 +429,12 @@ static void garage_id(char *out, size_t cap, const char *car, int slot) {
 static void garage_read(GarageFile *g) {
     memset(g, 0, sizeof *g);
     FILE *f = fopen(GARAGE_SAVE, "r");
-    if (!f) return;
+    if (!f) f = fopen(GARAGE_SAVE, "r");   /* one retry: the open itself needs memory */
+    if (!f) {   /* GitHub #18: there but unreadable (out of memory) is not an empty garage */
+        struct stat st;
+        if (stat(GARAGE_SAVE, &st) == 0) { g->bad = 1; printf("garage: %s unreadable now\n", GARAGE_SAVE); }
+        return;
+    }
     static char line[4096];
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
@@ -447,9 +453,21 @@ static void garage_read(GarageFile *g) {
             if (slot < 0) { printf("garage: no free slot for %s's line, dropped\n", name); continue; }
             g->legacy = 1;
         }
-        g->line[slot] = strdup(body);
+        if (!(g->line[slot] = strdup(body))) g->bad = 1;
+#ifdef OPENUG2_SIM_PRE_H
+        /* test aid (simulator): OPENUG2_SIM_GARAGE_SHORT=1 -- every read misses
+           its last tuned line, as an out-of-memory strdup would */
+        else if (getenv("OPENUG2_SIM_GARAGE_SHORT")) {
+            long at = ftell(f); int more = 0; char peek[64];
+            while (fgets(peek, sizeof peek, f)) if (peek[0] == '#') { more = 1; break; }
+            fseek(f, at, SEEK_SET);
+            if (!more) { free(g->line[slot]); g->line[slot] = NULL; g->bad = 1; }
+        }
+#endif
     }
+    if (ferror(f)) g->bad = 1;
     fclose(f);
+    if (g->bad) printf("garage: %s read short (out of memory), its cars kept as they are\n", GARAGE_SAVE);
     if (g->legacy && g->cur[0] && !strchr(g->cur, '#'))   /* an old CURRENT: its car's line, when it has one */
         for (int i = 0; i < GARAGE_NSLOT; i++)
             if (garage_line_is(g->line[i], g->cur)) {
@@ -458,13 +476,21 @@ static void garage_read(GarageFile *g) {
                 break;
             }
 }
+/* never writes back a short read (it would drop the tuned cars it missed,
+   GitHub #18); a temp file renamed over the old one, so a failed write leaves it */
 static void garage_write(GarageFile *g) {
-    FILE *f = fopen(GARAGE_SAVE, "w");
+    if (g->bad) { printf("garage: %s not rewritten (it was read short)\n", GARAGE_SAVE); return; }
+    char tmp[300]; snprintf(tmp, sizeof tmp, "%s.tmp", GARAGE_SAVE);
+    FILE *f = fopen(tmp, "w");
     g_garage_gen++;
     if (!f) { printf("garage: %s not written\n", GARAGE_SAVE); return; }
-    for (int i = 0; i < GARAGE_NSLOT; i++) if (g->line[i]) fprintf(f, "#%d %s\n", i, g->line[i]);
-    if (g->cur[0]) fprintf(f, "CURRENT %s\n", g->cur);
-    fclose(f);
+    int ok = 1;
+    for (int i = 0; i < GARAGE_NSLOT; i++) if (g->line[i]) ok &= fprintf(f, "#%d %s\n", i, g->line[i]) > 0;
+    if (g->cur[0]) ok &= fprintf(f, "CURRENT %s\n", g->cur) > 0;
+    ok &= fclose(f) == 0;
+    if (!ok) { remove(tmp); printf("garage: %s not written\n", GARAGE_SAVE); return; }
+    remove(GARAGE_SAVE);
+    rename(tmp, GARAGE_SAVE);
     if (g->legacy) printf("garage: old per-type lines moved to tuned slots\n");
     g->legacy = 0;
 }
@@ -567,10 +593,21 @@ static void cust_open_mark(const N2CarConfig *cfg, const char *rim, int rs) {
 /* the Customize car select's tuned entries (FEPlayerCarDB's tuned list):
    n = how many, folders + slots out */
 static int garage_list(char car[][32], int slot[], int cap) {
+    /* the last full read stands in for a short one: the list does not lose
+       its tuned cars for a moment (GitHub #18) */
+    static char kcar[GARAGE_NSLOT][32]; static int kslot[GARAGE_NSLOT], kn = -1;
     GarageFile g; garage_read(&g);
     int n = 0;
+    if (g.bad && kn >= 0) {
+        for (; n < kn && n < cap; n++) { memcpy(car[n], kcar[n], 32); slot[n] = kslot[n]; }
+        garage_free(&g);
+        return n;
+    }
     for (int i = 0; i < GARAGE_NSLOT && n < cap; i++)
         if (g.line[i] && sscanf(g.line[i], "%31s", car[n]) == 1) slot[n++] = i;
+    if (!g.bad) {
+        for (kn = 0; kn < n && kn < GARAGE_NSLOT; kn++) { memcpy(kcar[kn], car[kn], 32); kslot[kn] = slot[kn]; }
+    }
     garage_free(&g);
     return n;
 }
@@ -1705,11 +1742,13 @@ static void garage_restore_car(const char *car) {
     N2CarConfig c; char rim[16] = ""; int rs = 0;
     if (garage_load_car(car, &c, rim, &rs)) {
         g_shop_req = c; g_shop_req_pending = 1;
-        if (rim[0]) {
-            memcpy(g_shop_rim_folder, rim, sizeof rim); g_shop_rim_style = rs;
-            g_shop_rim_pending = 1;
-        }
     }
+    /* GitHub #13: a stock car (no tuned slot) or a build without rims wears
+       its own wheel (NFSU style 1 = the car's stock wheel mesh); before, the
+       previous car's rims stayed on every car switched to */
+    if (!rim[0]) { snprintf(rim, sizeof rim, "NFSU"); rs = 1; }
+    memcpy(g_shop_rim_folder, rim, sizeof rim); g_shop_rim_style = rs;
+    g_shop_rim_pending = 1;
 }
 #include "world_capture_policy.h"
 #include "world_scenery.h"
@@ -3337,8 +3376,14 @@ static int prepare_body_kit(BodyKitCandidate *kit,
             const N2Mesh *candidate=kit->scene.meshes+j;
             if(candidate->famkey==m->famkey || (m->car_part &&
                config->parts[m->car_part-1] && candidate->car_part==m->car_part))found=1;
+            /* GitHub #12: aftermarket brakes (n2_mod_brakes) replace the car's own
+               front brakes -- not a dropped part; every kit change on a car with
+               upgraded brakes (Rachel's 350Z, imported saves) was refused here */
+            if(m->car_mount==N2_MOUNT_FRONT_BRAKE && candidate->car_mount==N2_MOUNT_FRONT_BRAKE)found=1;
         }
-        if(!found)KIT_FAIL("would drop a stock part (family %08x)",(unsigned)m->famkey);
+        if(!found){char nm[64]="";long off=m->car_source;
+            if(off>=8 && off<=len)n2_car_mesh_name(data,off,off+n2_u32(data+off-4),nm);
+            KIT_FAIL("would drop a stock part (family %08x %s)",(unsigned)m->famkey,nm);}
     }
     kit->stock_wheel=n2_car_prepare_wheels(&kit->scene);
     if(glGetError()!=GL_NO_ERROR)KIT_FAIL("GL error before upload");
@@ -5218,6 +5263,9 @@ static void career_apply_preset(void) {   /* RideInfo::FillWithPreset: the prese
     if (g_career_preset_rim[0]) {
         memcpy(g_shop_rim_folder, g_career_preset_rim, sizeof g_shop_rim_folder);
         g_shop_rim_style = g_career_preset_rs; g_shop_rim_pending = 1;
+    } else {   /* stock: the car's own wheel, not the last car's rims (GitHub #13) */
+        snprintf(g_shop_rim_folder, sizeof g_shop_rim_folder, "NFSU");
+        g_shop_rim_style = 1; g_shop_rim_pending = 1;
     }
     printf("career: the preset ride on %s (rims %s %d)\n", g_career_preset_car,
            g_career_preset_rim[0] ? g_career_preset_rim : "stock", g_career_preset_rs);
@@ -13905,6 +13953,7 @@ static int select_car_vinyl(int choice) {
    DELETES it (a crash comes back in the city). */
 #define VENUE_FILE "ux0:data/NFSU2/venue.txt"
 static int g_boot_ev;          /* the venue event to start once loaded */
+static int g_boot_restart;     /* one-time boot work done: start over once set up */
 static int g_in_venue;         /* on a venue track (not the city) */
 static const char *g_switch_track;   /* queued in-process track switch */
 static int g_switch_ev;              /* ... and the event to start there */
@@ -16097,7 +16146,7 @@ int main(int argc, char **argv) {
                 { "STREAML4RA", "THE CITY" }, { "STREAML4RB", "DRAG STRIPS 1" },
                 { "STREAML4RC", "DRIFT VENUES" }, { "STREAML4RD", "DRAG STRIPS 2" },
                 { "STREAML4RF", "STREET X TRACKS" }, { "STREAML4RG", "URL TRACKS" } };
-            const char *conv[8], *conv_name[8]; int nconv = 0, boot_listed = 0;
+            const char *conv[8], *conv_name[8]; int nconv = 0, boot_listed = 0, tiles_relaunch = 0;
             for (int q = 0; q < (int)(sizeof k_tile_tracks / sizeof *k_tile_tracks); q++) {
                 if (!strcmp(k_tile_tracks[q][0], trackname)) boot_listed = 1;
                 char bp[1024]; snprintf(bp, sizeof bp, "%s/%s.BUN", troot, k_tile_tracks[q][0]);
@@ -16153,6 +16202,7 @@ int main(int argc, char **argv) {
                 res_unpin(); world_instance_library_release(); world_instance_cache_flush();
                 extern void vita_progress_screen_done(void); vita_progress_screen_done();
                 if (g_boot_fe) shop_loading_text(g_boot_fe, NULL, NULL);   /* back to "LOADING" */
+                tiles_relaunch = 1;
             }
             /* an older release's tile sets (another WTILE_VERSION) off the
                card once this version's are complete (lowest-priority thread) */
@@ -16195,7 +16245,15 @@ int main(int argc, char **argv) {
                 vita_mark("tiles: packing done");
                 extern void vita_progress_screen_done(void); vita_progress_screen_done();
                 if (g_boot_fe) shop_loading_text(g_boot_fe, NULL, NULL);
+                tiles_relaunch = 1;
             }
+            /* user log 11-16: the session after a first-run conversion started its
+               first world build with 54 MB live in the heap and 932 kernel blocks
+               (a normal boot: 23 MB, 442) -- what the conversion left behind
+               fragmented both, and 30 min later builds failed out of memory. The
+               game starts over in a fresh process instead (the venue kept). */
+            /* the restart waits for the shader compile below (one restart) */
+            if (tiles_relaunch) g_boot_restart = 1;
         }
     }
     int nm = 0;
@@ -16557,6 +16615,9 @@ int main(int argc, char **argv) {
     g_manual = g_opt.p[0].manual;
     g_cc_setting = g_opt.p[0].camera;
     SDL_AudioDeviceID adev = audio_init();
+#ifdef __vita__
+    if (g_boot_fe) audio_pause_game(1);   /* GitHub #10: no engine idle under the boot loading screen */
+#endif
     music_init(dataroot);  LOAD_PUMP();
     printf("speech: %s\n", speech_init(dataroot) ? "UG2_Speech + nisaudio indexed" : "no speech data"); career_speech_hook = career_speech_log;
     if (!g_opt.playlist_set) music_default_playlist(g_opt.pl_song, g_opt.pl_mode);
@@ -16650,6 +16711,32 @@ int main(int argc, char **argv) {
     RProg rp = render_program();
 #ifdef __vita__
     render_world_lite_program(&rp);
+    {   /* user log 11-16 (userlogb): a first boot compiles the 27 linked
+           programs on the device (33 s), and the shader compiler leaves the
+           heap and the kernel blocks bloated -- the first world build started
+           with 53 MB live and 939 blocks (a cached boot: 23 MB, 442) and the
+           session ran out of memory 8 min in. Once the programs are saved the
+           game starts over in a fresh process that reads them back. The flag
+           file stops a loop when the cache does not stick. */
+        extern int g_prog_compiles, g_prog_saved;
+        static const char *const flag = "ux0:data/NFSU2/cache/shader_restart.txt";
+        FILE *rf = fopen(flag, "r");
+        if (rf) { fclose(rf); remove(flag); }
+#ifdef OPENUG2_SIM_PRE_H
+        /* test aid (simulator): desktop GL saves no program binaries;
+           OPENUG2_SIM_PROGSAVED=1 counts them as saved to run the restart */
+        if (getenv("OPENUG2_SIM_PROGSAVED")) g_prog_saved = g_prog_compiles;
+#endif
+        int sh = !rf && g_prog_compiles && g_prog_saved == g_prog_compiles;
+        if (sh && (rf = fopen(flag, "w")) != NULL) fclose(rf);
+        if (sh || g_boot_restart) {
+            vita_mark("boot: one-time work done (%d programs compiled%s), restarting the game with a clean heap",
+                      g_prog_compiles, g_boot_restart ? ", tiles converted" : "");
+            venue_relaunch(g_in_venue ? trackname : NULL, g_boot_ev);
+        }
+        if (g_prog_compiles)
+            vita_mark("shaders: %d programs compiled (%d saved), no restart", g_prog_compiles, g_prog_saved);
+    }
 #ifdef __vita__
     boot_frame();
 #endif
@@ -18996,6 +19083,7 @@ int main(int argc, char **argv) {
         g_boot_full = NULL;
         if (g_boot_fe && !g_ls_fe) g_ls_fe = g_boot_fe;   /* kept: every later loading screen */
         else if (g_boot_fe) shop_close(&g_boot_fe);
+        if (g_boot_fe) audio_pause_game(0);   /* the loading screen is gone: the game's sounds back */
         g_boot_fe = NULL; g_ls_drawn = 0;
         if (fe) shop_set_car(fe, carname, &carcfg, modification);
         else if (!nf) fe = shop_open(dataroot, carname, &carcfg, modification,
@@ -19253,6 +19341,7 @@ int main(int argc, char **argv) {
 #endif
         pf_mark(PF_FRAME_TOP);
 #ifdef __vita__
+        { extern void vita_step(const char *label); vita_step("frame"); }   /* the hang recorder's frame tick */
         vita_wd_armed = RT_RACE && race_state == 0 && !race_place_pending && !race_start_pending
                         && g_rt.t > 1.0f;
         int vita_ticks = 1;
@@ -20482,7 +20571,12 @@ int main(int argc, char **argv) {
                 /* 0x4d82d0: the stick turns the car (turntable) and moves the
                    eye: y -= in x 0.5 in [-6.5, -0.1], z += in x 0.1 in
                    [1.2, 5.2], per 1/60 s */
-                heading += vita_rstick_x * 0.035f;
+                /* the sign is the pad's (GitHub #19): the PC's mouse drag
+                   (0x4a5d90: +0x248 = dx * 0.5) turns it the other way, the
+                   GC CarOrbiter (HandleJoyEvent 800fa690: -(x - 128) / 128,
+                   HandleTick 800fccbc: +0x294 += that x dt x 60 deg) pushes
+                   right -> the heading goes down */
+                heading -= vita_rstick_x * 0.035f;
                 g_room_eye[1] -= vita_lstick_y * 0.5f;
                 if (g_room_eye[1] < -6.5f) g_room_eye[1] = -6.5f;
                 if (g_room_eye[1] > -0.1f) g_room_eye[1] = -0.1f;
@@ -23055,13 +23149,25 @@ int main(int argc, char **argv) {
              sound plays the scene (idling down, the event track's rev
              patterns) instead of the car; one step a tick (assumed: the
              call rate of the game's audio update is not decoded) */
-          g_rt.rev_on = nis_rev_step(&g_rt.rev, g_rt.active && g_rt.nis && race_state == 0);
+          /* the player's engine (0x484c50, GC SFXCTL_Physics::UpdateParams 800946c0)
+             leaves the scene once its car is activated (Car::Activate 80224ce4 ->
+             SFX message 11 -> +0xd0, the hand-off) and the race stage is 2..4:
+             the countdown revs are the player's own (GitHub #8). Only the AI's
+             (0x47c490, GC SFXCTL_AIPhysics 800950c8) wait for stage 4 = GO. */
+          g_rt.rev_on = nis_rev_step(&g_rt.rev, g_rt.active && g_rt.nis && race_state == 0 && g_rt.nis_on);
           for (int k = 0; k < g_rt.n; k++)
               nis_rev_step(&g_rt.arev[k], g_rt.active && g_rt.nis && race_state == 0);
           if (g_rt.rev_on) {
               g_engine.target_rpm = g_rt.rev.rpm;
               g_engine.load = g_rt.rev.thr * 0.01f;     /* throttle 0..100 */
           }
+#ifdef OPENUG2_SIM_PRE_H
+          {   static int ll;   /* test aid: the start line's gas, tach and engine note */
+              if (getenv("OPENUG2_SIM_LINELOG") && race_state == 0 && g_rt.active && ++ll % 10 == 0)
+                  printf("line: gas %d nis_on %d rev_on %d tach %.0f sound %.0f\n", ks[SDL_SCANCODE_W] != 0,
+                         g_rt.nis_on, g_rt.rev_on, g_n2s.rpm_tach, g_engine.target_rpm);
+          }
+#endif
           /* rpm and throttle already shape the recordings' loudness; speed
              only adds a little on top (0.16 at a standstill was near silent
              next to the shift and skid clips) */
@@ -24917,6 +25023,20 @@ int main(int argc, char **argv) {
                 chasecam_photo(&g_ccam, &cc, up3, g_sc.cam, g_wcoll, &cc_out);
             } else {
                 g_nis_znear = 0;
+                {   /* port addition (user request): the right stick orbits the chase
+                       views -- not with hydraulics fitted (the stick is theirs,
+                       0x4078f2), paused, or on the post-race screens */
+                    float ox = 0.0f, oy = 0.0f;
+                    int rs_bound = 0;   /* a right stick direction bound to an action (PR #22): the stick is that action's */
+                    for (int a = 0; a < OPT_ACT_COUNT; a++)
+                        for (int k = 0; k < 2; k++)
+                            if (g_opt.ctl[a][k] >= VB_RS_UP && g_opt.ctl[a][k] <= VB_RS_RIGHT) rs_bound = 1;
+                    if (!rs_bound && g_hyd_level <= 0 && !g_pause.on && !post_up() && !tun_active() &&
+                        !(g_rt.active && (g_rt.pfinished || g_rt.postrace))) {
+                        ox = -vita_rstick_x; oy = vita_rstick_y;   /* right: the view turns right */
+                    }
+                    chasecam_orbit(&g_ccam, ox, oy, cc_dt);
+                }
                 chasecam_update(&g_ccam, &cc, cc_dt, g_wcoll, cobs, ncobs, &cc_out);
                 {   /* the jump cam zones' TrackCarCameraMover (ChangeCameraMover 0xf / 0x10) */
                     JcCar jc; JcEnv je;
@@ -29110,6 +29230,10 @@ int main(int argc, char **argv) {
             hs.have_rpm = 1;
             hs.rpm = g_engine.target_rpm;
             hs.rpm_redline = ENG_REDLINE_RPM;   /* the gearbox's own limit */
+            if (g_n2 && g_n2rec_ok) {   /* GitHub #15: the tach's dial and needle scale by the engine (0x5ed9b0) */
+                hs.tach_red = n2sim_param(g_n2, 0x1f4);
+                hs.tach_lim = n2sim_param(g_n2, 0x1f8);
+            }
             /* manual shows the selected gear (N, R); automatic shows R
                while rolling backwards */
             hs.gear = g_manual ? gear : speed < -0.005f ? -1 : gear;
@@ -29670,6 +29794,14 @@ int main(int argc, char **argv) {
 #ifdef __vita__
             if (world2 && race_state == 0 && world.city.race.active && race_place_pending)
                 hud_draw_banner(hud, &rp, &quad, "LOADING", NULL, W, H);
+            {   /* the game's sounds (engine, skids, ambience) stop under the loading
+                   screen; its own menu sounds play (GitHub #10: the engine went on
+                   behind it after a race) */
+                static int ls_mute;
+                int up = g_restart_ls && ((race_state == 3 && (race_start_pending || g_qr_pending || g_career_go || g_switch_track))
+                                          || (race_state == 0 && race_place_pending));
+                if (up != ls_mute) { audio_pause_game(up ? 1 : g_pause.on); ls_mute = up; }
+            }
             if (g_restart_ls) {                  /* RCSTATE LOADING after a Restart */
                 if ((race_state == 3 && (race_start_pending || g_qr_pending || g_career_go || g_switch_track))
                     || (race_state == 0 && race_place_pending)) {

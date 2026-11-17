@@ -45,6 +45,8 @@ typedef struct {
     /* --- drivetrain readouts --- */
     float speed_kmh;          /* REAL: PHYS_KMH(speed) */
     float rpm, rpm_redline;   /* PROVISIONAL: the virtual AUDIO gearbox */
+    float tach_red, tach_lim; /* engine record +0x1f0 +4 / +8: the tach's dial class (0x5ed9b0) and
+                                 needle scale; 0 = the default 10500 dial */
     int   gear;               /* <0 reverse, 0 neutral, 1..n forward */
     int   gear_out;           /* car +0x448 == 0 (gearbox mid-shift): orange gear */
     int   nitro_active;       /* REAL, but binary: there is no tank model */

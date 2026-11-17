@@ -17,7 +17,7 @@ TITLE="OpenUG2"                    # file names (elf, vpk)
 VPK_NAME="NFSU2Vita"                # the release VPK's file name
 DISPLAY_TITLE="NFS Underground 2"  # name on the LiveArea / home screen
 TITLEID="NFSU20001"
-VERSION="00.11"
+VERSION="00.12"
 
 mkdir -p "$OUT/obj" "$OUT/sce_sys"
 
