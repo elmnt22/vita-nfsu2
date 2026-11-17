@@ -2165,14 +2165,21 @@ static const struct { int act; uint32_t str; int career; } k_lsc_act[LSC_N] = { 
 static void lsc_anchor(int vb, float *x, float *y) {
     static const float a[VB_COUNT][2] = {
         { 0, 0 },
-        { 216, 124 }, { 226, 114 }, { 206, 114 }, { 216, 104 },   /* cross circle square triangle */
-        { 40, 80 }, { 216, 80 },                                   /* L R */
-        { 40, 105 }, { 40, 123 }, { 31, 114 }, { 49, 114 },        /* d-pad */
-        { 222, 166 }, { 207, 166 },                                /* start select */
-        { 54, 146 }, { 54, 146 },                                  /* left stick */
-        { 114, 211 }, { 142, 211 }, { 114, 223 }, { 142, 223 },    /* rear touch corners (inset) */
+        { 216, 124 }, { 226, 114 }, { 206, 114 }, { 216, 104 },
+        { 40, 80 }, { 216, 80 },
+        { 40, 105 }, { 40, 123 }, { 31, 114 }, { 49, 114 },
+        { 222, 166 }, { 207, 166 },
+        { 54, 146 }, { 54, 146 },
+        { 114, 211 }, { 142, 211 }, { 114, 223 }, { 142, 223 },
+        { 54, 136 }, { 54, 156 },
+        { 202, 136 }, { 202, 156 },
+        { 192, 146 }, { 212, 146 },
+        { 97, 113 }, { 159, 113 },
+        { 97, 149 }, { 159, 149 }
     };
-    *x = a[vb][0]; *y = a[vb][1];
+
+    *x = a[vb][0];
+    *y = a[vb][1];
 }
 
 typedef struct { int k; float a, b, c, d, e, w; } LscShp;   /* 0 rrect (cx cy hw hh r; w > 0: its outline), 1 segment (x0 y0 x1 y1, half width w) */
