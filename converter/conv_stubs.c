@@ -72,3 +72,4 @@ void vita_copy_push(void *dst, const void *src, unsigned n) { memcpy(dst, src, n
 int vita_copy_idle(void) { return 1; }
 void vita_copy_wait(void) {}
 void vita_copy_stats(unsigned long long *us, unsigned long long *bytes) { *us = 0; *bytes = 0; }
+void vita_step(const char *label) { (void)label; }   /* the hang recorder (sdl_vita.c) */

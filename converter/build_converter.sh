@@ -25,7 +25,7 @@ GAME_FLAGS=(-include "$ROOT/sim/include/sim_pre.h")
 # and the collision copy the tiles carry)
 SRC="src/world_tiles.c src/world_instance.c src/world.c src/resource.c src/world_mesh.c src/world_resident.c
      src/render.c src/physics.c src/wcoll.c src/shop.c src/feng.c converter/conv_extras.c
-     src/options.c src/perfparts.c src/vinyl.c src/pcsave.c src/garage_line.c"
+     src/options.c src/perfparts.c src/vinyl.c src/pcsave.c src/garage_line.c src/beyond.c"
 
 OBJS=(); pids=()
 for s in $SRC; do
