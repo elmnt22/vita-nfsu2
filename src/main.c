@@ -24973,6 +24973,16 @@ int main(int argc, char **argv) {
                 chasecam_photo(&g_ccam, &cc, up3, g_sc.cam, g_wcoll, &cc_out);
             } else {
                 g_nis_znear = 0;
+                {   /* port addition (user request): the right stick orbits the chase
+                       views -- not with hydraulics fitted (the stick is theirs,
+                       0x4078f2), paused, or on the post-race screens */
+                    float ox = 0.0f, oy = 0.0f;
+                    if (g_hyd_level <= 0 && !g_pause.on && !post_up() && !tun_active() &&
+                        !(g_rt.active && (g_rt.pfinished || g_rt.postrace))) {
+                        ox = -vita_rstick_x; oy = vita_rstick_y;   /* right: the view turns right */
+                    }
+                    chasecam_orbit(&g_ccam, ox, oy, cc_dt);
+                }
                 chasecam_update(&g_ccam, &cc, cc_dt, g_wcoll, cobs, ncobs, &cc_out);
                 {   /* the jump cam zones' TrackCarCameraMover (ChangeCameraMover 0xf / 0x10) */
                     JcCar jc; JcEnv je;
