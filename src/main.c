@@ -6906,6 +6906,7 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
                          const WEvent *e, int laps, float carpos[3], float *heading)
 {
     RT_CRUMB("race setup: event %d", e->id);
+    troot = beyond_troot(troot, e->reg);   /* Beyond: its ROUTESBEYOND */
     rt_end();
     g_rt.laps = laps = rt_test_laps(laps);
     if (!g_ai_have || !g_n2rec_ok || !perf_ready() || airace_ntypes() <= 0) {
@@ -13125,7 +13126,7 @@ static int event_start_focus(const char *troot, const char *track, int ev, float
     if (!troot || !track || !xy || ev < 4000) return 0;
     const char *stem = !strncmp(track, "STREAM", 6) ? track + 6 : track;
     char p[1024];
-    snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", troot, stem, ev);
+    snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", beyond_troot(troot, stem), stem, ev);
     long len = 0;
     unsigned char *d = n2_read_file(p, &len);
     if (!d) return 0;
@@ -14105,9 +14106,10 @@ static int switch_thread(void *a) {
     if (g_sw.ok) g_sw.ok = world_resident_precompute(g_sw.cand);
     /* as the boot's world_load_ex: the city data reads the ground of this area */
     if (g_sw.ok) world_ground_grid_activate(&g_sw.cand->world.grid);
-    if (beyond_is_track(g_sw.args.trackname)) { g_sw.done = 1; return 0; }   /* no events / nav: free roam only */
+    /* (Beyond: its events from ROUTESBEYOND when the converter wrote them; free roam without) */
     g_sw.ok = g_sw.ok &&
-              world_city_load(&g_sw.city, &g_sw.cand->world, g_sw.args.track_root, g_sw.args.trackname) > 0;
+              (world_city_load(&g_sw.city, &g_sw.cand->world, g_sw.args.track_root, g_sw.args.trackname) > 0 ||
+               beyond_is_track(g_sw.args.trackname));
     g_sw.done = 1;
     return 0;
 }
@@ -21183,7 +21185,11 @@ int main(int argc, char **argv) {
                 g_roam_level = g_qr.traffic; g_roam_diff = g_qr.difficulty;   /* 0x53f580: R+4, R+2 */
                 if (g_rt.roam) rt_end();
                 if (beyond_enabled() && g_beyond_pick) {   /* the World Expansion (beyond.h), chosen at Free Run */
-                    if (!beyond_is_track(trackname)) venue_go(BEYOND_TRACK, 0);
+                    int bev = 0;
+#ifdef OPENUG2_SIM_PRE_H
+                    if (getenv("OPENUG2_SIM_BEYOND_EV")) bev = atoi(getenv("OPENUG2_SIM_BEYOND_EV"));   /* test aid (simulator): that Beyond event on arrival */
+#endif
+                    if (!beyond_is_track(trackname)) venue_go(BEYOND_TRACK, bev);
                     else { race_state = 1; g_ride_ready = 0; }
                 }
                 else if (strcmp(stem, "L4RA")) { venue_go(NULL, 0); }

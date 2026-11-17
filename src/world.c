@@ -583,6 +583,7 @@ int world_city_load(WorldCity *city,
                     const WorldNeighborhood *initial_neighborhood,
                     const char *troot, const char *trackname) {
     if (!city || !initial_neighborhood || !troot || !trackname) return 0;
+    troot = beyond_troot(troot, trackname);   /* Beyond: its own events (ROUTESBEYOND) */
     World facade;
     memset(&facade, 0, sizeof facade);
     facade.neighborhood = *initial_neighborhood;
@@ -1817,7 +1818,7 @@ static int race_load_grid(const World *w, const char *troot, int evid,
         const char *rn = w->neighborhood.rgn[r].name;
         const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
         char p[1024];
-        snprintf(p, sizeof p, "%s/ROUTES%s/TrackPosMarkersAll.bin", troot, stem);
+        snprintf(p, sizeof p, "%s/ROUTES%s/TrackPosMarkersAll.bin", beyond_troot(troot, stem), stem);
         long len = 0; unsigned char *d = n2_read_file(p, &len);
         if (!d) continue;
         N2Leaf leaf[4]; int nl = 0;

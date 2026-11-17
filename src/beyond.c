@@ -152,6 +152,9 @@ int beyond_tex_decode(uint32_t key, N2Tex *t) {
     return 1;
 }
 
+const char *beyond_troot(const char *troot, const char *reg) {
+    return reg && beyond_is_track(reg) && beyond_enabled() ? BEYOND_DIR : troot;
+}
 int beyond_spawn(float xy[2], float *heading_rad) {
     FILE *f = fopen(BEYOND_DIR "/spawn.txt", "r");
     if (!f) return 0;
