@@ -3375,8 +3375,14 @@ static int prepare_body_kit(BodyKitCandidate *kit,
             const N2Mesh *candidate=kit->scene.meshes+j;
             if(candidate->famkey==m->famkey || (m->car_part &&
                config->parts[m->car_part-1] && candidate->car_part==m->car_part))found=1;
+            /* GitHub #12: aftermarket brakes (n2_mod_brakes) replace the car's own
+               front brakes -- not a dropped part; every kit change on a car with
+               upgraded brakes (Rachel's 350Z, imported saves) was refused here */
+            if(m->car_mount==N2_MOUNT_FRONT_BRAKE && candidate->car_mount==N2_MOUNT_FRONT_BRAKE)found=1;
         }
-        if(!found)KIT_FAIL("would drop a stock part (family %08x)",(unsigned)m->famkey);
+        if(!found){char nm[64]="";long off=m->car_source;
+            if(off>=8 && off<=len)n2_car_mesh_name(data,off,off+n2_u32(data+off-4),nm);
+            KIT_FAIL("would drop a stock part (family %08x %s)",(unsigned)m->famkey,nm);}
     }
     kit->stock_wheel=n2_car_prepare_wheels(&kit->scene);
     if(glGetError()!=GL_NO_ERROR)KIT_FAIL("GL error before upload");
