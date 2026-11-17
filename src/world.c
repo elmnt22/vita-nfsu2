@@ -2907,6 +2907,7 @@ static struct {
     uint16_t *tree;           /* nodes * 4 */
     float cur[8], last[2];
     int have_cur;
+    int fixed;                /* World Expansion (port): the one entry used everywhere, -1 the tree */
 } g_fog;
 static struct { float I, v[8], mix[8]; int n; } g_fog_rain;   /* the rain's share (rain.c) */
 
@@ -2919,6 +2920,11 @@ static uint32_t fog_hash(const char *s) {
 int world_fog_load(const char *troot, const char *track) {
     free(g_fog.palette); free(g_fog.tree);
     memset(&g_fog, 0, sizeof g_fog);
+    g_fog.fixed = -1;
+    /* the World Expansion has no fog table and the city's tree is in city
+       coordinates: L4RA's "Normal Fog", its most common entry everywhere */
+    int borrow = beyond_is_track(track);
+    if (borrow) track = "L4RA";
     const char *stem = !strncmp(track, "STREAM", 6) ? track + 6 : track;
     char path[1024]; snprintf(path, sizeof path, "%s/%s.BUN", troot, stem);
     FILE *f = fopen(path, "rb");
@@ -2977,10 +2983,37 @@ int world_fog_load(const char *troot, const char *track) {
     printf("fog: %s \"Normal Fog\" %s (%d entries, %d nodes, box %.0f,%.0f..%.0f,%.0f)\n",
            path, g_fog.ok ? "loaded" : "missing", g_fog.entries, g_fog.nodes,
            g_fog.box[0], g_fog.box[1], g_fog.box[2], g_fog.box[3]);
+    if (g_fog.ok && borrow) {
+        /* the entry covering the most of the box (leaves are shared: walk it, by area) */
+        static double area[256];
+        int stack[256], depth[256], sp = 0, best = 0;
+        memset(area, 0, sizeof area);
+        stack[sp] = 0; depth[sp++] = 0;
+        while (sp > 0) {
+            sp--;
+            int k = stack[sp], d = depth[sp];
+            if (g_fog.tree[k * 4] == 0) {
+                int e = g_fog.tree[k * 4 + 1];
+                if (e < 256) area[e] += ldexp(1.0, -2 * d);
+                continue;
+            }
+            for (int c = 0; c < 4 && sp < 256; c++) {
+                int ch = g_fog.tree[k * 4 + c];
+                if (ch > 0 && ch < g_fog.nodes && d < 30) { stack[sp] = ch; depth[sp++] = d + 1; }
+            }
+        }
+        for (int e = 1; e < g_fog.entries && e < 256; e++) if (area[e] > area[best]) best = e;
+        g_fog.fixed = best;
+        const float *v = (const float *)(g_fog.palette + (size_t)best * (size_t)g_fog.stride);
+        printf("fog: World Expansion uses L4RA entry %d (%.0f%% of its box): amount %.2f, start %.0f m\n",
+               best, area[best] * 100.0, v[0], v[1]);
+    }
     return g_fog.ok;
 }
 
 static const float *fog_entry(float x, float y) {
+    if (g_fog.fixed >= 0 && g_fog.fixed < g_fog.entries)
+        return (const float *)(g_fog.palette + (size_t)g_fog.fixed * (size_t)g_fog.stride);
     float x0 = g_fog.box[0], y0 = g_fog.box[1], x1 = g_fog.box[2], y1 = g_fog.box[3];
     int idx = 0;
     /* no box test: 0x5f0930 / 0x5f0a30's "outside -> 0" exit never holds

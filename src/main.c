@@ -25492,6 +25492,9 @@ int main(int argc, char **argv) {
            10000+; the fog-off 2000 m covers the strips and is cheap there
            (opaque world ~0.5 ms). */
         if (!g_fog_linear) zfar = 2000.0f;
+        /* the World Expansion keeps the 2000 m it was tested with on HW (hwlog78/80, "little
+           pop-in"): its borrowed fog sets the look, not a nearer cut */
+        if (beyond_is_track(trackname)) zfar = 2000.0f;
         if (zfar < WORLD_STANDIN_GATE + 400.0f) zfar = WORLD_STANDIN_GATE + 400.0f;
         {   int nsk = 0; skyline_batches(&nsk);   /* the resident skyline (skyline.c) reaches farther */
             if (nsk && g_fog_linear && zfar < skyline_outer() + 200.0f) zfar = skyline_outer() + 200.0f; }   /* a stand-in batch reaching past the gate is not sliced (256 m stand-in cells: diagonal 362 m) */
