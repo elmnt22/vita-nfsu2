@@ -29065,6 +29065,7 @@ int main(int argc, char **argv) {
                 } else if (g_acid_t[i].c) acid_slot_drop(&g_acid_t[i]);
             }
             /* the World Expansion's race starts (port): free roam there, the zone the car is in */
+            g_glow_cells = beyond_is_track(trackname);
             g_bey_roam = beyond_enabled() && beyond_is_track(trackname) && race_state == 1 && !RT_RACE && !g_fe && !g_shop;
             g_bey_scene = &scene;
             if (g_bey_roam && !g_pause.on) {

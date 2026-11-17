@@ -356,6 +356,7 @@ int upload_world_batches_bind_checked(WorldBatchUpload *job, const GLuint *textu
  * since there are only ever a handful of skybox/neon meshes per city. Sky,
  * glow, vista and diagnostic-marker batches keep their own dedicated render
  * treatment, so their callers pass mtexmode = NULL (-> N2_DRAW_OPAQUE). */
+extern int g_glow_cells;   /* Beyond: glow batches per world cell (render.c) */
 int  upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
                         const unsigned char *mtexmode);
 void render_batch_array_free(N2Batch **batches, int *count);

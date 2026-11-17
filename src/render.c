@@ -3709,6 +3709,7 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
 /* Same merge as above but for exactly one category, grouped by texture only
  * (no spatial grid — a city has a handful of skybox/neon meshes, not tens of
  * thousands, so there's nothing for a cell split to buy here). */
+int g_glow_cells;   /* Beyond (port): glow batched per world cell, so a rebuild finds them by hash */
 int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
                        const unsigned char *mtexmode) {
     int n = s->count;
@@ -3719,6 +3720,14 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
         if (s->meshes[i].cat == cat) {
             ent[m].key = mtex[i]; ent[m].idx = i;
             ent[m].cell_x = ent[m].cell_y = 0;
+            /* hwlog80: Beyond's glow batches spanned the whole resident set,
+               so tiles coming and going changed every batch -- repacked each
+               rebuild (20-46 ms on the frame thread). Per cell they persist. */
+            if (g_glow_cells && cat == N2_GLOW && s->meshes[i].world_bounds_valid) {
+                const float *wb = s->meshes[i].world_bounds;
+                ent[m].cell_x = (int)floorf((wb[0] + wb[3]) * 0.5f / WORLD_BATCH_CELL_M);
+                ent[m].cell_y = (int)floorf((wb[1] + wb[4]) * 0.5f / WORLD_BATCH_CELL_M);
+            }
             int mode = mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE;
             ent[m].group = (unsigned char)n2_world_batch_material_group(
                 &s->meshes[i], mode);
@@ -3751,7 +3760,9 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
     int i0 = 0, verts = 0;
     for (int i = 0; i <= m; i++) {
         int flush = (i == m) || (i > i0 && (ent[i].key != ent[i0].key ||
-                                            ent[i].group != ent[i0].group)) ||
+                                            ent[i].group != ent[i0].group ||
+                                            ent[i].cell_x != ent[i0].cell_x ||
+                                            ent[i].cell_y != ent[i0].cell_y)) ||
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
             if (nb == cap) {
@@ -3803,9 +3814,10 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
 #ifdef __vita__
     {
         static int logged;
-        if (cat == N2_SKY && logged < 12) {
+        if ((cat == N2_SKY || cat == N2_GLOW) && logged < 24) {
             logged++;
-            printf("sky batches: %d (%d meshes), %d found by hash%s\n", nb, m, found,
+            printf("%s batches: %d (%d meshes), %d found by hash%s\n",
+                   cat == N2_SKY ? "sky" : "glow", nb, m, found,
                    pk ? "" : " (no mesh hashes)");
         }
     }
