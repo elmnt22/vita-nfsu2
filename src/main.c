@@ -9162,6 +9162,7 @@ static struct {
     int wcfail;                   /* the shop dialog in its failed-challenge form (its dtor: ResetPostFailure) */
     int mv_shop;                  /* the pre-shop movie has played: LaunchEngagedShop */
     int bev;                      /* ENG_RACE of a World Expansion event (port): its id, ev NULL */
+    int bshop;                    /* ENG_SHOP of a World Expansion shop (port): its type + 1, shop NULL */
 } g_eng;
 static int g_eng_auto;            /* RC message 0x11: an engage dialog pops by itself (a challenge's goal / failure) */
 /* ShowcaseMagazineDialog (UI_ShowCase_Preview.fng, GC 800e8a08 / PC 0x4ce770):
@@ -9663,6 +9664,28 @@ static int eng_beyond_open(const char *dataroot, int idx)
     printf("engage: Beyond race dialog %s (event %d, type %d, %d m, %s)\n", beyond_event_name(id), id, type, len, nm[0]);
     return 1;
 }
+/* The shop dialog for a World Expansion shop / garage (port): EngageShopDialog's
+   header / accept of its type; the body a shop's "been before" one, a crib's own */
+static int eng_beyond_shop_open(const char *dataroot, int idx)
+{
+    int type;
+    if (!beyond_shop_at(idx, &type, NULL, NULL)) return 0;
+    Hud *h = hud_init_screen(dataroot, "GLOBAL/InGameCommon.bun", "UI_EngageShopDialog.fng");
+    if (!h) { printf("engage: UI_EngageShopDialog.fng not loaded\n"); return 0; }
+    g_eng.h = h; g_eng.kind = ENG_SHOP; g_eng.ev = NULL; g_eng.shop = NULL; g_eng.done = 0; g_eng.wcfail = 0;
+    g_eng.bshop = type + 1; g_eng.bev = 0;
+    unsigned char fs[0x60]; memset(fs, 0, sizeof fs); fs[0x50] = (unsigned char)type;
+    hud_screen_wrap(h, 1);
+    hud_screen_label_h(h, 0x02edbde5u, career_shop_header(fs));
+    hud_screen_label_h(h, 0x04a04e7cu, type ? 0x15d6b438u : 0x987eecdau);
+    hud_screen_label_h(h, 0xd72f002au, career_shop_accept(fs));
+    hud_screen_script_all(h, "FadeIn");
+    hud_screen_script_h(h, 0xb1000cc8u, "Init"); hud_screen_script_h(h, 0xb8a7c6ceu, "Init");
+    g_eng.focus = 1; eng_focus();
+    audio_fe_play(FE_SND_BACK);
+    printf("engage: Beyond shop dialog (type %d)\n", type);
+    return 1;
+}
 /* EngageShopDialog::Setup 800e7e74; open sound: MakeFrontendSound(10). A world
    challenge running: at its goal shop the shop's header with
    GetEnterUniquesShopMessageBody (0xe514579d); failed (no shop) header "",
@@ -9671,7 +9694,7 @@ static int eng_shop_open(const char *dataroot, const unsigned char *shop)
 {
     Hud *h = hud_init_screen(dataroot, "GLOBAL/InGameCommon.bun", "UI_EngageShopDialog.fng");
     if (!h) { printf("engage: UI_EngageShopDialog.fng not loaded\n"); return 0; }
-    g_eng.h = h; g_eng.kind = ENG_SHOP; g_eng.ev = NULL; g_eng.shop = shop; g_eng.done = 0;
+    g_eng.h = h; g_eng.kind = ENG_SHOP; g_eng.ev = NULL; g_eng.shop = shop; g_eng.done = 0; g_eng.bshop = 0;
     hud_screen_wrap(h, 1);                    /* the FEng string layout: lines break at Sw */
     g_eng.wcfail = career_wc_active() && g_career.wcs.failed;
     if (g_eng.wcfail) {
@@ -10003,6 +10026,18 @@ static float rdf(const unsigned char *p) { float f; memcpy(&f, p, 4); return f; 
 static int g_bey_roam;                /* this frame: Beyond free roam, no race */
 static const N2Scene *g_bey_scene;    /* its streamed ground (no wcoll yet) */
 static int g_bey_zone = -1;           /* the event start the car stands in (event index), -1 none */
+static int g_bey_szone = -1;          /* the shop / garage the car stands at (shops.txt index), -1 none */
+static int g_bey_shop_type = -1;      /* the Beyond shop open (its type), -1 none: back to free roam on exit */
+static int bey_shop_indicator(int t)  /* ei_shop_type 80111ca4 */
+{
+    switch (t) { case 0: return 0xc; case 1: return 0xf; case 2: return 0xd; case 3: return 0xe; case 5: return 0x10; }
+    return 1;
+}
+static int bey_shop_filter(int t)     /* map_zone_filter's shop half (0x500340) */
+{
+    switch (t) { case 1: return 9; case 2: return 10; case 5: return 11; case 3: return 12; case 0: return 14; }
+    return 10;
+}
 static float g_trig_zref;             /* the zone's height, for the scene ground under its emitters */
 static int bey_trig_k(int type)       /* airace type -> k_trig_map */
 {
@@ -11204,7 +11239,8 @@ static void eng_key(int key)
             pause_close();
         } else if (key == PK_OK) {                                   /* decline */
             audio_fe_play(FE_SND_BACK);
-            career_decline_shop(g_eng.shop);
+            if (g_eng.shop) career_decline_shop(g_eng.shop);
+            g_eng.bshop = 0;
             printf("engage: shop declined\n");
             pause_close();
         } else if (key == PK_BACK) {
@@ -19915,9 +19951,9 @@ int main(int argc, char **argv) {
                          !post_up() && career_current_zone() && career_can_engage() && eng_open(dataroot)) {
                 }
                 /* ... at a World Expansion event's start (port): its race dialog */
-                else if (k == SDLK_KP_9 && !e.key.repeat && g_bey_roam && g_bey_zone >= 0 && !post_up() && !g_eng.h) {
+                else if (k == SDLK_KP_9 && !e.key.repeat && g_bey_roam && (g_bey_zone >= 0 || g_bey_szone >= 0) && !post_up() && !g_eng.h) {
                     pause_close();
-                    if (eng_beyond_open(dataroot, g_bey_zone)) {
+                    if (g_bey_szone >= 0 ? eng_beyond_shop_open(dataroot, g_bey_szone) : eng_beyond_open(dataroot, g_bey_zone)) {
                         g_pause.on = 1; g_pause.race = 0; g_pause.eat_start = 0;
                         audio_pause_game(1); music_pause(1);
                     }
@@ -21294,6 +21330,28 @@ int main(int argc, char **argv) {
                     printf("showcase: the front end could not be opened\n");
                     world_tiles_trim(0);
                 }
+            } else if (act == ENG_ACT_SHOP && g_eng.bshop && race_state == 1) {
+                /* a World Expansion shop / garage (port): the front end's Customize over its scene */
+                int t = g_eng.bshop - 1;
+                g_eng.bshop = 0;
+                if (g_bey_szone >= 0) hud_event_remove(bey_shop_indicator(t));
+                g_bey_szone = -1;
+                race_state = 3;
+                vel[0] = vel[1] = 0; speed = 0;
+                garage_race = -1;
+                world_tiles_trim(1);
+                if (!g_shop) g_shop = shop_open(dataroot, carname, &carcfg, modification,
+                                                wheel_brands[wheel_brand], wheel_style);
+                if (g_shop) cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
+                if (g_shop && shop_beyond_customize(g_shop, t)) {
+                    g_bey_shop_type = t;
+                    printf("beyond: shop type %d entered\n", t);
+                } else {
+                    shop_close(&g_shop);
+                    world_tiles_trim(0);
+                    race_state = 1; g_ride_ready = 0;
+                    printf("beyond: the shop could not be opened -- back to free roam\n");
+                }
             } else if (act == ENG_ACT_SHOP && g_eng.shop && !g_eng.mv_shop &&
                        ((const char *)g_eng.shop)[0x20] && !career_been_to_shop(g_eng.shop)) {
                 /* MaybeEnterShop 0x499640: ShopDataDesc +0x20 is the pre-shop movie (SCENE05 /
@@ -21792,6 +21850,13 @@ int main(int argc, char **argv) {
                     shop_close(&g_shop);
                     world_tiles_trim(0);
                     kit_globalb_release();
+                    if (g_bey_shop_type >= 0) {   /* a World Expansion shop (port): back to its free roam */
+                        g_bey_shop_type = -1;
+                        race_state = 1; g_ride_ready = 0;
+                        vel[0] = vel[1] = 0; speed = 0;
+                        printf("beyond: shop left -- back to free roam\n");
+                        break;
+                    }
                     if (cs == 1) {   /* CalcPrevScreenFromChooseCustomizeCategory: UI_CareerCrib.fng */
                         world_tiles_trim(1);
                         g_fe = shop_open(dataroot, carname, &carcfg, modification,
@@ -23988,6 +24053,11 @@ int main(int argc, char **argv) {
             if (ba && !bat_done && g_bey_roam && g_ride_ready && !bat_t) bat_t = SDL_GetTicks();
             if (ba && !bat_done && bat_t && SDL_GetTicks() - bat_t > 3000) {
                 bat_done = 1;
+                float sp[3], sh;   /* "shop:<i>": that shops.txt line */
+                if (!strncmp(ba, "shop:", 5) && beyond_shop_at(atoi(ba + 5), NULL, sp, &sh)) {
+                    memcpy(g_ft.p, sp, sizeof sp); g_ft.go = 1; heading = sh;
+                    printf("sim: OPENUG2_SIM_BEYOND_AT %s -> (%.0f %.0f %.1f)\n", ba, sp[0], sp[1], sp[2]);
+                }
                 for (int i = 0; i < beyond_event_count(); i++) {
                     int id, t, l; float p[3], hd;
                     if (beyond_event_at(i, &id, &t, &l) && id == atoi(ba) && beyond_event_start(i, p, &hd)) {
@@ -29019,6 +29089,28 @@ int main(int argc, char **argv) {
                 if (beyond_event_at(g_bey_zone, &id, &t, &l)) hud_event_remove(bey_indicator(t));
                 g_bey_zone = -1;
             }
+            if (g_bey_roam && !g_pause.on) {                              /* ... and the shop / garage */
+                int in = -1; float best = 15.0f * 15.0f;
+                for (int i = 0; i < beyond_shop_count(); i++) {
+                    float p[3];
+                    if (!beyond_shop_at(i, NULL, p, NULL) || fabsf(p[2] - carpos[2]) > 8.0f) continue;
+                    float dx = p[0] - carpos[0], dy = p[1] - carpos[1], d = dx * dx + dy * dy;
+                    if (d < best) { best = d; in = i; }
+                }
+                if (in != g_bey_szone) {
+                    int t;
+                    if (g_bey_szone >= 0 && beyond_shop_at(g_bey_szone, &t, NULL, NULL)) hud_event_remove(bey_shop_indicator(t));
+                    if (in >= 0 && beyond_shop_at(in, &t, NULL, NULL)) {
+                        hud_event_add(bey_shop_indicator(t), 0);
+                        printf("beyond: at shop %d (type %d)\n", in, t);
+                    }
+                    g_bey_szone = in;
+                }
+            } else if (!g_bey_roam && g_bey_szone >= 0) {
+                int t;
+                if (beyond_shop_at(g_bey_szone, &t, NULL, NULL)) hud_event_remove(bey_shop_indicator(t));
+                g_bey_szone = -1;
+            }
             trig_update((live && g_career_mode && g_rt.active && g_rt.roam && n2_active()) ||
                         (live && g_bey_roam && n2_active()));   /* UpdateTriggerEffects */
             {   /* The showroom stands in room space at the car's world spot (DISC01 under the
@@ -29533,6 +29625,12 @@ int main(int argc, char **argv) {
                     if (!beyond_event_at(i, &id, &t, &l) || !beyond_event_start(i, p, NULL) || (k = bey_trig_k(t)) < 0) continue;
                     HudMapZone *m = &map_zones[hs.map_zone_n++];
                     m->x = p[0]; m->y = p[1]; m->type = map_zone_type(k); m->cross = 0; m->blink = 0;
+                }
+                for (int i = 0; i < beyond_shop_count() && hs.map_zone_n < 64; i++) {
+                    int t; float p[3];
+                    if (!beyond_shop_at(i, &t, p, NULL)) continue;
+                    HudMapZone *m = &map_zones[hs.map_zone_n++];
+                    m->x = p[0]; m->y = p[1]; m->type = map_zone_type(bey_shop_filter(t)); m->cross = 0; m->blink = 0;
                 }
                 hs.map_zones = map_zones;
             } else

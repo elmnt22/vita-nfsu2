@@ -198,6 +198,7 @@ void  shop_draw_under(Shop *s, const RProg *rp, int width, int height);
    back to Explore Mode. Either way the exit is SHOP_ACT_EXIT. Returns 0
    for a shop type the port has no screen for. shop: the ShopDataDesc
    (entry 0), its scene (+0x40) the platform. */
+int   shop_beyond_customize(Shop *s, int type);   /* World Expansion shop / garage (port), non-career */
 int   shop_career_customize(Shop *s, int entry, const unsigned char *shop);
 /* the crib again after Change Parts, on that option (from_main: it was
    entered from the career menu) */

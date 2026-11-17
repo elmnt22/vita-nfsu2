@@ -219,6 +219,38 @@ static void bx_events_load(void) {
     }
     printf("beyond: %d race events, %d free-roam starts\n", g_bx_nev, ns);
 }
+
+/* ---- shops and the garage (ROUTESBEYOND/shops.txt: "type x y z heading_deg") ---- */
+#define BX_MAXSHOP 32
+static struct { int type; float p[3], head; } g_bx_shop[BX_MAXSHOP];
+static int g_bx_nshop = -1;
+static void bx_shops_load(void) {
+    if (g_bx_nshop >= 0) return;
+    g_bx_nshop = 0;
+    if (!beyond_enabled()) return;
+    FILE *f = fopen(BEYOND_DIR "/ROUTESBEYOND/shops.txt", "r");
+    if (!f) return;
+    char line[160];
+    while (g_bx_nshop < BX_MAXSHOP && fgets(line, sizeof line, f)) {
+        int t; float x, y, z, hd;
+        if (sscanf(line, "%d %f %f %f %f", &t, &x, &y, &z, &hd) != 5 || t < 0 || t > 6) continue;
+        g_bx_shop[g_bx_nshop].type = t;
+        g_bx_shop[g_bx_nshop].p[0] = x; g_bx_shop[g_bx_nshop].p[1] = y; g_bx_shop[g_bx_nshop].p[2] = z;
+        g_bx_shop[g_bx_nshop].head = hd * 3.14159265f / 180.0f;
+        g_bx_nshop++;
+    }
+    fclose(f);
+    printf("beyond: %d shops\n", g_bx_nshop);
+}
+int beyond_shop_count(void) { bx_shops_load(); return g_bx_nshop; }
+int beyond_shop_at(int i, int *type, float p[3], float *head) {
+    bx_shops_load();
+    if (i < 0 || i >= g_bx_nshop) return 0;
+    if (type) *type = g_bx_shop[i].type;
+    if (p) memcpy(p, g_bx_shop[i].p, sizeof g_bx_shop[i].p);
+    if (head) *head = g_bx_shop[i].head;
+    return 1;
+}
 int beyond_event_count(void) { bx_events_load(); return g_bx_nev; }
 int beyond_event_at(int i, int *id, int *type, int *len) {
     bx_events_load();

@@ -8618,6 +8618,29 @@ int shop_career_customize(Shop *s, int entry, const unsigned char *shop) {
     return 1;
 }
 
+/* The World Expansion's shops and garage (port; beyond.h shops.txt): no career
+   there, so its shops open the front end's Customize (no wallet, the front
+   end's unlocks, the FE garage) -- the garage at the Car Shop menu, a shop at
+   its own category as PickScreenForShop does (3 perf, 1 paint, 2 body parts,
+   5 specialties), in the city shop's scene */
+int shop_beyond_customize(Shop *s, int type) {
+    static const int plat[7] = { 1, 6, 7, 8, 3, 2, 5 };   /* SHOWROOM, PAINTSHOP01, PARTSSHOP01, PERFSHOP01, .., AUDIOSHOP01 */
+    if (!s || type < 0 || type > 6) return 0;
+    s->cust_entry = 0;
+    s->cshop = NULL; s->fe_shop = NULL;
+    s->career = 0;
+    s->platform = plat[type];
+    switch (type) {
+    case 2: s->cust_shop = 0; s->body.sel = 0; s->body.scroll = 0.0f; body_locks(s); s->screen = SC_BODY; break;
+    case 3: s->cust_shop = 1; car_shop_open(s, CAT_PERFORMANCE); break;
+    case 1: s->cust_shop = 2; car_shop_open(s, CAT_GRAPHICS); break;
+    case 5: s->cust_shop = 3; car_shop_open(s, CAT_SPECIALTIES); break;
+    default: s->cust_shop = 0; s->screen = SC_CAR_SHOP; break;   /* the garage */
+    }
+    printf("beyond shop: type %d, screen %d, platform %d\n", type, s->screen, s->platform);
+    return 1;
+}
+
 /* LaunchFrontendShopFromGame 8012721c for the shop the career is in */
 /* ---- UIMagazineReward (GC 801868fc / PC 565750, Notify 80186f18 / PC
    55b260): UI_MagazineReward.fng over UI_MagazineBack.fng, the CarViewer
