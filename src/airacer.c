@@ -5035,9 +5035,10 @@ static AiAction *goal_choose(AiRacer *r, int cur, int prio)
 static int far_ok(const AiRacer *r)
 {
     const AiWorld *w = r->w;
+    if (r->no_ground && !w->drag && !w->x890108 && r->dplan.n > 2 &&
+        r->in_race && !r->entry_done && r->act) return 1;              /* port (Beyond): no ground loaded here (drift too) */
     if (w->drag || w->x890108 || w->drift || w->x890104) return 0;     /* 0x89e7d8 0x890108 0x89e7d9 0x890104 */
     if (r->dplan.n <= 2) return 0;                                      /* driver +0x10 */
-    if (r->no_ground && r->in_race && !r->entry_done && r->act) return 1;   /* port (Beyond): no ground loaded here */
     if (0 < r->far_hold || 0 < r->phys_time) return 0;                 /* 0x401820(+0x730 / +0x734) */
     if (r->car.speed < 5.0f || r->car.wheels <= 0) return 0;            /* car +0x42c (0x783504), +0x424 */
     if (!r->act) return 0;

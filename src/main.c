@@ -12073,6 +12073,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
             int surf;
             if (airacer_reset_pose(c->r, rp, &rh, &rv)) {
                 if (rt_ground(&c->wc, rp[0], rp[1], rp[2] + 1.0f, &z, nrm, &surf)) rp[2] = z;
+                else if (beyond_is_track(g_rt.reg)) airacer_set_no_ground(c->r, 1);   /* not streamed in: the far mover (below) */
                 n2sim_reset(c->s, rp, rh);
                 float vel[3] = { cosf(rh) * (rv + 0.1f), sinf(rh) * (rv + 0.1f), 0 };   /* 0x5f52c0 */
                 n2sim_set_velocity(c->s, vel);
