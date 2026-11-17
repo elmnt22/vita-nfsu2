@@ -294,3 +294,61 @@ unsigned char *beyond_trackmap(int id, int *w, int *h) {
     if (px) { *w = (int)W; *h = (int)H; }
     return px;
 }
+
+/* ---- progress (port): beyond/progress.txt, apart from the UG2 save ----
+   one line per raced event: "id won best_ticks best_place" (ticks 1/4000 s,
+   0 = no time, e.g. a drift) */
+#define BX_PROG BEYOND_DIR "/progress.txt"
+static struct { int id, won, best, place; } g_bx_prog[BX_MAXEV];
+static int g_bx_progn = -1;
+static void bx_prog_load(void) {
+    if (g_bx_progn >= 0) return;
+    g_bx_progn = 0;
+    FILE *f = fopen(BX_PROG, "r");
+    if (!f) return;
+    while (g_bx_progn < BX_MAXEV &&
+           fscanf(f, "%d %d %d %d", &g_bx_prog[g_bx_progn].id, &g_bx_prog[g_bx_progn].won,
+                  &g_bx_prog[g_bx_progn].best, &g_bx_prog[g_bx_progn].place) == 4)
+        g_bx_progn++;
+    fclose(f);
+}
+int beyond_progress(int id, int *won, int *best_ticks, int *best_place) {
+    bx_prog_load();
+    for (int i = 0; i < g_bx_progn; i++)
+        if (g_bx_prog[i].id == id) {
+            if (won) *won = g_bx_prog[i].won;
+            if (best_ticks) *best_ticks = g_bx_prog[i].best;
+            if (best_place) *best_place = g_bx_prog[i].place;
+            return 1;
+        }
+    return 0;
+}
+int beyond_progress_won_count(void) {
+    bx_prog_load();
+    int n = 0;
+    for (int i = 0; i < g_bx_progn; i++) n += g_bx_prog[i].won != 0;
+    return n;
+}
+int beyond_progress_record(int id, int won, int ticks, int place) {
+    if (beyond_event_type(id) < 0) return 0;
+    bx_prog_load();
+    int i = 0;
+    while (i < g_bx_progn && g_bx_prog[i].id != id) i++;
+    if (i == g_bx_progn) {
+        if (g_bx_progn == BX_MAXEV) return 0;
+        g_bx_prog[i].id = id; g_bx_prog[i].won = 0; g_bx_prog[i].best = 0; g_bx_prog[i].place = 0;
+        g_bx_progn++;
+    }
+    if (won) g_bx_prog[i].won = 1;
+    if (ticks > 0 && (!g_bx_prog[i].best || ticks < g_bx_prog[i].best)) g_bx_prog[i].best = ticks;
+    if (place > 0 && (!g_bx_prog[i].place || place < g_bx_prog[i].place)) g_bx_prog[i].place = place;
+    const char *tmp = BX_PROG ".tmp";
+    FILE *f = fopen(tmp, "w");
+    if (!f) return 0;
+    int ok = 1;
+    for (int k = 0; k < g_bx_progn; k++)
+        if (fprintf(f, "%d %d %d %d\n", g_bx_prog[k].id, g_bx_prog[k].won, g_bx_prog[k].best, g_bx_prog[k].place) < 0) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    if (ok) { remove(BX_PROG); ok = rename(tmp, BX_PROG) == 0; }
+    return ok;
+}

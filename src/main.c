@@ -23955,6 +23955,19 @@ int main(int argc, char **argv) {
                            career_string((uint16_t)(g_career.engaged_event[0] | g_career.engaged_event[1] << 8)),
                            g_rt.ent[0].place, g_eng.won ? "won" : "lost");
                 }
+                if (g_bey_freerace && !g_career_mode) {   /* World Expansion (port): its own progress file */
+                    int id = world.city.ev[world.city.race.ev].id;
+                    int place = g_rt.drift ? rt_drift_place() : g_rt.dstatus[0] ? 0 : g_rt.ent[0].place;
+                    int won = place == 1;
+                    int ticks = g_rt.drift || !place ? 0 : g_rt.ftime[0];
+                    int was_won = 0, was_best = 0;
+                    beyond_progress(id, &was_won, &was_best, NULL);
+                    beyond_progress_record(id, won, ticks, place);
+                    printf("beyond: event %d place %d time %.2f s%s%s (%d won)\n", id, place, ticks / 4000.0,
+                           won && !was_won ? " -- first win" : "",
+                           ticks && (!was_best || ticks < was_best) ? " -- best time" : "",
+                           beyond_progress_won_count());
+                }
                 {   /* trophies (trophy.c, the port's own): a won race with underglow, a career drift */
                     int career_ev = g_career_mode && g_eng.commit && g_career.engaged_event;
                     int won = career_ev ? g_eng.won

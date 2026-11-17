@@ -43,5 +43,9 @@ int beyond_shop_count(void);                   /* shops.txt: shops + the garage 
 int beyond_shop_at(int i, int *type, float p[3], float *head);   /* career shop type: 0 garage, 1 paint, 2 body, 3 perf, 5 specialties */
 int beyond_event_start(int i, float p[3], float *head);   /* event i's free-roam start (starts.txt); 0: none */
 const char *beyond_event_name(int id);         /* NULL: not a Beyond event */
+/* progress (port): beyond/progress.txt, never the UG2 save. ticks = 1/4000 s, 0 none */
+int beyond_progress(int id, int *won, int *best_ticks, int *best_place);
+int beyond_progress_record(int id, int won, int ticks, int place);
+int beyond_progress_won_count(void);
 unsigned char *beyond_trackmap(int id, int *w, int *h);   /* its Quick Race map, RGBA (free it); NULL: none */
 #endif
