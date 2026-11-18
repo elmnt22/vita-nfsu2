@@ -1864,7 +1864,7 @@ enum { DA_NONE, DA_PAINT_ADD, DA_PART, DA_RIM, DA_PERF_PKG, DA_PERF_STOCK, DA_PE
        DA_LOT_BUY, DA_LOT_TRADE, DA_LOT_BROWSE, DA_LOT_EXIT,
        DA_CRIB_PLAY, DA_CRIB_MAIN, DA_CRIB_TEST, DA_CRIB_SWITCH,
        DA_PART_BUY, DA_RIM_BUY, DA_SHOP_LEAVE, DA_PERF_PKG_BUY, DA_PERF_PART_BUY, DA_GEN_BUY,
-       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_MAG_SAVE, DA_MAG_NOSAVE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY, DA_QR_DELETE, DA_QR_BAYVIEW, DA_QR_BEYOND, DA_QR_ROCKPORT, DA_QR_PALMONT, DA_QR_CITIES, DA_CRIB_BAYVIEW, DA_CRIB_CITIES, DA_CRIB_ROCKPORT, DA_CRIB_PALMONT, DA_XP_SHARE, DA_XP_FRESH };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
+       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_MAG_SAVE, DA_MAG_NOSAVE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY, DA_QR_DELETE, DA_QR_BAYVIEW, DA_QR_BEYOND, DA_QR_ROCKPORT, DA_QR_PALMONT, DA_QR_CITIES, DA_CRIB_BAYVIEW, DA_CRIB_CITIES, DA_CRIB_ROCKPORT, DA_CRIB_PALMONT, DA_XP_SHARE, DA_XP_FRESH, DA_XP_KEEP, DA_XP_TOFRESH, DA_XP_TOSHARE };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
 static void dlg_act(Shop *s, int act);
 static void dialog(Shop *s, int pk, int nbtn, uint32_t msg, int act, uint32_t b1, uint32_t b2);
 /* PartSelectionScreen 801615f8 in the career: a part to buy -- too little
@@ -7857,9 +7857,22 @@ static void crib_trip(Shop *s, int city) {
     else crib_play(s);
 }
 static void crib_city(Shop *s, int city) {
-    if (xp_garage_choice(city) >= 0) { crib_trip(s, city); return; }
+    int was = xp_garage_choice(city);
     s->trip_city = city;
     char b[256];
+    const char *cn = city == 1 ? "Rockport" : "Palmont";
+    if (was >= 0 && s->crib_city != city) { crib_trip(s, city); return; }
+    if (was >= 0) {   /* port: at that city's garage the choice can change (EXPANSION_PLAN) */
+        if (was) snprintf(b, sizeof b, "Your garage is shared with your career in %s. Start fresh gives %s its own career, "
+                          "from the start.%s", cn, cn, profile_xf_exists(city) ? " Its old one there is cleared." : "");
+        else snprintf(b, sizeof b, "%s has its own career. Share your garage instead? %s's own career stays saved.", cn, cn);
+        dialog_text(s, DLG_AUTO, 2, b, DA_XP_KEEP, STR_YES, STR_NO);
+        s->dlg_l1 = was ? "Keep sharing" : "Keep it";
+        s->dlg_l2 = was ? "Start fresh" : "Share";
+        s->dlg_act2 = was ? DA_XP_TOFRESH : DA_XP_TOSHARE;
+        s->dlg_sel = 0; dlg_focus(s);
+        return;
+    }
     snprintf(b, sizeof b, "Share Your Garage? Bring your garage to %s. Your cars, parts and cash are shared with your career.",
              city == 1 ? "Rockport" : "Palmont");
     dialog_text(s, DLG_AUTO, 2, b, DA_XP_SHARE, STR_YES, STR_NO);
@@ -9747,6 +9760,14 @@ static void dlg_act(Shop *s, int act) {
     case DA_XP_SHARE: case DA_XP_FRESH:
         xp_garage_choice_set(s->trip_city, act == DA_XP_SHARE);
         printf("xp garage: %s -> %s\n", s->trip_city == 1 ? "Rockport" : "Palmont", act == DA_XP_SHARE ? "share" : "start fresh");
+        crib_trip(s, s->trip_city);
+        break;
+    case DA_XP_KEEP: crib_trip(s, s->trip_city); break;
+    case DA_XP_TOFRESH: case DA_XP_TOSHARE:   /* to fresh: the city's old career cleared; to share: it stays saved */
+        if (act == DA_XP_TOFRESH) profile_xf_forget(s->trip_city); else profile_xf_leave();
+        xp_garage_choice_set(s->trip_city, act == DA_XP_TOSHARE);
+        printf("xp garage: %s switched -> %s\n", s->trip_city == 1 ? "Rockport" : "Palmont",
+               act == DA_XP_TOSHARE ? "share" : "start fresh");
         crib_trip(s, s->trip_city);
         break;
     case DA_QR_CITIES:   /* Free Run, another city: which one */

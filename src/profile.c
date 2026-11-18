@@ -378,6 +378,19 @@ void profile_xf_leave(void) {
     g_xf_city = 0; g_xf_wins = 0;
 }
 
+int profile_xf_exists(int city) {
+    char f[16], p[320]; struct stat st;
+    snprintf(f, sizeof f, "XPCITY%d", city);
+    return profile_file(f, p, sizeof p) && stat(p, &st) == 0;
+}
+/* port: switching a city back to Start fresh starts it clean (EXPANSION_PLAN "Share Your Garage") */
+void profile_xf_forget(int city) {
+    if (g_xf_city == city) profile_xf_leave();
+    char f[16], p[320];
+    snprintf(f, sizeof f, "XPCITY%d", city);
+    if (profile_file(f, p, sizeof p) && remove(p) == 0) printf("xp fresh: city %d career cleared\n", city);
+}
+
 int profile_load(const char *name) {
     char path[300]; profile_path(name, path, sizeof path);
     long n; unsigned char *f = read_file(path, &n);

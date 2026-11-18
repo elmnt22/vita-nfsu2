@@ -56,6 +56,8 @@ int  profile_xf_city(void);         /* 0: the Bayview career is in */
 int  profile_xf_save(void);
 void profile_xf_win(void);          /* a first win in the city (its stage) */
 int  profile_xf_wins(void);
+int  profile_xf_exists(int city);   /* a saved city career */
+void profile_xf_forget(int city);   /* the city's own career gone (a new one next trip) */
 
 /* AllocBackupDB 0x52a460 / IsDirty 0x52a4c0 / RestoreFromBackupDB 0x5347c0 */
 int profile_snapshot(void);   /* 0: out of memory, no snapshot */
