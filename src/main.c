@@ -12368,6 +12368,25 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
     if (!g_rt.active) return 0;
     Uint64 pf_race_control = pf_stamp();
     int player_n2 = n2_active() && g_n2 && g_n2_ticked;
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* sim test: OPENUG2_SIM_RAM="<s> <m/s> <headon>" once, s seconds into the race, puts the
+           player 25 m behind opponent 0 (or ahead of it, facing it, with headon 1) driving at it, so
+           a real car-car hit runs CheckForWildCollision -> crash mode -> crash jump cam */
+        static float rs = -1, rv; static int rh, done;
+        if (rs < 0) { rs = 0; if (getenv("OPENUG2_SIM_RAM")) sscanf(getenv("OPENUG2_SIM_RAM"), "%f %f %d", &rs, &rv, &rh); }
+        if (rs > 0 && !done && racing && player_n2 && g_rt.n > 0 && g_rt.t - g_rt.start >= rs) {
+            const N2State *o = &g_rt.car[0].st;
+            float fx = cosf(o->heading), fy = sinf(o->heading), d = rh ? 25.0f : -25.0f;
+            float pos[3] = { o->pos[0] + fx * d, o->pos[1] + fy * d, o->pos[2] + 0.3f };
+            float h = rh ? o->heading + 3.14159265f : o->heading, s = rh ? -rv : rv;
+            float v3[3] = { fx * s, fy * s, 0 };
+            n2sim_reset(g_n2, pos, h); n2sim_set_velocity(g_n2, v3);
+            done = 1;
+            printf("ramtest: player at (%.1f %.1f %.1f) %s opponent 0 at %.0f m/s\n",
+                   pos[0], pos[1], pos[2], rh ? "head-on to" : "behind", rv);
+        }
+    }
+#endif
     /* every car's route locator (car +0x8d8, 0x5da330) */
     if (g_rt.rp) {
         if (player_n2) racepath_locate(g_rt.rp, &g_rt.loc[0], g_n2s.pos);

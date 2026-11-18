@@ -2649,6 +2649,7 @@ static void player_bottom(float dt, const CarSfxListener *L, float ref)
             unsigned z = g_bo_zone_n % 4;
             g_bo_zone_n = z + 1;
             g_pbo.z_on = stitch_start(FXZ(0), 13, 0, k_bo_first[2] + (int)z, &g_pbo.z_sp) > 0;
+            printf("[bottom] jump cam landing -> stitch %d (%s)\n", k_bo_first[2] + (int)z, g_pbo.z_on ? "playing" : "no voice");
         }
     }
     if (down == 4 && g_pbo.tilt) g_pbo.tilt = 0;
