@@ -24151,7 +24151,7 @@ int main(int argc, char **argv) {
                resident's meshes in that box once, 20 s in (texkey 0 = all) */
             static int md_done, md_tick;
             const char *mdv = getenv("OPENUG2_SIM_MESHDUMP");
-            if (mdv && !md_done && active_resident && race_state == 1 && g_rt.roam && ++md_tick > 600) {
+            if (mdv && !md_done && active_resident && race_state == 1 && ++md_tick > 600) {
                 float mx = 0, my = 0, mr = 20; unsigned mk = 0;
                 sscanf(mdv, "%f %f %f %x", &mx, &my, &mr, &mk);
                 md_done = 1;
@@ -24170,9 +24170,9 @@ int main(int argc, char **argv) {
                             if (x > cmax[c]) cmax[c] = x;
                         }
                     int nv = m->nverts > 0 ? m->nverts : 1;
-                    printf("meshdump: [%d] %s aname=%s cat=%d texkey=%08x exact=%d verts=%d xy=[%.1f..%.1f][%.1f..%.1f]"
+                    printf("meshdump: [%d] %s aname=%s cat=%d scen %d %d:%d texkey=%08x exact=%d verts=%d xy=[%.1f..%.1f][%.1f..%.1f]"
                            " vcol avg %.0f %.0f %.0f %.0f min %d %d %d %d max %d %d %d %d%c",
-                           mi, m->sname[0] ? m->sname : "(unnamed)", m->aname[0] ? m->aname : "-", m->cat,
+                           mi, m->sname[0] ? m->sname : "(unnamed)", m->aname[0] ? m->aname : "-", m->cat, m->scen_has, m->scen_region, m->scen_index,
                            m->texkey, m->mat_exact, m->nverts, bb[0], bb[2], bb[1], bb[3],
                            cs[0] / nv, cs[1] / nv, cs[2] / nv, cs[3] / nv, cmin[0], cmin[1], cmin[2], cmin[3],
                            cmax[0], cmax[1], cmax[2], cmax[3], 10);

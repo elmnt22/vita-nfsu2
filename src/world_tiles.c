@@ -2662,6 +2662,13 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
             if (m->scen_has && sel.count && !wg_selection_visible(&sel, m->scen_region, m->scen_index)) {
                 hidden++; continue;
             }
+            if (!m->scen_has && ground && sel.count) {   /* tiles built before 11-18: an event-grouped
+                                                           identity chunk by name (world_instance.c) */
+                const uint16_t (*idr)[2] = NULL; int nidr = 0, vis = 0;
+                world_instance_ident_refs(troot, track, m->aname, &idr, &nidr);
+                for (int k = 0; k < nidr && !vis; k++) vis = wg_selection_visible(&sel, idr[k][0], idr[k][1]);
+                if (nidr && !vis) { hidden++; continue; }
+            }
             int role = m->world_role, drop_vcol = 0;
             if (role == 1 || role == 2) {   /* a LOD pair: full model (1) + stand-in (2) */
                 if (near && role == 2) {

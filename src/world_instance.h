@@ -89,6 +89,14 @@ int world_instance_district_boxes(const char *track_root, const char *bundle,
                                   float (**boxes)[4], int *count);
 void world_instance_cache_selftest(void);
 
+/* Event-grouped ground chunks placed at the identity (drift markers, URL
+ * berms, drag road pieces): the scenery records (section, row) of the chunk
+ * named `name` (folded, 27 chars); returns their count, 0 if none. *pairs
+ * stays valid until the next call. Reads / builds a small card index once
+ * per bundle. */
+int world_instance_ident_refs(const char *track_root, const char *bundle, const char *name,
+                              const uint16_t (**pairs)[2], int *count);
+
 int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
                          const char *track_root,
                          const char *const *bundles, int bundle_count,

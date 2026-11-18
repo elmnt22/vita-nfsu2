@@ -13,6 +13,10 @@ void vita_mark(const char *fmt, ...);
 /* world_scenery.h: the career stage whose scenery / lock walls are up (-1 none). */
 int g_wg_career_stage = -1, g_wg_career_owns_car;
 #include <assert.h>
+#include <stdio.h>
+#ifdef __vita__
+#include <sys/stat.h>
+#endif
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1632,7 +1636,9 @@ static signed char *own_memo; static const void *own_memo_items; static int own_
 static int winst_place_ground_prototypes(const WInstLibrary *library,
                                          N2Scene *scene, N2Scene *vista,
                                          WInstStats *stats,
-                                         float focus_x, float focus_y, float radius) {
+                                         float focus_x, float focus_y, float radius,
+                                         const char *ident_root, const char *ident_bundle,
+                                         const WGSelection *scenery) {
     static const float identity[16] = {
         1, 0, 0, 0, 0, 1, 0, 0,
         0, 0, 1, 0, 0, 0, 0, 1,
@@ -1649,6 +1655,16 @@ static int winst_place_ground_prototypes(const WInstLibrary *library,
     for (int i = 0; i < library->count; i++) {
         WInstProto *proto = (WInstProto *)&library->items[i];
         if (proto->instanced || !proto->any_ground) continue;
+        /* an event-grouped identity chunk (drift markers, berms): its
+           scenery record goes on its meshes, and another event's is left out */
+        const uint16_t (*idr)[2] = NULL; int nidr = 0;
+        if (ident_root) world_instance_ident_refs(ident_root, ident_bundle, proto->name, &idr, &nidr);
+        if (nidr && scenery && scenery->count) {
+            int vis = 0;
+            for (int k = 0; k < nidr && !vis; k++) vis = wg_selection_visible(scenery, idr[k][0], idr[k][1]);
+            if (!vis) { if (stats) stats->scenery_hidden++; continue; }
+        }
+        uint16_t id_reg = nidr ? idr[0][0] : 0, id_row = nidr ? idr[0][1] : 0;
 #ifdef __vita__
         /* before anything costly: winst_proto_has_own_matrix scans every
            prototype name, which over the whole library was seconds a build */
@@ -1714,7 +1730,11 @@ static int winst_place_ground_prototypes(const WInstLibrary *library,
             }
 #endif
             if (!winst_place_mesh(dst, source, matrix, proto->name, stats)) ok = 0;
-            else if (own_matrix && stats) stats->own_matrix_meshes++;
+            else {
+                if (own_matrix && stats) stats->own_matrix_meshes++;
+                if (nidr) { N2Mesh *pm = &dst->meshes[dst->count - 1];
+                            pm->scen_has = 1; pm->scen_region = id_reg; pm->scen_index = id_row; }
+            }
         }
 #ifdef __vita__
         /* Admit only complete prototype ground sets; a clipped set cannot
@@ -2163,7 +2183,8 @@ int world_instance_build_for_event(N2Scene *scene, N2Scene *vista,
        swap was late for */
     if (!winst_place_ground_prototypes(&library, &built_scene, &built_vista,
                                        &local_stats, focus_x, focus_y,
-                                       view_radius + 60.0f)) goto cleanup;
+                                       view_radius + 60.0f, track_root,
+                                       local_stats.bundle, &scenery)) goto cleanup;
     VMARK("    ground placed: %d meshes", built_scene.count);
 #ifdef __vita__
     VMARK("    CPU tiles: %ld ground meshes reused",g_ground_cache_hits);
@@ -2255,4 +2276,172 @@ int world_instance_build(N2Scene *scene, N2Scene *vista,
                          WInstStats *stats) {
     return world_instance_build_for_event(scene, vista, track_root, bundles, bundle_count,
                                 focus_x, focus_y, view_radius, shared, shared_len, stats, 0);
+}
+
+/* ---- event-grouped ground chunks placed at the identity ---------------------
+ * Some events author their own ground pieces as identity placements in their
+ * BARRIERS_<event> group: the stadium's drift markers (L4RC
+ * TRN_SI_DriftMarker0n -> 4311..4315), the vacant lot's DriftSZn (4301..4306),
+ * the drag strips' road pieces (L4RB 4221..4223) and the URL berms (L4RG
+ * *_BERM 4711..4716). Retail shows one event's set; the port's ground pass
+ * (winst_mark_instanced leaves identity records to it) placed every set as
+ * plain ground with no scenery record, so every race showed all of them
+ * (user 11-18: blue / white strips on the drift track).
+ *
+ * This index maps each such chunk's folded name to its scenery records
+ * (section, row), read from the STREAM bundle's grouped sections only and
+ * kept on the card (the Vita's pinned copy has its sections stripped, and
+ * world tiles built before 11-18 carry no record for these meshes). */
+typedef struct { char name[28]; uint32_t hash; uint16_t region, row; } WInstIdentRef;
+static struct { char key[256]; WInstIdentRef *refs; int n, loaded; } g_ident;
+
+static int winst_ident_cmp(const void *a, const void *b) {
+    const WInstIdentRef *x = a, *y = b;
+    if (x->hash != y->hash) return x->hash < y->hash ? -1 : 1;
+    int c = strcmp(x->name, y->name);
+    if (c) return c;
+    if (x->region != y->region) return x->region < y->region ? -1 : 1;
+    return (x->row > y->row) - (x->row < y->row);
+}
+
+#define WINST_IDENT_MAGIC 0x31444749u   /* "IGD1" */
+static void winst_ident_cache_path(const char *bundle, char *out, size_t cap) {
+    char stem[64]; snprintf(stem, sizeof stem, "%s", bundle);
+    char *dot = strrchr(stem, '.'); if (dot && !strcmp(dot, ".BUN")) *dot = 0;
+    snprintf(out, cap, "ux0:data/NFSU2/cache/identgrp_%s.bin", stem);
+}
+
+static int winst_ident_build(const char *root, const char *bundle, long *src_len_out,
+                             uint32_t *ov_count_out) {
+    const char *stem = !strncmp(bundle, "STREAM", 6) ? bundle + 6 : bundle;
+    char cname[64]; snprintf(cname, sizeof cname, "%s", stem);
+    char *dot = strrchr(cname, '.'); if (dot && !strcmp(dot, ".BUN")) *dot = 0;
+    long clen = 0;
+    unsigned char *cdata = winst_read_named(root, cname, &clen);
+    WGTable table; WGSelection all = {0};
+    int ok = cdata && wg_open_file(cdata, (size_t)clen, &table) && wg_selection_open(&table, -1, &all);
+    *ov_count_out = ok ? (uint32_t)table.override_count : 0;
+    free(cdata);
+    if (!ok) { free(all.items); return 0; }
+    static unsigned char grouped[65536 / 8];
+    memset(grouped, 0, sizeof grouped);
+    for (size_t i = 0; i < all.count; i++)
+        grouped[all.items[i].section >> 3] |= (unsigned char)(1u << (all.items[i].section & 7));
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s%s", root, bundle, winst_has_suffix(bundle, ".BUN") ? "" : ".BUN");
+    FILE *f = fopen(path, "rb");
+    if (!f) { free(all.items); return 0; }
+    fseek(f, 0, SEEK_END); long flen = ftell(f); fseek(f, 0, SEEK_SET);
+    *src_len_out = flen;
+    int cap = 0; unsigned char *buf = NULL; long bcap = 0;
+    for (long p = 0; p + 8 <= flen; ) {
+        unsigned char h[32];
+        if (fseek(f, p, SEEK_SET) || fread(h, 1, 8, f) != 8) break;
+        uint32_t id = n2_u32(h), sz = n2_u32(h + 4);
+        if ((long)sz > flen - p - 8) break;
+        if (id == 0x80034100u && sz >= 24 && fread(h + 8, 1, 24, f) == 24 &&
+            n2_u32(h + 8) == 0x00034101u) {
+            uint32_t reg = n2_u32(h + 16 + 0x0c);
+            if (reg < 65536 && (grouped[reg >> 3] >> (reg & 7) & 1)) {
+                if ((long)sz > bcap) { free(buf); bcap = (long)sz; buf = (unsigned char *)malloc((size_t)bcap); }
+                WInstSection sec;
+                if (buf && !fseek(f, p + 8, SEEK_SET) && fread(buf, 1, sz, f) == sz &&
+                    winst_parse_section(buf, 0, (long)sz, &sec)) {
+                    for (int i = 0; i < sec.placement_count; i++) {
+                        WInstPlacement pl;
+                        if (!winst_decode_placement(sec.placements + (long)i * 64, 64, &pl) ||
+                            !winst_identity_placement(pl.matrix) ||
+                            pl.type_index >= (unsigned)sec.type_count ||
+                            !wg_selection_find(&all, (unsigned)sec.region_id, (unsigned)i)) continue;
+                        char tn[33]; memcpy(tn, sec.types + (long)pl.type_index * 68, 32); tn[32] = 0;
+                        if (g_ident.n == cap) {
+                            int nc = cap ? cap * 2 : 64;
+                            WInstIdentRef *g = (WInstIdentRef *)realloc(g_ident.refs, (size_t)nc * sizeof *g);
+                            if (!g) break;
+                            g_ident.refs = g; cap = nc;
+                        }
+                        WInstIdentRef *r = &g_ident.refs[g_ident.n++];
+                        memset(r, 0, sizeof *r);
+                        r->hash = winst_name_key(tn, r->name);
+                        r->region = (uint16_t)sec.region_id; r->row = (uint16_t)i;
+                    }
+                }
+            }
+        }
+        p += 8 + (long)sz;
+    }
+    fclose(f); free(buf); free(all.items);
+    return 1;
+}
+
+static void winst_ident_load(const char *root, const char *bundle) {
+    char key[256]; snprintf(key, sizeof key, "%s/%s", root, bundle);
+    if (g_ident.loaded && !strcmp(g_ident.key, key)) return;
+    free(g_ident.refs); memset(&g_ident, 0, sizeof g_ident);
+    snprintf(g_ident.key, sizeof g_ident.key, "%s", key);
+    g_ident.loaded = 1;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s%s", root, bundle, winst_has_suffix(bundle, ".BUN") ? "" : ".BUN");
+    long src_len = -1;
+    { FILE *s = fopen(path, "rb"); if (s) { fseek(s, 0, SEEK_END); src_len = ftell(s); fclose(s); } }
+    char cpath[300]; winst_ident_cache_path(bundle, cpath, sizeof cpath);
+    FILE *c = fopen(cpath, "rb");
+    if (c) {   /* {magic, source length, count} + refs */
+        uint32_t hd[3] = {0, 0, 0};
+        int ok = fread(hd, 4, 3, c) == 3 && hd[0] == WINST_IDENT_MAGIC && (long)hd[1] == src_len && hd[2] < 65536;
+        if (ok && hd[2]) {
+            g_ident.refs = (WInstIdentRef *)malloc(hd[2] * sizeof *g_ident.refs);
+            ok = g_ident.refs && fread(g_ident.refs, sizeof *g_ident.refs, hd[2], c) == hd[2];
+        }
+        fclose(c);
+        if (ok) { g_ident.n = (int)hd[2]; return; }
+        free(g_ident.refs); g_ident.refs = NULL;
+    }
+    long got_len = 0; uint32_t novr = 0;
+    if (!winst_ident_build(root, bundle, &got_len, &novr)) {
+        printf("ground event index %s: no scenery groups\n", bundle);
+        return;
+    }
+    if (g_ident.n > 1) qsort(g_ident.refs, (size_t)g_ident.n, sizeof *g_ident.refs, winst_ident_cmp);
+    printf("ground event index %s: %d event-grouped identity chunks (of %u grouped records)\n",
+           bundle, g_ident.n, (unsigned)novr);
+#ifdef __vita__
+    mkdir("ux0:data/NFSU2/cache", 0777);
+#endif
+    FILE *w = fopen(cpath, "wb");
+    if (w) {
+        uint32_t hd[3] = { WINST_IDENT_MAGIC, (uint32_t)got_len, (uint32_t)g_ident.n };
+        int ok = fwrite(hd, 4, 3, w) == 3 &&
+                 (!g_ident.n || fwrite(g_ident.refs, sizeof *g_ident.refs, (size_t)g_ident.n, w) == (size_t)g_ident.n);
+        fclose(w);
+        if (!ok) remove(cpath);
+    }
+}
+
+int world_instance_ident_refs(const char *track_root, const char *bundle, const char *name,
+                              const uint16_t (**pairs)[2], int *count) {
+    static uint16_t out[64][2];
+    *count = 0; *pairs = (const uint16_t (*)[2])out;
+    if (!track_root || !bundle || !name || !name[0]) return 0;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_NOIDENT")) return 0;   /* test aid (simulator): the old behaviour */
+#endif
+    winst_ident_load(track_root, bundle);
+    if (!g_ident.n) return 0;
+    WInstIdentRef key; memset(&key, 0, sizeof key);
+    key.hash = winst_name_key(name, key.name);
+    int lo = 0, hi = g_ident.n;
+    while (lo < hi) {   /* first with this hash + name */
+        int mid = (lo + hi) / 2; const WInstIdentRef *r = &g_ident.refs[mid];
+        int c = r->hash != key.hash ? (r->hash < key.hash ? -1 : 1) : strcmp(r->name, key.name);
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    int n = 0;
+    for (int i = lo; i < g_ident.n && n < 64 && g_ident.refs[i].hash == key.hash &&
+                     !strcmp(g_ident.refs[i].name, key.name); i++) {
+        out[n][0] = g_ident.refs[i].region; out[n][1] = g_ident.refs[i].row; n++;
+    }
+    *count = n;
+    return n;
 }
