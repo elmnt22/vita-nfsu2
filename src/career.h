@@ -161,6 +161,9 @@ int  career_event_purse(const unsigned char *ev);             /* GetEventPurse 0
 int  career_url_purse(int stage);
 int  career_random_encounter_purse(int stage);
 int  career_star_rating_purse(int stage);
+/* port (World Expansion, shared garage): what a Bayview race of this type (+0xf) pays at the
+   current stage -- the mean purse of the stage's ordinary (+0x34 3) events of the type (any type when none) */
+int  career_stage_race_purse(int type);
 
 /* ---- starting a career (C2; CAREER.md "C2: starting a career") --------- */
 #define CAREER_DDAY_A 0xdd60e402u     /* enter CC_CAR_LOT_1 in the DDAY_PLAYER_CAR preset */

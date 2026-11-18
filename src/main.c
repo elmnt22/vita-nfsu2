@@ -9781,7 +9781,7 @@ static void bey_retune(const char *carname, int type)
 /* The race dialog for a World Expansion event (port): RaceEngageDialog::Setup's
    fields from the Beyond event -- its length, a non-career event's random
    body / subject / race type (stage > 0, no sponsor), a random sender, its
-   generated track map; no purse (Beyond pays nothing yet) */
+   generated track map; a purse only on a career trip with the shared garage (port) */
 static int eng_beyond_open(const char *dataroot, int idx)
 {
     int id, type, len;
@@ -9796,7 +9796,12 @@ static int eng_beyond_open(const char *dataroot, int idx)
     eng_fmt_f(num, sizeof num, (float)len * 0.000625f);
     snprintf(b, sizeof b, "%s %s", num, hud_screen_string(h, g_opt.kmh ? 0xb5d640b1u : 0xac3a4f4cu));
     hud_screen_text_h(h, 0x080c9daau, b);
-    hud_screen_text_h(h, 0xb54b81a7u, "");
+    if (g_xp_trip && g_xp_trip_share) {
+        int was_won = 0, full = career_stage_race_purse(type == 6 ? 0 : type);
+        beyond_progress(id, &was_won, NULL, NULL);
+        hud_num(num, sizeof num, was_won ? full / 4 : full);   /* a repeat win pays a quarter */
+        hud_screen_text_h(h, 0xb54b81a7u, num);
+    } else hud_screen_text_h(h, 0xb54b81a7u, "");
     hud_screen_label_h(h, 0xde075b62u, career_engage_body(fev, eng_rand));
     uint32_t sub, typ;
     fev[0xd] = type != 6;                     /* the labels: the per-type table (a stage event leaves Circuit's) */
@@ -24323,9 +24328,20 @@ int main(int argc, char **argv) {
                     int place = g_rt.drift ? rt_drift_place() : g_rt.dstatus[0] ? 0 : g_rt.ent[0].place;
                     int won = place == 1;
                     int ticks = g_rt.drift || !place ? 0 : g_rt.ftime[0];
+#ifdef OPENUG2_SIM_PRE_H
+                    if (getenv("OPENUG2_SIM_WIN")) won = 1;   /* test aid (simulator): count the race as won */
+#endif
                     int was_won = 0, was_best = 0;
                     beyond_progress(id, &was_won, &was_best, NULL);
                     beyond_progress_record(id, won, ticks, place);
+                    if (won && g_xp_trip && g_xp_trip_share) {   /* port: a career trip's purse, into the career wallet */
+                        int t = beyond_event_type(id), full = career_stage_race_purse(t == 6 ? 0 : t);
+                        int pay = was_won ? full / 4 : full;
+                        g_career.cash += pay;
+                        printf("xp trip: purse $%d%s, career cash $%d\n", pay, was_won ? " (a repeat win)" : "", g_career.cash);
+                        if (g_opt.autosave && profile_named())
+                            printf("xp trip: saved (%s)\n", profile_save() ? "ok" : "FAILED");
+                    }
                     printf("beyond: event %d place %d time %.2f s%s%s (%d won)\n", id, place, ticks / 4000.0,
                            won && !was_won ? " -- first win" : "",
                            ticks && (!was_best || ticks < was_best) ? " -- best time" : "",

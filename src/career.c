@@ -573,6 +573,23 @@ int career_random_encounter_purse(int stage)
     const unsigned char *sd = stage >= 0 && stage < 8 ? g_career.st[stage].stage : NULL;
     return sd ? rd16s(sd + 2) : 0;
 }
+int career_stage_race_purse(int type)
+{
+    /* +0x34 3: an ordinary race (1 sponsor, 2 URL); a finished career (stage 6) has
+       none -- the last stage that does */
+    for (int st = g_career.stage; st >= 0; st--)
+        for (int any = 0; any < 2; any++) {
+            long sum = 0; int n = 0;
+            for (int i = 0; i < career_nevents(); i++) {
+                const unsigned char *ev = career_event(i);
+                if ((signed char)ev[0x37] != st || ev[0x34] != 3 || (int)rd32(ev + 0x30) <= 0) continue;
+                if (!any && ev[0xf] != type) continue;
+                sum += (long)rd32(ev + 0x30); n++;
+            }
+            if (n) return (int)((sum / n + 50) / 100 * 100);   /* to the $100 */
+        }
+    return career_random_encounter_purse(g_career.stage);
+}
 int career_star_rating_purse(int stage)
 {
     const unsigned char *sd = stage >= 0 && stage < 8 ? g_career.st[stage].stage : NULL;
