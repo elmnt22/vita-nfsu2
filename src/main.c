@@ -5364,6 +5364,7 @@ static int g_career_mode, g_career_go, g_career_nis_pending, g_career_nis_on, g_
    (1 Rockport, 2 Palmont). The city runs as its free roam (career mode off), its garages
    open the career crib again; g_xp_trip_share: the garage is shared (cash / parts / cars) */
 static int g_xp_trip, g_xp_trip_share, g_xp_trip_go;
+static int g_xp_trip_shop;   /* a shared trip's shop is open: the career's (career mode on until it is left) */
 static int g_career_spawn_on; static float g_career_spawn[3], g_career_heading;
 static int g_career_preset_on, g_career_preset_rs, g_career_prev_car = -1;
 static char g_career_preset_car[32], g_career_preset_rim[16];
@@ -20797,6 +20798,13 @@ int main(int argc, char **argv) {
             world_instance_library_release();
             world_instance_cache_flush();
             world_tiles_trim(0);
+            /* an expansion city: its translation / minimap / events / props as at a venue boot (port; the
+               world picker and the career trips switch into it) */
+            if (xpcity_is_city(next_track) && !xpcity_prepare(troot, next_track)) {
+                vita_mark("track switch: %s could not be prepared -- the city instead", next_track);
+                next_track = "STREAML4RA"; next_ev = 0;
+            }
+            xpcity_barriers_select(troot, next_track);   /* before the build: the scenery selection hides the MW race barriers */
             vita_heap_report("switch: old track freed");
             Hud *sw_ls = NULL;
             if (!loading_screen(dataroot))
@@ -21388,13 +21396,14 @@ int main(int argc, char **argv) {
                     hud_event_reset();
                     gps_stop();
                     g_xp_trip = city; g_xp_trip_go = 1; g_xpcity_pick = city;
+                    g_wg_career_stage = -1; g_wg_career_owns_car = 0;   /* no career scenery / lock walls in the city */
                     world_tiles_trim(0);
                     printf("xp trip: %s with the career car (%s garage, $%d)\n", city == 1 ? "Rockport" : "Palmont",
                            g_xp_trip_share ? "shared" : "fresh", g_career.cash);
                 } else if (sa.kind == SHOP_ACT_CAREER) {   /* StartCareerFreeRoam 8011cbac */
                     shop_close(&g_fe);
                     g_fe_in = 0;
-                    g_xp_trip = 0; g_xp_trip_go = 0;
+                    g_xp_trip = 0; g_xp_trip_go = 0; g_xp_trip_shop = 0;
                     g_career_mode = 1; g_career_go = 1; g_career_nis_pending = sa.career_nis;
 #ifdef OPENUG2_SIM_PRE_H
                     if (getenv("OPENUG2_WATEST_NIS")) g_career_nis_pending = 1;   /* test aid (simulator): the career start scene */
@@ -21683,6 +21692,19 @@ int main(int argc, char **argv) {
                     g_fe = fe; g_fe_in = 0;
                     printf("xp trip: garage -> the career crib\n");
                 } else { world_tiles_trim(0); printf("xp trip: the crib could not be opened\n"); }
+            } else if (act == ENG_ACT_SHOP && g_eng.bshop > 1 && g_xp_trip && g_xp_trip_share && race_state == 1 &&
+                       career_shop_of_type(g_eng.bshop - 1)) {
+                /* port: a shared-garage trip's shop -- the career's shop of that type (its screens, prices,
+                   unlocks) on the career car with the career's cash; left, back to the city's free roam */
+                int t = g_eng.bshop - 1;
+                g_eng.bshop = 0;
+                if (g_bey_szone >= 0) hud_event_remove(bey_shop_indicator(t));
+                g_bey_szone = -1;
+                rt_end();
+                hud_event_reset();
+                g_career_mode = 1; g_xp_trip_shop = 1;
+                g_cshop_pending = career_shop_of_type(t);
+                printf("xp trip: shop type %d -> the career's %s ($%d)\n", t, (const char *)g_cshop_pending, g_career.cash);
             } else if (act == ENG_ACT_SHOP && g_eng.bshop && race_state == 1) {
                 /* a World Expansion shop / garage (port): the front end's Customize over its scene */
                 int t = g_eng.bshop - 1;
@@ -22233,6 +22255,16 @@ int main(int argc, char **argv) {
                             shop_crib_return(g_fe, g_crib_from_main);
                             g_fe_in = 1;
                         } else { world_tiles_trim(0); race_state = 1; g_ride_ready = 0; }
+                        break;
+                    }
+                    if (cs == 2 && g_xp_trip_shop) {   /* port: a shared trip's shop left -- the city again */
+                        if (g_cshop_dirty && profile_named())
+                            printf("career shop: saved on the way out (%s)\n", profile_save() ? "ok" : "FAILED");
+                        g_cshop_dirty = 0;
+                        g_xp_trip_shop = 0; g_career_mode = 0;
+                        race_state = 1; g_ride_ready = 0;
+                        vel[0] = vel[1] = 0; speed = 0;
+                        printf("xp trip: shop left -- back to free roam%s\n", tt ? " (no Test Track on a trip)" : "");
                         break;
                     }
                     if (cs == 2 && tt) {   /* the perf shop's Test Track (DoStartTuning 801720f0): entry 1 */
