@@ -2,6 +2,7 @@
 #include "skyline.h"
 #include "world_tiles.h"
 #include "beyond.h"
+#include "xpcity.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,8 +23,9 @@
 /* ux0:data/NFSU2/skyminh.txt "<m>" or OPENUG2_SKYMINH: the height cut (A/B runs;
    another height has its own cache file) */
 static int sky_beyond(void);
+static int sky_xp(void);   /* Rockport / Palmont: as big, the same cut and budget */
 static float sky_min_h(void) {
-    if (sky_beyond()) return SKYLINE_BEYOND_MIN_H;   /* (own cache file name, by the height) */
+    if (sky_beyond() || sky_xp()) return SKYLINE_BEYOND_MIN_H;   /* (own cache file name, by the height) */
     static float v = -1.0f;
     if (v < 0.0f) {
         v = SKYLINE_MIN_H;
@@ -170,6 +172,7 @@ static void collect(void *ctx, const N2Mesh *m) {
     free(nor);
 }
 static int sky_beyond(void) { return beyond_is_track(S.track); }
+static int sky_xp(void) { return xpcity_is_city(S.track); }
 /* keep the tallest stand-ins whose vertices + indices fit `budget` bytes (in their collected order) */
 static float *g_trim_h;
 static int trim_cmp(const void *a, const void *b) {
@@ -212,6 +215,9 @@ static void cache_path(char *out, size_t n) {
     if (sky_beyond())   /* the budget is in the name: another budget builds again */
         snprintf(out, n, "%s/%s_sky_v%d_%d_h%d_b%ld.bin", WTILE_DIR, S.track, WTILE_BEYOND_VERSION, SKYLINE_FILE_VER,
                  (int)sky_min_h(), SKYLINE_BEYOND_BUDGET >> 10);
+    else if (sky_xp())
+        snprintf(out, n, "%s/%s_sky_v%d_%d_h%d_b%ld.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER,
+                 (int)sky_min_h(), SKYLINE_BEYOND_BUDGET >> 10);
     else if (sky_min_h() == SKYLINE_MIN_H) snprintf(out, n, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER);
     else snprintf(out, n, "%s/%s_sky_v%d_%d_h%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER, (int)sky_min_h());
 }
@@ -220,6 +226,8 @@ void skyline_forget(const char *track) {
     char p[256];
     snprintf(p, sizeof p, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, track, WTILE_VERSION, SKYLINE_FILE_VER); remove(p);
     snprintf(p, sizeof p, "%s/%s_sky_v%d_%d_h%d.bin", WTILE_DIR, track, WTILE_VERSION, SKYLINE_FILE_VER, (int)sky_min_h()); remove(p);
+    snprintf(p, sizeof p, "%s/%s_sky_v%d_%d_h%d_b%ld.bin", WTILE_DIR, track, WTILE_VERSION, SKYLINE_FILE_VER,
+             (int)SKYLINE_BEYOND_MIN_H, SKYLINE_BEYOND_BUDGET >> 10); remove(p);
 }
 static int cache_read(void) {
     char path[256]; cache_path(path, sizeof path);
@@ -317,7 +325,7 @@ static int loader(void *arg) {
     if (!ok && !SDL_AtomicGet(&S.abort)) {
         int tiles = world_tiles_each_standin(S.track, sky_min_h(), collect, NULL, &S.abort);
         ok = tiles > 0 && S.nmesh > 0 && !SDL_AtomicGet(&S.abort);
-        if (ok && sky_beyond()) trim_budget(SKYLINE_BEYOND_BUDGET);
+        if (ok && (sky_beyond() || sky_xp())) trim_budget(SKYLINE_BEYOND_BUDGET);
         printf("skyline: built from %d tiles: %d stand-ins >= %.0f m, %ld verts, %ld KB\n", tiles, S.nmesh,
                (double)sky_min_h(), S.nv, (S.nv * (long)sizeof(SkyV) + S.ni * 2) >> 10);
         if (ok) { cache_write(); S.built = 1; }
