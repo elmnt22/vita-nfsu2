@@ -3,6 +3,9 @@
 #define XPCITY_H
 /* track is an expansion city (STREAML2RA / STREAML5RA) */
 int xpcity_is_city(const char *track);
+/* a city whose stream section nearest the origin is not in the city (Palmont: the canyons):
+   its free-roam start, written to xy; 0 = keep the authored focus */
+int xpcity_default_focus(const char *track, float xy[2]);
 const char *xpcity_region(const char *track);   /* its routes region (L2RA ...): TRACKS/ROUTES<region> */
 /* Makes sure the city's translated stream is in troot (from the PC tool, or
    translated here from ux0:data/NFSU2/expansion/<game>/TRACKS behind a progress
