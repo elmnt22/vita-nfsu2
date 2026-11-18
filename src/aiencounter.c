@@ -753,7 +753,7 @@ static int getaway_take_link(AiRacer *r, Lk *l)
 /* ---- ChaseCar's pathfinding (the Outrun, 0x41e540) ------------------------- */
 typedef struct {                /* the search state (0x38 bytes) */
     Pt *start; int sdir;
-    unsigned short dec[15];     /* bits 0-12 the link, bit 13 taken */
+    uint32_t dec[15];           /* bits 0-12 the link, bit 13 taken (port: 0-15, 16; nets past 8191 links) */
     int count;
     Pt *pt; float rem; int dir;
 } PfState;
@@ -806,12 +806,12 @@ static int pf_depth(AiWorld *w, PfState *res, Pt *start, const float *tgt, float
                 cur.pt = t;
                 break;
             }
-            int li = lk_index(n, l) & 0x1fff;
+            int li = lk_index(n, l) & 0xffff;
             PfState br = cur;
             br.pt = t; br.dir = cur.dir ^ (int)(f >> 23 & 1);
             br.rem = cur.rem + pt_seglen(cur.pt) - along;
-            if (br.count < 15) br.dec[br.count++] = (unsigned short)(li | 0x2000);
-            if (cur.count < 15) cur.dec[cur.count++] = (unsigned short)li;
+            if (br.count < 15) br.dec[br.count++] = (uint32_t)li | 0x10000u;
+            if (cur.count < 15) cur.dec[cur.count++] = (uint32_t)li;
             if (t) { if (world_race_route(w) && kind != 0) PF_BACK(br); else PF_FRONT(br); }
             if (k == nl - 1) {                                          /* only after the last link */
                 PfState nx = cur;
@@ -898,8 +898,8 @@ static void enc_pathfind(AiRacer *r, int target)
         int slot = -1;
         for (int i = 0; i < 16; i++) if (!(r->linkmem[i] & 1)) { slot = i; break; }
         if (slot < 0) break;
-        unsigned d = node.dec[k], link = d & 0x1fff, take = d >> 13 & 1;
-        r->linkmem[slot] = ((link << 1 | take) << 3) | (r->linkmem[slot] & 0xfffe0007u) | 7u;
+        unsigned d = node.dec[k], link = d & 0xffff, take = d >> 16 & 1;
+        r->linkmem[slot] = ((link << 1 | take) << 3) | (r->linkmem[slot] & 0xfff00007u) | 7u;
     }
 }
 /* the goal's Think (vt+0x44): ChaseCar's 0x420910 in the Outrun, an AI racer */

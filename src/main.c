@@ -9993,9 +9993,10 @@ static void gps_walls_sync(AiGps *p)
     aigps_set_walls(p, seg, n);
     if (stage >= 0) printf("gps: route search keeps out of %d lock walls (%s)\n", n, gn);
 }
+static int g_bey_roam;                 /* (below) */
 static AiGps *gps_pf(void)
 {
-    if (!g_gps.pf && g_rt.net) g_gps.pf = aigps_new(g_rt.net);
+    if (!g_gps.pf && g_rt.net) { g_gps.pf = aigps_new(g_rt.net); if (g_bey_roam) aigps_set_big(g_gps.pf); }
     gps_walls_sync(g_gps.pf);
     return g_gps.pf;
 }
@@ -10105,6 +10106,10 @@ static const struct { float x, y, size; uint32_t label; } k_wm_region[6] = {   /
     { 251, 299, 213, 0xc08af0b6u }, /* Coal Harbor East */
     { 132, 341, 171, 0xc08af0b7u }, /* Coal Harbor West */
 };
+/* the World Expansion's map (port): its whole square, then its four quarters */
+static const struct { float x, y, size; const char *name; } k_wm_bregion[5] = {
+    { 0, 0, 512, NULL }, { 0, 0, 256, "North West" }, { 256, 0, 256, "North East" },
+    { 0, 256, 256, "South West" }, { 256, 256, 256, "South East" } };
 static const char *const k_wm_prefix[15] = {   /* PTR table 0x7f4348 */
     "CIRCUITEVENTINDICATOR_", "DRAGEVENTINDICATOR_", "STREETEVENTINDICATOR_", "DRIFTEVENTINDICATOR_",
     "SPRINTEVENTINDICATOR_", "URLEVENTINDICATOR_", "SUVEVENTINDICATOR_", "PAINTSHOPINDICATOR_",
@@ -10131,13 +10136,17 @@ static int wm_filter_byte(int t)                /* element type -> the career's 
     static const signed char r[14] = { 0, 1, 2, 3, 4, 5, 7, 9, 10, 12, 13, 11, 14, 15 };
     return t >= 0 && t < 14 ? r[t] : -1;
 }
+static unsigned char g_wm_bhide[16];        /* the World Expansion map's own filter (port): the career's is the profile's */
+static int g_wm_bey;                        /* the world map open is the World Expansion's */
 static int wm_filtered(int t)                   /* IsFilteredOut 0x4964d0 */
 {
+    if (g_wm_bey) return t >= 0 && t < 16 && g_wm_bhide[t];
     int r = wm_filter_byte(t);
     return r >= 0 && !g_career.a8869[r];
 }
 static void wm_set_filtered(int t, int hidden)  /* SetFilteredOut 0x496390 */
 {
+    if (g_wm_bey) { if (t >= 0 && t < 16) g_wm_bhide[t] = (unsigned char)(hidden != 0); return; }
     unsigned char v = hidden ? 0 : 1;
     if (t == 13) { g_career.a8869[6] = g_career.a8869[8] = g_career.a8869[15] = v; return; }
     int r = wm_filter_byte(t);
@@ -10347,6 +10356,7 @@ static struct {
     float mcx, mcy, mw, mh;
     int dlg_kind, dsel;                 /* 1 engage (two buttons), 2 deactivate (one) */
     int fresh;                          /* the frame it opened: the World Map press's own d-pad Left */
+    int zr[64]; float bz[64];           /* World Expansion entries (port): radar index, ground height */
 } g_wm;
 /* Fast travel (LiveArea Settings, fasttravel.txt; the NFSU2FastTravel PC mod,
    github.com/CrabJournal/NFSU2FastTravel): the World Map's two-button GPS
@@ -10379,8 +10389,10 @@ static int wm_on_map(const WmEl *e)             /* IsOnWorldMap 0x496760 */
 static void wm_tick(void)                       /* WorldMapWrapper::Tick 0x4b09e0 */
 {
     Hud *h = g_wm.h;
-    float sz = k_wm_region[g_wm.zoom].size, w = sz / 512.0f;
-    float cu = (k_wm_region[g_wm.zoom].x + sz * 0.5f) / 512.0f, cv = (k_wm_region[g_wm.zoom].y + sz * 0.5f) / 512.0f;
+    float rx = g_wm_bey ? k_wm_bregion[g_wm.zoom].x : k_wm_region[g_wm.zoom].x;
+    float ry = g_wm_bey ? k_wm_bregion[g_wm.zoom].y : k_wm_region[g_wm.zoom].y;
+    float sz = g_wm_bey ? k_wm_bregion[g_wm.zoom].size : k_wm_region[g_wm.zoom].size, w = sz / 512.0f;
+    float cu = (rx + sz * 0.5f) / 512.0f, cv = (ry + sz * 0.5f) / 512.0f;
     hud_screen_obj_uv(h, g_wm.map, cu - w * 0.5f, cv - w * 0.5f, cu + w * 0.5f, cv + w * 0.5f);
     for (int i = 0; i < g_wm.nel; i++) {
         WmEl *e = &g_wm.el[i];
@@ -10479,10 +10491,40 @@ static void wm_add_el(int type, int obj, float x, float y, float head, int zi)
     WmEl *e = &g_wm.el[g_wm.nel++];
     e->type = type; e->obj = obj; e->wx = x; e->wy = y; e->head = head; e->zi = zi;
 }
-static int wm_open(const char *dataroot, float px, float py, float phead)
+static void wm_region_label(void);
+/* the World Expansion's entries (port): every event start and shop of the set, the
+   nearest of each type to the car while the type's 9 icons last */
+typedef struct { int radar; float x, y, z, d; uint32_t id; } WmCand;
+static int wm_cand_cmp(const void *a, const void *b)
+{
+    float d = ((const WmCand *)a)->d - ((const WmCand *)b)->d;
+    return d < 0 ? -1 : d > 0;
+}
+static int wm_bey_cands(WmCand *c, int cap, float px, float py)
+{
+    int n = 0;
+    for (int i = 0; i < beyond_event_count() && n < cap; i++) {
+        int id, t, l, k; float p[3];
+        if (!beyond_event_at(i, &id, &t, &l) || !beyond_event_start(i, p, NULL) || (k = bey_trig_k(t)) < 0) continue;
+        c[n].radar = k; c[n].id = 0xbe000000u | (uint32_t)id;
+        c[n].x = p[0]; c[n].y = p[1]; c[n].z = p[2]; n++;
+    }
+    for (int i = 0; i < beyond_shop_count() && n < cap; i++) {
+        int t; float p[3];
+        if (!beyond_shop_at(i, &t, p, NULL)) continue;
+        c[n].radar = bey_shop_filter(t); c[n].id = 0xbf000000u | (uint32_t)i;
+        c[n].x = p[0]; c[n].y = p[1]; c[n].z = p[2]; n++;
+    }
+    for (int i = 0; i < n; i++) c[i].d = (c[i].x - px) * (c[i].x - px) + (c[i].y - py) * (c[i].y - py);
+    qsort(c, (size_t)n, sizeof *c, wm_cand_cmp);
+    return n;
+}
+/* bmap: the World Expansion's BMAP (port; free roam of a Beyond / expansion set), NULL the career's */
+static int wm_open(const char *dataroot, float px, float py, float phead, const char *bmap)
 {
     pause_close();
     memset(&g_wm, 0, sizeof g_wm);
+    g_wm_bey = bmap != NULL;
     g_wm.h = hud_init_screen(dataroot, "GLOBAL/GLOBALB.BUN", "UI_InGame_WorldMap.fng");
     if (!g_wm.h) { printf("world map: UI_InGame_WorldMap.fng not loaded\n"); return 0; }
     Hud *h = g_wm.h;
@@ -10491,12 +10533,26 @@ static int wm_open(const char *dataroot, float px, float py, float phead)
     /* the map: TRACKMAP<0x89e7a0>, the UV window of the zoom region */
     g_wm.map = hud_screen_find_h(h, 0x90fe80f3u);
     hud_screen_obj_box(h, g_wm.map, &g_wm.mcx, &g_wm.mcy, &g_wm.mw, &g_wm.mh);
-    {   char p[1024], n[32];
+    if (bmap) {   /* "BMAP" w h x0 y0 size zoom, RGBA (hud_set_trackmap_file) */
+        long len = 0; uint32_t bw = 0, bh = 0; float fl[4] = { 0 };
+        unsigned char *d = n2_read_file(bmap, &len);
+        if (d && len >= 28 && !memcmp(d, "BMAP", 4)) { memcpy(&bw, d + 4, 4); memcpy(&bh, d + 8, 4); memcpy(fl, d + 12, 16); }
+        if (!d || !bw || bw > 4096 || bh != bw || (long)(28 + (size_t)bw * bh * 4) > len || !(fl[2] > 0)) {
+            printf("world map: %s missing or unreadable\n", bmap);
+            free(d); hud_free(&g_wm.h); g_wm_bey = 0; return 0;
+        }
+        hud_screen_tex_rgba(h, 0x90fe80f3u, (int)bw, (int)bh, d + 28);
+        free(d);
+        g_wm_trk.ev = -2; g_wm_trk.x0 = fl[0]; g_wm_trk.y0 = fl[1]; g_wm_trk.ext = fl[2];   /* the city's HUD fill sets it back */
+        g_wm.maxzoom = 4;
+    } else {
+        char p[1024], n[32];
         snprintf(p, sizeof p, "%s/TRACKS/TRACKMAP%d.BIN", dataroot, g_wm_trk.ev);
         snprintf(n, sizeof n, "TRACKMAP%d", g_wm_trk.ev);
-        hud_screen_tex_file(h, 0x90fe80f3u, p, n, 1); }
-    static const unsigned char k_maxzoom[8] = { 1, 1, 2, 3, 4, 5, 5, 5 };   /* 0x7f4328 */
-    g_wm.maxzoom = k_maxzoom[g_career.stage & 7];
+        hud_screen_tex_file(h, 0x90fe80f3u, p, n, 1);
+        static const unsigned char k_maxzoom[8] = { 1, 1, 2, 3, 4, 5, 5, 5 };   /* 0x7f4328 */
+        g_wm.maxzoom = k_maxzoom[g_career.stage & 7];
+    }
     g_wm.loc = hud_screen_find_h(h, 0xe2848973u);
     g_wm.loc_c[0] = hud_screen_find_h(h, 0x4f649313u); g_wm.loc_c[1] = hud_screen_find_h(h, 0x4f649314u);
     hud_screen_obj_hide(h, g_wm.loc, 1);
@@ -10514,7 +10570,24 @@ static int wm_open(const char *dataroot, float px, float py, float phead)
         }
     }
     int wc = career_wc_active();
-    for (int i = 0; i < 64; i++) {             /* the unlocked zones on radar */
+    if (bmap) {
+        static WmCand cand[512];
+        int nc = wm_bey_cands(cand, 512, px, py);
+        for (int i = 0; i < nc && g_wm.nzone < 64; i++) {
+            int t = wm_type(cand[i].radar);
+            if (cnt[t] > 9) continue;               /* the type's icons ran out: the nearer ones shown */
+            char nm[48]; snprintf(nm, sizeof nm, "%s%d", k_wm_prefix[t], cnt[t]++);
+            int o = hud_screen_find(h, nm);
+            if (o < 0) continue;
+            CareerZone *z = &g_wm.zone[g_wm.nzone];
+            memset(z, 0, sizeof *z); z->zone = cand[i].id;
+            g_wm.zr[g_wm.nzone] = cand[i].radar; g_wm.bz[g_wm.nzone] = cand[i].z;
+            g_wm.zone_el[g_wm.nzone] = g_wm.nel;
+            wm_add_el(t, o, cand[i].x, cand[i].y, 0.0f, g_wm.nzone);
+            g_wm.nzone++;
+        }
+    }
+    for (int i = 0; !bmap && i < 64; i++) {    /* the unlocked zones on radar */
         const CareerZone *z = career_unlocked_zone(i);
         if (!z || !z->zone || !(career_zone_on_radar(z) || wc) || g_wm.nzone >= 64) continue;
         float x, y;
@@ -10529,7 +10602,7 @@ static int wm_open(const char *dataroot, float px, float py, float phead)
         wm_add_el(t, o, x, y, 0.0f, g_wm.nzone);
         g_wm.nzone++;
     }
-    for (int i = 0; i < g_wm_nai && i < 3; i++) {   /* the opponents (AI world racers) */
+    for (int i = 0; !bmap && i < g_wm_nai && i < 3; i++) {   /* the opponents (AI world racers) */
         char nm[48]; snprintf(nm, sizeof nm, "%s%d", k_wm_prefix[14], cnt[14]++);
         wm_add_el(14, hud_screen_find(h, nm), g_wm_ai[i].x, g_wm_ai[i].y, g_wm_ai[i].head, -1);
     }
@@ -10539,7 +10612,7 @@ static int wm_open(const char *dataroot, float px, float py, float phead)
         if (!gps_idle()) { int g = wm_gps_target(); if (g >= 0 && !wm_filtered(wm_zone_type(g))) wm_set_gps(g); }
         else wm_set_gps(0);
     }
-    hud_screen_label_h(h, 0x632b4fa8u, k_wm_region[0].label);
+    wm_region_label();
     /* the legend: one row a type, numbered in zone order */
     uint32_t on = hud_screen_obj_argb(h, hud_screen_find_h(h, 0xdd9ef5ffu));
     uint32_t off = hud_screen_obj_argb(h, hud_screen_find(h, "PAINTSHOPINDICATOR_1"));
@@ -10549,7 +10622,7 @@ static int wm_open(const char *dataroot, float px, float py, float phead)
     }
     for (int i = 0; i < g_wm.nzone; i++) {
         const CareerZone *z = &g_wm.zone[i];
-        int radar = map_zone_filter(z), t = wm_type(radar), r = 0;
+        int radar = bmap ? g_wm.zr[i] : map_zone_filter(z), t = wm_type(radar), r = 0;
         while (r < g_wm.nrow && g_wm.row[r].type != t) r++;
         char nm[48];
         if (r == g_wm.nrow) {                   /* 0x4b0d50 */
@@ -10586,9 +10659,15 @@ static int wm_open(const char *dataroot, float px, float py, float phead)
     g_wm.fresh = 1;
     g_pause.on = 1; g_pause.race = 0; g_pause.eat_start = 0;
     audio_pause_game(1); music_pause(1);
-    printf("world map: %d zones, %d rows, %d opponents, zoom regions 0..%d, TRACKMAP%d\n",
-           g_wm.nzone, g_wm.nrow, g_wm_nai, g_wm.maxzoom, g_wm_trk.ev);
+    printf("world map: %d zones, %d rows, %d opponents, zoom regions 0..%d, %s%d\n",
+           g_wm.nzone, g_wm.nrow, bmap ? 0 : g_wm_nai, g_wm.maxzoom, bmap ? bmap : "TRACKMAP", bmap ? 0 : g_wm_trk.ev);
     return 1;
+}
+static void wm_region_label(void)
+{
+    if (!g_wm_bey) { hud_screen_label_h(g_wm.h, 0x632b4fa8u, k_wm_region[g_wm.zoom].label); return; }
+    if (k_wm_bregion[g_wm.zoom].name) hud_screen_text_h(g_wm.h, 0x632b4fa8u, k_wm_bregion[g_wm.zoom].name);
+    else hud_screen_label_h(g_wm.h, 0x632b4fa8u, k_wm_region[0].label);              /* Full Map */
 }
 static void wm_zoom(int next)                   /* ScrollZoomRegion 0x4cbda0 */
 {
@@ -10596,13 +10675,14 @@ static void wm_zoom(int next)                   /* ScrollZoomRegion 0x4cbda0 */
     g_wm.zoom = next ? (g_wm.zoom + 1) % n : (g_wm.zoom + n - 1) % n;
     audio_fe_play(next ? FE_SND_RIGHT : FE_SND_LEFT);
     wm_tick();
-    hud_screen_label_h(g_wm.h, 0x632b4fa8u, k_wm_region[g_wm.zoom].label);
+    wm_region_label();
     hud_screen_obj_hide(g_wm.h, g_wm.loc, 0);
     if (g_wm.gps >= 0) {
         wm_set_gps(g_wm.gps);
         if (!wm_on_map(&g_wm.el[g_wm.zone_el[g_wm.gps]])) hud_screen_obj_hide(g_wm.h, g_wm.loc, 1);
     }
-    printf("world map: zoom %d (%s)\n", g_wm.zoom, hud_screen_string(g_wm.h, k_wm_region[g_wm.zoom].label));
+    printf("world map: zoom %d (%s)\n", g_wm.zoom, g_wm_bey && k_wm_bregion[g_wm.zoom].name ? k_wm_bregion[g_wm.zoom].name
+                                                    : hud_screen_string(g_wm.h, k_wm_region[g_wm.zoom].label));
 }
 static void wm_toggle(void)                     /* ToggleHighlightedRowFilter 0x4b0ef0 */
 {
@@ -10657,8 +10737,20 @@ static void wm_key(const char *dataroot, int k, int repeat)
             audio_fe_play(FE_SND_SELECT);
             const CareerZone *z = &g_wm.zone[g_wm.gps];
             const WmEl *e = &g_wm.el[g_wm.zone_el[g_wm.gps]];
-            gps_start(z, e->wx, e->wy);
+            float tx = e->wx, ty = e->wy, rp[3];
+            if (g_wm_bey) {   /* the entry's ground (port), on the road nearest it (a garage's spot is in its yard) */
+                g_gps.fake_z = g_wm.bz[g_wm.gps]; g_gps.fake_z_on = 1;
+                if (ainet_nearest_point(g_rt.net, tx, ty, g_gps.fake_z, 80.0f, rp)) { tx = rp[0]; ty = rp[1]; g_gps.fake_z = rp[2]; }
+            }
+            gps_start(z, tx, ty);
+            if (g_wm_bey) g_gps.fake_z_on = 0;
             wm_close();                                          /* +0x60: the map closes */
+        } else if (k == SDLK_KP_ENTER && g_wm.dlg_kind == 1 && g_wm.dsel == 1 && fast_travel_on() && g_wm_bey) {
+            const WmEl *e = &g_wm.el[g_wm.zone_el[g_wm.gps]];   /* the World Expansion's entry (port): its start / shop spot */
+            audio_fe_play(FE_SND_SELECT);
+            g_ft.p[0] = e->wx; g_ft.p[1] = e->wy; g_ft.p[2] = g_wm.bz[g_wm.gps]; g_ft.go = 1;
+            printf("fast travel: to (%.0f %.0f %.1f)\n", (double)g_ft.p[0], (double)g_ft.p[1], (double)g_ft.p[2]);
+            wm_close();
         } else if (k == SDLK_KP_ENTER && g_wm.dlg_kind == 1 && g_wm.dsel == 1 && fast_travel_on()) {   /* the mod's No */
             const CareerZone *z = &g_wm.zone[g_wm.gps];
             const unsigned char *r = gps_zone_rec(z->zone);
@@ -20176,7 +20268,13 @@ int main(int argc, char **argv) {
                 /* the World Map binding (RacingJoyHandler joy event 0xc0 -> RC message
                    0x12): career free roam only, the game paused under it */
                 else if (k == SDLK_KP_6 && !e.key.repeat && race_state == 1 && g_rt.roam && g_rt.w && g_career_mode &&
-                         g_rt.zones && !post_up() && wm_open(dataroot, carpos[0], carpos[1], heading)) {
+                         g_rt.zones && !post_up() && wm_open(dataroot, carpos[0], carpos[1], heading, NULL)) {
+                }
+                /* ... and the World Expansion's free roam (port): its set's starts and shops on its map */
+                else if (k == SDLK_KP_6 && !e.key.repeat && race_state == 1 && g_bey_roam && g_rt.net && !g_career_mode &&
+                         !g_pause.on && !post_up() &&
+                         wm_open(dataroot, carpos[0], carpos[1], heading,
+                                 xpcity_is_city(trackname) ? xpcity_map(trackname) : "ux0:data/NFSU2/beyond/minimap.bin")) {
                 }
                 /* the Read SMS binding (joy event 0xc2 -> SetEngagingDialog + RC message
                    0xd): career free roam, not engaging; an empty queue opens an empty mailbox */
@@ -29380,6 +29478,10 @@ int main(int argc, char **argv) {
                 int id, t, l;
                 if (beyond_event_at(g_bey_zone, &id, &t, &l)) hud_event_remove(bey_indicator(t));
                 g_bey_zone = -1;
+            }
+            if (g_bey_roam && g_gps.active && !g_pause.on) {              /* the World Expansion's GPS (port): there */
+                float dx = g_gps.x - carpos[0], dy = g_gps.y - carpos[1];
+                if (dx * dx + dy * dy < 20.0f * 20.0f) { printf("gps: arrived\n"); gps_stop(); }
             }
             if (g_bey_roam && !g_pause.on) {                              /* ... and the shop / garage (an expansion city's: its own shops.txt) */
                 int in = -1; float best = 15.0f * 15.0f;

@@ -752,7 +752,8 @@ struct AiRacer {
     /* controller (0x420500 / 0x4260b0) */
     Pt   *rpt;                 /* +0xc current route point */
     int   rdir;                /* +0x10 travelling forward along it */
-    uint32_t linkmem[16];      /* +0x14: bit0 valid, bit3 decision, bits 4-16 link */
+    uint32_t linkmem[16];      /* +0x14: bit0 valid, bit3 decision, bits 4-16 link (port: 4-19, the
+                                  World Expansion's nets pass 8191 links; 17-31 were never read) */
     /* DriveInfo, +0x54 */
     int   nent;                /* +0x58 */
     RacerEnt ent[16];          /* +0x5c */
@@ -1065,7 +1066,8 @@ typedef struct PfNode {
     float g, h;                /* +8 metres travelled, +0xc 2-D distance left (99999 dead, 0 at the goal) */
     float target[3];           /* +0x10 */
     struct { Pt *pt; unsigned char dir; unsigned short dec; } succ[3];   /* +0x20, 8 bytes each (+0x26 link, 0xffff none) */
-    unsigned short dec[64];    /* +0x38 signpost decisions: bits 0-12 link, 13 taken */
+    uint32_t dec[64];          /* +0x38 signpost decisions: bits 0-12 link, 13 taken (port: 0-15, 16 --
+                                  the World Expansion's nets pass 8191 links) */
     signed char nsucc, ndec;   /* +0xb8 / +0xb9 */
     char  atgoal;              /* +0xba */
     char  startdir, dir;       /* +0xbb / +0xbc: 1 along the points' order */
@@ -1080,7 +1082,7 @@ static int gps_decision(const AiRacer *r, Lk *l)
     if (k == 7 || k == 5 || k == 10 || !r->gps) return 0;
     unsigned li = (unsigned)lk_index(r->w->net, l) & 0xffff;
     for (int i = 0; i < r->gps->ndec; i++)
-        if ((unsigned)(r->gps->dec[i] & 0x1fff) == li) return r->gps->dec[i] >> 13 & 1;
+        if ((unsigned)(r->gps->dec[i] & 0xffff) == li) return r->gps->dec[i] >> 16 & 1;
     return 0;
 }
 /* 0x41cfa0: the controller decides a branch, remembering the answer per link
@@ -1096,20 +1098,20 @@ static int ctrl_choose_link(AiRacer *r, Lk *l, int dir, int traffic)
         /* the human's controller: every decision remembered (vt+0x5c
            0x403210), taken when always or of kind 0 (vt+0x54 0x418910) */
         for (int i = 0; i < 16; i++)
-            if ((r->linkmem[i] & 1) && (li & 0xffff) == (r->linkmem[i] >> 4 & 0x1fff))
+            if ((r->linkmem[i] & 1) && (li & 0xffff) == (r->linkmem[i] >> 4 & 0xffff))
                 return r->linkmem[i] >> 3 & 1;
         int k = f & 0xf;
         int take = link_always(r, l) || (k != 5 && k != 10 && k != 7 && k == 0);
         int slot = -1;
         for (int i = 0; i < 16; i++) if (!(r->linkmem[i] & 1)) { slot = i; break; }
         if (slot == -1) slot = 0;
-        r->linkmem[slot] = ((li & 0x1fff) << 1 | (unsigned)(take & 1)) << 3 | (r->linkmem[slot] & 0xfffe0003u) | 3;
+        r->linkmem[slot] = ((li & 0xffff) << 1 | (unsigned)(take & 1)) << 3 | (r->linkmem[slot] & 0xfff00003u) | 3;
         return take;
     }
     int mem = goal_remember_link(r, l);
     if (mem)
         for (int i = 0; i < 16; i++)
-            if ((r->linkmem[i] & 1) && (li & 0xffff) == (r->linkmem[i] >> 4 & 0x1fff))
+            if ((r->linkmem[i] & 1) && (li & 0xffff) == (r->linkmem[i] >> 4 & 0xffff))
                 return r->linkmem[i] >> 3 & 1;
     int take = goal_take_link(r, l);
     if (take && (f >> 16 & 3) == 2 && !r->traffic) r->last_kind2_link = (int)(li & 0xffff);   /* vt+0x58 0x410580 (0x7e95c4) */
@@ -1117,7 +1119,7 @@ static int ctrl_choose_link(AiRacer *r, Lk *l, int dir, int traffic)
         int slot = -1;
         for (int i = 0; i < 16; i++) if (!(r->linkmem[i] & 1)) { slot = i; break; }
         if (slot == -1) slot = 0;                 /* full: the original resets the planner */
-        r->linkmem[slot] = ((li & 0x1fff) << 1 | (unsigned)(take & 1)) << 3 | (r->linkmem[slot] & 0xfffe0003u) | 3;
+        r->linkmem[slot] = ((li & 0xffff) << 1 | (unsigned)(take & 1)) << 3 | (r->linkmem[slot] & 0xfff00003u) | 3;
     }
     return take;
 }
@@ -3509,7 +3511,7 @@ static void linkmem_tidy(AiRacer *r)
     for (int i = 0; i < 16; i++) {
         uint32_t m = r->linkmem[i];
         if (!(m & 1) || (m & 4)) continue;
-        Lk *l = n->links + (m >> 4 & 0x1fff) * 0x20;
+        Lk *l = n->links + (m >> 4 & 0xffff) * 0x20;
         int s = rds16(l + 10), k = rds16(l + 6);                        /* 0x5d3f80 */
         if (s >= 0 && fl_find(&r->L, s, k) != -1) continue;
         r->linkmem[i] &= ~1u;
@@ -6882,6 +6884,7 @@ float ainet_reftime_at(const float tab[513], float d)
    postedness 2 (a human player) throughout. */
 #define PF_OPEN_MAX   0x9f      /* PFM +0x44 */
 #define PF_CLOSED_MAX 0x4ff     /* PFM +0x2c4 */
+#define PF_CLOSED_BIG 0x3000    /* the World Expansion's denser road nets (port): aigps_set_big */
 #define PF_DEAD 99999.0f        /* 0x47c34f80 */
 typedef struct { Pt *pt; char dir; float g; } PfLite;   /* PathfindingNodeLite (pool 0x81cbbc) */
 struct AiGps {
@@ -6892,7 +6895,8 @@ struct AiGps {
     float  start[3], sdir[2], target[3];   /* +0x10 / +0x20 / +0x30 */
     int    cursor;             /* +0x40 section of the open-list scan */
     PfNode *open[PF_OPEN_MAX]; int nopen;  /* +0x44 / +0x16c4: sorted, the cheapest last */
-    PfLite closed[PF_CLOSED_MAX]; int nclosed;   /* +0x2c4 / +0x16c8 */
+    PfLite closed[PF_CLOSED_BIG]; int nclosed;   /* +0x2c4 / +0x16c8 */
+    int closed_max, big;                /* PF_CLOSED_MAX (retail), PF_CLOSED_BIG for big */
     int    nopen0;             /* +0x16cc */
     int    algorithm, posted;  /* +0x16d0 / +0x16d4 */
     PfNode result;             /* +0x16e0 */
@@ -6913,6 +6917,7 @@ struct AiGps {
    player into a wall (the stage-0 drive from the airport). A road hop p -> q
    that crosses one is a dead end, like a Stop link. Set by pf_service. */
 static const float *pf_walls; static int pf_nwalls;
+static int pf_big;   /* the search running is a big net's (aigps_set_big) */
 static int pf_seg_cross(float ax, float ay, float bx, float by, const float *w)
 {
     float rx = bx - ax, ry = by - ay, sx = w[2] - w[0], sy = w[3] - w[1];
@@ -6985,7 +6990,10 @@ static float pt_travel(const AiNet *n, Pt *p, Pt *q, int back)
 {
     float d[2];
     if (!back) { d[0] = pt_dx(p); d[1] = pt_dy(p); } else pt_backdir(n, p, d);
-    return (pt_y(q) - pt_y(p)) * d[1] + (pt_x(q) - pt_x(p)) * d[0];
+    float t = (pt_y(q) - pt_y(p)) * d[1] + (pt_x(q) - pt_x(p)) * d[0];
+    /* port: a World Expansion net's joins can land a link's far point a little behind
+       it -- a negative step, and a loop of them never lets the search end */
+    return pf_big && t < 0.0f ? 0.0f : t;
 }
 /* 0x40cd00: how far q lies outside the road's half widths at p */
 static float pt_latout(Pt *p, const float *q)
@@ -7105,9 +7113,9 @@ static int pf_successor(const PfNode *N, const AiNet *n, int k, PfNode *o)
     o->dir = (char)N->succ[k].dir;
     o->g = pt_travel(n, N->cur, o->cur, N->dir == 0) + o->g;
     for (int i = 0; i < k; i++)
-        if (o->ndec < 0x3f) { o->dec[(int)o->ndec] = (unsigned short)((o->dec[(int)o->ndec] & 0xc000) | (N->succ[i].dec & 0x1fff)); o->ndec++; }
+        if (o->ndec < 0x3f) { o->dec[(int)o->ndec] = (o->dec[(int)o->ndec] & 0xfffe0000u) | (N->succ[i].dec & 0xffffu); o->ndec++; }
     if (N->succ[k].dec != 0xffff && o->ndec < 0x3f) {
-        o->dec[(int)o->ndec] = (unsigned short)((o->dec[(int)o->ndec] & 0xc000) | (N->succ[k].dec & 0x1fff) | 0x2000);
+        o->dec[(int)o->ndec] = (o->dec[(int)o->ndec] & 0xfffe0000u) | (N->succ[k].dec & 0xffffu) | 0x10000u;
         o->ndec++;
     }
     return 1;
@@ -7219,13 +7227,16 @@ static void pf_astar(AiGps *g, uint64_t t0)
                 } else { *g->open[io] = *s; pf_free(g, s); }           /* 0x40a2d0 */
                 pf_sort(g);
             }
-            if (g->nclosed < PF_CLOSED_MAX) {
+            if (g->nclosed < g->closed_max) {
                 PfLite *q = &g->closed[g->nclosed++];
                 q->pt = c->cur; q->dir = c->dir != 0; q->g = c->g;
             }
         } else if (!g->found) { g->result = *c; g->found = 1; }
         pf_free(g, c);
     }
+    /* port: a big net's search with its closed list full would cycle for ever (the retail
+       one never fills on Bayview) -- it ends as no path */
+    if (g->big && !g->found && g->nclosed >= g->closed_max) g->nopen = 0;
     if (g->found || g->nopen == 0) { pf_clearlists(g); g->state = 3; }
 }
 /* 0x4268a0 Service: the time-sliced search; when finished the status and
@@ -7233,7 +7244,7 @@ static void pf_astar(AiGps *g, uint64_t t0)
 static void pf_service(AiGps *g)
 {
     uint64_t t0 = SDL_GetPerformanceCounter();
-    pf_walls = g->walls; pf_nwalls = g->nwalls;
+    pf_walls = g->walls; pf_nwalls = g->nwalls; pf_big = g->big;
 #ifdef OPENUG2_SIM_PRE_H
     if (getenv("OPENUG2_SIM_GPSNOWALLS")) pf_nwalls = 0;   /* test aid: the original's search (A/B) */
 #endif
@@ -7261,6 +7272,7 @@ AiGps *aigps_new(const AiNet *net)
     g->net = net;
     g->cursor = -1;
     g->halfwid = 1.0f;
+    g->closed_max = PF_CLOSED_MAX;
     for (int i = 0; i < PF_OPEN_MAX + 2; i++) g->pfree[g->npfree++] = &g->pool[i];
     g->w = aiworld_new(net, NULL, 0);
     g->r = (AiRacer *)calloc(1, sizeof *g->r);
@@ -7287,6 +7299,26 @@ void aigps_free(AiGps *g)
     free(g->walls);
     free(g);
 }
+/* port: the GPS-posted road point nearest (x, y) within maxd metres and 8 m of z
+   (a World Expansion GPS target off the road: a garage's yard) */
+int ainet_nearest_point(const AiNet *n, float x, float y, float z, float maxd, float out[3])
+{
+    if (!n) return 0;
+    float best = maxd * maxd; int ok = 0;
+    for (int i = 0; i < n->norder; i++) {
+        const unsigned char *s = n->order[i];
+        if (x < rdf(s + 0x60) - maxd || x > rdf(s + 0x68) + maxd || y < rdf(s + 0x64) - maxd || y > rdf(s + 0x6c) + maxd) continue;
+        int np = sec_npts(s);
+        for (int k = 0; k < np; k++) {
+            Pt *p = sec_pt(s, k);
+            if (!pt_posted(p, 2) || fabsf(pt_z(p) - z) > 8.0f) continue;
+            float dx = pt_x(p) - x, dy = pt_y(p) - y, d = dx * dx + dy * dy;
+            if (d < best) { best = d; out[0] = pt_x(p); out[1] = pt_y(p); out[2] = pt_z(p); ok = 1; }
+        }
+    }
+    return ok;
+}
+void aigps_set_big(AiGps *g) { if (g) { g->big = 1; g->closed_max = PF_CLOSED_BIG; } }
 void aigps_set_halfwidth(AiGps *g, float half_wid) { if (g && 0 < half_wid) g->halfwid = half_wid; }
 void aigps_set_walls(AiGps *g, const float *seg, int n)
 {
@@ -7357,8 +7389,8 @@ static Pt *pf_closest_route_point(const PfNode *N, const AiNet *n, const float *
             if (b18 == dir && (f & 0xf) == 3) break;
             if (b18 == dir || lk_ignore(l, P) || lk_never(l, P)) continue;
             if (lk_always(l, P)) { must = l; continue; }
-            if (di < N->ndec && (unsigned)(lk_index(n, l) & 0xffff) == (unsigned)(N->dec[di] & 0x1fff)) {
-                if (N->dec[di] >> 13 & 1) must = l;
+            if (di < N->ndec && (unsigned)(lk_index(n, l) & 0xffff) == (unsigned)(N->dec[di] & 0xffff)) {
+                if (N->dec[di] >> 16 & 1) must = l;
                 di++;
             }
         }
@@ -7475,8 +7507,8 @@ int aigps_path(const AiGps *g, float *xyz, int max)
             if (b18 == dir && (f & 0xf) == 3) break;
             if (b18 == dir || lk_ignore(l, 2) || lk_never(l, 2)) continue;
             if (lk_always(l, 2)) { must = l; continue; }
-            if (di < N->ndec && (unsigned)(lk_index(n, l) & 0xffff) == (unsigned)(N->dec[di] & 0x1fff)) {
-                if (N->dec[di] >> 13 & 1) must = l;
+            if (di < N->ndec && (unsigned)(lk_index(n, l) & 0xffff) == (unsigned)(N->dec[di] & 0xffff)) {
+                if (N->dec[di] >> 16 & 1) must = l;
                 di++;
             }
         }
