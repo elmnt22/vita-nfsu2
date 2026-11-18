@@ -155,6 +155,28 @@ int nis_pick(const NisPickCtx *c, AiRng *rng, unsigned *hash, int *variant)
         if (c->two_player && !two_player_ok(e)) continue;
         cand[nc++] = i;
     }
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aids (simulator): OPENUG2_SIM_NISLIST prints the table (allowed here or not);
+           OPENUG2_SIM_NISIDX=<i> plays entry i if this race allows it */
+        static int listed;
+        if (getenv("OPENUG2_SIM_NISLIST") && !listed++) {
+            for (unsigned i = 0; i < n && i < 64; i++) {
+                const unsigned char *q = T.sel + 0x1c + i * 12;
+                char nm[16] = "?";
+                for (int k = 1; k < 64; k++) { char t[16]; snprintf(t, sizeof t, "IntroNis%02d", k);
+                    if (nis_hash(t) == rd32(q)) { snprintf(nm, sizeof nm, "%s", t); break; } }
+                int ok = 0; for (int j = 0; j < nc; j++) ok |= cand[j] == i;
+                printf("nis table %2u: %s v%d flags %02x racers %d..%d type %d%s\n", i, nm, q[4], q[5], q[6], q[7],
+                       (signed char)q[8], ok ? " (allowed here)" : "");
+            }
+        }
+        const char *fi = getenv("OPENUG2_SIM_NISIDX");
+        if (fi && (unsigned)atoi(fi) < n) {   /* forced, whatever the start slot / filters */
+            cand[0] = (unsigned)atoi(fi); nc = 1;
+            printf("nis: sim entry %u forced\n", cand[0]);
+        }
+    }
+#endif
     if (!nc) return 0;
     const unsigned char *e = T.sel + 0x1c + cand[airng_int(rng, nc)] * 12;   /* 0x43c1c0 */
     *hash = rd32(e); *variant = e[4];
