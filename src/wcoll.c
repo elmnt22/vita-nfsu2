@@ -466,7 +466,7 @@ static int bound_find(WColl *w, const float *p)
 static volatile int g_wc_order_lock;
 static int bound_find_locked(WColl *w, const float *p, float *near_dist)
 {
-    while (__sync_lock_test_and_set(&g_wc_order_lock, 1)) { }
+    for (int n_ = 0; __sync_lock_test_and_set(&g_wc_order_lock, 1); n_++) if (n_ > 64) SDL_Delay(1);
     int b = bound_find(w, p);
     if (b < 0) bound_nearest(w, p, near_dist);
     __sync_lock_release(&g_wc_order_lock);
@@ -491,7 +491,7 @@ int wcoll_visible_sections(WColl *w, const float p[2], const short **list)
         return w->vis[i].n;
     }
     float d = 0.0f;
-    while (__sync_lock_test_and_set(&g_wc_order_lock, 1)) { }
+    for (int n_ = 0; __sync_lock_test_and_set(&g_wc_order_lock, 1); n_++) if (n_ > 64) SDL_Delay(1);
     int b = bound_nearest(w, p, &d);
     __sync_lock_release(&g_wc_order_lock);
     if (b < 0 || !(d < 0.1f)) return -1;

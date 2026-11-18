@@ -692,7 +692,7 @@ static unsigned char *hud_read_file(const char *path, long *len) {
     }
     if (slot < 0) return n2_read_file(path, len);
     unsigned char *d = NULL;
-    while (__sync_lock_test_and_set(&g_hfc_lock, 1)) {}
+    for (int n_ = 0; __sync_lock_test_and_set(&g_hfc_lock, 1); n_++) if (n_ > 64) SDL_Delay(1);
     if (g_hfc_data[slot] && (d = (unsigned char *)malloc((size_t)g_hfc_len[slot])) != NULL) {
         memcpy(d, g_hfc_data[slot], (size_t)g_hfc_len[slot]);
         *len = g_hfc_len[slot];
@@ -704,7 +704,7 @@ static unsigned char *hud_read_file(const char *path, long *len) {
     unsigned char *keep = (unsigned char *)malloc((size_t)*len);
     if (!keep) return d;
     memcpy(keep, d, (size_t)*len);
-    while (__sync_lock_test_and_set(&g_hfc_lock, 1)) {}
+    for (int n_ = 0; __sync_lock_test_and_set(&g_hfc_lock, 1); n_++) if (n_ > 64) SDL_Delay(1);
     if (!g_hfc_data[slot]) { g_hfc_data[slot] = keep; g_hfc_len[slot] = *len; keep = NULL; }
     __sync_lock_release(&g_hfc_lock);
     free(keep);
@@ -2726,6 +2726,7 @@ static void str_load(const char *dataroot, unsigned char **plang, uint32_t **psh
     }
 }
 static void dw_load_strings(struct HudDriftW *w, const char *dataroot) {
+    if (w->lang) return;   /* already loaded (drift/drag init + hud_build both ask): the copy leaked ~300 KB a race */
     str_load(dataroot, &w->lang, &w->sh, &w->st, &w->nstr);
 }
 /* the plain race HUD's own copy (its lap box label) */

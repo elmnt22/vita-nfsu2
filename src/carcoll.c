@@ -662,7 +662,7 @@ static float gjk(const Pair *q, GBlk *g, float *wa, float *wb)
     }
     {
         GBlk keep = *g;
-        for (;;) {
+        for (int it = 0; it < 64; it++) {               /* cap: a NaN distance never improves */
             float nout[3] = { -out[0], -out[1], -out[2] };
             float sa[3], sb[3];
             ia = sup_hull(q, out, sa); REL(sa);
@@ -675,7 +675,7 @@ static float gjk(const Pair *q, GBlk *g, float *wa, float *wb)
             if (!newa && !newb) break;                  /* nothing new: this is it */
             float nd2 = gjk_feats(g, out);
             if (nd2 == 0.0f) { d2 = 0.0f; goto touch; }  /* overlap */
-            if (d2 <= nd2) { *g = keep; break; }        /* no better: the last block */
+            if (!(nd2 < d2)) { *g = keep; break; }      /* no better (or NaN): the last block */
             keep = *g;
             d2 = nd2;
         }

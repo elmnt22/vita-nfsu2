@@ -1,5 +1,6 @@
 /* airacer.c — the retail NFSU2 AI racer (see airacer.h). */
 #include <stdarg.h>
+#include "SDL.h"   /* SDL_Delay: the pool lock backs off */
 #include "airacer.h"
 #include "world_resident.h"
 #include "wcoll.h"
@@ -329,12 +330,17 @@ static float fp_speed(const FPoint *f, int lane) { int s = lslot(lane); return s
    objects are the same, zeroed as calloc gave them. */
 typedef struct PoolFree { struct PoolFree *next; } PoolFree;
 typedef struct { size_t size; PoolFree *free; volatile int lock; } Pool;
+/* backs off after 64 spins: race cars step on 3 cores, and a spinner must
+   not starve a holder (or the heap lock's holder) on its own core */
+static void pool_lock(Pool *pl) { for (int n_ = 0; __sync_lock_test_and_set(&pl->lock, 1); n_++) if (n_ > 64) SDL_Delay(1); }
 static void *pool_take(Pool *pl)
 {
-    while (__sync_lock_test_and_set(&pl->lock, 1)) { }
-    if (!pl->free) {                                                    /* a chunk of 64 more */
+    pool_lock(pl);
+    if (!pl->free) {                                                    /* a chunk of 64 more, */
+        __sync_lock_release(&pl->lock);                                 /* malloc'd unlocked */
         size_t sz = (pl->size + 15) & ~(size_t)15;
         unsigned char *c = (unsigned char *)malloc(sz * 64);
+        pool_lock(pl);
         if (c) for (int i = 63; i >= 0; i--) { PoolFree *b = (PoolFree *)(c + sz * (size_t)i); b->next = pl->free; pl->free = b; }
     }
     PoolFree *b = pl->free;
@@ -346,7 +352,7 @@ static void *pool_take(Pool *pl)
 static void pool_give(Pool *pl, void *p)
 {
     if (!p) return;
-    while (__sync_lock_test_and_set(&pl->lock, 1)) { }
+    pool_lock(pl);
     ((PoolFree *)p)->next = pl->free; pl->free = (PoolFree *)p;
     __sync_lock_release(&pl->lock);
 }
@@ -1254,7 +1260,8 @@ static void fl_junction(AiRacer *r, FList *L, FPoint *nw)
     }
     Pt *p = pt_at(n, nw->sec, nw->pt);
     float x = (p ? fp_along(n, nw, p, ref) + (nw->dist - nw->off) : 0) - nw->dist + 3.0f;
-    while (p && fp_seglen(n, nw, p) < x) {
+    int steps = 0;                                                      /* as the walk below: a link */
+    while (p && fp_seglen(n, nw, p) < x && ++steps <= 100) {           /* loop never passes ref */
         const unsigned char *sec = n->sec[nw->sec];
         Pt *q = p;
         int idx = pt_index(n, q), dir = !nw->back;

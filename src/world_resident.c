@@ -249,7 +249,7 @@ static int resident_vista_batches(WorldResidentResources *resources,
 typedef struct { float **normals; PackedMesh *packed; int n; } ResidentDeferred;
 static ResidentDeferred *g_rdef; static int g_rdef_n, g_rdef_cap;
 static volatile int g_rdef_lock;
-static void rdef_lock(void) { while (__sync_lock_test_and_set(&g_rdef_lock, 1)) { } }
+static void rdef_lock(void) { for (int n_ = 0; __sync_lock_test_and_set(&g_rdef_lock, 1); n_++) if (n_ > 64) SDL_Delay(1); }
 static void rdef_unlock(void) { __sync_lock_release(&g_rdef_lock); }
 static int resident_defer_normals(WorldResidentResources *r) {
     if (!r->mesh_normals && !r->mesh_packed) return 1;

@@ -2559,7 +2559,7 @@ void shop_close(Shop **sp) {
     /* s->prog is the process-wide program (make_program): never deleted */
     for (int i = 0; i < PK_COUNT; i++) { feng_free_package(s->pk[i]); free(s->pk[i]); }
     if (s->map_tex) glDeleteTextures(1, &s->map_tex);
-    free(s->qr_anim);
+    free(s->qr_anim); free(s->alt_anim); free(s->brand_anim);   /* ~116 KB each: leaked per visit before 11-18 */
     free(s->tex); free(s->lang); free(s->str_hash); free((void *)s->str_txt); free(s->db);
     free(s);
     *sp = NULL;

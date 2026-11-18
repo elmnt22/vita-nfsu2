@@ -4945,8 +4945,18 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
         g_n2_gen = g_n2rec_gen; g_n2_live = 0; g_n2_nos_applied = -1;
     }
     if (!g_n2) return 0;
+    /* the last finite pose handed in: a sim step that goes NaN (a degenerate
+       force step) comes back here instead of staying NaN for good -- every
+       compare below is false for NaN, so respawns could never reset it */
+    static float ok_pos[3], ok_h; static int ok_have;
+    if (isfinite(carpos[0]) && isfinite(carpos[1]) && isfinite(carpos[2]) && isfinite(*heading)) {
+        memcpy(ok_pos, carpos, sizeof ok_pos); ok_h = *heading; ok_have = 1;
+    } else if (ok_have) {
+        memcpy(carpos, ok_pos, sizeof ok_pos); *heading = ok_h; vel[0] = vel[1] = 0;
+    }
     float dx = carpos[0] - g_n2_out[0], dy = carpos[1] - g_n2_out[1], dz = carpos[2] - g_n2_out[2];
     float dh = *heading - g_n2_outh;
+    if (!isfinite(dx + dy + dz + dh)) { g_n2_live = 0; dh = 0; }
     while (dh > 3.14159f) dh -= 6.28318f;
     while (dh < -3.14159f) dh += 6.28318f;
     /* the showroom turns the car on its turntable (heading set from the
@@ -5111,7 +5121,29 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
         N2Body pb; n2sim_body(g_n2, &pb);
         smk_end(pb.pos);
     }
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* sim test: OPENUG2_SIM_NANCAR=<tick> poisons the sim state once (the recovery below) */
+        static int nan_at = -2, nan_tick;
+        if (nan_at == -2) { const char *e = getenv("OPENUG2_SIM_NANCAR"); nan_at = e ? atoi(e) : -1; }
+        if (nan_at >= 0 && ++nan_tick == nan_at) {
+            float bad[3] = { NAN, NAN, NAN };
+            n2sim_set_velocity(g_n2, bad);
+            printf("n2sim: sim test poisoned the state at tick %d\n", nan_tick);
+        }
+    }
+#endif
     n2sim_state(g_n2, &g_n2s);
+    if (!(isfinite(g_n2s.pos[0]) && isfinite(g_n2s.pos[1]) && isfinite(g_n2s.pos[2]) &&
+          isfinite(g_n2s.vel[0]) && isfinite(g_n2s.vel[1]) && isfinite(g_n2s.vel[2]) &&
+          isfinite(g_n2s.heading)) && ok_have) {
+        static int nan_logged;
+        if (nan_logged++ < 5) printf("n2sim: non-finite state, car reset to its last pose (%.1f %.1f %.1f)\n",
+                                     ok_pos[0], ok_pos[1], ok_pos[2]);
+        n2sim_reset(g_n2, ok_pos, ok_h);
+        float v0[3] = { 0, 0, 0 };
+        n2sim_set_velocity(g_n2, v0);
+        n2sim_state(g_n2, &g_n2s);
+    }
     memcpy(carpos, g_n2s.pos, sizeof g_n2s.pos);
     vel[0] = g_n2s.vel[0] / 60.0f; vel[1] = g_n2s.vel[1] / 60.0f;
     *heading = g_n2s.heading;

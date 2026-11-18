@@ -195,7 +195,7 @@ static void wf_lock(int who)
 {
     if (!__sync_lock_test_and_set(&g_wf_lock, 1)) return;
     Uint64 t0 = SDL_GetPerformanceCounter();
-    while (__sync_lock_test_and_set(&g_wf_lock, 1)) { }
+    for (int n_ = 0; __sync_lock_test_and_set(&g_wf_lock, 1); n_++) if (n_ > 64) SDL_Delay(1);
     double ms = (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)SDL_GetPerformanceFrequency();
     if (ms > g_wf_wait_max[who]) g_wf_wait_max[who] = ms;
 }

@@ -1494,7 +1494,7 @@ static SharedBatchBuffers *g_shared_batches[SHARED_BATCH_SLOTS];
 /* The GL thread is the only writer; the world worker looks entries up
    (render_world_plan_fill), so insert/remove and that lookup take this. */
 static volatile int g_sbl;
-static void sbl_lock(void) { while (__sync_lock_test_and_set(&g_sbl, 1)) { } }
+static void sbl_lock(void) { for (int n_ = 0; __sync_lock_test_and_set(&g_sbl, 1); n_++) if (n_ > 64) SDL_Delay(1); }
 static void sbl_unlock(void) { __sync_lock_release(&g_sbl); }
 static int g_batch_reuse;
 static long g_batch_reused, g_batch_reused_bytes;

@@ -141,6 +141,12 @@ static int world_dedup(World *w) {
     float (*bb)[6] = (float (*)[6])malloc((size_t)nm * sizeof *bb);
     int   *ord     = (int *)malloc((size_t)nm * sizeof *ord);
     char  *drop    = (char *)calloc((size_t)nm, 1);
+    /* new index = count of survivors before this original slot */
+    int *keptbefore = (int *)malloc((size_t)(nm + 1) * sizeof *keptbefore);
+    if (!bb || !ord || !drop || !keptbefore) {   /* low memory: duplicates stay (harmless) */
+        free(bb); free(ord); free(drop); free(keptbefore);
+        return 0;
+    }
     for (int i = 0; i < nm; i++) {
         if (s->meshes[i].world_bounds_valid) {
             for (int k = 0; k < 3; k++) {
@@ -174,8 +180,6 @@ static int world_dedup(World *w) {
     }
     assert(residual == 0);
 
-    /* new index = count of survivors before this original slot */
-    int *keptbefore = (int *)malloc((size_t)(nm + 1) * sizeof *keptbefore);
     keptbefore[0] = 0;
     for (int i = 0; i < nm; i++) keptbefore[i + 1] = keptbefore[i] + (drop[i] ? 0 : 1);
     for (int r = 0; r < w->neighborhood.nreg; r++) {
@@ -527,6 +531,11 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
     /* per-mesh XY bounds — the draw cull and the ground grid both key off it */
     int nm = w->neighborhood.scene.count;
     w->neighborhood.mbb = (float (*)[4])malloc((size_t)nm * 4 * sizeof(float));
+    if (!w->neighborhood.mbb) {   /* low memory: this area waits for the next build */
+        world_scene_free(&w->neighborhood.scene); world_scene_free(&w->neighborhood.vista);
+        printf("world: no memory for mesh bounds (%d meshes); this area waits for the next build\n", nm);
+        return 0;
+    }
     for (int i = 0; i < nm; i++) {
         N2Mesh *m = &w->neighborhood.scene.meshes[i];
         if (m->world_bounds_valid) {

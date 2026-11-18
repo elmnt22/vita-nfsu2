@@ -322,11 +322,11 @@ static int event_zone_type(const unsigned char *ev)                     /* get_e
     default: return 0;
     }
 }
-static void pile_add_event(CareerPile *p, const unsigned char *ev)      /* CertainlyAddToPile */
+static int pile_add_event(CareerPile *p, const unsigned char *ev)       /* CertainlyAddToPile */
 {
-    p->zone_count[event_zone_type(ev)]++;
     for (int i = 0; i < 64; i++)
-        if (!p->event[i]) { p->event[i] = ev; return; }
+        if (!p->event[i]) { p->event[i] = ev; p->zone_count[event_zone_type(ev)]++; return 1; }
+    return 0;                                   /* pile full */
 }
 static void pile_add_challenge(CareerPile *p, const unsigned char *wc)
 {
@@ -487,7 +487,7 @@ void career_build_events(void)                                          /* Build
         int have = pile_count_type(p, t), max = pile_max(t);
         const unsigned char *ev;
         while ((max == -1 || have < max) && (ev = pile_random(p, t)) != NULL) {
-            pile_add_event(p, ev);
+            if (!pile_add_event(p, ev)) break;  /* full: the same pick would come back forever */
             have = pile_count_type(p, t);
         }
     }
