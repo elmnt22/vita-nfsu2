@@ -631,6 +631,7 @@ static int garage_list(char car[][32], int slot[], int cap) {
    and street FX are hidden (VITA_PROBE). Right stick: X turns the car on the
    turntable, Y raises/lowers the camera. */
 static int g_showroom;                 /* drawing the room this frame */
+static float g_room_carhold[3];        /* where the car stood when the room opened (held there) */
 #ifdef __vita__
 static int g_refl_ready;               /* this frame's road reflection is rendered */
 static int g_room_refl_ready;          /* this frame's garage floor reflection (view 4) is rendered */
@@ -19660,10 +19661,10 @@ int main(int argc, char **argv) {
                the pause menu's confirmed action (as pause_key's OK sets it), once */
             static int pa_done;
             const char *pa = getenv("OPENUG2_SIM_PAUSEACT");
-            if (pa && !pa_done && g_career_mode && RT_RACE && !g_rt.pfinished && g_rt.start >= 0
-                && g_rt.t - g_rt.start > 15.0f && g_career.engaged_event && g_post.action < 0) {
+            if (pa && !pa_done && (g_career_mode ? g_career.engaged_event != NULL : !strcmp(pa, "quit")) && RT_RACE && !g_rt.pfinished
+                && g_rt.start >= 0 && g_rt.t - g_rt.start > 15.0f && g_post.action < 0) {   /* "quit": a quick race too (GH #29 repro) */
                 pa_done = 1;
-                const CareerRecord *r = career_record(n2_u32(g_career.engaged_event + 8));
+                const CareerRecord *r = g_career.engaged_event ? career_record(n2_u32(g_career.engaged_event + 8)) : NULL;
                 g_post.action = !strcmp(pa, "quit") ? PR_QUIT_PAUSE : !strcmp(pa, "wmap") ? PR_WORLDMAP_PAUSE : PR_EXPLORE_ABANDON;
                 printf("sim pause: %s mid-race (record +6 = %d, cash %d)\n", pa, r ? r->flag[CREC_DONE] : -1, (int)g_career.cash);
             }
@@ -20780,6 +20781,7 @@ int main(int argc, char **argv) {
             if (want_room && !g_showroom) {
                 if (g_room_n || room_load(dataroot, plat)) {
                     g_showroom = 1; g_room_heading = heading;
+                    memcpy(g_room_carhold, carpos, sizeof g_room_carhold);
                     /* The garage camera's default view (0x44cc30 type 11,
                        preset 0x7f608c [car, SUV]) in room space, the room
                        anchored at DISC01 under the car: eye (0, -4, 1.4),
@@ -20792,6 +20794,23 @@ int main(int argc, char **argv) {
                     heading = 305.773f * 0.01745329f;
                     g_room_steer = 26.0f; g_rv.view = 0; g_rv.dur = 0.0f;
                     cam_snap = 1;
+                }
+            } else if (want_room && g_showroom) {
+                /* GH #29: the car under the menus is the world car, and its
+                   physics keeps running (the turntable turns it). After a race
+                   quit it still had the post-race drive's momentum inside n2sim
+                   (zeroing vel does not reach it), crept off the trimmed ground
+                   and fell -- the camera chasing it round the room. Held at the
+                   spot the room opened on, the sim restarted at rest. */
+                float dx = carpos[0] - g_room_carhold[0], dy = carpos[1] - g_room_carhold[1];
+                if (dx*dx + dy*dy > 0.02f*0.02f || carpos[2] < g_room_carhold[2] - 0.3f) {
+                    static int told;
+                    if (told++ < 3) printf("showroom: the car drifted %.2f m (z %+.2f), held at (%.1f, %.1f)\n",
+                                           sqrtf(dx*dx + dy*dy), carpos[2] - g_room_carhold[2], g_room_carhold[0], g_room_carhold[1]);
+                    carpos[0] = g_room_carhold[0]; carpos[1] = g_room_carhold[1];
+                    if (carpos[2] < g_room_carhold[2] - 0.3f) carpos[2] = g_room_carhold[2];
+                    vel[0] = vel[1] = 0; speed = 0;
+                    g_n2_live = 0;   /* n2sim restarts here, at rest */
                 }
             } else if (!want_room && g_showroom) {
                 g_showroom = 0; heading = g_room_heading;   /* back as it was parked */
