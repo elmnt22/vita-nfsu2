@@ -16,6 +16,7 @@
 #include "physics.h"
 #include "resource.h"
 #include "beyond.h"
+#include "xpcity.h"
 
 #ifdef __vita__
 void vita_mark(const char *fmt, ...);
@@ -2966,7 +2967,7 @@ int world_fog_load(const char *troot, const char *track) {
     g_fog.fixed = -1;
     /* the World Expansion has no fog table and the city's tree is in city
        coordinates: L4RA's "Normal Fog", its most common entry everywhere */
-    int borrow = beyond_is_track(track);
+    int borrow = beyond_is_track(track) || xpcity_is_city(track);   /* (the expansion cities too: Bayview's night fog) */
     if (borrow) track = "L4RA";
     const char *stem = !strncmp(track, "STREAM", 6) ? track + 6 : track;
     char path[1024]; snprintf(path, sizeof path, "%s/%s.BUN", troot, stem);

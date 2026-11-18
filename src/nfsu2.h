@@ -38,6 +38,8 @@ static int n2_sky_profile_parse(const char *name) {
 static uint32_t n2_sky_remap_key(int profile, uint32_t source_key) {
     static const uint32_t dome[] = {0x2414a01eu, 0x27f186b7u, 0x8a9a05cfu};
     static const uint32_t cap[]  = {0x5fb8bcd1u, 0x3e6947eau, 0xb0eb9302u};
+    if (source_key == 0x94d70856u) source_key = dome[N2_SKY_SUNRISE];   /* Rockport's SKYDOME (MW 2005): */
+    else if (source_key == 0xde38d700u) source_key = cap[N2_SKY_SUNRISE];   /* UG2's sky over it */
     if (profile < N2_SKY_SUNRISE || profile > N2_SKY_NIGHT) return source_key;
     if (source_key == dome[N2_SKY_SUNRISE]) return dome[profile];
     if (source_key == cap[N2_SKY_SUNRISE])  return cap[profile];
