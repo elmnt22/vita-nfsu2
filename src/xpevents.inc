@@ -412,6 +412,22 @@ static void write_shops(const PosE *pos, int npos, const char *path, long *nshop
             if (fprintf(f, "%d %.1f %.1f %.2f %.1f\n", t, p->p.x, p->p.y, p->p.z, h) < 0) ok = 0;
             nshop++;
         }
+    /* Carbon: named gates, no customization shops (it customizes in the safehouse): the
+       safehouses are garages, its four car lots the four UG2 shops (port choice) */
+    static const char *cgate[] = {
+        "menu_gate_safehouse/safehouse_tuner/respawn", "menu_gate_safehouse/safehouse_muscle/respawn",
+        "menu_gate_safehouse/safehouse_exotic/respawn", "menu_gate_safehouse/safehouse_highway/respawn",
+        "menu_gate_carlot/carlot_tuner01/respawn", "menu_gate_carlot/carlot_muscle/respawn",
+        "menu_gate_carlot/carlot_exotic/respawn", "menu_gate_carlot/carlot_tuner02/respawn",
+    };
+    for (int i = 0; i < 8; i++) {
+        const PosE *p = pos_find(pos, npos, vlt_hash((const uint8_t *)cgate[i], strlen(cgate[i])));
+        if (!p) continue;
+        int t = i < 4 ? 0 : cycle[i - 4];
+        double h = fmod(p->rot, 360.0); if (h > 180) h -= 360; if (h <= -180) h += 360;
+        if (fprintf(f, "%d %.1f %.1f %.2f %.1f\n", t, p->p.x, p->p.y, p->p.z, h) < 0) ok = 0;
+        nshop++;
+    }
     if (fclose(f) != 0) ok = 0;
     if (!ok) remove(path);
     if (nshops) *nshops = ok ? nshop : 0;
