@@ -4,7 +4,7 @@
    and the on-device setup (xpcity.c). Port of ExpansionDev/roads (mwrn.py + mkroutes.py)
    and BeyondDev/tools/events/freeroam.py.
 
-   MW (L2RA.BUN chunk 0x3b800, a tagged "CARP" container): RNhd counts (u16 profiles,
+   MW (L2RA.BUN chunk 0x3b800, a tagged "CARP" container; Carbon's L5RA.BUN the same): RNhd counts (u16 profiles,
    nodes, segments, -, roads) followed by the arrays back to back:
      node 32 B: position f32 x3 (Y-up: world x = +8, y = -(+0), z = +4), +12 u16 index,
                 +14 u16 lane profile, +16 u8 segment count, +18 u16 segments[4]
@@ -515,7 +515,7 @@ int xp_routes(const char *bun_path, const char *out_path, int game, XpRoadStats 
 {
     XpRoadStats dummy; if (!st) st = &dummy;
     memset(st, 0, sizeof *st);
-    if (game != XP_GAME_MW) return XP_ERR_FORMAT;   /* Carbon's road network: with Carbon */
+    if (game != XP_GAME_MW && game != XP_GAME_CARBON) return XP_ERR_FORMAT;   /* Carbon's 0x3b800 tables are MW's */
     size_t clen = 0; int rc = XP_ERR_FORMAT;
     uint8_t *chunk = read_road_chunk(bun_path, &clen, &rc);
     if (!chunk) return rc;

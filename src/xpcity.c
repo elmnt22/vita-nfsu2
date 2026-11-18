@@ -39,11 +39,12 @@ static int city_of(const char *track) {
     return -1;
 }
 int xpcity_is_city(const char *track) { return city_of(track) >= 0; }
-int xpcity_default_focus(const char *track, float xy[2]) {
-    /* Palmont: the downtown freeway (port choice, a road checked in the sim); Rockport keeps
-       its authored focus */
+int xpcity_default_focus(const char *track, float xy[2], float *heading_deg) {
+    /* Palmont: road-net node 1871 on the downtown freeway, facing along it to node 1872
+       (port choice, checked in the sim); Rockport keeps its authored focus */
     if (city_of(track) != 1) return 0;
-    xy[0] = 3600.0f; xy[1] = 420.0f;
+    xy[0] = 3614.6f; xy[1] = 415.4f;
+    if (heading_deg) *heading_deg = -30.0f;
     return 1;
 }
 const char *xpcity_region(const char *track) { int c = city_of(track); return c >= 0 ? k_city[c].bun + 6 : NULL; }

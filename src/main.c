@@ -16525,7 +16525,10 @@ int main(int argc, char **argv) {
             winst_default_focus(companion,companion_len,stream,stream_len,world2_spawn_xy);
         free(companion);
 #endif
-        if (focused) xpcity_default_focus(trackname, world2_spawn_xy);   /* (Palmont) */
+        {   float hd;
+            if (focused && xpcity_default_focus(trackname, world2_spawn_xy, &hd) && !world2_heading_set) {
+                world2_heading_deg = hd; world2_heading_set = 1;   /* (Palmont) */
+            } }
 #ifdef __vita__
         /* a venue boot loads around its event's start line */
         if (focused && g_in_venue) event_start_focus(troot,trackname,g_boot_ev,world2_spawn_xy);
@@ -20829,7 +20832,7 @@ int main(int argc, char **argv) {
                 if (!sw_ok) vita_mark("track switch: no start point in beyond/spawn.txt");
             } else {
                 sw_ok = track_focus_cached(troot, next_track, g_sw.focus);
-                if (sw_ok) xpcity_default_focus(next_track, g_sw.focus);   /* (Palmont) */
+                if (sw_ok) xpcity_default_focus(next_track, g_sw.focus, NULL);   /* (Palmont) */
                 /* a venue event loads around its own start line */
                 if (sw_ok) event_start_focus(troot, next_track, next_ev, g_sw.focus);
                 /* career free roam: around its spawn (GetRespawnParameters / event 4000's start) */
