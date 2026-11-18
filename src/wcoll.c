@@ -74,6 +74,8 @@ typedef struct {
     int nlist;
     const unsigned char *cells;  /* u16 start, u16 count, W*H (0x34137) */
     int ncells;
+    float ox, oy;                /* (port) polygon xy origin: 0 in UG2, the 0x341f0 origin in an
+                                    expansion city (xpconv.c; Rockport runs past +-4096 m) */
     unsigned char *data;         /* owned chunk payload */
 } Pack;
 
@@ -89,7 +91,7 @@ typedef struct {
     char name[32];
 } Group;
 
-#define WC_NSLOT 520             /* 26 section letters x 20 */
+#define WC_NSLOT 1040            /* 26 section letters x 20 (UG2) or x 40 (an expansion city) */
 
 /* a drivable section's visible-section record (chunk 0x34153, 0xa4 bytes:
    +8 s16 section, +0xc its boundary (FindBoundary, filled at load), +0x10
@@ -108,6 +110,9 @@ struct WColl {
     int *order;                  /* the boundary list, most recently found first */
     Group *groups; int ngroups;
     unsigned char *enabled;      /* the world's +0x2f0 list as a flag per group */
+    int xp;                      /* (port) an expansion city (MW / Carbon, translated by xpconv.c):
+                                    drivable sections x01..x39, each pack numbered as its
+                                    section (no x20.. copies), MW visible-section records */
 };
 
 static uint32_t rd32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -124,10 +129,11 @@ static uint32_t str_hash(const char *s)                                 /* 0x43d
 
 /* 0x5d3c10: section number -> slot. Sections x20..x39 are the collision
  * copies of drivable sections x00..x19 (offset 0x800dfc = 20 in game). */
-static int section_slot(int s)
+static int section_slot(const WColl *w, int s)
 {
     if (s == 0) return 0;
     int m = s % 100;
+    if (w->xp) { int i = m + (s / 100 - 1) * 40; return m < 40 && i >= 0 && i < WC_NSLOT ? i : -1; }
     if (m >= 20 && m < 40) m -= 20;
     int i = m + (s / 100 - 1) * 20;
     return i >= 0 && i < WC_NSLOT ? i : -1;
@@ -155,9 +161,9 @@ static void load_bounds(WColl *w, const unsigned char *d, long len)
                 if (rd32(d + q) == 0x11111111u || rd32(d + q) == 0) { q += 4; continue; }
                 int sec = rds16(d + q + 8), n = d[q + 10];   /* +11 = MW flag byte, 0 in UG2 */
                 if (n < 1 || q + 0x24 + n * 8 > end) break;
-                /* Only drivable sections (x00..x19) are tracked; the x41..,
+                /* Only drivable sections (x00..x19; x01..x39 in an expansion city) are tracked; the x41..,
                    x98, x99 boundaries are scenery and region outlines. */
-                if (sec % 100 < 20) {
+                if (sec % 100 < (w->xp ? 40 : 20)) {
                     if (w->nbnd == cap) {
                         int nc = cap ? cap * 2 : 256;
                         Bound *nb = (Bound *)realloc(w->bnd, (size_t)nc * sizeof *w->bnd);
@@ -173,6 +179,21 @@ static void load_bounds(WColl *w, const unsigned char *d, long len)
                     for (int k = 0; k < 2 * n; k++) b->xy[k] = rdf(d + q + 0x24 + k * 4);
                 }
                 q += 0x24 + n * 8;
+            }
+        } else if (id == 0x34153 && !w->vis && w->xp) {
+            /* MW's records are not UG2's fixed 0xa4: +0xc s16 section, +0xe u8
+               count, +0xf u8 capacity, +0x12 the sections as s16, each record
+               padded to 4 bytes */
+            int cnt = 0;
+            for (long q = o + 8; q + 0x12 <= end; q += (0x12 + 2 * d[q + 0xf] + 3) & ~3L) cnt++;
+            w->vis = (VisRec *)calloc((size_t)(cnt > 0 ? cnt : 1), sizeof *w->vis);
+            for (long q = o + 8; w->vis && q + 0x12 <= end; q += (0x12 + 2 * d[q + 0xf] + 3) & ~3L) {
+                VisRec *v = &w->vis[w->nvis++];
+                int n = d[q + 0xe];
+                if (q + 0x12 + 2 * n > end) n = 0;
+                v->section = rds16(d + q + 0xc); v->bnd = -1;
+                v->n = n > 72 ? 72 : n;
+                for (int k = 0; k < v->n; k++) v->vis[k] = rds16(d + q + 0x12 + 2 * k);
             }
         } else if (id == 0x34153 && !w->vis) {
             /* VisibleSectionManager::Loader (GC 8020b628): the drivable
@@ -257,10 +278,13 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
                     } else if (cid == 0x34134) { p->poly = b; p->npoly = (int)(csz >> 5); }
                     else if (cid == 0x34136) { p->list = b; p->nlist = (int)(csz >> 2); }
                     else if (cid == 0x34137) { p->cells = b; p->ncells = (int)(csz >> 2); }
+                    else if (cid == 0x341f0 && csz >= 12 && !memcmp(b, "XPC1", 4)) {
+                        p->ox = rdf(b + 4); p->oy = rdf(b + 8); w->xp = 1;
+                    }
                     o += 8 + csz;
                 }
                 p->data = raw;
-                int s = section_slot(p->section);
+                int s = section_slot(w, p->section);
                 if (p->poly && p->list && p->cells && p->W > 0 && p->H > 0 &&
                     p->ncells >= p->W * p->H && s >= 0) {
                     w->slot[s] = w->npacks++;
@@ -524,11 +548,11 @@ static void select_pack(WColl *w, WCollCtx *c, const float *p)
     int sec = c->bnd >= 0 ? w->bnd[c->bnd].section : 0;
     if (c->pack < 0) {
         if (!sec) return;
-        int s = section_slot(sec);
+        int s = section_slot(w, sec);
         if (s < 0 || w->slot[s] < 0) return;
         c->pack = w->slot[s]; c->ncache = 0;
-    } else if (w->packs[c->pack].section - 20 != sec) {
-        int s = section_slot(sec);
+    } else if (w->packs[c->pack].section - (w->xp ? 0 : 20) != sec) {
+        int s = section_slot(w, sec);
         c->pack = s >= 0 ? w->slot[s] : -1;
         c->ncache = 0;
     }
@@ -537,13 +561,13 @@ static void select_pack(WColl *w, WCollCtx *c, const float *p)
 /* ---- polygons ----------------------------------------------------------- */
 typedef WCollPoly Poly;
 
-static void poly_expand(const unsigned char *q, Poly *o)                /* 0x5d7f10 */
+static void poly_expand(const Pack *k, const unsigned char *q, Poly *o)  /* 0x5d7f10 */
 {
     o->id = 0;
     int base = rds16(q + 4);
     for (int i = 0; i < 4; i++) {                                       /* 0x5d2cc0 */
-        o->v[i][0] = (float)rds16(q + 8 + 2*i) * 0.125f;
-        o->v[i][1] = (float)rds16(q + 0x10 + 2*i) * 0.125f;
+        o->v[i][0] = (float)rds16(q + 8 + 2*i) * 0.125f + k->ox;
+        o->v[i][1] = (float)rds16(q + 0x10 + 2*i) * 0.125f + k->oy;
         o->v[i][2] = (float)((base * 256 + rds16(q + 0x18 + 2*i)) * 256) * (1.0f / 65536.0f);
     }
     o->flags = q[3];
@@ -567,10 +591,10 @@ static void poly_expand(const unsigned char *q, Poly *o)                /* 0x5d7
    is good until the next poly_at. */
 static const Poly *poly_at(const WColl *w, int pack, const unsigned char *q, int pi, int main, Poly *tmp)
 {
-    if (!main) { poly_expand(q, tmp); return tmp; }
+    if (!main) { poly_expand(&w->packs[pack], q, tmp); return tmp; }
     uint32_t key = ((uint32_t)pack << 16) | (uint32_t)pi;
     PolyCache *e = &g_pc[(key * 2654435761u) >> (32 - PC_BITS)];
-    if (e->w != w || e->key != key) { poly_expand(q, &e->p); e->w = w; e->key = key; }
+    if (e->w != w || e->key != key) { poly_expand(&w->packs[pack], q, &e->p); e->w = w; e->key = key; }
     return &e->p;
 }
 
@@ -611,7 +635,7 @@ int wcoll_group_walls(const WColl *w, const char *name, float *seg, int max)
             const unsigned char *q = k->poly + 32 * pi;
             if (q[0] != gi) continue;
             Poly o;
-            poly_expand(q, &o);
+            poly_expand(k, q, &o);
             int a = 0, b = 1; float best = -1.0f;
             for (int i = 0; i < o.nv; i++)
                 for (int j = i + 1; j < o.nv; j++) {
@@ -681,7 +705,7 @@ float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
     const unsigned char *cell = k->cells + 4 * (k->W * cy + cx);
     int start = rd16(cell), end = start + rd16(cell + 2);
     if (end > k->nlist) end = k->nlist;
-    int px = (int)(p[0] * 65536.0f), py = (int)(p[1] * 65536.0f);
+    int px = (int)((p[0] - k->ox) * 65536.0f), py = (int)((p[1] - k->oy) * 65536.0f);
     int best = -1; float bz = -99999.0f;
     for (int pass = 0; pass < 2 && best < 0; pass++) {
         for (int e = start; e < end; e++) {
@@ -760,10 +784,10 @@ int wcoll_gather(WColl *w, WCollCtx *c, const float pos[3], const float mn[2], c
                 if (pi >= k->npoly) continue;
                 const unsigned char *q = k->poly + 32 * pi;
                 int sel = q[1], dup = 0;
-                if (rds16(q + 8 + (sel & 3) * 2) * 0.125f > mx[0]) continue;
-                if (rds16(q + 0x10 + ((sel >> 2) & 3) * 2) * 0.125f > mx[1]) continue;
-                if (!(mn[0] <= rds16(q + 8 + ((sel >> 4) & 3) * 2) * 0.125f)) continue;
-                if (!(mn[1] <= rds16(q + 0x10 + (sel >> 6) * 2) * 0.125f)) continue;
+                if (rds16(q + 8 + (sel & 3) * 2) * 0.125f + k->ox > mx[0]) continue;
+                if (rds16(q + 0x10 + ((sel >> 2) & 3) * 2) * 0.125f + k->oy > mx[1]) continue;
+                if (!(mn[0] <= rds16(q + 8 + ((sel >> 4) & 3) * 2) * 0.125f + k->ox)) continue;
+                if (!(mn[1] <= rds16(q + 0x10 + (sel >> 6) * 2) * 0.125f + k->oy)) continue;
                 if (q[0] && (c->nogroups || !w->enabled[q[0]])) continue;
                 for (int i = 0; i < n && !dup; i++) dup = ids[i] == pi;    /* the 0x20 mark */
                 if (dup || n >= 160) continue;
@@ -776,7 +800,7 @@ int wcoll_gather(WColl *w, WCollCtx *c, const float pos[3], const float mn[2], c
     int mainthr = g_pc_tid && pc_self() == g_pc_tid;   /* cached polygons: frame thread only (11-15) */
     for (int i = 0; i < n && m < max; i++) {
         if (mainthr) out[m] = *poly_at(w, c->pack, k->poly + 32 * ids[i], ids[i], 1, NULL);
-        else poly_expand(k->poly + 32 * ids[i], &out[m]);
+        else poly_expand(k, k->poly + 32 * ids[i], &out[m]);
         out[m].id = (c->pack << 16) | ids[i];
         m++;
     }
