@@ -145,3 +145,26 @@ int xpcity_prepare(const char *troot, const char *track) {
     vita_progress_screen_done();
     return ok;
 }
+
+/* the Free Run world picker (shop.c): 0 Bayview, 1 Rockport, 2 Palmont */
+int g_xpcity_pick;
+static int city_ok(int c)
+{
+    char a[256], b[256], m[256];
+    snprintf(a, sizeof a, "ux0:data/NFSU2/TRACKS/%s.BUN", k_city[c].bun);
+    snprintf(b, sizeof b, "ux0:data/NFSU2/TRACKS/%s.BUN", k_city[c].companion);
+    snprintf(m, sizeof m, "ux0:data/NFSU2/TRACKS/%s.xp", k_city[c].bun);
+    if (xp_file_size(a) > 0 && xp_file_size(b) > 0 && xp_marker_ok(m, k_city[c].game, -1)) return 1;   /* translated */
+    snprintf(a, sizeof a, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
+    snprintf(b, sizeof b, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
+    return xp_file_size(a) > 0 && xp_file_size(b) > 0;   /* raw: translated on the way in */
+}
+int xpcity_installed(int pick)
+{
+    static int known[NCITY], ok[NCITY];   /* the files do not change while the game runs */
+    int c = pick - 1;
+    if (c < 0 || c >= NCITY) return pick == 0;
+    if (!known[c]) { ok[c] = city_ok(c); known[c] = 1; }
+    return ok[c];
+}
+const char *xpcity_track(int pick) { return pick >= 1 && pick <= NCITY ? k_city[pick - 1].bun : NULL; }

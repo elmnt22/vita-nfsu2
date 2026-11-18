@@ -11,4 +11,8 @@ int xpcity_prepare(const char *troot, const char *track);
 int xpcity_window_made(void);
 /* the city's minimap file (BMAP) once xpcity_prepare found or made it, else NULL */
 const char *xpcity_map(const char *track);
+/* the Free Run world picker: 0 Bayview, 1 Rockport, 2 Palmont */
+extern int g_xpcity_pick;
+int xpcity_installed(int pick);          /* translated or raw files there (Bayview: 1) */
+const char *xpcity_track(int pick);      /* its stream name (STREAML2RA ...), Bayview NULL */
 #endif

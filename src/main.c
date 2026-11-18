@@ -21608,7 +21608,12 @@ int main(int argc, char **argv) {
             if (g_qr.type == QR_FREERUN) {
                 g_roam_level = g_qr.traffic; g_roam_diff = g_qr.difficulty;   /* 0x53f580: R+4, R+2 */
                 if (g_rt.roam) rt_end();
-                if (beyond_enabled() && g_beyond_pick) {   /* the World Expansion (beyond.h), chosen at Free Run */
+                if (g_xpcity_pick && xpcity_track(g_xpcity_pick)) {   /* Rockport / Palmont, chosen at Free Run */
+                    const char *xt = xpcity_track(g_xpcity_pick);
+                    if (strncmp(trackname, xt, strlen(xt))) venue_go(xt, 0);
+                    else { race_state = 1; g_ride_ready = 0; }
+                }
+                else if (beyond_enabled() && g_beyond_pick) {   /* the World Expansion (beyond.h), chosen at Free Run */
                     int bev = 0;
 #ifdef OPENUG2_SIM_PRE_H
                     if (getenv("OPENUG2_SIM_BEYOND_EV")) bev = atoi(getenv("OPENUG2_SIM_BEYOND_EV"));   /* test aid (simulator): that Beyond event on arrival */
