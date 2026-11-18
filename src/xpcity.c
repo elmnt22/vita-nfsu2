@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <SDL2/SDL.h>
+#include <SDL.h>
 #include "xpconv.h"
 #include "xpcity.h"
 #include "skyline.h"
