@@ -10,6 +10,7 @@
  * rest exactly as it does for a Bayview track. */
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <SDL2/SDL.h>
 #include "xpconv.h"
 #include "xpcity.h"
@@ -78,6 +79,20 @@ static void make_map(int c, const char *troot)
     int rc = xp_file_size(raw) > 0 ? xp_minimap(raw, g_map, k_city[c].game) : XP_ERR_OPEN_IN;
     vita_mark("xpcity: minimap %s: %s", g_map, rc == XP_OK ? "made" : "none (no raw MINI_MAP.BIN)");
 }
+/* the free-roam road net (TRACKS/ROUTES<companion>/RoutesFreeRoam.bin): from the PC tool, or
+   made here from the companion bundle's road network (xproads.c, well under a second) */
+static void make_routes(int c, const char *troot)
+{
+    char dir[256], out[300], bun[256];
+    snprintf(dir, sizeof dir, "%s/ROUTES%s", troot, k_city[c].companion);
+    snprintf(out, sizeof out, "%s/RoutesFreeRoam.bin", dir);
+    if (xp_file_size(out) > 0) return;
+    mkdir(dir, 0777);
+    snprintf(bun, sizeof bun, "%s/%s.BUN", troot, k_city[c].companion);
+    XpRoadStats st;
+    int rc = xp_routes(bun, out, k_city[c].game, &st);
+    vita_mark("xpcity: road net %s: %s (%ld sections, %ld links)", out, rc == XP_OK ? "made" : "failed", st.sections, st.links);
+}
 const char *xpcity_map(const char *track)
 {
     int c = city_of(track);
@@ -96,7 +111,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     long long raw_size = xp_file_size(raw);
     int have = xp_file_size(out) > 0 && xp_file_size(outc) > 0;
     /* sent from the PC tool (no raw files here), or translated before from these raw files */
-    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { make_map(c, troot); return 1; }
+    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { make_map(c, troot); make_routes(c, troot); return 1; }
     if (raw_size <= 0 || xp_file_size(rawc) <= 0) {
         vita_mark("xpcity: %s is not installed (no translated city, no raw files in " XP_RAW_ROOT "/%s)",
                   k_city[c].name, k_city[c].dir);
@@ -135,7 +150,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     if (t) SDL_WaitThread(t, NULL);
     else job_thread(NULL);
     int ok = g_job.rc == XP_OK && copy_file(rawc, outc) && xp_marker_write(mark, k_city[c].game, raw_size);
-    if (ok) make_map(c, troot);
+    if (ok) { make_map(c, troot); make_routes(c, troot); }
     vita_mark("xpcity: %s %s in %.1f s", k_city[c].name, ok ? "translated" : "FAILED", (SDL_GetTicks() - t0) / 1000.0);
     if (!ok) {
         remove(mark);

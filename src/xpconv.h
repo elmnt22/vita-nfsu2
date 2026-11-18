@@ -27,4 +27,8 @@ long long xp_file_size(const char *path);
 /* The city's minimap (MW: TRACKS/L2RA/MINI_MAP.BIN) -> the game's BMAP file
    (hud_set_trackmap_file): 1024 px RGBA + its world window. */
 int xp_minimap(const char *mini_map_bin, const char *out_path, int game);
+/* The city's free-roam road net (xproads.c): MW L2RA.BUN chunk 0x3b800 -> RoutesFreeRoam.bin
+   for TRACKS/ROUTES<region> (airacer.c ainet_load). */
+typedef struct { long lanes, dead, sections, points, links, dropped; } XpRoadStats;
+int xp_routes(const char *companion_bun, const char *out_path, int game, XpRoadStats *stats);
 #endif
