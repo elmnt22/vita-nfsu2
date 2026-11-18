@@ -142,13 +142,16 @@ static int nm_bin(Nm *m, const uint8_t *b, size_t n, int with_last)
 #define F_CHILD 0x916e0e78u
 #define F_BARRIERS 0xe244f26bu      /* the race's own BARRIER_SPLINE_<n> scenery groups ('*' = the other way round) */
 #define VCOL 0x8e112eb7u
+#define F_TLIMIT 0x7585f041u        /* TimeLimit (s, float): tollbooth / checkpoint races */
+#define F_TBONUS 0xf52cc30eu        /* TimeBonus (s, int): a time_bonus_checkpoint */
+#define F_TRAPS 0x822179d1u         /* SpeedTrapList: the speed trap markers */
 enum { RT_CIRCUIT = 0, RT_SPRINT = 1, RT_DRAG = 4, RT_DRIFT = 5 };   /* UG2's race types (AIRACE_*) */
 /* the event's own rules where MW / Carbon differ from UG2's type (modes.txt "id mode"; xpmode.h) */
 enum { XM_NONE = 0, XM_CANYON_DUEL = 1, XM_CANYON_SPRINT = 2, XM_CANYON_DRIFT = 3, XM_CHECKPOINT = 4,
        XM_TOLLBOOTH = 5, XM_SPEEDTRAP = 6, XM_LAPKO = 7, XM_NMODES = 8 };
 static const char *const k_mode_label[XM_NMODES] = { NULL, "Canyon Duel", "Canyon Sprint", "Canyon Drift",
                                                       "Checkpoint", "Tollbooth", "Speedtrap", "Lap Knockout" };
-typedef struct { uint32_t key; int ord; D3 p; float rot; } PosE;   /* rot: F_ROT, degrees = the world heading */
+typedef struct { uint32_t key; int ord; D3 p; float rot; int tb; } PosE;   /* tb: TimeBonus, -1 none */   /* rot: F_ROT, degrees = the world heading */
 typedef struct {
     char name[64]; int type, order; uint32_t par;   /* par: the parent collection (Carbon: the type) */
     int closed;                             /* laps (circuits, Carbon's drift races); else start -> finish */
@@ -156,6 +159,9 @@ typedef struct {
     uint32_t *cps, *child; int ncps, nchild;
     char (*bar)[24]; int nbar;              /* as listed ('*' kept) */
     D3 *wp; int nwp;
+    float tlim;                             /* TimeLimit (s), 0 none */
+    uint32_t *traps; int ntraps;            /* SpeedTrapList */
+    char gates[1024];                       /* gates.txt lines: "id T x y z bonus" / "id S x y z 0" (id filled later) */
 } Race;
 typedef struct { uint32_t fo, de; int ix, ord; } FixE;
 static int fix_cmp(const void *x, const void *y)
@@ -235,7 +241,7 @@ static int is_barrier_name(const uint8_t *s, size_t n)
 }
 static void free_races(Race *r, int n)
 {
-    for (int i = 0; i < n; i++) { free(r[i].cps); free(r[i].child); free(r[i].bar); free(r[i].wp); }
+    for (int i = 0; i < n; i++) { free(r[i].cps); free(r[i].child); free(r[i].bar); free(r[i].wp); free(r[i].traps); }
     free(r);
 }
 static int race_cmp(const void *x, const void *y)
@@ -324,8 +330,8 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
             if (carbon) eo = (size_t)off + ((32 + 4 * (size_t)nt + 7) & ~(size_t)7);
             if (eo + (size_t)12 * ne > vsz) continue;
             /* the last entry of each field (a dict): 0 none, 1 inline, 2 pointer (de), 3 other */
-            int kpos = 0, kcps = 0, kchild = 0, kbar = 0; uint32_t dpos = 0, dcps = 0, dchild = 0, dbar = 0;
-            float rot = 0;
+            int kpos = 0, kcps = 0, kchild = 0, kbar = 0, ktr = 0; uint32_t dpos = 0, dcps = 0, dchild = 0, dbar = 0, dtr = 0;
+            float rot = 0, tlim = 0; int tb = -1;
             for (uint32_t j = 0; j < ne; j++) {
                 const uint8_t *en = vl + eo + 12 * j;
                 uint32_t k = u32le(en), de = 0; int kind;
@@ -336,10 +342,13 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
                 else if (k == F_CHILD) { kchild = kind; dchild = de; }
                 else if (k == F_BARRIERS) { kbar = kind; dbar = de; }
                 else if (k == F_ROT && kind == 1) rot = f32le(en + 4);
+                else if (k == F_TLIMIT && kind == 1) tlim = f32le(en + 4);
+                else if (k == F_TBONUS && kind == 1) tb = (int)u32le(en + 4);
+                else if (k == F_TRAPS) { ktr = kind; dtr = de; }
             }
             if (kpos == 2 && (size_t)dpos + 12 <= bsz) {
                 if (npos == cpos) { int cc = cpos ? cpos * 2 : 1024; PosE *p2 = realloc(pos, (size_t)cc * sizeof *p2); if (!p2) { ok = 0; break; } pos = p2; cpos = cc; }
-                pos[npos].key = key; pos[npos].ord = npos; pos[npos].rot = rot;
+                pos[npos].key = key; pos[npos].ord = npos; pos[npos].rot = rot; pos[npos].tb = tb;
                 pos[npos].p.x = f32le(b + dpos); pos[npos].p.y = f32le(b + dpos + 4); pos[npos].p.z = f32le(b + dpos + 8); npos++;
             }
             if (!racebin || !kcps) continue;
@@ -354,6 +363,8 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
             memcpy(r->name, nm->s + slash + 1, (size_t)tl); r->order = nr - 1; r->par = u32le(col + 8);
             if (kcps == 2) r->cps = u32_array(b, bsz, dcps, &r->ncps);
             if (kchild == 2) r->child = u32_array(b, bsz, dchild, &r->nchild);
+            if (ktr == 2) r->traps = u32_array(b, bsz, dtr, &r->ntraps);
+            r->tlim = tlim;
             if (carbon && kbar == 2 && (size_t)dbar + 8 <= bsz) {   /* Carbon: s16 numbers, negative = '*' (port guess) */
                 int cnt = u16le(b + dbar);
                 r->bar = calloc((size_t)(cnt ? cnt : 1), 24);
@@ -407,7 +418,24 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
             const NmE *pn = nm_get(&names, r->par);
             fprintf(stderr, "xp type: %s par %.*s\n", r->name, pn ? (int)pn->n : 8, pn ? (const char *)pn->s : "?");
         }
-        if (r->type < 0 || !sg || !ncp) { free(r->cps); free(r->child); free(r->bar); free(r->wp); continue; }
+        if (r->type < 0 || !sg || !ncp) { free(r->cps); free(r->child); free(r->bar); free(r->wp); free(r->traps); continue; }
+        /* the event's own rules' markers: time bonus gates (children time_bonus_checkpoint<n>,
+           their TimeBonus) and the speed traps (SpeedTrapList) */
+        if (r->mode == XM_CHECKPOINT && r->tlim <= 0) r->tlim = 90.0f;   /* gpcore tollboothrace TimeLimit */
+        {
+            size_t gl = 0;
+            for (int j = 0; j < r->nchild; j++) {
+                const PosE *p = pos_find(pos, npos, r->child[j]);   /* time_bonus_checkpoint<n>, checkpoint<n>_timebonus */
+                if (!p || p->tb <= 0 || gl + 64 > sizeof r->gates) continue;
+                gl += (size_t)snprintf(r->gates + gl, sizeof r->gates - gl, "T %.1f %.1f %.1f %d|", p->p.x, p->p.y, p->p.z, p->tb);
+            }
+            for (int j = 0; j < r->ntraps; j++) {
+                const PosE *p = pos_find(pos, npos, r->traps[j]);
+                if (!p || gl + 64 > sizeof r->gates) continue;
+                gl += (size_t)snprintf(r->gates + gl, sizeof r->gates - gl, "S %.1f %.1f %.1f 0|", p->p.x, p->p.y, p->p.z);
+            }
+        }
+        free(r->traps); r->traps = NULL;
         r->wp = malloc((size_t)(ncp + 2) * sizeof *r->wp);
         if (!r->wp) { ok = 0; break; }
         r->wp[r->nwp++] = sg->p;
@@ -1047,7 +1075,7 @@ static int routes_bin(const DPolys *S, int closed, FILE *f)
 }
 
 /* ---- the whole set ---- */
-typedef struct { int id, type, closed, mode, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; } EvMeta;   /* pl: the route, x y every ~15 m */
+typedef struct { int id, type, closed, mode, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; float tlim; char gates[1024]; } EvMeta;   /* pl: the route, x y every ~15 m */
 static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t *recs, const unsigned char *keep, int reread)
 {
     int nk = 0; for (int i = 0; i < nm; i++) nk += keep[i];
@@ -1160,7 +1188,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         f = okw ? fopen(p, "wb") : NULL;
         if (f) { okw = routes_bin(&S, closed, f); if (fclose(f)) okw = 0; } else okw = 0;
         if (!okw) { free(ch); rc = XP_ERR_WRITE; goto done; }
-        EvMeta *m = &meta[nm]; m->id = ev; m->type = r->type; m->closed = r->closed; m->mode = r->mode; m->len = (int)pyround(L); m->partlen = part.n;
+        EvMeta *m = &meta[nm]; m->id = ev; m->type = r->type; m->closed = r->closed; m->mode = r->mode; m->tlim = r->tlim; memcpy(m->gates, r->gates, sizeof m->gates); m->len = (int)pyround(L); m->partlen = part.n;
         /* a barrier the route still crosses (no way round it the format holds) stays off */
         size_t bl = 0; for (int b = 0; b < r->nbar; b++) bl += strlen(r->bar[b]) + 1;
         m->bars = malloc(bl + 1); if (!m->bars) { free(ch); goto done; }
@@ -1223,15 +1251,21 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         FILE *fe = fopen(p, "w"); snprintf(p, sizeof p, "%s/starts.txt", out_dir);
         FILE *fs = fopen(p, "w"); snprintf(p, sizeof p, "%s/barriers.txt", out_dir);
         FILE *fb = fopen(p, "w"); snprintf(p, sizeof p, "%s/modes.txt", out_dir);
-        FILE *fmo = fopen(p, "w");
-        int okw = fe && fs && fb && fmo, cnt[6 * XM_NMODES] = {0};
+        FILE *fmo = fopen(p, "w"); snprintf(p, sizeof p, "%s/gates.txt", out_dir);
+        FILE *fg = fopen(p, "w");
+        int okw = fe && fs && fb && fmo && fg, cnt[6 * XM_NMODES] = {0};
         for (int i = 0; i < nm && okw; i++) {
             const char *label = meta[i].mode ? k_mode_label[meta[i].mode] :
                                 meta[i].type == RT_CIRCUIT ? "Circuit" : meta[i].type == RT_SPRINT ? "Sprint" :
                                 meta[i].type == RT_DRIFT ? "Drift" : "Drag";
             fprintf(fe, "%d %d %d %s %s %d\n", meta[i].id, meta[i].type, meta[i].len, city, label,
                     ++cnt[meta[i].mode * 6 + meta[i].type]);
-            if (meta[i].mode) fprintf(fmo, "%d %d\n", meta[i].id, meta[i].mode);
+            if (meta[i].mode) fprintf(fmo, "%d %d %.0f\n", meta[i].id, meta[i].mode, meta[i].tlim);
+            for (const char *g = meta[i].gates; meta[i].mode && *g; ) {   /* "id T|S x y z bonus" */
+                const char *e = strchr(g, '|'); if (!e) break;
+                fprintf(fg, "%d %.*s\n", meta[i].id, (int)(e - g), g);
+                g = e + 1;
+            }
             fputs(meta[i].start, fs);
             if (meta[i].bars && meta[i].bars[0]) fprintf(fb, "%d %s\n", meta[i].id, meta[i].bars);
             st->events++;
@@ -1254,6 +1288,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         if (fs && fclose(fs)) okw = 0;
         if (fb && fclose(fb)) okw = 0;
         if (fmo && fclose(fmo)) okw = 0;
+        if (fg && fclose(fg)) okw = 0;
         rc = okw ? XP_OK : XP_ERR_WRITE;
     }
 done:

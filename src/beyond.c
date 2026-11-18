@@ -194,7 +194,10 @@ void beyond_close(void) {
    calls (beyond_event_count/_at/_start) see the set beyond_events_select picked (default BEYOND). */
 #define BX_MAXEV 512
 #define BX_XP_ROUTES "ux0:data/NFSU2/TRACKS"
-static struct { int id, type, len, mode, has_start; float start[3], head; char name[40], stem[8]; } g_bx_ev[BX_MAXEV];
+static struct { int id, type, len, mode, has_start; float start[3], head; char name[40], stem[8]; float tlim; int g0, ng; } g_bx_ev[BX_MAXEV];
+#define BX_MAXGATE 1024
+static BxGate g_bx_gate[BX_MAXGATE];   /* gates.txt: the own-rule events' time bonus gates / speed traps */
+static int g_bx_ngate;
 static int g_bx_nev = -1;
 static short g_bx_view[BX_MAXEV];
 static int g_bx_nview = -1;
@@ -238,9 +241,25 @@ static void bx_events_set(const char *dir, const char *stem) {
     snprintf(p, sizeof p, "%s/modes.txt", dir);
     if ((f = fopen(p, "r")) != NULL) {   /* "id mode": the event's own MW / Carbon rules (BX_MODE_*) */
         while (fgets(line, sizeof line, f)) {
-            int id, mo;
-            if (sscanf(line, "%d %d", &id, &mo) != 2 || mo <= 0 || mo >= BX_MODE_COUNT) continue;
-            for (int i = first; i < g_bx_nev; i++) if (g_bx_ev[i].id == id) { g_bx_ev[i].mode = mo; nmo++; }
+            int id, mo; float tl = 0;
+            if (sscanf(line, "%d %d %f", &id, &mo, &tl) < 2 || mo <= 0 || mo >= BX_MODE_COUNT) continue;
+            for (int i = first; i < g_bx_nev; i++) if (g_bx_ev[i].id == id) { g_bx_ev[i].mode = mo; g_bx_ev[i].tlim = tl; nmo++; }
+        }
+        fclose(f);
+    }
+    snprintf(p, sizeof p, "%s/gates.txt", dir);
+    if ((f = fopen(p, "r")) != NULL) {   /* "id T|S x y z bonus", in race order per event */
+        while (fgets(line, sizeof line, f) && g_bx_ngate < BX_MAXGATE) {
+            int id, v; char k; float x, y, z;
+            if (sscanf(line, "%d %c %f %f %f %d", &id, &k, &x, &y, &z, &v) != 6) continue;
+            for (int i = first; i < g_bx_nev; i++) if (g_bx_ev[i].id == id) {
+                if (!g_bx_ev[i].ng) g_bx_ev[i].g0 = g_bx_ngate;
+                if (g_bx_ev[i].g0 + g_bx_ev[i].ng != g_bx_ngate) break;   /* not contiguous: dropped */
+                BxGate *g = &g_bx_gate[g_bx_ngate++];
+                g->kind = k; g->p[0] = x; g->p[1] = y; g->p[2] = z; g->val = v;
+                g_bx_ev[i].ng++;
+                break;
+            }
         }
         fclose(f);
     }
@@ -248,7 +267,7 @@ static void bx_events_set(const char *dir, const char *stem) {
 }
 static void bx_events_load(void) {
     if (g_bx_nev >= 0) return;
-    g_bx_nev = 0;
+    g_bx_nev = 0; g_bx_ngate = 0;
     if (beyond_enabled()) bx_events_set(BEYOND_DIR "/ROUTESBEYOND", "BEYOND");
     static const char *const xp[] = { "L2RA", "L5RA" };
     for (int k = 0; k < 2; k++) {
@@ -343,6 +362,13 @@ int beyond_event_start(int i, float p[3], float *head) {
 }
 int beyond_event_type(int id) { int i = bx_ev_index(id); return i < 0 ? -1 : g_bx_ev[i].type; }
 int beyond_event_mode(int id) { int i = bx_ev_index(id); return i < 0 ? 0 : g_bx_ev[i].mode; }
+float beyond_event_timelimit(int id) { int i = bx_ev_index(id); return i < 0 ? 0 : g_bx_ev[i].tlim; }
+int beyond_event_gates(int id, const BxGate **g) {
+    int i = bx_ev_index(id);
+    if (i < 0 || !g_bx_ev[i].ng) { *g = NULL; return 0; }
+    *g = &g_bx_gate[g_bx_ev[i].g0];
+    return g_bx_ev[i].ng;
+}
 const char *beyond_event_name(int id) { int i = bx_ev_index(id); return i < 0 ? NULL : g_bx_ev[i].name; }
 /* the Quick Race track map of a Beyond event: ROUTESBEYOND/TRACKMAP<id>.bin
    (BeyondDev tools/events/trackmaps.py, the minimap's BMAP format), RGBA,

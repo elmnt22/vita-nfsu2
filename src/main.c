@@ -5594,6 +5594,52 @@ static void cyn_hud_draw(Hud *h, const RProg *rp, GpuMesh *quad, int W, int H)
     static const float plate[4] = { 0.0f, -190.0f, 250.0f, 76.0f };
     hud_draw_lines(h, rp, quad, W, H, ln, 3, plate);
 }
+/* port: the World Expansion's other own-rule events (MW / Carbon rules, gpcore + the race
+   scripts): Checkpoint (Carbon tollboothrace) / Tollbooth (MW) -- alone against a clock:
+   TimeLimit at the start, each time bonus gate passed adds its TimeBonus, the clock out ->
+   out of the race; over the line -> won. Speedtrap (speedtraprace): each trap's speed
+   (km/h, GetSimableSpeedKmh) adds to the racer's points, placed by points
+   (RankPlayersByPoints); Carbon: once a racer is over the line the ones still out lose
+   OvertimePenaltyPerSec (10) a second (SuddenDeathMode). */
+#define XR_MAXG 48
+static struct {
+    int on, mode, carbon, done, timeout, sudden, located;
+    float clock, flash, sd_t;
+    int flash_val, ng;
+    float gp[XR_MAXG][3], gm[XR_MAXG]; int gval[XR_MAXG];
+    int nextg[1 + AIRACE_MAX], traps[1 + AIRACE_MAX];
+    float pts[1 + AIRACE_MAX];
+} g_xr;
+static int xr_points(void) { return g_xr.on && g_xr.mode == BX_MODE_SPEEDTRAP; }
+static void xr_hud_draw(Hud *h, const RProg *rp, GpuMesh *quad, int W, int H)
+{
+    char l0[48], l1[48], l2[48], a[24];
+    uint32_t c1 = 0xffffcc33u, c2 = 0xffffffffu;
+    int pass = g_xr.nextg[0];
+    l2[0] = 0;
+    if (xr_points()) {
+        snprintf(l0, sizeof l0, "SPEEDTRAP  %d / %d", pass < g_xr.ng ? pass + 1 : g_xr.ng, g_xr.ng);
+        hud_num(a, sizeof a, (int)(g_xr.pts[0] + 0.5f));
+        snprintf(l1, sizeof l1, "%s km/h", a);
+        if (g_xr.flash > 0.0f) { snprintf(l2, sizeof l2, "TRAP  %d km/h", g_xr.flash_val); c2 = 0xff40e040u; }
+        else if (g_xr.sudden && !g_rt.pfinished) { snprintf(l2, sizeof l2, "SUDDEN DEATH  -10 / s"); c2 = 0xffff4030u; }
+    } else {
+        snprintf(l0, sizeof l0, "%s  %d / %d", g_xr.mode == BX_MODE_TOLLBOOTH ? "TOLLBOOTH" : "CHECKPOINT",
+                 pass < g_xr.ng ? pass + 1 : g_xr.ng, g_xr.ng);
+        float c = g_xr.clock < 0.0f ? 0.0f : g_xr.clock;
+        int ds = (int)(c * 10.0f);
+        snprintf(l1, sizeof l1, "%d:%02d.%d", ds / 600, ds / 10 % 60, ds % 10);
+        if (c < 10.0f) c1 = 0xffff4030u;
+        if (g_xr.flash > 0.0f) { snprintf(l2, sizeof l2, "+%d s", g_xr.flash_val); c2 = 0xff40e040u; }
+    }
+    HudLine ln[3] = {
+        { l0, 0.0f, -214.0f, 0.55f, 1, 0xffd8d8e0u },
+        { l1, 0.0f, -190.0f, 1.20f, 1, c1 },
+        { l2, 0.0f, -164.0f, 0.70f, 1, c2 },
+    };
+    static const float plate[4] = { 0.0f, -190.0f, 250.0f, 76.0f };
+    hud_draw_lines(h, rp, quad, W, H, ln, l2[0] ? 3 : 2, plate);
+}
 static int g_rt_watch;   /* race ticks of per-car state logged after a scene skip */
 /* the player's car and race for the jump cams (jumpcam.c) */
 static const AiRacer *jc_fp(void) { return g_rt.human ? g_rt.human : g_rt.pdrag ? g_rt.pdrag : g_rt.pdrv; }
@@ -6371,6 +6417,7 @@ static void rt_end(void)
        smokeable again (World::World -> SpawnSmokeables 0x5b4220) */
     smk_world_reset();
     g_cyn_on = 0;                       /* a canyon duel goes with its race (g_cyn kept for leg 2) */
+    g_xr.on = 0;
     g_pose_ring_clear = 1; g_reset_blink = 0.0f;   /* the Player goes with the world */
     rain_world_reset();                 /* ResetWorldTime 0x576cf0 + a new Rain */
     jumpcam_reset();                    /* ClearZone, time scale 1 */
@@ -7240,6 +7287,29 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
         printf("canyon duel %d: leg %d (the player %s), points %.0f / %.0f\n", e->id, leg,
                leg == 1 ? "chases" : "leads", g_cyn.score[0], g_cyn.score[1]);
     } else g_cyn_next_leg = 0;
+    memset(&g_xr, 0, sizeof g_xr);
+    if (beyond_event_mode(e->id) == BX_MODE_LAPKO && e->circuit) g_rt_lapko = 1;   /* MW lap knockout = UG2's Lap KO, from any start */
+    {   /* port: Checkpoint / Tollbooth / Speedtrap (g_xr): the rules' data from the converter */
+        int mo = beyond_event_mode(e->id);
+        if (mo == BX_MODE_CHECKPOINT || mo == BX_MODE_TOLLBOOTH || mo == BX_MODE_SPEEDTRAP) {
+            const BxGate *bg; int nb = beyond_event_gates(e->id, &bg);
+            char want = mo == BX_MODE_SPEEDTRAP ? 'S' : 'T';
+            g_xr.on = 1; g_xr.mode = mo; g_xr.carbon = !strcmp(e->reg, "L5RA");
+            for (int i = 0; i < nb && g_xr.ng < XR_MAXG; i++) if (bg[i].kind == want) {
+                memcpy(g_xr.gp[g_xr.ng], bg[i].p, sizeof g_xr.gp[0]);
+                g_xr.gval[g_xr.ng++] = bg[i].val;
+            }
+            if (mo != BX_MODE_SPEEDTRAP) {     /* alone against the clock (no opponents in MW / Carbon) */
+                g_xr.clock = beyond_event_timelimit(e->id);
+                if (g_xr.clock <= 0.0f) g_xr.clock = 90.0f;   /* gpcore tollboothrace TimeLimit */
+                g_rt.nopp = 0; pos[0] = 1;
+            }
+            printf("xp rules %d: %s, %d %s%s, time limit %.0f s\n", e->id,
+                   mo == BX_MODE_SPEEDTRAP ? "speedtrap" : mo == BX_MODE_TOLLBOOTH ? "tollbooth" : "checkpoint",
+                   g_xr.ng, want == 'S' ? "speed traps" : "time bonus gates",
+                   mo == BX_MODE_SPEEDTRAP && g_xr.carbon ? " (sudden death)" : "", g_xr.clock);
+        }
+    }
     g_rt_keep.nopp = g_rt.nopp;
     memcpy(g_rt_keep.opp, g_rt.opp, sizeof g_rt_keep.opp);
     memcpy(g_rt_keep.pos, pos, sizeof g_rt_keep.pos);
@@ -8418,7 +8488,7 @@ static void rt_results(const char *dataroot, const char *carname)
     hud_free(&g_results);
     hud_free(&g_post.menu); hud_free(&g_post.dlg);
     snprintf(g_post.dataroot, sizeof g_post.dataroot, "%s", dataroot);
-    int pts = g_rt.drift || g_cyn_on;   /* port: a canyon duel lists its points (RankPlayersByPoints) */
+    int pts = g_rt.drift || g_cyn_on || xr_points();   /* port: a canyon duel / speedtrap lists its points (RankPlayersByPoints) */
     g_results = hud_init_screen(dataroot, pts ? "GLOBAL/InGameDrift.bun" : "GLOBAL/InGameRace.bun",
                                 "UI_PostRaceResults.fng");
     if (!g_results) return;
@@ -8426,11 +8496,11 @@ static void rt_results(const char *dataroot, const char *carname)
     int n = 0;
     const char *me = player_name();
     row[n].name = me ? me : ""; row[n].car = carname; row[n].me = 1;
-    row[n].score = g_rt.drift ? drift_score(&g_rt.acc[0]) : g_cyn_on ? g_cyn.score[0] : 0;
+    row[n].score = g_rt.drift ? drift_score(&g_rt.acc[0]) : g_cyn_on ? g_cyn.score[0] : xr_points() ? g_xr.pts[0] : 0;
     row[n].place = g_rt.ent[0].place; row[n++].time = g_rt.ftime[0];
     for (int k = 1; k <= g_rt.n && k <= g_rt.nopp; k++) {
         row[n].name = g_rt.opp[k - 1].name; row[n].car = g_rt.opp[k - 1].car; row[n].me = 0;
-        row[n].score = g_rt.drift ? drift_score(&g_rt.acc[k]) : g_cyn_on && k == 1 ? g_cyn.score[1] : 0;
+        row[n].score = g_rt.drift ? drift_score(&g_rt.acc[k]) : g_cyn_on && k == 1 ? g_cyn.score[1] : xr_points() ? g_xr.pts[k] : 0;
         row[n].place = g_rt.ent[k].place; row[n++].time = g_rt.ftime[k];
     }
     for (int k = 0; k < g_rt.nvirt; k++) {               /* set-score downhill opponents */
@@ -8513,7 +8583,7 @@ static void rt_results(const char *dataroot, const char *carname)
     hud_screen_script_all(g_results, "FadeIn");
     g_resalt.n = n; g_resalt.gap = 0; g_resalt.t = 0.0f; g_resalt.len = 4.5f;   /* 0x4f3be0: +0x74 = 0x78dff0 */
     g_resalt.pts = pts;
-    if (g_cyn_on) hud_screen_label_h(g_results, 0xa4ec03beu, 0x70802830u);   /* the column: "Points" (English.bin) */
+    if (g_cyn_on || xr_points()) hud_screen_label_h(g_results, 0xa4ec03beu, 0x70802830u);   /* the column: "Points" (English.bin) */
     for (int i = 0; i < n; i++) g_resalt.time[i] = row[i].time;
     rt_stats_build(me ? me : "", carname);
     printf("results: %d racers, player \"%s\"%c", n, me ? me : "", 10);
@@ -12975,6 +13045,102 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                 g_rt.places = 2;
                 race_standings(order, g_rt.n + 1);
                 g_rt.ppos = g_rt.ent[0].pos;
+            }
+        }
+        /* port: Checkpoint / Tollbooth / Speedtrap (g_xr) */
+        if (g_xr.on && !g_xr.done && g_rt.rp && g_rt.start >= 0.0f && g_rt.t >= g_rt.start) {
+            float L = racepath_lap(g_rt.rp);
+            if (!g_xr.located) {               /* each gate's place along the route, in race order */
+                g_xr.located = 1;
+                for (int i = 0; i < g_xr.ng; i++) {
+                    RpLoc l; rploc_init(&l);
+                    racepath_locate(g_rt.rp, &l, g_xr.gp[i]);
+                    /* in the entries' race distance (laps from the start line, race_entry_update);
+                       a sprint's trap past the line counts at the line */
+                    float pc = l.frac * 100.0f, f = g_rt.cps.cp[g_rt.cps.finish], s0 = g_rt.cps.cp[g_rt.cps.start];
+                    if (f > s0 && pc > f) pc = f - 0.01f;
+                    if (f > s0 && pc < s0) pc = s0;
+                    g_xr.gm[i] = racecps_lap_frac(&g_rt.cps, pc);
+                }
+                for (int i = 1; i < g_xr.ng; i++)
+                    for (int j = i; j > 0 && g_xr.gm[j - 1] > g_xr.gm[j]; j--) {
+                        float t = g_xr.gm[j]; g_xr.gm[j] = g_xr.gm[j - 1]; g_xr.gm[j - 1] = t;
+                        int v = g_xr.gval[j]; g_xr.gval[j] = g_xr.gval[j - 1]; g_xr.gval[j - 1] = v;
+                    }
+                for (int i = 0; i < g_xr.ng; i++) printf("xp rules: gate %d at %.0f m (%d)\n", i + 1, g_xr.gm[i] * L, g_xr.gval[i]);
+            }
+            if (g_xr.flash > 0.0f) g_xr.flash -= dt;
+            for (int k = 0; k <= g_rt.n; k++) {
+                float m = g_rt.ent[k].dist;
+                if (k == 0 && g_rt.pfinished && !g_rt.ent[0].place) continue;
+                while (g_xr.nextg[k] < g_xr.ng && m >= g_xr.gm[g_xr.nextg[k]]) {
+                    int gi = g_xr.nextg[k]++;
+                    if (xr_points()) {         /* triggerenter: the speed over the trap */
+                        float kmh = fabsf(k ? g_rt.car[k - 1].st.speed : g_n2s.speed) * 3.6f;
+                        g_xr.pts[k] += kmh; g_xr.traps[k]++;
+                        if (k == 0) { g_xr.flash = 2.0f; g_xr.flash_val = (int)(kmh + 0.5f); }
+                        printf("xp rules: %s speed trap %d at %.0f km/h, %.0f points\n",
+                               k ? g_rt.opp[k - 1].name : "player", gi + 1, kmh, g_xr.pts[k]);
+                    } else if (k == 0) {       /* a time bonus gate */
+                        g_xr.clock += (float)g_xr.gval[gi];
+                        g_xr.flash = 2.0f; g_xr.flash_val = g_xr.gval[gi];
+                        printf("xp rules: time bonus gate %d, +%d s -> %.1f s\n", gi + 1, g_xr.gval[gi], g_xr.clock);
+                    }
+                }
+            }
+            if (!xr_points()) {
+                if (g_rt.pfinished) {
+                    g_xr.done = 1;
+                    printf("xp rules: over the line with %.1f s left\n", g_xr.clock);
+                } else if ((g_xr.clock -= dt) <= 0.0f) {   /* out of time: out of the race */
+                    g_xr.clock = 0.0f; g_xr.done = 1; g_xr.timeout = 1;
+                    g_rt.ent[0].place = 1;
+                    g_rt.dstatus[0] = 3;
+                    g_rt.ftime[0] = rt_project_time(0);
+                    g_rt.pfinished = 1;
+                    g_rt.pfin_tick = g_rt.ticks;
+                    g_rt.pdrv = airacer_take_over(g_rt.w, g_rt.pdrag ? g_rt.pdrag : g_rt.human, g_n2, g_rt.psuv, player_half_wid);
+                    airacer_free(g_rt.human); g_rt.human = NULL;
+                    airacer_free(g_rt.pdrag); g_rt.pdrag = NULL;
+                    g_n2_dsteer_on = 0;
+                    if (g_rt.pdrv) airacer_park(g_rt.pdrv);
+                    g_rt.places = 1;
+                    printf("xp rules: out of time\n");
+                }
+            } else {
+                int any = 0;
+                for (int k = 0; k <= g_rt.n; k++) if (g_rt.ent[k].place) any = 1;
+                if (any && !g_xr.sudden && g_xr.carbon) { g_xr.sudden = 1; g_xr.sd_t = 0.0f; printf("xp rules: sudden death\n"); }
+                if (g_xr.sudden && (g_xr.sd_t += dt) >= 1.0f) {   /* NotifyRaceTimeSecTick */
+                    g_xr.sd_t -= 1.0f;
+                    for (int k = 0; k <= g_rt.n; k++)
+                        if (!g_rt.ent[k].place) { g_xr.pts[k] -= 10.0f; if (g_xr.pts[k] < 0.0f) g_xr.pts[k] = 0.0f; }
+                }
+                if (g_rt.pfinished) {          /* placed by points: the cars still out estimated */
+                    int first = 0x7fffffff;
+                    for (int k = 0; k <= g_rt.n; k++) if (g_rt.ent[k].place && g_rt.ftime[k] < first) first = g_rt.ftime[k];
+                    for (int k = 1; k <= g_rt.n; k++) {
+                        if (g_rt.ent[k].place) continue;
+                        g_rt.ftime[k] = rt_project_time(k);
+                        float avg = g_xr.traps[k] ? g_xr.pts[k] / (float)g_xr.traps[k] : fabsf(g_rt.car[k - 1].st.speed) * 3.6f;
+                        g_xr.pts[k] += avg * (float)(g_xr.ng - g_xr.nextg[k]);   /* GUESS: the traps still ahead at its average */
+                        if (g_xr.carbon && g_rt.ftime[k] > first)
+                            g_xr.pts[k] -= 10.0f * (float)(g_rt.ftime[k] - first) / 4000.0f;
+                        if (g_xr.pts[k] < 0.0f) g_xr.pts[k] = 0.0f;
+                        airacer_park(g_rt.car[k - 1].r);
+                    }
+                    for (int k = 0; k <= g_rt.n; k++) {
+                        int pl = 1;
+                        for (int j = 0; j <= g_rt.n; j++)
+                            if (g_xr.pts[j] > g_xr.pts[k] || (g_xr.pts[j] == g_xr.pts[k] && j < k)) pl++;
+                        g_rt.ent[k].place = pl;
+                    }
+                    g_rt.places = g_rt.n + 1;
+                    g_xr.done = 1;
+                    race_standings(order, g_rt.n + 1);
+                    g_rt.ppos = g_rt.ent[0].pos;
+                    printf("xp rules: speedtrap over, player %.0f points, place %d\n", g_xr.pts[0], g_rt.ent[0].place);
+                }
             }
         }
         /* RCSTATE_RACE_IN_PROGRESS (0x60b3a0): every human finished and the
@@ -24495,7 +24661,7 @@ int main(int argc, char **argv) {
                     int id = world.city.ev[world.city.race.ev].id;
                     int place = g_rt.drift ? rt_drift_place() : g_rt.dstatus[0] ? 0 : g_rt.ent[0].place;
                     int won = place == 1;
-                    int ticks = g_rt.drift || g_cyn_on || !place ? 0 : g_rt.ftime[0];
+                    int ticks = g_rt.drift || g_cyn_on || xr_points() || !place ? 0 : g_rt.ftime[0];
 #ifdef OPENUG2_SIM_PRE_H
                     if (getenv("OPENUG2_SIM_WIN")) won = 1;   /* test aid (simulator): count the race as won */
 #endif
@@ -30774,7 +30940,8 @@ int main(int argc, char **argv) {
             /* DetermineHudFeatures 0x600090: player zone 6 / 7 (the jump cams) -> 0, no HUD */
             if (jumpcam_zone() == 6 || jumpcam_zone() == 7) hud_postrace = 1;
             if (VITA_PROBE(10) && !g_rt.nis_cam && !hud_postrace) hud_draw(hud_now, &rp, &quad, &hs, W, H);
-            if (g_cyn_on && g_rt.active && hud && !g_rt.nis_cam && !hud_postrace) cyn_hud_draw(hud, &rp, &quad, W, H);   }
+            if (g_cyn_on && g_rt.active && hud && !g_rt.nis_cam && !hud_postrace) cyn_hud_draw(hud, &rp, &quad, W, H);
+            if (g_xr.on && g_rt.active && hud && !g_rt.nis_cam && !hud_postrace) xr_hud_draw(hud, &rp, &quad, W, H);   }
             pf_mark(PF_PD_HUD);
 #ifdef __vita__
             if (world2 && race_state == 0 && world.city.race.active && race_place_pending)

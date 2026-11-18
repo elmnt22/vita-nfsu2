@@ -50,7 +50,12 @@ const char *beyond_event_name(int id);         /* NULL: not a Beyond event */
 /* the event's own rules where the MW / Carbon event isn't one of UG2's (modes.txt; xpevents.inc XM_*) */
 enum { BX_MODE_NONE = 0, BX_MODE_CANYON_DUEL, BX_MODE_CANYON_SPRINT, BX_MODE_CANYON_DRIFT, BX_MODE_CHECKPOINT,
        BX_MODE_TOLLBOOTH, BX_MODE_SPEEDTRAP, BX_MODE_LAPKO, BX_MODE_COUNT };
-int beyond_event_mode(int id);                 /* BX_MODE_*; 0: UG2's own rules */
+int beyond_event_mode(int id);
+/* the own rules' data: TimeLimit (s; tollbooth / checkpoint), the time bonus gates ('T', val
+   = TimeBonus s) and speed traps ('S'), in the converter's order (gates.txt) */
+typedef struct { char kind; float p[3]; int val; } BxGate;
+float beyond_event_timelimit(int id);
+int beyond_event_gates(int id, const BxGate **g);                 /* BX_MODE_*; 0: UG2's own rules */
 /* progress (port): beyond/progress.txt, never the UG2 save. ticks = 1/4000 s, 0 none */
 int beyond_progress(int id, int *won, int *best_ticks, int *best_place);
 int beyond_progress_record(int id, int won, int ticks, int place);
