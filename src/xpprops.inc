@@ -17,6 +17,12 @@
    info per (kind, model). Big structures (roofs, towers, booths, boats, parked cars)
    stay scenery, as UG2 has no prop like them.
 
+   Carbon (raw STREAML5RA.BUN): the same packs with the count at +10 (u16), the kind's
+   VLT key at +0x24 and the placement index at +0x28; its instance rows are 0x60 B
+   (+0 / +0x10 box, +0x20 position, +0x2c float 3x3, +0x54 info number). Its own kinds
+   (signpost, trashbin, streetlight) get the nearest UG2 prop's values too; canyon rails
+   (togue_rail), booths, scaffolding and parked cars stay scenery.
+
    Output (one bundle, read by smk_load in place of the companion + stream):
      0x80034020 hulls (0x39200 header, name at +0x1c / 0x39201 vertices, 48 B, +0x10),
      0x34026 infos, 0x34107 placements (one per spawner), 0x34027 packs of 0x70-byte
@@ -93,6 +99,9 @@ static const XpKind k_kinds[] = {
     { "stand",             "SANDWICH_BOARD",  0.01f,  0,    0.4f, "PLASTIC", 0 },
     { "tire",              "NONE",            0.01f,  0,    0.6f, "RUBBER", 0 },
     { "glass",             "GLASS",           0.05f,  0.1f, 0.4f, "GLASS", FX_GLASS },
+    { "signpost",          "ROAD_SIGN_METAL", 0.005f, 0.2f, 0.5f, "METAL", 0 },   /* Carbon */
+    { "trashbin",          "TRASHCAN",        0.1f,   0,    0.2f, "METAL", 0 },
+    { "streetlight",       "METAL_BIG",       0.15f,  0.6f, 0.5f, "METAL", 0 },
 };
 #define XP_PROP_MAXDIM 12.0f   /* a model longer than this stays scenery */
 #define XP_TRUNK 0.3f          /* the half width of a tall model's pole / trunk hull */
@@ -137,8 +146,9 @@ static int solid_boxes(const uint8_t *b, size_t n, SolidBox **sb, size_t *nsb, s
     return 0;
 }
 /* one section (0x80034100): fill its spawners (sorted by section, row) */
-static void sec_fill(const uint8_t *b, size_t n, XpSp *sp, int nsp)
+static void sec_fill(const uint8_t *b, size_t n, XpSp *sp, int nsp, int carbon)
 {
+    const size_t irow = carbon ? 0x60 : 0x40;
     const uint8_t *sec = NULL, *inf = NULL, *ins = NULL; size_t ninf = 0, nins = 0;
     for (size_t q = 0; q + 8 <= n; ) {
         uint32_t id = u32le(b + q), sz = u32le(b + q + 4); const uint8_t *c = b + q + 8;
@@ -146,7 +156,7 @@ static void sec_fill(const uint8_t *b, size_t n, XpSp *sp, int nsp)
         size_t f = fill_skip(c, sz);
         if (id == 0x34101u && sz >= 0x10) sec = c;
         else if (id == 0x34102u) { inf = c + f; ninf = (sz - f) / 0x48; }
-        else if (id == 0x34103u) { ins = c + f; nins = (sz - f) / 0x40; }
+        else if (id == 0x34103u) { ins = c + f; nins = (sz - f) / irow; }
         q += 8 + sz;
     }
     if (!sec || !ins) return;
@@ -156,14 +166,16 @@ static void sec_fill(const uint8_t *b, size_t n, XpSp *sp, int nsp)
     for (int i = lo; i < nsp && sp[i].sec == s; i++) {
         XpSp *S = &sp[i];
         if (S->row >= nins) continue;
-        const uint8_t *r = ins + (size_t)S->row * 0x40;
-        for (int k = 0; k < 3; k++) { S->mn[k] = f32le(r + 4 * k); S->mx[k] = f32le(r + 12 + 4 * k); }
+        const uint8_t *r = ins + (size_t)S->row * irow;
+        for (int k = 0; k < 3; k++) { S->mn[k] = f32le(r + 4 * k); S->mx[k] = f32le(r + (carbon ? 0x10 : 12) + 4 * k); }
         memset(S->M, 0, sizeof S->M);
         for (int j = 0; j < 3; j++)
-            for (int k = 0; k < 3; k++) S->M[4 * j + k] = (float)(int16_t)(r[0x2c + 2 * (3 * j + k)] | r[0x2d + 2 * (3 * j + k)] << 8) / 8192.0f;
+            for (int k = 0; k < 3; k++)
+                S->M[4 * j + k] = carbon ? f32le(r + 0x2c + 4 * (3 * j + k))
+                                         : (float)(int16_t)(r[0x2c + 2 * (3 * j + k)] | r[0x2d + 2 * (3 * j + k)] << 8) / 8192.0f;
         for (int k = 0; k < 3; k++) S->M[12 + k] = f32le(r + 0x20 + 4 * k);
         S->M[15] = 1;
-        unsigned ii = (unsigned)(r[62] | r[63] << 8);
+        unsigned ii = carbon ? (unsigned)(r[0x54] | r[0x55] << 8) : (unsigned)(r[62] | r[63] << 8);
         if (inf && ii < ninf) { S->solid = u32le(inf + (size_t)ii * 0x48 + 0x18); S->ok = 1; }
     }
 }
@@ -187,7 +199,8 @@ static void ob_align_hdr(Buf *o)
 int xp_props(const char *raw_companion, const char *raw_stream, const char *out_path, int game, XpPropStats *st)
 {
     XpPropStats z; memset(&z, 0, sizeof z); if (!st) st = &z; memset(st, 0, sizeof *st);
-    if (game != XP_GAME_MW) return XP_ERR_FORMAT;
+    if (game != XP_GAME_MW && game != XP_GAME_CARBON) return XP_ERR_FORMAT;
+    const int carbon = game == XP_GAME_CARBON;
     size_t pln = 0; uint8_t *pl = read_top(raw_companion, 0x34108u, &pln);
     if (!pl) return XP_ERR_OPEN_IN;
     uint32_t np = (uint32_t)(pln / 6);
@@ -211,14 +224,15 @@ int xp_props(const char *raw_companion, const char *raw_stream, const char *out_
             if (sz > bcap) { uint8_t *nb = realloc(buf, sz); if (!nb) { rc = XP_ERR_MEMORY; break; } buf = nb; bcap = sz; }
             if (fread(buf, 1, sz, f) != sz) { rc = XP_ERR_READ; break; }
             if (id == 0x80134000u) { if (solid_boxes(buf, sz, &sb, &nsb, &sbcap)) { rc = XP_ERR_MEMORY; break; } }
-            else if (id == 0x80034100u) sec_fill(buf, sz, sp, nsp);
+            else if (id == 0x80034100u) sec_fill(buf, sz, sp, nsp, carbon);
             else {
                 size_t p = fill_skip(buf, sz); if (sz - p < 16) continue;
-                const uint8_t *pk = buf + p; int cnt = (int16_t)(pk[12] | pk[13] << 8);
+                const uint8_t *pk = buf + p;
+                int cnt = carbon ? (pk[10] | pk[11] << 8) : (int16_t)(pk[12] | pk[13] << 8);
                 for (int i = 0; i < cnt && p + 16 + (size_t)(i + 1) * 64 <= sz; i++) {
                     const uint8_t *r = pk + 16 + i * 64;
                     st->mw++;
-                    uint32_t key = u32le(r + 0x28), oi = u32le(r + 0x2c);
+                    uint32_t key = u32le(r + (carbon ? 0x24 : 0x28)), oi = u32le(r + (carbon ? 0x28 : 0x2c));
                     int k = 0; while (k < nk && kh[k] != key) k++;
                     if (k == nk) { st->other_kind++; continue; }
                     if (oi >= np) { st->bad++; continue; }
