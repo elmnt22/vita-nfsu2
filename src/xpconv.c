@@ -69,6 +69,10 @@ static XpStats st;
 /* ---- one MW mesh (0x80134100) -> UG2 ---- */
 #define MAXG 256
 #define MAXS 16
+/* the night relight (X4): MW's daytime vertex colours x these (B, G, R): a cool,
+   dim night like Bayview's prelight; 0 for the sky solids */
+static int g_night, g_relight;
+static const float k_night[3] = { 0.50f, 0.40f, 0.36f };
 static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
 {
     const uint8_t *vb[MAXS]; size_t vbn[MAXS]; int nvb = 0;
@@ -125,7 +129,12 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
     /* vertices: pos, normal, colour, uv (the first 36 bytes of every MW layout) */
     {   size_t c = open_chunk(o, 0x134b01); align_fill(o, 0x80);
         for (int k = 0; k < nvb; k++)
-            for (uint32_t i = 0; i < svert[k]; i++) put(o, vb[k] + (size_t)i * stride[k], 36);
+            for (uint32_t i = 0; i < svert[k]; i++) {
+                uint8_t vx[36]; memcpy(vx, vb[k] + (size_t)i * stride[k], 36);
+                if (g_night)   /* Rockport is daytime: its prelight down to a night level (B, G, R, A) */
+                    for (int ch = 0; ch < 3; ch++) vx[24 + ch] = (uint8_t)(vx[24 + ch] * k_night[ch] + 0.5f);
+                put(o, vx, 36);
+            }
         close_chunk(o, c); }
     /* UG2 records: +0 bmin, +12 index count, +16 bmax, +28 texture slot, +32 matid,
        +52 index start, +56 flags */
@@ -161,6 +170,17 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
 /* ---- one MW solid object (0x80134010) ---- */
 static void conv_object(Buf *o, const uint8_t *p, size_t n)
 {
+    g_night = g_relight;   /* the sky keeps its colours */
+    for (size_t q = 0; q + 8 <= n; ) {
+        uint32_t id = rd32(p + q), sz = rd32(p + q + 4);
+        if (q + 8 + sz > n) break;
+        if (id == 0x134011) {
+            size_t f = skip_fill(p + q + 8, sz);
+            if (sz - f > 0xa4 && !memcmp(p + q + 8 + f + 0xa0, "SKY", 3)) g_night = 0;
+            break;
+        }
+        q += 8 + sz;
+    }
     size_t obj = open_chunk(o, 0x80134010);
     for (size_t q = 0; q + 8 <= n; ) {
         uint32_t id = rd32(p + q), sz = rd32(p + q + 4);
@@ -470,6 +490,70 @@ static void conv_carp(Buf *o, const uint8_t *d, size_t sz, const uint8_t *raw)
 }
 
 /* containers walked (rebuilt), everything else copied */
+/* ---- the night lights (X4): MW has no light flares, so its lamp scenery makes them:
+   each lamp model's head (xp_lamps.inc, from lampheads.py) at every instance becomes a
+   UG2 world flare (0x80135100 pack per scenery section, read by aciddraw's wf_pack) ---- */
+typedef struct { uint32_t key; int n; float h[4][3]; } XpLamp;
+static const XpLamp k_lamps[] = {
+#include "xp_lamps.inc"
+};
+static const XpLamp *lamp_find(uint32_t key)
+{
+    for (size_t i = 0; i < sizeof k_lamps / sizeof *k_lamps; i++) if (k_lamps[i].key == key) return &k_lamps[i];
+    return NULL;
+}
+#define XP_MAXFL 4096
+static void lamp_pack(Buf *o, const uint8_t *d, size_t n)
+{
+    const uint8_t *sec = NULL, *inf = NULL, *ins = NULL; size_t ninf = 0, nins = 0;
+    for (size_t q = 0; q + 8 <= n; ) {
+        uint32_t id = rd32(d + q), sz = rd32(d + q + 4); const uint8_t *c = d + q + 8;
+        if (q + 8 + sz > n) return;
+        size_t f = skip_fill(c, sz);
+        if (id == 0x34101 && sz >= 0x10) sec = c;
+        else if (id == 0x34102) { inf = c + f; ninf = (sz - f) / 0x48; }
+        else if (id == 0x34103) { ins = c + f; nins = (sz - f) / 0x40; }
+        q += 8 + sz;
+    }
+    if (!sec || !inf || !ins) return;
+    static float fl[XP_MAXFL][3]; int nf = 0;
+    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+    for (size_t i = 0; i < nins && nf < XP_MAXFL; i++) {
+        const uint8_t *r = ins + i * 0x40;
+        unsigned k = (unsigned)(r[62] | r[63] << 8); if (k >= ninf) continue;
+        const XpLamp *L = lamp_find(rd32(inf + k * 0x48 + 0x18)); if (!L) continue;
+        float m[9], t[3];
+        for (int j = 0; j < 9; j++) m[j] = (float)(int16_t)(r[0x2c + 2 * j] | r[0x2d + 2 * j] << 8) / 8192.0f;
+        for (int j = 0; j < 3; j++) memcpy(&t[j], r + 0x20 + 4 * j, 4);
+        for (int h = 0; h < L->n && nf < XP_MAXFL; h++) {
+            float *p = fl[nf++];
+            for (int c = 0; c < 3; c++) {   /* row-vector basis, as winst_decode_placement */
+                p[c] = t[c] + L->h[h][0] * m[c] + L->h[h][1] * m[3 + c] + L->h[h][2] * m[6 + c];
+                if (p[c] < mn[c]) mn[c] = p[c];
+                if (p[c] > mx[c]) mx[c] = p[c];
+            }
+        }
+    }
+    if (!nf) return;
+    size_t pk = open_chunk(o, 0x80135100);
+    size_t hc = open_chunk(o, 0x135101);
+    uint8_t h[0x60]; memset(h, 0, sizeof h);
+    uint32_t u = (uint32_t)nf; memcpy(h, &u, 4); memcpy(h + 4, &u, 4); memcpy(h + 8, &u, 4);
+    memcpy(h + 0x30, mn, 12); memcpy(h + 0x40, mx, 12);
+    memcpy(h + 0x50, &u, 4); memcpy(h + 0x54, sec + 0x0c, 4);
+    put(o, h, sizeof h); close_chunk(o, hc);
+    size_t rc = open_chunk(o, 0x135102); align_fill(o, 0x10);
+    for (int i = 0; i < nf; i++) {
+        uint8_t r[0x30]; memset(r, 0, sizeof r);
+        r[0] = r[4] = 0x0b; r[12] = r[13] = r[14] = 0xff;
+        memcpy(r + 0x10, fl[i], 12);
+        const float dn[3] = { 0.0f, 0.0f, -1.0f }; memcpy(r + 0x20, dn, 12);
+        r[0x2c] = 9; r[0x2d] = 2;   /* Bayview's street lamps: type 9, flags 2, facing down */
+        put(o, r, sizeof r);
+    }
+    close_chunk(o, rc); close_chunk(o, pk);
+    st.lights += nf;
+}
 static int is_walked(uint32_t id) { return id == 0x80134000 || id == 0x80034100; }
 static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const uint8_t *raw);
 static void walk(Buf *o, const uint8_t *p, size_t n)
@@ -489,6 +573,7 @@ static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const u
     else if (id == 0x3b801) conv_carp(o, d, sz, raw);
     else if (is_walked(id)) { size_t c = open_chunk(o, id); walk(o, d, sz); close_chunk(o, c); }
     else put(o, raw, 8 + sz);
+    if (id == 0x80034100 && g_relight) lamp_pack(o, d, sz);   /* after its section */
 }
 
 /* One top-level chunk in memory at a time (MW's largest 7.8 MB, Carbon's 13.8 MB),
@@ -497,7 +582,7 @@ static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const u
 int xp_convert(const char *in_path, const char *out_path, int game,
                XpProgress progress, void *ud, XpStats *out_stats)
 {
-    (void)game;
+    g_relight = game == XP_GAME_MW;   /* Carbon is a night city already */
     memset(&st, 0, sizeof st); g_oom = 0;
     FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
     FILE *w = fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }

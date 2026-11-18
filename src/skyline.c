@@ -215,6 +215,12 @@ static void cache_path(char *out, size_t n) {
     else if (sky_min_h() == SKYLINE_MIN_H) snprintf(out, n, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER);
     else snprintf(out, n, "%s/%s_sky_v%d_%d_h%d.bin", WTILE_DIR, S.track, WTILE_VERSION, SKYLINE_FILE_VER, (int)sky_min_h());
 }
+/* an expansion city translated again (xpcity.c): its stand-ins carry the old vertex colours */
+void skyline_forget(const char *track) {
+    char p[256];
+    snprintf(p, sizeof p, "%s/%s_sky_v%d_%d.bin", WTILE_DIR, track, WTILE_VERSION, SKYLINE_FILE_VER); remove(p);
+    snprintf(p, sizeof p, "%s/%s_sky_v%d_%d_h%d.bin", WTILE_DIR, track, WTILE_VERSION, SKYLINE_FILE_VER, (int)sky_min_h()); remove(p);
+}
 static int cache_read(void) {
     char path[256]; cache_path(path, sizeof path);
     FILE *f = fopen(path, "rb");
