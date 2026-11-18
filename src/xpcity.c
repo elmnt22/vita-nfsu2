@@ -94,6 +94,33 @@ static void make_routes(int c, const char *troot)
     int rc = xp_routes(bun, out, k_city[c].game, &st);
     vita_mark("xpcity: road net %s: %s (%ld sections, %ld links)", out, rc == XP_OK ? "made" : "failed", st.sections, st.links);
 }
+/* the city's race events (xp_events): once, from the raw MW files (gameplay.bin, the
+   companion, the stream's barrier walls); the Prep Tool sends them ready made */
+static void make_events(int c, const char *troot)
+{
+    char dir[256], ev[300], gp[256], rawc[256], raws[256];
+    snprintf(dir, sizeof dir, "%s/ROUTES%s", troot, k_city[c].companion);
+    snprintf(ev, sizeof ev, "%s/events.txt", dir);
+    if (xp_file_size(ev) > 0) return;
+    snprintf(gp, sizeof gp, XP_RAW_ROOT "/%s/GLOBAL/gameplay.bin", k_city[c].dir);
+    snprintf(rawc, sizeof rawc, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
+    snprintf(raws, sizeof raws, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
+    if (xp_file_size(gp) <= 0 || xp_file_size(rawc) <= 0 || xp_file_size(raws) <= 0) {
+        vita_mark("xpcity: no race events for %s (no raw gameplay.bin / %s / %s)", k_city[c].name, k_city[c].companion, k_city[c].bun);
+        return;
+    }
+    mkdir(dir, 0777);
+    char title[64]; snprintf(title, sizeof title, "PREPARING %s", k_city[c].name);
+    if (g_window) vita_progress_screen(title, "BUILDING THE RACES", "ONE TIME ONLY", 0.0f);
+    Uint32 t0 = SDL_GetTicks();
+    XpEventStats st;
+    int rc = xp_events(gp, rawc, raws, dir, k_city[c].game, k_city[c].name[0] == 'R' ? "Rockport" : "Palmont", 7301, &st);
+    if (rc != XP_OK) remove(ev);
+    vita_mark("xpcity: race events %s: %s in %.1f s (%ld MW races -> %ld events: %ld circuits %ld sprints %ld drags, %ld skipped, "
+              "%ld dropped; barriers %ld on %ld off)", dir, rc == XP_OK ? "made" : "FAILED", (SDL_GetTicks() - t0) / 1000.0,
+              st.races, st.events, st.circuits, st.sprints, st.drags, st.skipped, st.dropped, st.barriers_on, st.barriers_off);
+    if (g_window) vita_progress_screen_done();
+}
 const char *xpcity_map(const char *track)
 {
     int c = city_of(track);
@@ -112,7 +139,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     long long raw_size = xp_file_size(raw);
     int have = xp_file_size(out) > 0 && xp_file_size(outc) > 0;
     /* sent from the PC tool (no raw files here), or translated before from these raw files */
-    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { make_map(c, troot); make_routes(c, troot); return 1; }
+    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { make_map(c, troot); make_routes(c, troot); make_events(c, troot); return 1; }
     if (raw_size <= 0 || xp_file_size(rawc) <= 0) {
         vita_mark("xpcity: %s is not installed (no translated city, no raw files in " XP_RAW_ROOT "/%s)",
                   k_city[c].name, k_city[c].dir);
@@ -129,6 +156,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     snprintf(p, sizeof p, XP_CACHE "/tiles/%s_v%d.pak", k_city[c].bun, WTILE_VERSION); remove(p);
     skyline_forget(k_city[c].bun);
     snprintf(p, sizeof p, "%s/ROUTES%s/RoutesFreeRoam.bin", troot, k_city[c].companion); remove(p);   /* road net: rebuilt below */
+    snprintf(p, sizeof p, "%s/ROUTES%s/events.txt", troot, k_city[c].companion); remove(p);       /* race events too */
     if (!g_window) {   /* graphics up early: the world load's own screens come later */
         vita_fast_clocks();
         SDL_Window *w = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
@@ -152,7 +180,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     if (t) SDL_WaitThread(t, NULL);
     else job_thread(NULL);
     int ok = g_job.rc == XP_OK && xp_companion(rawc, outc, k_city[c].game) == XP_OK && xp_marker_write(mark, k_city[c].game, raw_size);
-    if (ok) { make_map(c, troot); make_routes(c, troot); }
+    if (ok) { make_map(c, troot); make_routes(c, troot); make_events(c, troot); }
     vita_mark("xpcity: %s %s in %.1f s", k_city[c].name, ok ? "translated" : "FAILED", (SDL_GetTicks() - t0) / 1000.0);
     if (!ok) {
         remove(mark);

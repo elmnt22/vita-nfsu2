@@ -37,7 +37,7 @@ static const float UTURN = 2.35619449f;   /* 135 degrees */
 
 typedef struct { float x, y, z; } V3;
 typedef struct { V3 *p; int n, cap; } Poly;
-typedef struct { Poly pts, simp; int seg, n0, n1; } Lane;
+typedef struct { Poly pts, simp; int seg, n0, n1; float len; } Lane;   /* len: the MW segment's (>= 1 m) */
 typedef struct { int si, j; int tgt, tsi, tj; uint32_t fl; } Link;   /* tgt piece, or -1 and (tsi, tj) */
 
 static uint16_t u16le(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
@@ -190,7 +190,7 @@ static int build_graph(const Rn *r, G *g)
                 for (int i = 0, j = ln->pts.n - 1; i < j; i++, j--) { V3 t = ln->pts.p[i]; ln->pts.p[i] = ln->pts.p[j]; ln->pts.p[j] = t; }
                 m0 = n1; m1 = n0;
             }
-            ln->seg = k; ln->n0 = m0; ln->n1 = m1;
+            ln->seg = k; ln->n0 = m0; ln->n1 = m1; ln->len = L;
             g->n++;
         }
     }
@@ -485,12 +485,9 @@ out:
     return ok;
 }
 
-int xp_routes(const char *bun_path, const char *out_path, int game, XpRoadStats *st)
+static uint8_t *read_road_chunk(const char *bun_path, size_t *clen_out, int *rc_out)
 {
-    XpRoadStats dummy; if (!st) st = &dummy;
-    memset(st, 0, sizeof *st);
-    if (game != XP_GAME_MW) return XP_ERR_FORMAT;   /* Carbon's road network: with Carbon */
-    FILE *f = fopen(bun_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    FILE *f = fopen(bun_path, "rb"); if (!f) { *rc_out = XP_ERR_OPEN_IN; return NULL; }
     uint8_t *chunk = NULL; size_t clen = 0; int rc = XP_ERR_FORMAT;
     for (;;) {   /* the top-level 0x3b800 chunk, read alone */
         uint8_t h[8];
@@ -504,6 +501,23 @@ int xp_routes(const char *bun_path, const char *out_path, int game, XpRoadStats 
         if (fseek(f, (long)sz, SEEK_CUR)) break;
     }
     fclose(f);
+    *clen_out = clen; *rc_out = rc;
+    return chunk;
+}
+static void free_graph(G *g)
+{
+    for (int i = 0; i < g->n; i++) { free(g->l[i].pts.p); free(g->l[i].simp.p); }
+    if (g->succ) for (int i = 0; i < g->n; i++) free(g->succ[i]);
+    free(g->succ); free(g->nsucc); free(g->l);
+    memset(g, 0, sizeof *g);
+}
+int xp_routes(const char *bun_path, const char *out_path, int game, XpRoadStats *st)
+{
+    XpRoadStats dummy; if (!st) st = &dummy;
+    memset(st, 0, sizeof *st);
+    if (game != XP_GAME_MW) return XP_ERR_FORMAT;   /* Carbon's road network: with Carbon */
+    size_t clen = 0; int rc = XP_ERR_FORMAT;
+    uint8_t *chunk = read_road_chunk(bun_path, &clen, &rc);
     if (!chunk) return rc;
     Rn r; G g; memset(&g, 0, sizeof g);
     rc = XP_ERR_FORMAT;
@@ -525,8 +539,8 @@ int xp_routes(const char *bun_path, const char *out_path, int game, XpRoadStats 
             }
         }
     }
-    for (int i = 0; i < g.n; i++) { free(g.l[i].pts.p); free(g.l[i].simp.p); }
-    if (g.succ) for (int i = 0; i < g.n; i++) free(g.succ[i]);
-    free(g.succ); free(g.nsucc); free(g.l); free(chunk);
+    free_graph(&g); free(chunk);
     return rc;
 }
+
+#include "xpevents.inc"
