@@ -5295,17 +5295,17 @@ static void ai_take_global(const unsigned char *g, long n)
         }
     }
     g_ai_have = got == 7;
-    if (g_ai_races && beyond_event_count() > 0) {   /* the World Expansion's events as track records (Quick Race lists, race setup) */
-        int nb = beyond_event_count();
+    if (g_ai_races && beyond_event_all(-1, NULL, NULL, NULL, NULL) > 0) {   /* the World Expansion's + the expansion cities' events as track records (Quick Race lists, race setup) */
+        int nb = beyond_event_all(-1, NULL, NULL, NULL, NULL);
         unsigned char *t = (unsigned char *)realloc(g_ai_races, (size_t)(g_ai_nraces + nb) * 0x128);
         if (t) {
             g_ai_races = t;
             for (int k = 0; k < nb; k++) {
-                int id = 0, type = 0, len = 0;
-                beyond_event_at(k, &id, &type, &len);
+                int id = 0, type = 0, len = 0; const char *bstem = "BEYOND";
+                beyond_event_all(k, &id, &type, &len, &bstem);
                 unsigned char *r = g_ai_races + (size_t)(g_ai_nraces + k) * 0x128;
                 memset(r, 0, 0x128);
-                snprintf((char *)r + 0x40, 8, "%s", "BEYOND");               /* the stem (STREAM<stem>) */
+                snprintf((char *)r + 0x40, 8, "%s", bstem);                   /* the stem (STREAM<stem>) */
                 r[0x7c] = 5;                                                  /* the mode's own icon */
                 r[0x85] = type == AIRACE_SPRINT || type == AIRACE_DRAG;       /* point to point */
                 r[0x8a] = (unsigned char)id; r[0x8b] = (unsigned char)(id >> 8);
@@ -10176,6 +10176,7 @@ static float rdf(const unsigned char *p) { float f; memcpy(&f, p, 4); return f; 
    route's start, the in-zone engage icon, and the Engage binding's race
    dialog (UI_EngageRaceDialog.fng) starting the race on the loaded map */
 static int g_bey_roam;                /* this frame: Beyond free roam, no race */
+static int g_bey_xp;                  /* ... in an expansion city (its events only: no Beyond shops) */
 static const N2Scene *g_bey_scene;    /* its streamed ground (no wcoll yet) */
 static int g_bey_zone = -1;           /* the event start the car stands in (event index), -1 none */
 static int g_bey_szone = -1;          /* the shop / garage the car stands at (shops.txt index), -1 none */
@@ -10207,7 +10208,7 @@ static int trig_ground(float x, float y, float *z)
 {
     /* GetElevation (TopologyCoordinate); here the collision ground under
        the point, from the player's height + 50 m (port) */
-    if (!g_wcoll && g_bey_roam && g_bey_scene) {                      /* Beyond: the streamed tiles */
+    if (!g_wcoll && g_bey_roam && !g_bey_xp && g_bey_scene) {         /* Beyond: the streamed tiles */
         WGroundHit gh;
         if (world_ground_hit(g_bey_scene, x, y, g_trig_zref + 3.0f, &gh) == WSURF_NONE) return 0;
         *z = gh.z;
@@ -10244,17 +10245,18 @@ static void trig_update(int free_run)
     N2Body bd; n2sim_body(g_n2, &bd);
     const unsigned char *use[12] = { 0 }; float d2[12] = { 0 };
     if (g_bey_roam) {                                                 /* Beyond: every event's start (port) */
-        static unsigned char bz[64][0x18]; static int bzn = -1;
-        if (bzn < 0) {
-            bzn = 0;
-            for (int i = 0; i < beyond_event_count() && i < 64; i++) {
+        static unsigned char bz[256][0x18]; static int bzn = -1, bzid = -1;
+        int id0 = 0; beyond_event_at(0, &id0, NULL, NULL);
+        if (bzn < 0 || bzid != id0) {                                 /* (again when the event set changes) */
+            bzn = 0; bzid = id0;
+            for (int i = 0; i < beyond_event_count() && i < 256; i++) {
                 float p[3]; if (!beyond_event_start(i, p, NULL)) continue;
                 memcpy(bz[i] + 4, &p[0], 4); memcpy(bz[i] + 8, &p[1], 4); memcpy(bz[i] + 0x14, &p[2], 4);
                 bzn++;
             }
             printf("beyond: %d free-roam race starts\n", bzn);
         }
-        for (int i = 0; i < beyond_event_count() && i < 64; i++) {
+        for (int i = 0; i < beyond_event_count() && i < 256; i++) {
             int id, type, len, k;
             float p[3];
             if (!beyond_event_at(i, &id, &type, &len) || !beyond_event_start(i, p, NULL) || (k = bey_trig_k(type)) < 0) continue;
@@ -24288,6 +24290,10 @@ int main(int argc, char **argv) {
         }
 #endif
 #ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_SIM_ZTRACE")) {   /* test aid (simulator): the player's position once a second (falls) */
+            static Uint32 zt_t;
+            if (SDL_GetTicks() - zt_t > 1000) { zt_t = SDL_GetTicks(); printf("ztrace: player (%.1f %.1f %.2f) speed %.1f state %d\n", carpos[0], carpos[1], carpos[2], speed, race_state); }
+        }
         {   /* test aid (simulator): OPENUG2_SIM_BEYOND_AT=<event id> puts the car on that Beyond event's start once its free roam stands */
             static int bat_done; static Uint32 bat_t;
             const char *ba = getenv("OPENUG2_SIM_BEYOND_AT");
@@ -29330,7 +29336,9 @@ int main(int argc, char **argv) {
             }
             /* the World Expansion's race starts (port): free roam there, the zone the car is in */
             g_glow_cells = beyond_is_track(trackname);
-            g_bey_roam = beyond_enabled() && beyond_is_track(trackname) && race_state == 1 && !RT_RACE && !g_fe && !g_shop;
+            g_bey_xp = xpcity_is_city(trackname);                         /* Rockport / Palmont: their MW / Carbon events */
+            beyond_events_select(g_bey_xp ? xpcity_region(trackname) : NULL);
+            g_bey_roam = ((beyond_enabled() && beyond_is_track(trackname)) || g_bey_xp) && race_state == 1 && !RT_RACE && !g_fe && !g_shop;
             g_bey_scene = &scene;
             if (g_bey_roam && !g_pause.on) {
                 int in = -1; float best = 15.0f * 15.0f;                  /* a career zone's size */
@@ -29354,7 +29362,7 @@ int main(int argc, char **argv) {
                 if (beyond_event_at(g_bey_zone, &id, &t, &l)) hud_event_remove(bey_indicator(t));
                 g_bey_zone = -1;
             }
-            if (g_bey_roam && !g_pause.on) {                              /* ... and the shop / garage */
+            if (g_bey_roam && !g_bey_xp && !g_pause.on) {                 /* ... and the shop / garage */
                 int in = -1; float best = 15.0f * 15.0f;
                 for (int i = 0; i < beyond_shop_count(); i++) {
                     float p[3];

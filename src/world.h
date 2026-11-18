@@ -13,7 +13,7 @@
 
 #define WORLD_MAXREG 16
 #define WORLD_MAXDIST 24
-#define WORLD_MAXEVENT 128
+#define WORLD_MAXEVENT 192   /* (Rockport: 150) */
 #define WORLD_MAXBARRIER 2048
 #define WORLD_EVPOLY 33
 

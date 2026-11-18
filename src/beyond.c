@@ -186,17 +186,24 @@ void beyond_close(void) {
     bx_unlock();
 }
 
-/* ---- race events (ROUTESBEYOND/events.txt: "id type length_m district n") ---- */
-#define BX_MAXEV 128
-static struct { int id, type, len, has_start; float start[3], head; char name[40]; } g_bx_ev[BX_MAXEV];
+/* ---- race events (ROUTESBEYOND/events.txt: "id type length_m district n") ----
+   Several sets, each with its stem: the World Expansion's (BEYOND, when enabled) and each installed
+   expansion city's (TRACKS/ROUTES<region>/events.txt from xproads/the Expansion Prep Tool: L2RA
+   Rockport, L5RA Palmont). The track records take every set (beyond_event_all); the free-roam
+   calls (beyond_event_count/_at/_start) see the set beyond_events_select picked (default BEYOND). */
+#define BX_MAXEV 512
+#define BX_XP_ROUTES "ux0:data/NFSU2/TRACKS"
+static struct { int id, type, len, has_start; float start[3], head; char name[40], stem[8]; } g_bx_ev[BX_MAXEV];
 static int g_bx_nev = -1;
-static void bx_events_load(void) {
-    if (g_bx_nev >= 0) return;
-    g_bx_nev = 0;
-    if (!beyond_enabled()) return;
-    FILE *f = fopen(BEYOND_DIR "/ROUTESBEYOND/events.txt", "r");
+static short g_bx_view[BX_MAXEV];
+static int g_bx_nview = -1;
+static char g_bx_sel[8] = "BEYOND";
+static void bx_events_set(const char *dir, const char *stem) {
+    char p[200], line[160];
+    snprintf(p, sizeof p, "%s/events.txt", dir);
+    FILE *f = fopen(p, "r");
     if (!f) return;
-    char line[160];
+    int first = g_bx_nev;
     while (g_bx_nev < BX_MAXEV && fgets(line, sizeof line, f)) {
         int id, type, len, num = 0, used = 0;
         if (sscanf(line, "%d %d %d %n", &id, &type, &len, &used) < 3 || id < 4000 || id > 7999) continue;
@@ -204,17 +211,20 @@ static void bx_events_load(void) {
         while (e > nm && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
         char *sp = strrchr(nm, ' ');                     /* the trailing number */
         if (sp && sscanf(sp + 1, "%d", &num) == 1) *sp = 0;
+        memset(&g_bx_ev[g_bx_nev], 0, sizeof g_bx_ev[g_bx_nev]);
         g_bx_ev[g_bx_nev].id = id; g_bx_ev[g_bx_nev].type = type; g_bx_ev[g_bx_nev].len = len;
         snprintf(g_bx_ev[g_bx_nev].name, sizeof g_bx_ev[g_bx_nev].name, num > 0 ? "%s %d" : "%s", nm, num);
+        snprintf(g_bx_ev[g_bx_nev].stem, sizeof g_bx_ev[g_bx_nev].stem, "%s", stem);
         g_bx_nev++;
     }
     fclose(f);
     int ns = 0;
-    if ((f = fopen(BEYOND_DIR "/ROUTESBEYOND/starts.txt", "r")) != NULL) {   /* "id x y z heading_deg" */
+    snprintf(p, sizeof p, "%s/starts.txt", dir);
+    if ((f = fopen(p, "r")) != NULL) {   /* "id x y z heading_deg" */
         while (fgets(line, sizeof line, f)) {
             int id; float x, y, z, hd;
             if (sscanf(line, "%d %f %f %f %f", &id, &x, &y, &z, &hd) != 5) continue;
-            for (int i = 0; i < g_bx_nev; i++)
+            for (int i = first; i < g_bx_nev; i++)
                 if (g_bx_ev[i].id == id) {
                     g_bx_ev[i].start[0] = x; g_bx_ev[i].start[1] = y; g_bx_ev[i].start[2] = z;
                     g_bx_ev[i].head = hd * 3.14159265f / 180.0f; g_bx_ev[i].has_start = 1; ns++;
@@ -222,7 +232,39 @@ static void bx_events_load(void) {
         }
         fclose(f);
     }
-    printf("beyond: %d race events, %d free-roam starts\n", g_bx_nev, ns);
+    printf("beyond: %s: %d race events, %d free-roam starts\n", stem, g_bx_nev - first, ns);
+}
+static void bx_events_load(void) {
+    if (g_bx_nev >= 0) return;
+    g_bx_nev = 0;
+    if (beyond_enabled()) bx_events_set(BEYOND_DIR "/ROUTESBEYOND", "BEYOND");
+    static const char *const xp[] = { "L2RA", "L5RA" };
+    for (int k = 0; k < 2; k++) {
+        char d[160]; snprintf(d, sizeof d, BX_XP_ROUTES "/ROUTES%s", xp[k]);
+        bx_events_set(d, xp[k]);
+    }
+}
+static void bx_view(void) {
+    bx_events_load();
+    if (g_bx_nview >= 0) return;
+    g_bx_nview = 0;
+    for (int i = 0; i < g_bx_nev; i++) if (!strcmp(g_bx_ev[i].stem, g_bx_sel)) g_bx_view[g_bx_nview++] = (short)i;
+}
+void beyond_events_select(const char *stem) {
+    if (!stem) stem = "BEYOND";
+    if (!strcmp(stem, g_bx_sel)) return;
+    snprintf(g_bx_sel, sizeof g_bx_sel, "%s", stem);
+    g_bx_nview = -1;
+}
+int beyond_event_all(int i, int *id, int *type, int *len, const char **stem) {
+    bx_events_load();
+    if (i < 0) return g_bx_nev;
+    if (i >= g_bx_nev) return 0;
+    if (id) *id = g_bx_ev[i].id;
+    if (type) *type = g_bx_ev[i].type;
+    if (len) *len = g_bx_ev[i].len;
+    if (stem) *stem = g_bx_ev[i].stem;
+    return 1;
 }
 
 /* ---- shops and the garage (ROUTESBEYOND/shops.txt: "type x y z heading_deg") ---- */
@@ -256,10 +298,11 @@ int beyond_shop_at(int i, int *type, float p[3], float *head) {
     if (head) *head = g_bx_shop[i].head;
     return 1;
 }
-int beyond_event_count(void) { bx_events_load(); return g_bx_nev; }
+int beyond_event_count(void) { bx_view(); return g_bx_nview; }
 int beyond_event_at(int i, int *id, int *type, int *len) {
-    bx_events_load();
-    if (i < 0 || i >= g_bx_nev) return 0;
+    bx_view();
+    if (i < 0 || i >= g_bx_nview) return 0;
+    i = g_bx_view[i];
     if (id) *id = g_bx_ev[i].id;
     if (type) *type = g_bx_ev[i].type;
     if (len) *len = g_bx_ev[i].len;
@@ -272,8 +315,9 @@ static int bx_ev_index(int id) {
     return -1;
 }
 int beyond_event_start(int i, float p[3], float *head) {
-    bx_events_load();
-    if (i < 0 || i >= g_bx_nev || !g_bx_ev[i].has_start) return 0;
+    bx_view();
+    if (i < 0 || i >= g_bx_nview || !g_bx_ev[g_bx_view[i]].has_start) return 0;
+    i = g_bx_view[i];
     memcpy(p, g_bx_ev[i].start, sizeof g_bx_ev[i].start);
     if (head) *head = g_bx_ev[i].head;
     return 1;
