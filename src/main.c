@@ -15041,7 +15041,7 @@ int main(int argc, char **argv) {
        ux0:data/NFSU2 and the native 960x544 screen. */
     static char vita_track[32];
     static char *vita_argv[] = { "nfsu2", "ux0:data/NFSU2", "--resolution", "960x544", "--hud",
-                                 "--perf-csv", "ux0:data/NFSU2/perf.csv", "--track", vita_track, NULL };
+                                 "--perf-csv", "ux0:data/NFSU2/logs/latest/perf.csv", "--track", vita_track, NULL };
     if (argc <= 1) {
         argc = 7; argv = vita_argv;
         FILE *vf = fopen(VENUE_FILE, "r");

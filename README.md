@@ -152,7 +152,7 @@ ux0:data/NFSU2/
 ├── NIS/   SDATA/    SOUND/     SUBTITLES/  TRACKS/  memcard/   <- copied from the PC game
 ├── cache/      <- converted world data, shaders, shop lists (made by the game or the Prep Tool)
 ├── profiles/   <- your saves
-└── log.txt, log_prev.txt, boot.txt, crumbs.txt               <- logs
+└── logs/        <- logs: latest/ is the current run, plus the last 5 runs by start time
 ```
 
 ### 3. Convert the world data (recommended)
@@ -253,14 +253,17 @@ change them in **Options → Controls**.
 ## Reporting problems
 
 Open an [issue](https://github.com/elmnt22/vita-nfsu2/issues). The game
-writes its logs to `ux0:data/NFSU2/`:
+writes its logs to `ux0:data/NFSU2/logs/`:
 
-- `log.txt`: the current run
-- `log_prev.txt`: the run before it. The next start overwrites it, so copy
-  it first.
-- `boot.txt`, `crumbs.txt`: startup and the last steps before a crash
+- `latest/`: the current run (or the last one, if the game is closed)
+- `2026-11-17_21-05-33/` and so on: the 5 runs before it, named by the time
+  each one started. Older runs are deleted.
 
-Attach them to the issue, plus a screenshot for a visual problem. For a
+Each folder has `log.txt`, plus `boot.txt` and `crumbs.txt` (startup and the
+last steps before a crash). If the game crashed, the crash is in `latest/`
+until you start the game again, then in the newest dated folder.
+
+Attach that folder's files to the issue, plus a screenshot for a visual problem. For a
 Prep Tool problem, attach `convert_log.txt` from its output folder
 (`NFSU2 Vita Prep`).
 

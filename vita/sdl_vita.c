@@ -39,6 +39,10 @@
 
 #ifndef GL_DITHER
 #define GL_DITHER 0x0BD0
+/* log folder, see logs_rotate */
+#define LOGS_DIR  "ux0:data/NFSU2/logs"
+#define LOGS_CUR  LOGS_DIR "/latest"
+#define LOGS_KEEP 5
 #endif
 
 /* newlib heap for the engine's own allocations (track bundles are read whole
@@ -73,7 +77,7 @@ static void boot_write_line(const char *line,int len) {
     unsigned long long begin=sceKernelGetProcessTimeWide();
     SceUID fd=g_boot_fd;
     if(fd<0) {
-        fd=sceIoOpen("ux0:data/NFSU2/boot.txt",SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND,0777);
+        fd=sceIoOpen(LOGS_CUR "/boot.txt",SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND,0777);
         if(g_boot_lock_ready)g_boot_fd=fd;
     }
     if(fd>=0) {
@@ -138,6 +142,124 @@ void vita_heap_report(const char *label) {
     vita_mark("  %s; kernel user free %u MB", big, (unsigned)(fi.size_user >> 20));
 }
 
+/* ---- the log folder (user 11-17): ux0:data/NFSU2/logs/latest holds this
+   run's log.txt, boot.txt, crumbs.txt and perf.csv. At each start the last
+   run's folder is renamed to its start time (logs/2026-11-17_21-05-33) and
+   only the newest LOGS_KEEP of those stay. Logs from builds before the folder
+   (loose in ux0:data/NFSU2) move into one "<time>_before-logs-folder". */
+#include <psp2/rtc.h>
+static void logs_stamp(const SceDateTime *t, char *out, int cap) {
+    snprintf(out, (size_t)cap, "%04u-%02u-%02u_%02u-%02u-%02u", (unsigned)t->year, (unsigned)t->month,
+             (unsigned)t->day, (unsigned)t->hour, (unsigned)t->minute, (unsigned)t->second);
+}
+static int logs_exists(const char *p) { SceIoStat st; return sceIoGetstat(p, &st) >= 0; }
+/* a free folder name under LOGS_DIR for stamp + suffix ("-2", "-3".. when taken) */
+static void logs_free_name(const char *stamp, const char *suffix, char *out, int cap) {
+    snprintf(out, (size_t)cap, "%s/%s%s", LOGS_DIR, stamp, suffix);
+    for (int n = 2; n < 100 && logs_exists(out); n++)
+        snprintf(out, (size_t)cap, "%s/%s%s-%d", LOGS_DIR, stamp, suffix, n);
+}
+/* moves dir src to dst: a folder rename, file by file when that fails */
+static void logs_move_dir(const char *src, const char *dst) {
+    if (sceIoRename(src, dst) >= 0) return;
+    sceIoMkdir(dst, 0777);
+    SceUID d = sceIoDopen(src);
+    if (d < 0) return;
+    SceIoDirent e; char a[256], b[256];
+    for (;;) {
+        memset(&e, 0, sizeof e);
+        if (sceIoDread(d, &e) <= 0) break;
+        if (!strcmp(e.d_name, ".") || !strcmp(e.d_name, "..")) continue;
+        snprintf(a, sizeof a, "%s/%s", src, e.d_name); snprintf(b, sizeof b, "%s/%s", dst, e.d_name);
+        sceIoRename(a, b);
+    }
+    sceIoDclose(d);
+    sceIoRmdir(src);
+}
+static void logs_rmdir(const char *dir) {   /* a run folder holds files only */
+    SceUID d = sceIoDopen(dir);
+    if (d >= 0) {
+        SceIoDirent e; char p[256];
+        for (;;) {
+            memset(&e, 0, sizeof e);
+            if (sceIoDread(d, &e) <= 0) break;
+            if (!strcmp(e.d_name, ".") || !strcmp(e.d_name, "..")) continue;
+            snprintf(p, sizeof p, "%s/%s", dir, e.d_name);
+            sceIoRemove(p);
+        }
+        sceIoDclose(d);
+    }
+    sceIoRmdir(dir);
+}
+static int logs_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+static void logs_rotate(void) {
+    sceIoMkdir("ux0:data/NFSU2", 0777);
+    sceIoMkdir(LOGS_DIR, 0777);
+    SceDateTime now; memset(&now, 0, sizeof now);
+    sceRtcGetCurrentClockLocalTime(&now);
+    char stamp[32], dst[192];
+    /* 1. loose files from builds before the folder */
+    static const char *const loose[] = { "log.txt", "boot.txt", "crumbs.txt", "perf.csv",
+                                         "log_prev.txt", "boot_prev.txt", "crumbs_prev.txt" };
+    int nloose = (int)(sizeof loose / sizeof loose[0]), any = 0;
+    for (int i = 0; i < nloose && !any; i++) {
+        char p[96]; snprintf(p, sizeof p, "ux0:data/NFSU2/%s", loose[i]); any = logs_exists(p);
+    }
+    if (any) {
+        logs_stamp(&now, stamp, sizeof stamp);
+        logs_free_name(stamp, "_before-logs-folder", dst, sizeof dst);
+        sceIoMkdir(dst, 0777);
+        for (int i = 0; i < nloose; i++) {
+            char a[96], b[256];
+            snprintf(a, sizeof a, "ux0:data/NFSU2/%s", loose[i]); snprintf(b, sizeof b, "%s/%s", dst, loose[i]);
+            sceIoRename(a, b);
+        }
+    }
+    /* 2. the last run, renamed to its start time (first line of its session.txt) */
+    if (logs_exists(LOGS_CUR)) {
+        stamp[0] = 0;
+        SceUID f = sceIoOpen(LOGS_CUR "/session.txt", SCE_O_RDONLY, 0);
+        if (f >= 0) {
+            int n = sceIoRead(f, stamp, sizeof stamp - 1); sceIoClose(f);
+            stamp[n > 0 ? n : 0] = 0;
+            for (int i = 0; stamp[i]; i++)
+                if (stamp[i] == '\n' || stamp[i] == '\r') { stamp[i] = 0; break; }
+                else if (!((stamp[i] >= '0' && stamp[i] <= '9') || stamp[i] == '-' || stamp[i] == '_')) stamp[i] = '-';
+        }
+        if (!stamp[0] || stamp[0] < '0' || stamp[0] > '9') logs_stamp(&now, stamp, sizeof stamp);
+        logs_free_name(stamp, "", dst, sizeof dst);
+        logs_move_dir(LOGS_CUR, dst);
+    }
+    /* 3. keep the newest LOGS_KEEP run folders (the names sort by time) */
+    static char names[64][64]; int nn = 0;
+    SceUID d = sceIoDopen(LOGS_DIR);
+    if (d >= 0) {
+        SceIoDirent e;
+        for (;;) {
+            memset(&e, 0, sizeof e);
+            if (sceIoDread(d, &e) <= 0) break;
+            if (!SCE_S_ISDIR(e.d_stat.st_mode) || e.d_name[0] < '0' || e.d_name[0] > '9') continue;
+            if (nn < 64) { snprintf(names[nn], sizeof names[nn], "%s", e.d_name); nn++; }
+        }
+        sceIoDclose(d);
+    }
+    qsort(names, (size_t)nn, sizeof names[0], logs_cmp);
+    for (int i = 0; i + LOGS_KEEP < nn; i++) {
+        snprintf(dst, sizeof dst, "%s/%s", LOGS_DIR, names[i]);
+        logs_rmdir(dst);
+    }
+    /* 4. this run's folder and its start time */
+    sceIoMkdir(LOGS_CUR, 0777);
+    logs_stamp(&now, stamp, sizeof stamp);
+    SceUID f = sceIoOpen(LOGS_CUR "/session.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (f >= 0) {
+        char line[160];
+        int len = snprintf(line, sizeof line,
+            "%s\nOpenUG2 run started %s (local time). This folder is renamed to that at the next start.\n", stamp, stamp);
+        sceIoWrite(f, line, (SceSize)len); sceIoClose(f);
+    }
+}
+
 /* Earliest possible sign of life: runs after the C runtime (and its heap
    reservation) but before main(). If boot.txt is missing, the app died in
    the loader or while reserving the heap. */
@@ -152,16 +274,16 @@ __attribute__((constructor(101))) static void vita_boot_probe(void) {
         (unsigned)(_newlib_heap_size_user >> 20), (unsigned)(info.size_user >> 20),
         (unsigned)(info.size_cdram >> 20), (unsigned)(info.size_phycont >> 20));
     g_heap_base = (char *)sbrk(0);
-    sceIoMkdir("ux0:data/NFSU2", 0777);
-    /* the last run's logs survive one relaunch as *_prev.txt (a crash's log was lost to the relaunch) */
-    sceIoRemove("ux0:data/NFSU2/log_prev.txt");    sceIoRename("ux0:data/NFSU2/log.txt", "ux0:data/NFSU2/log_prev.txt");
-    sceIoRemove("ux0:data/NFSU2/boot_prev.txt");   sceIoRename("ux0:data/NFSU2/boot.txt", "ux0:data/NFSU2/boot_prev.txt");
-    sceIoRemove("ux0:data/NFSU2/crumbs_prev.txt"); sceIoRename("ux0:data/NFSU2/crumbs.txt", "ux0:data/NFSU2/crumbs_prev.txt");
-    SceUID fd = sceIoOpen("ux0:data/NFSU2/boot.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    /* the last runs' logs are kept (a crash's log was lost to the relaunch): logs_rotate */
+    /* the app's own restart after the Settings screen (relaunch.tmp) stays in the same run folder */
+    SceIoStat rst;
+    int relaunch = sceIoGetstat("ux0:data/NFSU2/relaunch.tmp", &rst) >= 0 && logs_exists(LOGS_CUR);
+    if (!relaunch) logs_rotate();
+    SceUID fd = sceIoOpen(LOGS_CUR "/boot.txt", SCE_O_WRONLY | SCE_O_CREAT | (relaunch ? SCE_O_APPEND : SCE_O_TRUNC), 0777);
     if (fd >= 0) { sceIoWrite(fd, line, (SceSize)len); sceIoClose(fd); }
     g_boot_lock_ready=sceKernelCreateLwMutex(&g_boot_lock,"openug-boot",0,0,NULL)>=0;
     if (g_boot_lock_ready)
-        g_boot_fd=sceIoOpen("ux0:data/NFSU2/boot.txt",SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND,0777);
+        g_boot_fd=sceIoOpen(LOGS_CUR "/boot.txt",SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND,0777);
 }
 
 /* Startup milestones appended straight to boot.txt, independent of stdio, so
@@ -227,14 +349,14 @@ void vita_mark_stats(void) {
 #define VITA_H 544
 #define VITA_DATA "ux0:data/NFSU2"
 
-/* ---- logging: stdout/stderr -> ux0:data/NFSU2/log.txt ------------------
+/* ---- logging: stdout/stderr -> ux0:data/NFSU2/logs/latest/log.txt (logs_rotate) ------------------
    freopen() on the Vita opens the file but newlib keeps writing fds 1/2 to
    tty0, and swapping the stdout FILE pointer does not stick either. So the
    final syscall is intercepted instead (linked with -Wl,--wrap=_write_r):
    writes to fds 1/2 go straight to sceIoWrite, without a stdio buffer. Keep
    one append handle: streamed builds emit many lines, so opening/closing the
    file for every fragment adds memory-card work to the loading path. */
-#define LOG_PATH  VITA_DATA "/log.txt"
+#define LOG_PATH  LOGS_CUR "/log.txt"
 static int g_log_ready;
 static int g_logs_off;   /* nolog.txt, see vlog() */
 static SceUID g_log_fd = -1;
@@ -514,7 +636,7 @@ void vita_crumb(const char *fmt, ...) {
     va_end(ap);
     if (len > (int)sizeof line - 2) len = (int)sizeof line - 2;
     line[len++] = '\n';
-    SceUID fd = sceIoOpen(VITA_DATA "/crumbs.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    SceUID fd = sceIoOpen(LOGS_CUR "/crumbs.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     if (fd >= 0) { sceIoWrite(fd, line, (SceSize)len); sceIoClose(fd); }
 }
 
@@ -637,7 +759,7 @@ void vita_early_init(void) {
     vita_mark("main thread pinned to core 0: 0x%08X", (unsigned)
               sceKernelChangeThreadCpuAffinityMask(g_main_thid, SCE_KERNEL_CPU_MASK_USER_0));
     sceIoMkdir(VITA_DATA, 0777);
-    {   SceUID cf = sceIoOpen(VITA_DATA "/crumbs.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    {   SceUID cf = sceIoOpen(LOGS_CUR "/crumbs.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (cf >= 0) sceIoClose(cf); }
     SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     vita_mark("log.txt truncate: 0x%08X", (unsigned)fd);

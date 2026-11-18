@@ -78,7 +78,7 @@ echo "vitaGL: ${VGL:-ug2}"
 
 LIBS="-lvitaGL -lvitashark -lSceShaccCgExt -ltaihen_stub -lSceShaccCg_stub -lmathneon
       -lScePvf_stub -lSceCommonDialog_stub -lSceGxm_stub -lSceDisplay_stub -lSceAppMgr_stub -lSceAppUtil_stub
-      -lSceNpTrophy_stub -lSceSysmodule_stub -lSceKernelDmacMgr_stub -lSceCtrl_stub -lSceTouch_stub -lSceAudio_stub -lScePower_stub
+      -lSceNpTrophy_stub -lSceRtc_stub -lSceSysmodule_stub -lSceKernelDmacMgr_stub -lSceCtrl_stub -lSceTouch_stub -lSceAudio_stub -lScePower_stub
       -lSceLibKernel_stub -lSceKernelThreadMgr_stub -lstdc++ -lm -lc"
 
 echo "LD $TITLE.elf"
