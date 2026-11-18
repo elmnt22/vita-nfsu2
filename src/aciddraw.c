@@ -61,13 +61,34 @@ void aciddraw_world_flares_sections(int (*vis)(const float eye[3], const short *
    build focus; further tiles carry only road + terrain). Retail draws the
    whole city, so its flares always sit on a building; here a flare on a tile
    past the radius would hang in the sky over empty ground. r <= 0: no limit. */
-static float g_wf_area[3];
-void aciddraw_world_flares_area(float cx, float cy, float r) { g_wf_area[0] = cx; g_wf_area[1] = cy; g_wf_area[2] = r; }
-static int wf_in_area(const float p[3]) {
-    if (g_wf_area[2] <= 0.0f) return 1;
-    float tx = (floorf(p[0] / 128.0f) + 0.5f) * 128.0f - g_wf_area[0];   /* WTILE_SIZE tile centre */
-    float ty = (floorf(p[1] / 128.0f) + 0.5f) * 128.0f - g_wf_area[1];
-    return tx * tx + ty * ty <= g_wf_area[2] * g_wf_area[2];
+static float g_wf_area[3], g_wf_prev[3];
+static unsigned long g_wf_gen = ~0ul; static unsigned g_wf_t0; static float g_wf_fade = 1.0f;
+/* gen: the build that placed the area (a new one moves it); now_ms: the clock.
+   The lights of tiles the new area brought fade in with their buildings
+   (main.c WFADE_MS, the same smoothstep) instead of switching on at full
+   strength (user 11-17: "building lights have some pop in"). */
+void aciddraw_world_flares_area(float cx, float cy, float r, unsigned long gen, unsigned now_ms)
+{
+    if (gen != g_wf_gen) {
+        if (g_wf_gen != ~0ul) memcpy(g_wf_prev, g_wf_area, sizeof g_wf_prev);
+        else g_wf_prev[2] = -1.0f;   /* first area: nothing was placed before */
+        g_wf_gen = gen; g_wf_t0 = now_ms;
+    }
+    g_wf_area[0] = cx; g_wf_area[1] = cy; g_wf_area[2] = r;
+    float t = (float)(now_ms - g_wf_t0) / 900.0f;
+    g_wf_fade = t >= 1.0f ? 1.0f : t <= 0.0f ? 0.0f : t * t * (3.0f - 2.0f * t);
+}
+static int wf_tile_in(const float a[3], const float p[3]) {
+    float tx = (floorf(p[0] / 128.0f) + 0.5f) * 128.0f - a[0];   /* WTILE_SIZE tile centre */
+    float ty = (floorf(p[1] / 128.0f) + 0.5f) * 128.0f - a[1];
+    return tx * tx + ty * ty <= a[2] * a[2];
+}
+/* 0: the flare's tile has no buildings placed; else its strength (1, or the fade-in) */
+static float wf_area_k(const float p[3]) {
+    if (g_wf_area[2] <= 0.0f) return 1.0f;
+    if (!wf_tile_in(g_wf_area, p)) return 0.0f;
+    if (g_wf_fade >= 1.0f || (g_wf_prev[2] > 0.0f && wf_tile_in(g_wf_prev, p))) return 1.0f;
+    return g_wf_fade > 0.001f ? g_wf_fade : 0.001f;
 }
 
 /* SingleLightFlareParameters (0x7f3a30.., 0x2c bytes) per flare type, two
@@ -213,6 +234,7 @@ typedef struct {
     const float *V, *PV; float proj, eye[3], R[3], U[3], F[3];
     GLuint btex; int bblend, nq, drawn;
     float stretch;   /* flareType 2: 0x7f39a0 */
+    float wfade;     /* port: the world flare's tile fade-in (wf_area_k), 1 for the rest */
 } FlareCtx;
 
 /* eRenderLightFlare 0x490920 for flareType 0 (the main view), 2 (the road
@@ -299,7 +321,7 @@ static void flare_one(FlareCtx *c, const FlareQ *q)
         float sc = ds < f->cmin ? f->cmin : ds > f->cmax ? f->cmax : ds;
         size *= sc;
         unsigned char col[4] = { (unsigned char)clamp255(k * f->r), (unsigned char)clamp255(k * f->g),
-                                 (unsigned char)clamp255(k * f->b), (unsigned char)clamp255(k * f->a * fade * 2.0f) };
+                                 (unsigned char)clamp255(k * f->b), (unsigned char)clamp255(k * f->a * fade * c->wfade * 2.0f) };
         if (A.ftex[ti] != c->btex || A.fblend[ti] != c->bblend || c->nq >= 1000) {
             flush(c->btex, c->bblend, c->nq); c->drawn += c->nq; c->nq = 0;
             c->btex = A.ftex[ti]; c->bblend = A.fblend[ti];
@@ -344,7 +366,7 @@ static int wf_box_in_view(const float *M, const float mn[3], const float mx[3])
     return 1;
 }
 #define WF_MAXPK 128
-static long g_wf_stat[3];   /* main pass: packs taken, flares tried, frames (OPENUG2_FXLOG) */
+static long g_wf_stat[4];   /* main pass: packs taken, flares tried, frames (OPENUG2_FXLOG) */
 static int wf_packs(const FlareCtx *c, float reach2, int out[WF_MAXPK])
 {
     int n = 0;
@@ -387,7 +409,7 @@ static int wf_packs(const FlareCtx *c, float reach2, int out[WF_MAXPK])
    All three queues are emptied. */
 static int light_flares(const float V[16], const float PV[16], float proj)
 {
-    FlareCtx c; memset(&c, 0, sizeof c);
+    FlareCtx c; memset(&c, 0, sizeof c); c.wfade = 1.0f;
     c.V = V; c.PV = PV; c.proj = proj;
     for (int j = 0; j < 3; j++) {
         c.R[j] = V[4 * j]; c.U[j] = V[4 * j + 1]; c.F[j] = -V[4 * j + 2];
@@ -405,11 +427,13 @@ static int light_flares(const float V[16], const float PV[16], float proj)
                 FlareQ q;
                 memcpy(q.p, w->p, sizeof q.p); memcpy(q.d, w->d, sizeof q.d);
                 q.type = w->type > 14 ? 0 : w->type; q.flags = w->flags; q.k = 1.0f; q.ft = 0;
-                if (w->type > 14 || !wf_in_area(w->p)) continue;
+                if (w->type > 14 || !(c.wfade = wf_area_k(w->p))) continue;
+                g_wf_stat[3] += c.wfade < 1.0f;
                 flare_one(&c, &q);
             }
         }
         WF_UNLOCK();
+        c.wfade = 1.0f;   /* the cars' and the pool's flares are not on a tile */
     }
     for (int i = 0; i < g_ncq; i++) {
         /* RenderFlaresOnCar: eView::GetPixelSize(car position, 3.0) under 4
@@ -424,10 +448,10 @@ static int light_flares(const float V[16], const float PV[16], float proj)
     if (++g_wf_stat[2] >= 300) {   /* OPENUG2_FXLOG: the world walk's load per frame */
         static int log = -1;
         if (log < 0) log = getenv("OPENUG2_FXLOG") != NULL;
-        if (log) printf("flares: world walk %.1f packs, %.1f flares a frame (%s); worst lock wait render %.3f ms, loader %.3f ms\n",
-                        g_wf_stat[0] / 300.0, g_wf_stat[1] / 300.0, W.vis ? "visible sections" : "200 m boxes",
+        if (log) printf("flares: world walk %.1f packs, %.1f flares a frame, %ld fading in (%s); worst lock wait render %.3f ms, loader %.3f ms\n",
+                        g_wf_stat[0] / 300.0, g_wf_stat[1] / 300.0, g_wf_stat[3], W.vis ? "visible sections" : "200 m boxes",
                         g_wf_wait_max[0], g_wf_wait_max[1]);
-        g_wf_stat[0] = g_wf_stat[1] = g_wf_stat[2] = 0;
+        g_wf_stat[0] = g_wf_stat[1] = g_wf_stat[2] = g_wf_stat[3] = 0;
     }
     memcpy(g_rq, g_cq, sizeof(FlareQ) * (size_t)g_ncq); g_nrq = g_ncq;
     g_nfq = 0; g_ncq = 0;
@@ -465,7 +489,7 @@ int aciddraw_reflect_flares(const float V[16], const float PV[16], float proj, f
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, A.ibo);
     glEnable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
     glEnable(GL_BLEND); glDisable(GL_CULL_FACE);
-    FlareCtx c; memset(&c, 0, sizeof c);
+    FlareCtx c; memset(&c, 0, sizeof c); c.wfade = 1.0f;
     c.V = V; c.PV = PV; c.proj = proj;
     c.stretch = (10.0f - 1.2f) * wet + 1.2f;
     for (int j = 0; j < 3; j++) {
@@ -479,7 +503,7 @@ int aciddraw_reflect_flares(const float V[16], const float PV[16], float proj, f
             const WPack *k = &W.pk[pk[i]];
             for (int n = 0; n < k->n; n++) {
                 WFlare *w = &W.f[k->first + n];
-                if (w->type > 14 || !wf_in_area(w->p)) continue;
+                if (w->type > 14 || !(c.wfade = wf_area_k(w->p))) continue;
                 if (!w->ezs) {
                     float e = 0.0f;
                     w->ezs = 2;
@@ -493,6 +517,7 @@ int aciddraw_reflect_flares(const float V[16], const float PV[16], float proj, f
             }
         }
         WF_UNLOCK();
+        c.wfade = 1.0f;   /* the cars' and the pool's flares are not on a tile */
     }
     for (int i = 0; i < g_nrq; i++) {
         const float *P = g_rq[i].car;
@@ -536,7 +561,7 @@ int aciddraw_env_flares(const float V[16], const float PV[16], float proj)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, A.ibo);
     glEnable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
     glEnable(GL_BLEND); glDisable(GL_CULL_FACE);
-    FlareCtx c; memset(&c, 0, sizeof c);
+    FlareCtx c; memset(&c, 0, sizeof c); c.wfade = 1.0f;
     c.V = V; c.PV = PV; c.proj = proj;
     for (int j = 0; j < 3; j++) {
         c.R[j] = V[4 * j]; c.U[j] = V[4 * j + 1]; c.F[j] = -V[4 * j + 2];
@@ -551,7 +576,7 @@ int aciddraw_env_flares(const float V[16], const float PV[16], float proj)
             const WPack *k = &W.pk[pk[i]];
             for (int n = 0; n < k->n; n++) {
                 const WFlare *w = &W.f[k->first + n];
-                if (w->type > 14 || !wf_in_area(w->p)) continue;
+                if (w->type > 14 || !(c.wfade = wf_area_k(w->p))) continue;
                 FlareQ q; memset(&q, 0, sizeof q);
                 memcpy(q.p, w->p, sizeof q.p); memcpy(q.d, w->d, sizeof q.d);
                 q.type = w->type; q.flags = w->flags; q.k = 1.0f; q.ft = 1;
@@ -559,6 +584,7 @@ int aciddraw_env_flares(const float V[16], const float PV[16], float proj)
             }
         }
         WF_UNLOCK();
+        c.wfade = 1.0f;   /* the cars' and the pool's flares are not on a tile */
     }
     for (int i = 0; i < g_nfq; i++) { FlareQ q = g_fq[i]; q.ft = 4; flare_one(&c, &q); }
     flush(c.btex, c.bblend, c.nq); c.drawn += c.nq;

@@ -29272,7 +29272,7 @@ int main(int argc, char **argv) {
                                        ? &g_acid_p.c->own : NULL;
                 /* eRenderWorldLightFlares runs in the game's state 6 only (not the front end) */
                 aciddraw_world_flares_enable(!g_showroom && g_dbg.show_track && (passmode == 0 || passmode == 2));
-                { const WorldNeighborhood *fa = active_resident ? &active_resident->world : &world.neighborhood; aciddraw_world_flares_area(fa->center[0], fa->center[1], fa->radius); }   /* no flares over unplaced buildings */
+                { const WorldNeighborhood *fa = active_resident ? &active_resident->world : &world.neighborhood; aciddraw_world_flares_area(fa->center[0], fa->center[1], fa->radius, active_resident ? (unsigned long)active_resident->generation : 0ul, (unsigned)SDL_GetTicks()); }   /* no flares over unplaced buildings */
                 g_pc_t3 = SDL_GetPerformanceCounter();
                 g_dbg.drawn += aciddraw_draw(V, MVP, proj, incar);
                 g_pc_t4 = SDL_GetPerformanceCounter();

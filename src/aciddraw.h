@@ -58,8 +58,9 @@ int  aciddraw_env_flares(const float V[16], const float PV[16], float proj);
 void aciddraw_world_flares_reset(void);
 int  aciddraw_world_flares_add(const unsigned char *bundle, long len);
 void aciddraw_world_flares_enable(int on);
-/* only flares on tiles whose buildings are placed: build focus (cx, cy), radius r (<= 0 off) */
-void aciddraw_world_flares_area(float cx, float cy, float r);
+/* only flares on tiles whose buildings are placed: build focus (cx, cy), radius r (<= 0 off);
+   gen = the build that placed them (a new gen fades its new tiles' flares in over 0.9 s), now_ms = the clock */
+void aciddraw_world_flares_area(float cx, float cy, float r, unsigned long gen, unsigned now_ms);
 /* the walk's section source (FindDrivableSection 0x5e00d0): the visible
    sections of the drivable section under eye, their count (-1 none, -2 no
    section data: the port's old 200 m box pick) */
