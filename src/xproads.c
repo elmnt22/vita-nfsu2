@@ -544,3 +544,4 @@ int xp_routes(const char *bun_path, const char *out_path, int game, XpRoadStats 
 }
 
 #include "xpevents.inc"
+#include "xpprops.inc"

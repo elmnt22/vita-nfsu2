@@ -43,4 +43,9 @@ typedef struct { long races, events, circuits, sprints, drags, fallback, through
                  barriers_on, barriers_off, barrier_segs; } XpEventStats;
 int xp_events(const char *gameplay_bin, const char *raw_companion, const char *raw_stream,
               const char *out_dir, int game, const char *city, int first_id, XpEventStats *stats);
+
+/* The city's smackable props -> smokeables (xpprops.inc): one bundle with hulls, infos,
+   placements and spawner packs, read by smk_load in place of the city's own (11-18). */
+typedef struct { long mw, props, infos, packs, other_kind, no_model, too_big, bad; } XpPropStats;
+int xp_props(const char *raw_companion, const char *raw_stream, const char *out_path, int game, XpPropStats *stats);
 #endif

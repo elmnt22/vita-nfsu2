@@ -109,6 +109,7 @@ static int         g_fx_built;   /* the infos' emitter templates taken */
 static SmkSpawner *g_sp;     static int g_nsp;
 static uint32_t   *g_keys;   static int *g_keyidx;      /* sorted section<<16|instance */
 static SmkGpu    **g_gpu;
+static int        *g_pres; static int g_npres;   /* the present spawners (smk_touch: a World Expansion city has 12,692) */
 static SmkLive     g_live[SMK_LIVE_MAX];
 static WColl      *g_w;
 static float       g_now;
@@ -203,8 +204,8 @@ void smk_free(void)
         acid_free_clones(g_info[i].t_motion); acid_free_clones(g_info[i].t_anchor);
     }
     g_fx_built = 0;
-    free(g_info); free(g_sp); free(g_keys); free(g_keyidx); free(g_gpu);
-    g_info = NULL; g_sp = NULL; g_keys = NULL; g_keyidx = NULL; g_gpu = NULL;
+    free(g_info); free(g_sp); free(g_keys); free(g_keyidx); free(g_gpu); free(g_pres);
+    g_info = NULL; g_sp = NULL; g_keys = NULL; g_keyidx = NULL; g_gpu = NULL; g_pres = NULL; g_npres = 0;
     g_ninfo = g_nsp = 0;
     g_gen = (unsigned long)-1;
     memset(&g_st, 0, sizeof g_st);
@@ -217,9 +218,17 @@ int smk_load(const char *root, const char *stem)
         FILE *off = fopen("ux0:data/NFSU2/nosmk.txt", "r");
         if (off) { fclose(off); printf("smokeables: off (nosmk.txt)\n"); return 0; }
     }
-    char path[1100];
+    char path[1100], spath[1100];
     long n = 0;
-    snprintf(path, sizeof path, "%s/%s.BUN", root, stem);
+    /* a World Expansion city: its props were translated into one bundle (xpprops.inc,
+       infos + hulls + placements + spawners) that stands in for both files */
+    snprintf(path, sizeof path, "%s/XPSMK%s.BUN", root, stem);
+    FILE *xp = fopen(path, "rb");
+    if (xp) { fclose(xp); snprintf(spath, sizeof spath, "%s", path); }
+    else {
+        snprintf(path, sizeof path, "%s/%s.BUN", root, stem);
+        snprintf(spath, sizeof spath, "%s/STREAM%s.BUN", root, stem);
+    }
     unsigned char *d = read_file(path, &n);
     if (!d) return 0;
     const unsigned char *ov = NULL; long nov = 0;
@@ -263,7 +272,7 @@ int smk_load(const char *root, const char *stem)
     }
     free(d);
 
-    snprintf(path, sizeof path, "%s/STREAM%s.BUN", root, stem);
+    snprintf(path, sizeof path, "%s", spath);
     FILE *f = fopen(path, "rb");
     int cap = 0, npack = 0, noinfo = 0;
     if (f) {
@@ -286,6 +295,10 @@ int smk_load(const char *root, const char *stem)
                     fread(b, 1, sz, f) == sz && (long)sz > pad + 0x10) {
                     const unsigned char *pk = b + pad;
                     int cnt = (int16_t)rd16(pk + 0x0c);
+                    /* UG2's 0x70-byte spawners only: a World Expansion city's own packs
+                       (MW: 64-byte records, copied through by xpconv) would map garbage
+                       overrides onto its scenery and hide it as "props" (11-18) */
+                    if (cnt <= 0 || (long)sz - pad - 0x10 < (long)cnt * 0x70) { free(b); if (!ix) off += 8 + (long)sz; continue; }
                     npack++;
                     LOAD_PUMP();   /* the loading screen keeps moving */
                     for (int i = 0; i < cnt && pad + 0x10 + (long)(i + 1) * 0x70 <= (long)sz; i++) {
@@ -327,7 +340,8 @@ int smk_load(const char *root, const char *stem)
     g_keys = (uint32_t *)malloc((size_t)g_nsp * sizeof *g_keys);
     g_keyidx = (int *)malloc((size_t)g_nsp * sizeof *g_keyidx);
     g_gpu = (SmkGpu **)calloc((size_t)g_nsp, sizeof *g_gpu);
-    if (!g_keys || !g_keyidx || !g_gpu) {
+    g_pres = (int *)malloc((size_t)g_nsp * sizeof *g_pres);
+    if (!g_keys || !g_keyidx || !g_gpu || !g_pres) {
         printf("smokeables: %s: out of memory, none\n", stem);
         smk_free();
         return 0;
@@ -360,6 +374,7 @@ void smk_resident(const N2Scene *scene, const GLuint *mtex, const unsigned char 
     if (gen == g_gen) return;
     g_gen = gen;
     for (int i = 0; i < g_nsp; i++) { g_sp[i].nmesh = 0; g_sp[i].sig = 0; }
+    g_npres = 0;
     for (int m = 0; m < scene->count; m++) {
         const N2Mesh *x = &scene->meshes[m];
         if (x->world_role != 3 || !x->scen_has) continue;
@@ -373,6 +388,7 @@ void smk_resident(const N2Scene *scene, const GLuint *mtex, const unsigned char 
         SmkSpawner *S = &g_sp[i];
         S->present = S->nmesh > 0;
         loaded += S->present;
+        if (S->present) g_pres[g_npres++] = i;
         /* section load -> Spawn; unload -> Unspawn (the virgin goes, a live
            prop stays and sleeps) */
         if (S->present && !S->disabled && S->live < 0) S->virgin = 1;
@@ -571,7 +587,8 @@ static void convert(int si)
 
 void smk_touch(const float pos[3], float rad)
 {
-    for (int i = 0; i < g_nsp; i++) {
+    for (int j = 0; j < g_npres; j++) {                /* only a present spawner is drawn and can be met */
+        int i = g_pres[j];
         SmkSpawner *S = &g_sp[i];
         if (!S->virgin) continue;
         if (pos[0] + rad < S->mn[0] || pos[0] - rad > S->mx[0] ||
