@@ -967,7 +967,7 @@ static int routes_bin(const DPolys *S, int closed, FILE *f)
 }
 
 /* ---- the whole set ---- */
-typedef struct { int id, type, len; size_t partlen; char start[96]; char *bars; } EvMeta;
+typedef struct { int id, type, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; } EvMeta;   /* pl: the route, x y every ~15 m */
 static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t *recs, const unsigned char *keep, int reread)
 {
     int nk = 0; for (int i = 0; i < nm; i++) nk += keep[i];
@@ -1099,6 +1099,19 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         D3 a = S.v[0].p[0], bq = S.v[0].n > 1 ? S.v[0].p[1] : S.v[1 < S.n ? 1 : 0].p[0]; int fnd = 0;
         for (int s = 0; s < S.n && !fnd; s++) for (int i = 0; i < S.v[s].n; i++) if (dd2(S.v[s].p[i], a) > 8) { bq = S.v[s].p[i]; fnd = 1; break; }
         snprintf(m->start, sizeof m->start, "%d %.1f %.1f %.2f %.1f\n", ev, a.x, a.y, a.z, atan2(bq.y - a.y, bq.x - a.x) * 180.0 / 3.14159265358979323846);
+        {   /* the Quick Race / engage track map's line (beyond.c draws it on the city map) */
+            size_t tot = 0; for (int q = 0; q < S.n; q++) tot += (size_t)S.v[q].n;
+            m->pl = malloc((tot + 1) * 2 * sizeof(float)); m->npl = 0;
+            if (m->pl) {
+                D3 last = a; int have = 0;
+                for (int q = 0; q < S.n; q++) for (int i = 0; i < S.v[q].n; i++) {
+                    D3 v = S.v[q].p[i];
+                    if (have && dd2(v, last) < 15.0 && !(q == S.n - 1 && i == S.v[q].n - 1)) continue;
+                    m->pl[2 * m->npl] = (float)v.x; m->pl[2 * m->npl + 1] = (float)v.y; m->npl++;
+                    last = v; have = 1;
+                }
+            }
+        }
         nm++;
         free(ch);
     }
@@ -1121,7 +1134,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (bad) {
         /* the records shrink to the events kept */
         int w = 0;
-        for (int i = 0; i < nm; i++) if (keep[i]) { if (w != i) { memmove(recs + 0x110 * (size_t)w, recs + 0x110 * (size_t)i, 0x110); free(meta[w].bars); meta[w] = meta[i]; meta[i].bars = NULL; } w++; }
+        for (int i = 0; i < nm; i++) if (keep[i]) { if (w != i) { memmove(recs + 0x110 * (size_t)w, recs + 0x110 * (size_t)i, 0x110); free(meta[w].bars); free(meta[w].pl); meta[w] = meta[i]; meta[i].bars = NULL; meta[i].pl = NULL; } w++; }
         nm = w; memset(keep, 1, (size_t)(nm ? nm : 1));
         if (!write_allrec(out_dir, meta, nm, recs, keep, 1)) goto done;
     }
@@ -1139,6 +1152,18 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
             st->events++;
             if (meta[i].type == RT_CIRCUIT) st->circuits++; else if (meta[i].type == RT_SPRINT) st->sprints++; else st->drags++;
         }
+        snprintf(p, sizeof p, "%s/trackpoly.bin", out_dir);   /* "XTPL" n, then per event: id, closed, count, x y ... */
+        FILE *ft = fopen(p, "wb");
+        if (!ft) okw = 0;
+        else {
+            uint32_t hd[2] = { 0x4c505458u, (uint32_t)nm };
+            if (fwrite(hd, 4, 2, ft) != 2) okw = 0;
+            for (int i = 0; i < nm && okw; i++) {
+                int32_t eh[3] = { meta[i].id, meta[i].type == RT_CIRCUIT, meta[i].pl ? meta[i].npl : 0 };
+                if (fwrite(eh, 4, 3, ft) != 3 || (eh[2] && fwrite(meta[i].pl, 8, (size_t)eh[2], ft) != (size_t)eh[2])) okw = 0;
+            }
+            if (fclose(ft)) okw = 0;
+        }
         if (fe && fclose(fe)) okw = 0;
         if (fs && fclose(fs)) okw = 0;
         if (fb && fclose(fb)) okw = 0;
@@ -1146,7 +1171,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     }
 done:
     (void)nrecs;
-    if (meta) for (int i = 0; i < nr; i++) free(meta[i].bars);
+    if (meta) for (int i = 0; i < nr; i++) { free(meta[i].bars); free(meta[i].pl); }
     free(meta); free(recs); free(keep); free(mark); free(stamp); free(seen);
     free(C.dist); free(C.prev); free(C.touched); free(C.W); free(C.heap.v); free(C.nl.v);
     dps_free(&g2); dps_free(&S); free(part.b);

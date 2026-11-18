@@ -336,8 +336,105 @@ const char *beyond_event_name(int id) { int i = bx_ev_index(id); return i < 0 ? 
 /* the Quick Race track map of a Beyond event: ROUTESBEYOND/TRACKMAP<id>.bin
    (BeyondDev tools/events/trackmaps.py, the minimap's BMAP format), RGBA,
    malloc'd; NULL when none */
+/* an expansion city's event (port): drawn here like trackmaps.py does it -- the city's
+   minimap (TRACKS/<region>.MAP) framed on the route, dimmed, the route white with a
+   dark edge (ROUTES<region>/trackpoly.bin, xpevents.inc), a green dot at the start */
+static float *bx_tp_route(const char *stem, int id, int *n, int *closed)
+{
+    char p[200]; snprintf(p, sizeof p, BX_XP_ROUTES "/ROUTES%s/trackpoly.bin", stem);
+    FILE *f = fopen(p, "rb");
+    if (!f) return NULL;
+    uint32_t hd[2]; float *pl = NULL;
+    if (fread(hd, 4, 2, f) == 2 && hd[0] == 0x4c505458u)
+        for (uint32_t i = 0; i < hd[1] && !pl; i++) {
+            int32_t eh[3];
+            if (fread(eh, 4, 3, f) != 3 || eh[2] < 0 || eh[2] > 100000) break;
+            if (eh[0] != id) { if (fseek(f, (long)eh[2] * 8, SEEK_CUR)) break; continue; }
+            if (eh[2] >= 2 && (pl = (float *)malloc((size_t)eh[2] * 8)) && fread(pl, 8, (size_t)eh[2], f) != (size_t)eh[2]) { free(pl); pl = NULL; }
+            if (pl) { *n = eh[2]; *closed = eh[1]; }
+            break;
+        }
+    fclose(f);
+    return pl;
+}
+static void bx_tp_line(unsigned char *px, int S, float ax, float ay, float bx, float by, float r, const unsigned char rgb[3])
+{
+    int x0 = (int)floorf(fminf(ax, bx) - r - 1), x1 = (int)ceilf(fmaxf(ax, bx) + r + 1);
+    int y0 = (int)floorf(fminf(ay, by) - r - 1), y1 = (int)ceilf(fmaxf(ay, by) + r + 1);
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > S - 1) x1 = S - 1; if (y1 > S - 1) y1 = S - 1;
+    float dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) {
+            float qx = x + 0.5f - ax, qy = y + 0.5f - ay;
+            float t = l2 > 0 ? (qx * dx + qy * dy) / l2 : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
+            float ex = qx - t * dx, ey = qy - t * dy, d = sqrtf(ex * ex + ey * ey);
+            float a = r + 0.5f - d; if (a <= 0) continue; if (a > 1) a = 1;
+            unsigned char *o = px + 4 * ((size_t)y * S + x);
+            for (int k = 0; k < 3; k++) o[k] = (unsigned char)(o[k] + (rgb[k] - o[k]) * a);
+        }
+}
+static unsigned char *bx_tp_draw(const char *stem, int id, int *w, int *h)
+{
+    int n = 0, closed = 0;
+    float *pl = bx_tp_route(stem, id, &n, &closed);
+    if (!pl) return NULL;
+    char p[200]; snprintf(p, sizeof p, BX_XP_ROUTES "/%s.MAP", stem);
+    FILE *f = fopen(p, "rb");
+    unsigned char hd[28]; uint32_t MW = 0, MH = 0; float fl[4] = { 0 };
+    unsigned char *mm = NULL;
+    if (f && fread(hd, 1, 28, f) == 28 && !memcmp(hd, "BMAP", 4)) {
+        memcpy(&MW, hd + 4, 4); memcpy(&MH, hd + 8, 4); memcpy(fl, hd + 12, 16);
+        if (MW && MH && MW <= 4096 && MH <= 4096 && fl[2] > 0 && (mm = (unsigned char *)malloc((size_t)MW * MH * 4)) &&
+            fread(mm, 4, (size_t)MW * MH, f) != (size_t)MW * MH) { free(mm); mm = NULL; }
+    }
+    if (f) fclose(f);
+    enum { S = 256 };
+    unsigned char *px = mm ? (unsigned char *)malloc((size_t)S * S * 4) : NULL;
+    if (!px) { free(mm); free(pl); return NULL; }
+    float minx = pl[0], maxx = pl[0], miny = pl[1], maxy = pl[1];
+    for (int i = 1; i < n; i++) {
+        minx = fminf(minx, pl[2 * i]); maxx = fmaxf(maxx, pl[2 * i]);
+        miny = fminf(miny, pl[2 * i + 1]); maxy = fmaxf(maxy, pl[2 * i + 1]);
+    }
+    float span = fmaxf(maxx - minx, maxy - miny) * 1.25f + 200.0f;
+    float x0 = (minx + maxx) * 0.5f - span * 0.5f, y0 = (miny + maxy) * 0.5f + span * 0.5f;   /* top-left, y up */
+    for (int y = 0; y < S; y++)            /* the minimap's crop, bilinear, dimmed (0.55) */
+        for (int x = 0; x < S; x++) {
+            float wx = x0 + (x + 0.5f) / S * span, wy = y0 - (y + 0.5f) / S * span;
+            float u = (wx - fl[0]) / fl[2] * MW - 0.5f, v = (fl[1] - wy) / fl[2] * MH - 0.5f;
+            int iu = (int)floorf(u), iv = (int)floorf(v); float fu = u - iu, fv = v - iv;
+            unsigned char *o = px + 4 * ((size_t)y * S + x);
+            for (int k = 0; k < 3; k++) {
+                float c = 0;
+                for (int j = 0; j < 4; j++) {
+                    int su = iu + (j & 1), sv = iv + (j >> 1);
+                    if (su < 0) su = 0; if (sv < 0) sv = 0; if (su >= (int)MW) su = MW - 1; if (sv >= (int)MH) sv = MH - 1;
+                    c += mm[4 * ((size_t)sv * MW + su) + k] * ((j & 1) ? fu : 1 - fu) * ((j >> 1) ? fv : 1 - fv);
+                }
+                o[k] = (unsigned char)(c * 0.55f);
+            }
+            o[3] = 255;
+        }
+    free(mm);
+    static const unsigned char dark[3] = { 15, 15, 15 }, white[3] = { 255, 255, 255 }, green[3] = { 120, 230, 60 };
+    int ns = closed ? n : n - 1;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < ns; i++) {
+            int j = (i + 1) % n;
+            bx_tp_line(px, S, (pl[2 * i] - x0) / span * S, (y0 - pl[2 * i + 1]) / span * S,
+                       (pl[2 * j] - x0) / span * S, (y0 - pl[2 * j + 1]) / span * S, pass ? 0.7f : 1.7f, pass ? white : dark);
+        }
+    float sx = (pl[0] - x0) / span * S, sy = (y0 - pl[1]) / span * S;
+    bx_tp_line(px, S, sx, sy, sx, sy, 5.5f, dark);
+    bx_tp_line(px, S, sx, sy, sx, sy, 3.5f, green);
+    free(pl);
+    *w = S; *h = S;
+    return px;
+}
 unsigned char *beyond_trackmap(int id, int *w, int *h) {
-    if (bx_ev_index(id) < 0) return NULL;
+    int ei = bx_ev_index(id);
+    if (ei < 0) return NULL;
+    if (strcmp(g_bx_ev[ei].stem, "BEYOND")) return bx_tp_draw(g_bx_ev[ei].stem, id, w, h);
     char p[160]; snprintf(p, sizeof p, BEYOND_DIR "/ROUTESBEYOND/TRACKMAP%d.bin", id);
     FILE *f = fopen(p, "rb");
     if (!f) return NULL;
