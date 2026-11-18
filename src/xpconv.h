@@ -3,7 +3,7 @@
 #ifndef XPCONV_H
 #define XPCONV_H
 /* bumped whenever the translated output changes: an older marker = translate again */
-#define XP_VERSION 4   /* 2: collision packs (11-17), 3: night prelight + lamp flares (11-18), 4: endless walls fitted to the ground (11-18) */
+#define XP_VERSION 5   /* 2: collision packs (11-17), 3: night prelight + lamp flares (11-18), 4: endless walls fitted to the ground (11-18), 5: road curve tangents (11-18, RoutesFreeRoam rebuilt) */
 enum { XP_GAME_MW = 1, XP_GAME_CARBON = 2 };
 enum { XP_OK = 0, XP_ERR_OPEN_IN, XP_ERR_OPEN_OUT, XP_ERR_READ, XP_ERR_WRITE,
        XP_ERR_FORMAT, XP_ERR_MEMORY, XP_ERR_CANCELLED };

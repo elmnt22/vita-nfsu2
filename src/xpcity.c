@@ -127,6 +127,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     snprintf(p, sizeof p, XP_CACHE "/tiles/%s_v%d.idx", k_city[c].bun, WTILE_VERSION); remove(p);
     snprintf(p, sizeof p, XP_CACHE "/tiles/%s_v%d.pak", k_city[c].bun, WTILE_VERSION); remove(p);
     skyline_forget(k_city[c].bun);
+    snprintf(p, sizeof p, "%s/ROUTES%s/RoutesFreeRoam.bin", troot, k_city[c].companion); remove(p);   /* road net: rebuilt below */
     if (!g_window) {   /* graphics up early: the world load's own screens come later */
         vita_fast_clocks();
         SDL_Window *w = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);

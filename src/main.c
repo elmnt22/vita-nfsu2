@@ -12501,6 +12501,15 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
             if (h[i].car < ncars && h[i].other < ncars) h[k++] = h[i];
         nh = k;
     }
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_WALLTRACE"))   /* test aid (simulator): the player's world-polygon hits in a race */
+        for (int i = 0; i < nh; i++)
+            if (g_rt.csmap[h[i].car] == 0 && h[i].other < 0)
+                printf("walltrace: pack %d poly %d at (%.1f %.1f %.2f) nz %.2f wall %d surf %d imp %.1f\n",
+                       h[i].poly >> 16, h[i].poly & 0xffff, h[i].point[0], h[i].point[1], h[i].point[2],
+                       h[i].poly_nz, h[i].wall, h[i].surface,
+                       sqrtf(h[i].impulse[0]*h[i].impulse[0] + h[i].impulse[1]*h[i].impulse[1] + h[i].impulse[2]*h[i].impulse[2]));
+#endif
     hitch_mark("rt.contacts");
     pf_detail.race_physics += pf_elapsed(pf_race_physics);
     for (int i = 0; i < nh && i < 32; i++) {             /* to the race's numbering */
@@ -24293,7 +24302,11 @@ int main(int argc, char **argv) {
         if (getenv("OPENUG2_SIM_ZTRACE")) {   /* test aid (simulator): the player's position once a second (falls) */
             static Uint32 zt_t;
             int zt_ms = atoi(getenv("OPENUG2_SIM_ZTRACE"));   /* "1" = once a second, else every N ms */
-            if (SDL_GetTicks() - zt_t > (Uint32)(zt_ms > 1 ? zt_ms : 1000)) { zt_t = SDL_GetTicks(); printf("ztrace: player (%.1f %.1f %.2f) speed %.1f state %d\n", carpos[0], carpos[1], carpos[2], speed, race_state); }
+            if (SDL_GetTicks() - zt_t > (Uint32)(zt_ms > 1 ? zt_ms : 1000)) { zt_t = SDL_GetTicks(); printf("ztrace: player (%.1f %.1f %.2f) speed %.1f state %d", carpos[0], carpos[1], carpos[2], speed, race_state);
+                if (g_rt.active) printf(" | race wrong %d node %d prog %.0f frac %.3f dir (%.2f %.2f) hd %.2f",
+                                        g_rt.pwrong, g_rt.loc[0].node, g_rt.loc[0].progress, g_rt.loc[0].frac,
+                                        g_rt.loc[0].dir[0], g_rt.loc[0].dir[1], g_n2s.heading);
+                printf("\n"); }
         }
         {   /* test aid (simulator): OPENUG2_SIM_BEYOND_AT=<event id> puts the car on that Beyond event's start once its free roam stands */
             static int bat_done; static Uint32 bat_t;

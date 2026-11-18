@@ -6537,6 +6537,10 @@ int ainet_route_type(unsigned flags, int event)
     }
     return 3;
 }
+/* retail walks sections 0..0x5dc-1 (1,500) here and sizes the node base table by it;
+   the shipped route files stay well under, the World Expansion's Rockport net (11-18,
+   true road curves) has 2,036: every section the file can name (SEC_MAX) is walked */
+#define PREP_SEC SEC_MAX
 void ainet_prepare(AiNet *n, const AiRoutePrep *rp)
 {
     /* 0x5ddfc0 */
@@ -6546,7 +6550,7 @@ void ainet_prepare(AiNet *n, const AiRoutePrep *rp)
         const unsigned char *r = rp->class_curves + k * 0x10c;
         cv[k].n = 0x40; cv[k].x0 = 0; cv[k].x1 = rdf(r); cv[k].inv = 63.0f / cv[k].x1; cv[k].d = (const float *)(r + 0xc);
     }
-    for (int s = 0; s < 0x5dc && s < SEC_MAX; s++) {
+    for (int s = 0; s < PREP_SEC; s++) {
         const unsigned char *sc = n->sec[s];
         if (!sc || !(rd32(sc + 0x70) >> 6 & 1) || (rd32(sc + 0x70) >> 9 & 1)) continue;
         for (int dir = 0; dir < 2; dir++) {
@@ -6559,14 +6563,14 @@ void ainet_prepare(AiNet *n, const AiRoutePrep *rp)
         }
     }
     /* 0x5e8780: the nodes */
-    int total = 0, *base = (int *)calloc(0x5dc, sizeof *base);
-    for (int s = 0; s < 0x5dc && s < SEC_MAX; s++) {
+    int total = 0, *base = (int *)calloc(PREP_SEC, sizeof *base);
+    for (int s = 0; s < PREP_SEC; s++) {
         const unsigned char *sc = n->sec[s];
         if (sc && (rd32(sc + 0x70) >> 6 & 1) && !(rd32(sc + 0x70) >> 9 & 1)) total += sec_npts(sc);
     }
     RNode *nodes = (RNode *)calloc((size_t)(total ? total : 1), sizeof *nodes);
     if (!nodes || !base) { free(nodes); free(base); return; }
-    for (int s = 0, at = 0; s < 0x5dc && s < SEC_MAX; s++) {
+    for (int s = 0, at = 0; s < PREP_SEC; s++) {
         const unsigned char *sc = n->sec[s];
         if (!sc || !(rd32(sc + 0x70) >> 6 & 1) || (rd32(sc + 0x70) >> 9 & 1)) continue;
         int np = sec_npts(sc);

@@ -12,7 +12,7 @@
                 s16 centre offset /256 m (kind 1 / 10: traffic lanes; left side: no lanes = one way)
      road 8 B (unused here)
      segment 22 B: u16 node 0, node 1, length*64, -, index, flags (0x400: a one-way segment
-                runs node 1 -> node 0), +16 s8 x3 start control (-tangent), s8 x3 end tangent
+                runs node 1 -> node 0), +16 s8 x3 end control (-tangent), +19 s8 x3 start tangent
    Every segment gives one lane per way it carries (the innermost traffic lane); lanes are
    joined into sections by a path cover (greedy straightest, then augmenting paths: the route
    format holds 2,047 sections, MW's greedy cover alone makes 1,987), every other successor
@@ -152,7 +152,10 @@ static int build_graph(const Rn *r, G *g)
         float ch = sqrtf((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y) + (b.z - a.z) * (b.z - a.z));
         if (ch <= 0) ch = 1;
         V3 u = { (b.x - a.x) / ch, (b.y - a.y) / ch, (b.z - a.z) / ch }, t0, t1;
-        tri((const int8_t *)s + 16, -1, u, &t0); tri((const int8_t *)s + 19, 1, u, &t1);
+        /* +19 is the start's tangent, +16 the end's control (-tangent) (11-18: read the
+           other way round every bend bowed outward, 8% of the curve off the road; this way
+           0.2%, and the arc matches the stored length) */
+        tri((const int8_t *)s + 19, 1, u, &t0); tri((const int8_t *)s + 16, -1, u, &t1);
         int ns = (int)(L / STEP); if (ns < 1) ns = 1;
         int pa = node_prof(r, n0), pb = node_prof(r, n1), rev = (u16le(s + 10) & 0x400) != 0, one = prof_oneway(r, pa);
         for (int fwd = 1; fwd >= 0; fwd--) {
@@ -218,6 +221,67 @@ static int edge_cmp(const void *x, const void *y)
     if (p->a != q->a) return p->a - q->a;
     return p->b - q->b;
 }
+/* sections routes() makes: one per chain head, one per cycle */
+static int chain_count(int n, const int *nxt, const int *prv, unsigned char *seen)
+{
+    int c = 0;
+    memset(seen, 0, (size_t)n);
+    for (int pass = 0; pass < 2; pass++)
+        for (int s = 0; s < n; s++) {
+            if (seen[s] || (pass == 0 && prv[s] >= 0)) continue;
+            c++;
+            for (int a = s; a >= 0 && !seen[a]; a = nxt[a]) seen[a] = 1;
+        }
+    return c;
+}
+static int closes(int n, const int *nxt, int a, int b)   /* a -> b would close a cycle */
+{
+    for (int x = b, k = 0; x >= 0 && k < n; x = nxt[x], k++) if (x == a) return 1;
+    return 0;
+}
+/* only when the cover is still over MAX_SEC: join the remaining ends across the gentlest turns
+   over UTURN, as few as fit (freeroam.py hairpin_joins). Rockport's true road curves (11-18)
+   make every sharp Y junction end a section, ~3,200 of them; these joins are no links */
+#define SEC_MARGIN 32
+static int hairpin_joins(const G *g, int *nxt, int *prv)
+{
+    int n = g->n, heads = 0;
+    for (int a = 0; a < n; a++) heads += prv[a] < 0;
+    if (heads <= MAX_SEC - SEC_MARGIN) return 1;
+    int maxnode = 0;
+    for (int a = 0; a < n; a++) { if (g->l[a].n0 > maxnode) maxnode = g->l[a].n0; if (g->l[a].n1 > maxnode) maxnode = g->l[a].n1; }
+    int *head = malloc((size_t)(maxnode + 1) * sizeof *head), *nx = malloc((size_t)n * sizeof *nx);
+    unsigned char *seen = malloc((size_t)n);
+    Edge *e = NULL; long ne = 0, cap = 0; int ok = 0;
+    if (!head || !nx || !seen) goto out;
+    for (int i = 0; i <= maxnode; i++) head[i] = -1;
+    for (int i = n - 1; i >= 0; i--) { nx[i] = head[g->l[i].n0]; head[g->l[i].n0] = i; }
+    for (int a = 0; a < n; a++) {
+        if (nxt[a] >= 0) continue;
+        for (int b = head[g->l[a].n1]; b >= 0; b = nx[b]) {
+            if (b == a || prv[b] >= 0 || g->l[b].seg == g->l[a].seg) continue;
+            float t = turn(g, a, b);
+            if (t < UTURN) continue;
+            if (ne == cap) { long c = cap ? cap * 2 : 4096; Edge *m = realloc(e, (size_t)c * sizeof *m); if (!m) goto out; e = m; cap = c; }
+            e[ne].t = t; e[ne].a = a; e[ne].b = b; ne++;
+        }
+    }
+    if (ne) qsort(e, (size_t)ne, sizeof *e, edge_cmp);
+    long k = 0; int target = MAX_SEC - SEC_MARGIN;
+    while (k < ne) {
+        while (k < ne && heads > target) {
+            int a = e[k].a, b = e[k].b; k++;
+            if (nxt[a] < 0 && prv[b] < 0 && !closes(n, nxt, a, b)) { nxt[a] = b; prv[b] = a; heads--; }
+        }
+        int over = chain_count(n, nxt, prv, seen) - (MAX_SEC - 8);
+        if (over <= 0) break;
+        target = heads - over;
+    }
+    ok = 1;
+out:
+    free(head); free(nx); free(seen); free(e);
+    return ok;
+}
 static int cover(const G *g, int *nxt, int *prv)
 {
     int n = g->n; long ne = 0;
@@ -250,7 +314,7 @@ static int cover(const G *g, int *nxt, int *prv)
         if (found) for (int f = top; f >= 0; f--) { nxt[sa[f]] = sb[f]; prv[sb[f]] = sa[f]; }
     }
     free(seen); free(sa); free(si); free(sb);
-    return 1;
+    return hairpin_joins(g, nxt, prv);
 }
 
 /* ---- the route file ---- */
