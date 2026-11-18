@@ -10176,7 +10176,7 @@ static float rdf(const unsigned char *p) { float f; memcpy(&f, p, 4); return f; 
    route's start, the in-zone engage icon, and the Engage binding's race
    dialog (UI_EngageRaceDialog.fng) starting the race on the loaded map */
 static int g_bey_roam;                /* this frame: Beyond free roam, no race */
-static int g_bey_xp;                  /* ... in an expansion city (its events only: no Beyond shops) */
+static int g_bey_xp;                  /* ... in an expansion city (its own events and shops) */
 static const N2Scene *g_bey_scene;    /* its streamed ground (no wcoll yet) */
 static int g_bey_zone = -1;           /* the event start the car stands in (event index), -1 none */
 static int g_bey_szone = -1;          /* the shop / garage the car stands at (shops.txt index), -1 none */
@@ -29381,7 +29381,7 @@ int main(int argc, char **argv) {
                 if (beyond_event_at(g_bey_zone, &id, &t, &l)) hud_event_remove(bey_indicator(t));
                 g_bey_zone = -1;
             }
-            if (g_bey_roam && !g_bey_xp && !g_pause.on) {                 /* ... and the shop / garage */
+            if (g_bey_roam && !g_pause.on) {                              /* ... and the shop / garage (an expansion city's: its own shops.txt) */
                 int in = -1; float best = 15.0f * 15.0f;
                 for (int i = 0; i < beyond_shop_count(); i++) {
                     float p[3];

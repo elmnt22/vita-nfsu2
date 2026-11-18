@@ -132,12 +132,13 @@ static int nm_bin(Nm *m, const uint8_t *b, size_t n, int with_last)
 }
 
 #define F_POS 0x9f743a0eu
+#define F_ROT 0x5a6a57c6u
 #define F_CPS 0x34aae3fcu
 #define F_CHILD 0x916e0e78u
 #define F_BARRIERS 0xe244f26bu      /* the race's own BARRIER_SPLINE_<n> scenery groups ('*' = the other way round) */
 #define VCOL 0x8e112eb7u
 enum { RT_CIRCUIT = 0, RT_SPRINT = 1, RT_DRAG = 4 };
-typedef struct { uint32_t key; int ord; D3 p; } PosE;
+typedef struct { uint32_t key; int ord; D3 p; float rot; } PosE;   /* rot: F_ROT, degrees = the world heading */
 typedef struct {
     char name[64]; int type, order;
     uint32_t *cps, *child; int ncps, nchild;
@@ -221,7 +222,8 @@ static void last_part(const Nm *names, uint32_t k, const uint8_t **s, int *n)
 }
 /* races(): the race_bin_<n> collections with checkpoints -> name, type, waypoints (start
    grid, checkpoints in order, the finish line unless a circuit), barrier names */
-static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout)
+static void write_shops(const PosE *pos, int npos, const char *path, long *nshops);
+static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const char *shops_path, long *nshops)
 {
     *out = NULL; *nout = 0;
     if (gn < 0x10 || memcmp(gp, "VPAK", 4)) return 0;
@@ -276,6 +278,7 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout)
             if (eo + (size_t)12 * ne > vsz) continue;
             /* the last entry of each field (a dict): 0 none, 1 inline, 2 pointer (de), 3 other */
             int kpos = 0, kcps = 0, kchild = 0, kbar = 0; uint32_t dpos = 0, dcps = 0, dchild = 0, dbar = 0;
+            float rot = 0;
             for (uint32_t j = 0; j < ne; j++) {
                 const uint8_t *en = vl + eo + 12 * j;
                 uint32_t k = u32le(en), de = 0; int kind;
@@ -285,10 +288,11 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout)
                 else if (k == F_CPS) { kcps = kind; dcps = de; }
                 else if (k == F_CHILD) { kchild = kind; dchild = de; }
                 else if (k == F_BARRIERS) { kbar = kind; dbar = de; }
+                else if (k == F_ROT && kind == 1) rot = f32le(en + 4);
             }
             if (kpos == 2 && (size_t)dpos + 12 <= bsz) {
                 if (npos == cpos) { int cc = cpos ? cpos * 2 : 1024; PosE *p2 = realloc(pos, (size_t)cc * sizeof *p2); if (!p2) { ok = 0; break; } pos = p2; cpos = cc; }
-                pos[npos].key = key; pos[npos].ord = npos;
+                pos[npos].key = key; pos[npos].ord = npos; pos[npos].rot = rot;
                 pos[npos].p.x = f32le(b + dpos); pos[npos].p.y = f32le(b + dpos + 4); pos[npos].p.z = f32le(b + dpos + 8); npos++;
             }
             if (!racebin || !kcps) continue;
@@ -318,6 +322,7 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout)
         free(vn.e); free(fx);
     }
     if (ok) qsort(pos, (size_t)npos, sizeof *pos, pos_cmp);
+    if (ok && shops_path) write_shops(pos, npos, shops_path, nshops);
     /* the waypoints; races without a type, a start grid or checkpoints go */
     int w = 0;
     for (int i = 0; i < nr && ok; i++) {
@@ -352,6 +357,36 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout)
     free(names.e); free(pos);
     *out = R; *nout = w;
     return 1;
+}
+
+/* the city's garages and shops -> shops.txt ("type x y z heading_deg", beyond.c): each
+   menu gate's respawn marker (where MW puts the car down outside it, facing out) --
+   safehouses + car lots as garages (0), the customization shops cycled through
+   performance / paint / body / specialties (3 1 2 5, as the World Expansion's) */
+static void write_shops(const PosE *pos, int npos, const char *path, long *nshops)
+{
+    static const struct { const char *fmt; int type; } gate[] = {
+        { "menu_gate_safehouse/zone_safehouse_%d/respawn", 0 },
+        { "menu_gate_carlot/zone_carlot_%d/respawn", 0 },
+        { "menu_gate_customshop/zone_customshop_%d/respawn", -1 },
+    };
+    static const int cycle[4] = { 3, 1, 2, 5 };
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    int nshop = 0, ok = 1;
+    for (int g = 0; g < 3; g++)
+        for (int i = 1; i <= 16; i++) {
+            char nm[80]; snprintf(nm, sizeof nm, gate[g].fmt, i);
+            const PosE *p = pos_find(pos, npos, vlt_hash((const uint8_t *)nm, strlen(nm)));
+            if (!p) continue;
+            int t = gate[g].type >= 0 ? gate[g].type : cycle[(i - 1) % 4];
+            double h = fmod(p->rot, 360.0); if (h > 180) h -= 360; if (h <= -180) h += 360;
+            if (fprintf(f, "%d %.1f %.1f %.2f %.1f\n", t, p->p.x, p->p.y, p->p.z, h) < 0) ok = 0;
+            nshop++;
+        }
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) remove(path);
+    if (nshops) *nshops = ok ? nshop : 0;
 }
 
 /* ---- race barriers: each BARRIER_SPLINE group's wall segments (mwbar.py) ---- */
@@ -967,7 +1002,8 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     uint8_t *gp = read_all(gameplay_bin, &gn);
     if (!gp) return XP_ERR_OPEN_IN;
     Race *R = NULL; int nr = 0;
-    if (!read_races(gp, gn, &R, &nr)) { free(gp); return XP_ERR_FORMAT; }
+    char shops[600]; snprintf(shops, sizeof shops, "%s/shops.txt", out_dir);
+    if (!read_races(gp, gn, &R, &nr, shops, &st->shops)) { free(gp); return XP_ERR_FORMAT; }
     free(gp);
     st->races = nr;
     uint8_t *chunk = read_road_chunk(raw_companion, &clen, &rc);

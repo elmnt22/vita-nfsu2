@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define BEYOND_DIR "ux0:data/NFSU2/beyond"
 
@@ -198,6 +199,7 @@ static int g_bx_nev = -1;
 static short g_bx_view[BX_MAXEV];
 static int g_bx_nview = -1;
 static char g_bx_sel[8] = "BEYOND";
+static int g_bx_nshop;                 /* the selected set's shops (defined below) */
 static void bx_events_set(const char *dir, const char *stem) {
     char p[200], line[160];
     snprintf(p, sizeof p, "%s/events.txt", dir);
@@ -255,6 +257,7 @@ void beyond_events_select(const char *stem) {
     if (!strcmp(stem, g_bx_sel)) return;
     snprintf(g_bx_sel, sizeof g_bx_sel, "%s", stem);
     g_bx_nview = -1;
+    g_bx_nshop = -1;   /* that set's shops */
 }
 int beyond_event_all(int i, int *id, int *type, int *len, const char **stem) {
     bx_events_load();
@@ -267,15 +270,21 @@ int beyond_event_all(int i, int *id, int *type, int *len, const char **stem) {
     return 1;
 }
 
-/* ---- shops and the garage (ROUTESBEYOND/shops.txt: "type x y z heading_deg") ---- */
+/* ---- shops and the garage (ROUTESBEYOND/shops.txt: "type x y z heading_deg") ----
+   The selected set's (beyond_events_select): an expansion city's from its
+   TRACKS/ROUTES<region>/shops.txt (xpevents.inc: MW's menu gates) */
 #define BX_MAXSHOP 32
 static struct { int type; float p[3], head; } g_bx_shop[BX_MAXSHOP];
 static int g_bx_nshop = -1;
 static void bx_shops_load(void) {
     if (g_bx_nshop >= 0) return;
     g_bx_nshop = 0;
-    if (!beyond_enabled()) return;
-    FILE *f = fopen(BEYOND_DIR "/ROUTESBEYOND/shops.txt", "r");
+    char path[200];
+    if (!strcmp(g_bx_sel, "BEYOND")) {
+        if (!beyond_enabled()) return;
+        snprintf(path, sizeof path, BEYOND_DIR "/ROUTESBEYOND/shops.txt");
+    } else snprintf(path, sizeof path, BX_XP_ROUTES "/ROUTES%s/shops.txt", g_bx_sel);
+    FILE *f = fopen(path, "r");
     if (!f) return;
     char line[160];
     while (g_bx_nshop < BX_MAXSHOP && fgets(line, sizeof line, f)) {
@@ -287,7 +296,7 @@ static void bx_shops_load(void) {
         g_bx_nshop++;
     }
     fclose(f);
-    printf("beyond: %d shops\n", g_bx_nshop);
+    printf("beyond: %s: %d shops\n", g_bx_sel, g_bx_nshop);
 }
 int beyond_shop_count(void) { bx_shops_load(); return g_bx_nshop; }
 int beyond_shop_at(int i, int *type, float p[3], float *head) {
@@ -391,6 +400,7 @@ int beyond_progress_record(int id, int won, int ticks, int place) {
     if (won) g_bx_prog[i].won = 1;
     if (ticks > 0 && (!g_bx_prog[i].best || ticks < g_bx_prog[i].best)) g_bx_prog[i].best = ticks;
     if (place > 0 && (!g_bx_prog[i].place || place < g_bx_prog[i].place)) g_bx_prog[i].place = place;
+    mkdir(BEYOND_DIR, 0777);   /* an expansion-only install has no beyond folder yet */
     const char *tmp = BX_PROG ".tmp";
     FILE *f = fopen(tmp, "w");
     if (!f) return 0;

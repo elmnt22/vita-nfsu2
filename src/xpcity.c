@@ -100,8 +100,10 @@ static void make_events(int c, const char *troot)
 {
     char dir[256], ev[300], gp[256], rawc[256], raws[256];
     snprintf(dir, sizeof dir, "%s/ROUTES%s", troot, k_city[c].companion);
+    snprintf(ev, sizeof ev, "%s/shops.txt", dir);                    /* a set from before the shops: made again */
+    int have_shops = xp_file_size(ev) > 0;
     snprintf(ev, sizeof ev, "%s/events.txt", dir);
-    if (xp_file_size(ev) > 0) return;
+    if (have_shops && xp_file_size(ev) > 0) return;
     snprintf(gp, sizeof gp, XP_RAW_ROOT "/%s/GLOBAL/gameplay.bin", k_city[c].dir);
     snprintf(rawc, sizeof rawc, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
     snprintf(raws, sizeof raws, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
