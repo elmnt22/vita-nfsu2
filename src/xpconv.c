@@ -368,9 +368,9 @@ static void conv_carp(Buf *o, const uint8_t *d, size_t sz, const uint8_t *raw)
         if (fabsf(r0[0] - 1.0f) > 1e-3f) st.crot++;        /* not met in Rockport: baked unrotated */
         int grp = r[0x18] | r[0x19] << 8, ai = r[0x1a] | r[0x1b] << 8;
         if (ai >= 2048 || !g_art[ai]) { st.bad++; continue; }
-        /* MW scenery groups (race barriers, ...): kept, under a group number
-           nothing switches on until the events map them */
-        bake_article(g_art[ai], g_artn[ai], ip, grp ? 255 : 0);
+        /* MW scenery groups (race barriers, ...): the MW group id (L2RA 0x34109, named
+           in the translated companion's 0x3412f); a race switches its own on */
+        bake_article(g_art[ai], g_artn[ai], ip, grp);
         if (grp) st.cgrouped++;
     }
     if (g_oom) return;
@@ -490,9 +490,10 @@ static void conv_carp(Buf *o, const uint8_t *d, size_t sz, const uint8_t *raw)
             if (X[k] > X[ix1]) ix1 = k;
             if (Y[k] > Y[iy1]) iy1 = k;
         }
-        u[0] = (uint8_t)p->grp; u[1] = (uint8_t)(ix0 | iy0 << 2 | ix1 << 4 | iy1 << 6);
+        u[0] = (uint8_t)(p->grp ? 255 : 0); u[1] = (uint8_t)(ix0 | iy0 << 2 | ix1 << 4 | iy1 << 6);
         u[2] = (uint8_t)p->surf; u[3] = (uint8_t)(p->flags | (p->nv == 4 ? 0x10 : 0));
-        memcpy(u + 4, &zb, 2); u[6] = u[7] = 0xff;
+        memcpy(u + 4, &zb, 2);
+        u[6] = p->grp ? (uint8_t)p->grp : 0xff; u[7] = p->grp ? (uint8_t)(p->grp >> 8) : 0xff;   /* (port) MW group id, wcoll grp_on */
         put(o, u, sizeof u);
     }
     close_chunk(o, pc);
@@ -777,4 +778,105 @@ int xp_marker_ok(const char *marker_path, int game, long long source_size)
     int got = fscanf(f, "xpconv %d %d %lld", &v, &g, &n);
     fclose(f);
     return got == 3 && v == XP_VERSION && g == game && (source_size < 0 || n == source_size);
+}
+
+/* ---- the companion stream (L2RA.BUN): MW's scenery groups -> UG2's ----
+   MW 0x34108: 6-byte placements {u16 section (letter*100+n), u16 instance row, u16 flags}.
+   MW 0x34109: groups {u32 11, u32 11, u32 name hash, u16 id, u16 count, u32 flags,
+     u16 placement[count], pad to 4}; id 1 = the always-on default, the rest named
+     BARRIER_SPLINE_<n> (race barriers: race_bin field 0xe244f26b lists a race's own).
+   UG2 (world_group_reader.h): 0x34107 8-byte placements {section, row, flags, groups
+     using it}; 0x34108 groups {+8 name[32], +40 hash, +48 count, u16 placement[count],
+     pad to 4}. Collision (wcoll.c): 0x3412f, 32-byte records {hash, +9 name}, indexed
+     by the MW group id the collision polygons carry (xpconv conv_carp). Everything
+     else is copied. */
+static uint32_t xp_strhash(const char *s) { uint32_t h = 0xffffffffu; while (*s) h = h * 33u + (uint8_t)*s++; return h; }
+static void xp_group_name(uint32_t hash, int id, char *out, size_t n)
+{
+    char t[40];
+    static const char *fmt[] = { "BARRIER_SPLINE_%d", "BARRIER_SPLINE_%02d", "BARRIER_SPLINE_%03d" };   /* MW has _07 next to _7xx */
+    for (int f = 0; f < 3; f++)
+        for (int k = 0; k < (f ? (f == 1 ? 10 : 100) : 5000); k++) {
+            snprintf(t, sizeof t, fmt[f], k);
+            if (xp_strhash(t) == hash) { snprintf(out, n, "%s", t); return; }
+        }
+    snprintf(out, n, "XPGROUP_%d", id);   /* not a race barrier: stays as it is (shown, never solid) */
+}
+int xp_companion(const char *in_path, const char *out_path, int game)
+{
+    if (game != XP_GAME_MW) return XP_ERR_FORMAT;
+    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *d = n > 0 ? malloc((size_t)n) : NULL;
+    if (!d || fread(d, 1, (size_t)n, f) != (size_t)n) { free(d); fclose(f); return d ? XP_ERR_READ : XP_ERR_MEMORY; }
+    fclose(f);
+    const uint8_t *pl = NULL, *gr = NULL; uint32_t pln = 0, grn = 0;
+    for (long q = 0; q + 8 <= n; ) {
+        uint32_t id = rd32(d + q), sz = rd32(d + q + 4);
+        if (q + 8 + (long)sz > n) break;
+        if (id == 0x34108) { pl = d + q + 8; pln = sz; }
+        if (id == 0x34109) { gr = d + q + 8; grn = sz; }
+        q += 8 + (long)sz;
+    }
+    Buf o = {0}; g_oom = 0;
+    int rc = XP_OK;
+    if (pl && gr) {
+        uint32_t np = pln / 6;
+        uint16_t *refs = calloc(np ? np : 1, 2);
+        int maxid = 0;
+        if (!refs) { free(d); return XP_ERR_MEMORY; }
+        for (uint32_t p = 0; p + 20 <= grn; ) {                    /* pass 1: references, ids */
+            uint32_t cnt = (uint32_t)(gr[p + 14] | gr[p + 15] << 8); int gid = gr[p + 12] | gr[p + 13] << 8;
+            if (p + 20 + 2 * cnt > grn) { rc = XP_ERR_FORMAT; break; }
+            for (uint32_t j = 0; j < cnt; j++) { unsigned m = gr[p + 20 + 2*j] | gr[p + 21 + 2*j] << 8; if (m < np) refs[m]++; }
+            if (gid > maxid) maxid = gid;
+            p = (p + 20 + 2 * cnt + 3) & ~3u;
+        }
+        /* the rest of the file first, then the three tables */
+        for (long q = 0; rc == XP_OK && q + 8 <= n; ) {
+            uint32_t id = rd32(d + q), sz = rd32(d + q + 4);
+            if (q + 8 + (long)sz > n) break;
+            if (id != 0x34108 && id != 0x34109) put(&o, d + q, 8 + sz);
+            q += 8 + (long)sz;
+        }
+        size_t c = open_chunk(&o, 0x34107);
+        for (uint32_t k = 0; k < np; k++) {
+            uint16_t r[4]; memcpy(r, pl + 6 * k, 6); r[3] = refs[k]; put(&o, r, 8);
+        }
+        close_chunk(&o, c);
+        uint8_t (*rec)[32] = calloc((size_t)maxid + 1, 32);
+        if (!rec) { free(refs); free(d); free(o.p); return XP_ERR_MEMORY; }
+        c = open_chunk(&o, 0x34108);
+        for (uint32_t p = 0; rc == XP_OK && p + 20 <= grn; ) {
+            uint32_t cnt = (uint32_t)(gr[p + 14] | gr[p + 15] << 8); int gid = gr[p + 12] | gr[p + 13] << 8;
+            char nm[32]; xp_group_name(rd32(gr + p + 8), gid, nm, sizeof nm);
+            uint8_t h[52]; memset(h, 0, sizeof h);
+            memcpy(h + 8, nm, strlen(nm)); uint32_t hv = xp_strhash(nm); memcpy(h + 40, &hv, 4); memcpy(h + 48, &cnt, 4);
+            put(&o, h, 52);
+            uint32_t kept = 0;
+            for (uint32_t j = 0; j < cnt; j++) {
+                uint16_t m = (uint16_t)(gr[p + 20 + 2*j] | gr[p + 21 + 2*j] << 8);
+                if (m < np) { put(&o, &m, 2); kept++; }
+            }
+            if (kept != cnt) memcpy(o.p + o.n - 2 * kept - 4, &kept, 4);
+            while (o.n & 3) put(&o, "\0", 1);
+            memcpy(rec[gid], &hv, 4); memcpy(rec[gid] + 9, nm, strlen(nm) < 23 ? strlen(nm) : 22);
+            p = (p + 20 + 2 * cnt + 3) & ~3u;
+        }
+        close_chunk(&o, c);
+        c = open_chunk(&o, 0x3412f);
+        memcpy(rec[0] + 9, "NONE", 4);                               /* index 0: never switched */
+        put(&o, rec, ((size_t)maxid + 1) * 32);
+        close_chunk(&o, c);
+        free(rec); free(refs);
+    } else put(&o, d, (size_t)n);                                    /* no groups: as it is */
+    free(d);
+    if (g_oom) { free(o.p); return XP_ERR_MEMORY; }
+    if (rc != XP_OK) { free(o.p); return rc; }
+    FILE *w = fopen(out_path, "wb");
+    if (!w) { free(o.p); return XP_ERR_OPEN_OUT; }
+    int ok = fwrite(o.p, 1, o.n, w) == o.n;
+    ok &= fclose(w) == 0;
+    free(o.p);
+    return ok ? XP_OK : XP_ERR_WRITE;
 }

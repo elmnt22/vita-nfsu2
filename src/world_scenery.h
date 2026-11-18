@@ -24,6 +24,13 @@ enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4, WG_LOCK=8 };
  * g_wg_career_stage < 0 = no career (the port's own debug free roam): the
  * city stays fully open as before (lock walls hidden, FREE_ROAM* shown). */
 extern int g_wg_career_stage, g_wg_career_owns_car;
+/* (port) expansion city (MW Rockport): race barriers are MW's BARRIER_SPLINE_<n> groups
+ * (xpconv xp_companion), shared between races; each race names its own (MW race_bin
+ * field 0xe244f26b -> TRACKS/ROUTES<region>/barriers.txt). The hook (main.c xpbar_on,
+ * NULL outside an expansion city) says: 1 the event's own, 0 not (another race's, or
+ * free roam: MW shows none there), -1 the event has no barrier list. */
+extern int (*g_wg_xp_barrier_on)(const char *name,int event);
+static int wg_xp_barrier(const char *name) { return !strncmp(name,"BARRIER_SPLINE_",15); }
 static int wg_lock_group(const char *name) {
     return !strncmp(name,"BARRIERS_CAREER",15) || !strcmp(name,"BARRIERS_DEMO");
 }
@@ -78,6 +85,7 @@ static int wg_event_id(const char *name) {
 static int wg_event_group_present(const WGTable *table,int event) {
     if(!table)return 0;
     if(event<=0)return 1;
+    if(g_wg_xp_barrier_on)return g_wg_xp_barrier_on(NULL,event)>=0;
     for(size_t p=0;p<table->group_bytes;) {
         const unsigned char *g=table->groups+p;
         uint32_t refs=wg_u32(g+48);
@@ -109,12 +117,17 @@ static int wg_selection_open(const WGTable *table,int event,WGSelection *out) {
         int cg=wg_career_group_on((const char *)g+8,event);
         unsigned bits=id?WG_EVENT:cg>0?WG_OTHER:cg==0?WG_LOCK:WG_OTHER;
         if(id>0&&id==event){bits|=WG_ACTIVE;found=1;}
+        if(g_wg_xp_barrier_on&&wg_xp_barrier((const char *)g+8)) {
+            bits=WG_EVENT;
+            if(event>0&&g_wg_xp_barrier_on((const char *)g+8,event)==1){bits|=WG_ACTIVE;found=1;}
+        }
         uint32_t refs=wg_u32(g+48);
         for(uint32_t j=0;j<refs;j++)items[wg_u16(g+52+2*(size_t)j)].membership|=(unsigned char)bits;
         p+=(size_t)((52ULL+2ULL*refs+3)&~3ULL);
     }
     if(n>1)qsort(items,n,sizeof *items,wg_selected_cmp);
     for(size_t i=1;i<n;i++)if(!wg_selected_cmp(items+i-1,items+i)){free(items);return 0;}
+    if(!found&&g_wg_xp_barrier_on&&g_wg_xp_barrier_on(NULL,event)>=0)found=1;   /* a list whose groups this city lacks */
     if(!found){free(items);return 0;}
     out->items=items;out->count=n;return 1;
 }

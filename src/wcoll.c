@@ -443,7 +443,8 @@ const char *wcoll_poly_group(const WColl *w, int id)
 {
     int pk = id >> 16, pi = id & 0xffff;
     if (!w || pk < 0 || pk >= w->npacks || pi >= w->packs[pk].npoly) return "?";
-    int g = w->packs[pk].poly[32 * pi];
+    const unsigned char *q = w->packs[pk].poly + 32 * pi;
+    int g = w->xp && q[0] == 255 ? (q[6] | q[7] << 8) : q[0];
     return g > 0 && g < w->ngroups ? w->groups[g].name : "";
 }
 /* 0x5d80f0: groups are matched by name hash; index 0 is never switched */
@@ -623,6 +624,14 @@ static void select_pack(WColl *w, WCollCtx *c, const float *p)
 }
 
 /* ---- polygons ----------------------------------------------------------- */
+/* a polygon's barrier group switched on. (port) expansion city: MW has ~750 scenery
+   groups, so xpconv marks a grouped polygon 255 and keeps the MW group id in +6 (u16;
+   UG2's own packs have 0xffff there and never use group 255) */
+static int grp_on(const WColl *w, const unsigned char *q)
+{
+    int g = w->xp && q[0] == 255 ? (q[6] | q[7] << 8) : q[0];
+    return g < (w->ngroups > 256 ? w->ngroups : 256) && w->enabled[g];
+}
 typedef WCollPoly Poly;
 
 static void poly_expand(const Pack *k, const unsigned char *q, Poly *o)  /* 0x5d7f10 */
@@ -760,7 +769,7 @@ static int pack_ground(WColl *w, int pk, const float *p, float limit, int nogrou
         if (py < rds16(q + 0x10 + ((sel >> 2) & 3) * 2) * 8192) continue;
         if (px > rds16(q + 8 + ((sel >> 4) & 3) * 2) * 8192) continue;
         if (py > rds16(q + 0x10 + (sel >> 6) * 2) * 8192) continue;
-        if (q[0] && (nogroups || !w->enabled[q[0]])) continue;
+        if (q[0] && (nogroups || !grp_on(w, q))) continue;
         const Poly *op = poly_at(w, pk, q, pi, mainthr, &tmp);
         float ed = poly_edge(op, p);
         if (ed > 0) continue;
@@ -856,7 +865,7 @@ float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
             if (py < rds16(q + 0x10 + ((sel >> 2) & 3) * 2) * 8192) continue;
             if (px > rds16(q + 8 + ((sel >> 4) & 3) * 2) * 8192) continue;
             if (py > rds16(q + 0x10 + (sel >> 6) * 2) * 8192) continue;
-            if (q[0] && (c->nogroups || !w->enabled[q[0]])) continue;   /* barrier group off (0x5d8150: the collider's list) */
+            if (q[0] && (c->nogroups || !grp_on(w, q))) continue;   /* barrier group off (0x5d8150: the collider's list) */
             op = poly_at(w, c->pack, q, pi, mainthr, &tmp);
             float ed = poly_edge(op, p);
             if (ed > 0) continue;
@@ -961,7 +970,7 @@ static int gather_pack(WColl *w, WCollCtx *c, const float mn[2], const float mx[
                 if (rds16(q + 0x10 + ((sel >> 2) & 3) * 2) * 0.125f + k->oy > mx[1]) continue;
                 if (!(mn[0] <= rds16(q + 8 + ((sel >> 4) & 3) * 2) * 0.125f + k->ox)) continue;
                 if (!(mn[1] <= rds16(q + 0x10 + (sel >> 6) * 2) * 0.125f + k->oy)) continue;
-                if (q[0] && (c->nogroups || !w->enabled[q[0]])) continue;
+                if (q[0] && (c->nogroups || !grp_on(w, q))) continue;
                 for (int i = 0; i < n && !dup; i++) dup = ids[i] == pi;    /* the 0x20 mark */
                 if (dup || n >= 160) continue;
                 ids[n++] = pi;

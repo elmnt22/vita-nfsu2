@@ -3,7 +3,7 @@
 #ifndef XPCONV_H
 #define XPCONV_H
 /* bumped whenever the translated output changes: an older marker = translate again */
-#define XP_VERSION 5   /* 2: collision packs (11-17), 3: night prelight + lamp flares (11-18), 4: endless walls fitted to the ground (11-18), 5: road curve tangents (11-18, RoutesFreeRoam rebuilt) */
+#define XP_VERSION 7   /* 2: collision packs (11-17), 3: night prelight + lamp flares (11-18), 4: endless walls fitted to the ground (11-18), 5: road curve tangents (11-18, RoutesFreeRoam rebuilt), 6: race barrier groups (11-18: polygon group ids, companion group tables), 7: zero-padded barrier names */
 enum { XP_GAME_MW = 1, XP_GAME_CARBON = 2 };
 enum { XP_OK = 0, XP_ERR_OPEN_IN, XP_ERR_OPEN_OUT, XP_ERR_READ, XP_ERR_WRITE,
        XP_ERR_FORMAT, XP_ERR_MEMORY, XP_ERR_CANCELLED };
@@ -31,4 +31,7 @@ int xp_minimap(const char *mini_map_bin, const char *out_path, int game);
    for TRACKS/ROUTES<region> (airacer.c ainet_load). */
 typedef struct { long lanes, dead, sections, points, links, dropped; } XpRoadStats;
 int xp_routes(const char *companion_bun, const char *out_path, int game, XpRoadStats *stats);
+/* The city's companion stream (MW TRACKS/L2RA.BUN): copied with MW's scenery group
+   tables rewritten as UG2's (placements 0x34107, groups 0x34108, collision groups 0x3412f). */
+int xp_companion(const char *in_path, const char *out_path, int game);
 #endif

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "world_scenery.h"
 int g_wg_career_stage = -1, g_wg_career_owns_car;
+int (*g_wg_xp_barrier_on)(const char *name, int event);   /* world_scenery.h */
 static int count(const WGTable *t, int ev, const char *grp, int *vis) {
     WGSelection s; if (!wg_selection_open(t, ev, &s)) return -1;
     int n = 0; *vis = 0;

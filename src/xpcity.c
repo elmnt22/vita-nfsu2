@@ -10,6 +10,7 @@
  * rest exactly as it does for a Bayview track. */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <SDL2/SDL.h>
 #include "xpconv.h"
@@ -150,7 +151,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     }
     if (t) SDL_WaitThread(t, NULL);
     else job_thread(NULL);
-    int ok = g_job.rc == XP_OK && copy_file(rawc, outc) && xp_marker_write(mark, k_city[c].game, raw_size);
+    int ok = g_job.rc == XP_OK && xp_companion(rawc, outc, k_city[c].game) == XP_OK && xp_marker_write(mark, k_city[c].game, raw_size);
     if (ok) { make_map(c, troot); make_routes(c, troot); }
     vita_mark("xpcity: %s %s in %.1f s", k_city[c].name, ok ? "translated" : "FAILED", (SDL_GetTicks() - t0) / 1000.0);
     if (!ok) {
@@ -187,3 +188,65 @@ int xpcity_installed(int pick)
     return ok[c];
 }
 const char *xpcity_track(int pick) { return pick >= 1 && pick <= NCITY ? k_city[pick - 1].bun : NULL; }
+
+/* ---- race barriers (MW BARRIER_SPLINE_<n> groups; xpconv xp_companion) ----
+   TRACKS/ROUTES<region>/barriers.txt (mkevents): "<event> NAME NAME ...", a leading
+   '*' (MW: the barrier the other way round) dropped. */
+#include "wcoll.h"
+#include "world_scenery.h"
+typedef struct { int ev, first, n; } XpBarEv;
+static XpBarEv *g_bar_ev; static int g_bar_nev;
+static char (*g_bar_nm)[24]; static int g_bar_nnm;
+static char g_bar_region[16] = "";
+static const XpBarEv *bar_find(int event)
+{
+    for (int i = 0; i < g_bar_nev; i++) if (g_bar_ev[i].ev == event) return &g_bar_ev[i];
+    return NULL;
+}
+static int xpbar_on(const char *name, int event)
+{
+    const XpBarEv *e = bar_find(event);
+    if (!e) return -1;
+    if (!name) return 1;
+    for (int i = 0; i < e->n; i++) if (!strcmp(g_bar_nm[e->first + i], name)) return 1;
+    return 0;
+}
+void xpcity_barriers_select(const char *troot, const char *track)
+{
+    const char *reg = xpcity_is_city(track) ? xpcity_region(track) : NULL;
+    if (!reg) { g_wg_xp_barrier_on = NULL; g_bar_region[0] = 0; return; }
+    g_wg_xp_barrier_on = xpbar_on;
+    if (!strcmp(reg, g_bar_region)) return;
+    snprintf(g_bar_region, sizeof g_bar_region, "%s", reg);
+    free(g_bar_ev); free(g_bar_nm); g_bar_ev = NULL; g_bar_nm = NULL; g_bar_nev = g_bar_nnm = 0;
+    char p[1024]; snprintf(p, sizeof p, "%s/ROUTES%s/barriers.txt", troot, reg);
+    FILE *f = fopen(p, "r");
+    if (!f) { printf("xpcity: no race barriers (%s)\n", p); return; }
+    int cev = 0, cnm = 0; char tok[64];
+    while (fscanf(f, "%63s", tok) == 1) cnm++;
+    rewind(f);
+    char line[4096];
+    while (fgets(line, sizeof line, f)) cev++;
+    g_bar_ev = calloc((size_t)cev + 1, sizeof *g_bar_ev); g_bar_nm = calloc((size_t)cnm + 1, sizeof *g_bar_nm);
+    if (!g_bar_ev || !g_bar_nm) { fclose(f); free(g_bar_ev); free(g_bar_nm); g_bar_ev = NULL; g_bar_nm = NULL; return; }
+    rewind(f);
+    while (fgets(line, sizeof line, f)) {
+        char *s = strtok(line, " \t\r\n");
+        if (!s) continue;
+        XpBarEv *e = &g_bar_ev[g_bar_nev++];
+        e->ev = atoi(s); e->first = g_bar_nnm; e->n = 0;
+        while ((s = strtok(NULL, " \t\r\n")) && g_bar_nnm < cnm) {
+            if (*s == '*') s++;
+            snprintf(g_bar_nm[g_bar_nnm++], 24, "%s", s); e->n++;
+        }
+    }
+    fclose(f);
+    printf("xpcity: race barriers for %d events (%d groups) from %s\n", g_bar_nev, g_bar_nnm, p);
+}
+int xpcity_barriers_enable(WColl *w, int event)
+{
+    const XpBarEv *e = g_wg_xp_barrier_on ? bar_find(event) : NULL;
+    int n = 0;
+    for (int i = 0; e && i < e->n; i++) n += wcoll_enable_group(w, g_bar_nm[e->first + i]);
+    return n;
+}

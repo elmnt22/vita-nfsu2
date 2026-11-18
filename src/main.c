@@ -12505,10 +12505,11 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
     if (getenv("OPENUG2_SIM_WALLTRACE"))   /* test aid (simulator): the player's world-polygon hits in a race */
         for (int i = 0; i < nh; i++)
             if (g_rt.csmap[h[i].car] == 0 && h[i].other < 0)
-                printf("walltrace: pack %d poly %d at (%.1f %.1f %.2f) nz %.2f wall %d surf %d imp %.1f\n",
+                printf("walltrace: pack %d poly %d at (%.1f %.1f %.2f) nz %.2f wall %d surf %d imp %.1f grp %s\n",
                        h[i].poly >> 16, h[i].poly & 0xffff, h[i].point[0], h[i].point[1], h[i].point[2],
                        h[i].poly_nz, h[i].wall, h[i].surface,
-                       sqrtf(h[i].impulse[0]*h[i].impulse[0] + h[i].impulse[1]*h[i].impulse[1] + h[i].impulse[2]*h[i].impulse[2]));
+                       sqrtf(h[i].impulse[0]*h[i].impulse[0] + h[i].impulse[1]*h[i].impulse[1] + h[i].impulse[2]*h[i].impulse[2]),
+                       g_wcoll ? wcoll_poly_group(g_wcoll, h[i].poly) : "?");
 #endif
     hitch_mark("rt.contacts");
     pf_detail.race_physics += pf_elapsed(pf_race_physics);
@@ -15899,6 +15900,7 @@ int main(int argc, char **argv) {
     }
 #endif
     world_fog_load(troot, trackname);
+    xpcity_barriers_select(troot, trackname);   /* Rockport: its races' MW barrier groups (else off) */
     rain_load_track(troot, trackname);   /* Rain / Wind / Night Raining Fog; ResetWorldTime */
     snprintf(carp,    sizeof carp,    "%s/CARS/%s/GEOMETRY.BIN", dataroot, carname);
     snprintf(cartexp, sizeof cartexp, "%s/CARS/%s/TEXTURES.BIN", dataroot, carname);
@@ -20597,6 +20599,7 @@ int main(int argc, char **argv) {
                     vel[0] = vel[1] = 0.0f; speed = 0.0f;
                     g_ride_ready = 0;
                     world_fog_load(troot, trackname);
+                    xpcity_barriers_select(troot, trackname);   /* Rockport: its races' MW barrier groups (else off) */
                     rain_load_track(troot, trackname);
                     ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
                     selcirc = 0;
@@ -20845,6 +20848,7 @@ int main(int argc, char **argv) {
             g_ride_ready = 0; cam_snap = 1;
             skidn = skidhead = skidpen = 0;   /* the old track's tyre marks */
             world_fog_load(troot, trackname);
+            xpcity_barriers_select(troot, trackname);   /* Rockport: its races' MW barrier groups (else off) */
             rain_load_track(troot, trackname);
             vita_mark("  switch: fog + rain loaded (%u ms in)", SDL_GetTicks() - sw_t0);
             ls_pump();   /* the loading screen keeps moving between the steps */
@@ -23471,6 +23475,7 @@ int main(int argc, char **argv) {
                     n += wcoll_enable_group(g_wcoll, gn);
                     snprintf(gn, sizeof gn, "PLAYER_BARRIERS_%d", wcoll_event);
                     n += wcoll_enable_group(g_wcoll, gn);
+                    n += xpcity_barriers_enable(g_wcoll, wcoll_event);   /* Rockport: the MW race's own barriers */
                     printf("collision: race %d barrier groups on (%d)\n", wcoll_event, n);
                 }
             }

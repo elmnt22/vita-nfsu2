@@ -12,6 +12,7 @@ void vita_mark(const char *fmt, ...);
 
 /* world_scenery.h: the career stage whose scenery / lock walls are up (-1 none). */
 int g_wg_career_stage = -1, g_wg_career_owns_car;
+int (*g_wg_xp_barrier_on)(const char *name, int event);   /* world_scenery.h */
 #include <assert.h>
 #include <stdio.h>
 #ifdef __vita__

@@ -16,4 +16,10 @@ const char *xpcity_map(const char *track);
 extern int g_xpcity_pick;
 int xpcity_installed(int pick);          /* translated or raw files there (Bayview: 1) */
 const char *xpcity_track(int pick);      /* its stream name (STREAML2RA ...), Bayview NULL */
+/* race barriers (MW BARRIER_SPLINE groups): the city's per-event lists
+   (TRACKS/ROUTES<region>/barriers.txt) for the scenery selection (world_scenery.h hook,
+   cleared outside a city), and switching an event's groups solid. */
+void xpcity_barriers_select(const char *troot, const char *track);
+struct WColl;
+int xpcity_barriers_enable(struct WColl *w, int event);   /* groups switched on */
 #endif
