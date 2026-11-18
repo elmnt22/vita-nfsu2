@@ -153,7 +153,7 @@ static void load_bounds(WColl *w, const unsigned char *d, long len)
             long q = o + 8;
             while (q + 0x24 <= end) {
                 if (rd32(d + q) == 0x11111111u || rd32(d + q) == 0) { q += 4; continue; }
-                int sec = rds16(d + q + 8), n = rds16(d + q + 10);
+                int sec = rds16(d + q + 8), n = d[q + 10];   /* +11 = MW flag byte, 0 in UG2 */
                 if (n < 1 || q + 0x24 + n * 8 > end) break;
                 /* Only drivable sections (x00..x19) are tracked; the x41..,
                    x98, x99 boundaries are scenery and region outlines. */

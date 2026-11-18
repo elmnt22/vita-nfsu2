@@ -59,6 +59,7 @@
 #include "jumpcam.h"
 #include "skyline.h"
 #include "beyond.h"
+#include "xpcity.h"
 static int n2_find_record(const unsigned char *g, long len, const char *name, unsigned char *out);
 #include "ai.h"
 #include "audio.h"
@@ -9748,6 +9749,25 @@ static int eng_race_open(const char *dataroot, const unsigned char *ev)
            career_event_purse(ev));
     return 1;
 }
+/* SetupPlayerCarsAndStuff's eTuningSetting for a World Expansion race (port): the
+   QR mode of the event's type (tune_setting_for_race), -1 = free roam (setting 0) */
+static int bey_tune_setting(int type)
+{
+    int qr = type == AIRACE_DRAG ? QR_DRAG : type == AIRACE_DRIFT ? QR_DRIFT : type == AIRACE_URL ? QR_URL
+           : type == AIRACE_STREETX ? QR_STREETX : type == AIRACE_SPRINT ? QR_SPRINT : QR_CIRCUIT;
+    return type < 0 ? 0 : tune_setting_for_race(qr);
+}
+static void bey_retune(const char *carname, int type)
+{
+    if (tun_active()) return;
+    int set = bey_tune_setting(type);
+    const CareerCar *ccc = g_career_mode ? career_current_car() : NULL;
+    const uint8_t *want = ccc ? ccc->tune[set] : NULL;
+    const uint8_t (*fe)[TUNE_BYTES] = ccc || g_career_mode ? NULL : garage_tune_get(carname);
+    if (fe) want = fe[set];
+    if (want != g_tune_cur || fe) n2_retune(want);
+    printf("beyond: %s on tuning setting %d (%s)%c", carname, set, type < 0 ? "free roam" : "race type", 10);
+}
 /* The race dialog for a World Expansion event (port): RaceEngageDialog::Setup's
    fields from the Beyond event -- its length, a non-career event's random
    body / subject / race type (stage > 0, no sponsor), a random sender, its
@@ -15853,6 +15873,14 @@ int main(int argc, char **argv) {
     }
     char carp[1024], cartexp[1024], pathp[1024], troot[1024];
     snprintf(troot,   sizeof troot,   "%s/TRACKS", dataroot);
+#ifdef __vita__
+    /* Rockport / Palmont: their world stream translated into UG2's format, on the
+       first boot into the city when the Expansion Prep Tool did not (xpcity.c) */
+    if (xpcity_is_city(trackname) && !xpcity_prepare(troot, trackname)) {
+        vita_mark("venue boot: %s could not be prepared -- the city instead", trackname);
+        trackname = "STREAML4RA"; g_in_venue = 0; g_boot_ev = 0;
+    }
+#endif
     world_fog_load(troot, trackname);
     rain_load_track(troot, trackname);   /* Rain / Wind / Night Raining Fog; ResetWorldTime */
     snprintf(carp,    sizeof carp,    "%s/CARS/%s/GEOMETRY.BIN", dataroot, carname);
@@ -16427,8 +16455,10 @@ int main(int argc, char **argv) {
     {   /* graphics up before the world loads: the loading screens need them */
         extern void vita_fast_clocks(void);
         vita_fast_clocks();
-        SDL_Window *pw = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
-        SDL_GL_CreateContext(pw);
+        if (!xpcity_window_made()) {   /* an expansion city's translation opened it already */
+            SDL_Window *pw = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
+            SDL_GL_CreateContext(pw);
+        }
     }
     {   /* the game's loading screen, unless the front end is skipped */
         FILE *nf = fopen("ux0:data/NFSU2/nofrontend.txt", "r");
@@ -20943,6 +20973,7 @@ int main(int argc, char **argv) {
                 /* a World Expansion race engaged in its free roam (port): back to
                    driving there from the finish, as the career's Explore */
                 rt_end();
+                bey_retune(carname, -1);   /* SetupFreeRun's setting 0 */
                 world_set_mode(&world, MODE_FREEROAM, -1);
                 world.city.race.active = 0;
                 resident_args.scenery_event = runtime_scenery_event;   /* the free roam's (as a venue boot's) */
@@ -21439,6 +21470,8 @@ int main(int argc, char **argv) {
                     g_rt_opponents = 3; g_rt_difficulty = 1; g_rt_traffic = 1; g_rt_catchup = 1;
                     g_rt_reverse = 0; g_rt_lapko = 0; want_laps = 3;
                     g_bey_freerace = 1;
+                    for (int i = 0, zi, zt, zl; i < beyond_event_count(); i++)   /* its race type's tuning setting */
+                        if (beyond_event_at(i, &zi, &zt, &zl) && zi == id) { bey_retune(carname, zt); break; }
                     race_state = 3;
                     vel[0] = vel[1] = 0; speed = 0;
                     garage_race = q; race_start_pending = 1;

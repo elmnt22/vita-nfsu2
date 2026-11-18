@@ -614,8 +614,8 @@ static int parse_polygon_payload(const unsigned char *data, long len,
         long remain = len - pos;
         if (remain < 0x24) return 0;
         const unsigned char *record = data + pos;
-        int nxy = (int)winst_u16(record + 0x0a);
-        if (nxy < 1 || nxy > 64) return 0;
+        int nxy = record[0x0a];   /* +0x0b = flag byte (MW sets it; always 0 in UG2) */
+        if (nxy < 1) return 0;
         long record_size = 0x24 + (long)nxy * 8;
         if (record_size > remain) return 0;
         if (!append_region(regions, count, cap, record, nxy)) return 0;
@@ -796,6 +796,9 @@ static int winst_fixed_records(const unsigned char *data, long len, int stride,
                                const unsigned char **records, int *count) {
     if (!data || len < 0 || stride <= 0 || !records || !count) return 0;
     long filler = len % stride == 0 ? 0 : skip_filler(data, len);
+    /* filler comes in whole words: a record whose first byte is 0x11 (an MW
+       Rockport instance) must not be eaten with it */
+    if (filler && (len - filler) % stride) filler &= ~3L;
     long body = len - filler;
     if (body < 0 || body % stride || body / stride > INT_MAX) return 0;
     *records = data + filler;
