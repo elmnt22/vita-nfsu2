@@ -64,6 +64,24 @@ static int copy_file(const char *from, const char *to) {
     return ok;
 }
 
+/* the minimap (BMAP, TRACKS/<companion>.MAP): from the PC tool, or made here
+   from the raw TRACKS/<companion>/MINI_MAP.BIN (a second; no map = no radar) */
+static char g_map[1024];
+static void make_map(int c, const char *troot)
+{
+    char raw[256];
+    snprintf(g_map, sizeof g_map, "%s/%s.MAP", troot, k_city[c].companion);
+    if (xp_file_size(g_map) > 0) return;
+    snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s/MINI_MAP.BIN", k_city[c].dir, k_city[c].companion);
+    int rc = xp_file_size(raw) > 0 ? xp_minimap(raw, g_map, k_city[c].game) : XP_ERR_OPEN_IN;
+    vita_mark("xpcity: minimap %s: %s", g_map, rc == XP_OK ? "made" : "none (no raw MINI_MAP.BIN)");
+}
+const char *xpcity_map(const char *track)
+{
+    int c = city_of(track);
+    return c >= 0 && g_map[0] && strstr(g_map, k_city[c].companion) ? g_map : NULL;
+}
+
 int xpcity_prepare(const char *troot, const char *track) {
     int c = city_of(track);
     if (c < 0) return 1;
@@ -76,7 +94,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     long long raw_size = xp_file_size(raw);
     int have = xp_file_size(out) > 0 && xp_file_size(outc) > 0;
     /* sent from the PC tool (no raw files here), or translated before from these raw files */
-    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) return 1;
+    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { make_map(c, troot); return 1; }
     if (raw_size <= 0 || xp_file_size(rawc) <= 0) {
         vita_mark("xpcity: %s is not installed (no translated city, no raw files in " XP_RAW_ROOT "/%s)",
                   k_city[c].name, k_city[c].dir);
@@ -114,6 +132,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     if (t) SDL_WaitThread(t, NULL);
     else job_thread(NULL);
     int ok = g_job.rc == XP_OK && copy_file(rawc, outc) && xp_marker_write(mark, k_city[c].game, raw_size);
+    if (ok) make_map(c, troot);
     vita_mark("xpcity: %s %s in %.1f s", k_city[c].name, ok ? "translated" : "FAILED", (SDL_GetTicks() - t0) / 1000.0);
     if (!ok) {
         remove(mark);

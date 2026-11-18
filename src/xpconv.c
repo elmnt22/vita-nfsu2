@@ -542,6 +542,108 @@ int xp_convert(const char *in_path, const char *out_path, int game,
     return rc;
 }
 
+/* ---- the minimap: MW TRACKS/L2RA/MINI_MAP.BIN -> the game's BMAP file ----
+   MINI_MAP.BIN = 64 chunks 0x3a100, each a JDLZ-packed TPK holding one 128x128
+   DXT3 tile MINI_MAP_CHOP<n> (n = row * 8 + column, north up): a 1024 px map.
+   Its world window was fitted to the collision's asphalt (11-17: 82% of the
+   asphalt vertices land on road pixels, exactly 6.5 m a pixel). */
+static int jdlz(const uint8_t *s, int slen, uint8_t *out, int cap)   /* nfsu2.h n2_jdlz */
+{
+    if (slen < 16 || memcmp(s, "JDLZ", 4)) return 0;
+    int usize = (int)rd32(s + 8); if (usize > cap) usize = cap;
+    int op = 0, ip = 16, f1 = 1, f2 = 1;
+    while (ip < slen && op < usize) {
+        if (f1 == 1) { if (ip >= slen) break; f1 = s[ip++] | 0x100; }
+        if (f2 == 1) { if (ip >= slen) break; f2 = s[ip++] | 0x100; }
+        if (f1 & 1) {
+            int len, dist;
+            if (ip + 2 > slen) break;
+            if (f2 & 1) { len = (s[ip+1] | ((s[ip] & 0xF0) << 4)) + 3; dist = (s[ip] & 0x0F) + 1; }
+            else        { dist = (s[ip+1] | ((s[ip] & 0xE0) << 3)) + 17; len = (s[ip] & 0x1F) + 3; }
+            ip += 2;
+            if (dist > op) break;
+            for (int k = 0; k < len && op < usize; k++) { out[op] = out[op - dist]; op++; }
+            f2 >>= 1;
+        } else { if (ip >= slen) break; out[op++] = s[ip++]; }
+        f1 >>= 1;
+    }
+    return op;
+}
+static const uint8_t *find_id(const uint8_t *p, size_t n, uint32_t id)
+{
+    for (size_t i = 0; i + 8 <= n; i += 4) if (rd32(p + i) == id) return p + i;
+    return NULL;
+}
+int xp_minimap(const char *in_path, const char *out_path, int game)
+{
+    if (game != XP_GAME_MW) return XP_ERR_FORMAT;
+    const float x0 = -1222.4f, y0 = 5063.4f, size = 6656.0f;
+    const float zoom = 1.5f * 6656.0f / 5633.0f;              /* Bayview's radar reach (TRACKMAP4000: 5633 m, 1.5) */
+    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *d = n > 0 ? malloc((size_t)n) : NULL;
+    if (!d || fread(d, 1, (size_t)n, f) != (size_t)n) { free(d); fclose(f); return d ? XP_ERR_READ : XP_ERR_MEMORY; }
+    fclose(f);
+    const int W = 1024;
+    uint8_t *img = calloc((size_t)W * W, 4), *u = malloc(1 << 16);
+    if (!img || !u) { free(d); free(img); free(u); return XP_ERR_MEMORY; }
+    int tiles = 0;
+    for (long q = 0; q + 8 <= n; ) {
+        uint32_t id = rd32(d + q), sz = rd32(d + q + 4);
+        if (q + 8 + (long)sz > n) break;
+        int un = id == 0x3a100 ? jdlz(d + q + 8, (int)sz, u, 1 << 16) : 0;
+        const uint8_t *t4 = un ? find_id(u, (size_t)un, 0x33310004) : NULL;
+        const uint8_t *px = un ? find_id(u, (size_t)un, 0x33320002) : NULL;
+        if (t4 && px && !memcmp(t4 + 8 + 12, "MINI_MAP_CHOP", 13)) {
+            int k = atoi((const char *)t4 + 8 + 25);
+            uint32_t pn = rd32(px + 4); const uint8_t *b = px + 8;
+            while (pn && *b == 0x11) { b++; pn--; }
+            if (k >= 0 && k < 64 && pn >= 128 * 128 && px + 8 + rd32(px + 4) <= u + un) {
+                int tx = (k % 8) * 128, ty = (k / 8) * 128;
+                for (int by = 0; by < 32; by++)
+                    for (int bx = 0; bx < 32; bx++, b += 16) {      /* DXT3 */
+                        uint16_t c0 = (uint16_t)(b[8] | b[9] << 8), c1 = (uint16_t)(b[10] | b[11] << 8);
+                        uint32_t bits = rd32(b + 12);
+                        int pal[4][3];
+                        int cs[2] = { c0, c1 };
+                        for (int c = 0; c < 2; c++) {
+                            pal[c][0] = (cs[c] >> 11 & 31) * 255 / 31;
+                            pal[c][1] = (cs[c] >> 5 & 63) * 255 / 63;
+                            pal[c][2] = (cs[c] & 31) * 255 / 31;
+                        }
+                        for (int c = 0; c < 3; c++) {
+                            pal[2][c] = (2 * pal[0][c] + pal[1][c]) / 3;
+                            pal[3][c] = (pal[0][c] + 2 * pal[1][c]) / 3;
+                        }
+                        for (int p = 0; p < 16; p++) {
+                            uint8_t *o = img + ((size_t)(ty + by * 4 + p / 4) * W + tx + bx * 4 + p % 4) * 4;
+                            const int *c = pal[bits >> (2 * p) & 3];
+                            o[0] = (uint8_t)c[0]; o[1] = (uint8_t)c[1]; o[2] = (uint8_t)c[2];
+                            o[3] = 255;                         /* drawn by colour, as UG2's TRACKMAPs */
+                        }
+                    }
+                tiles++;
+            }
+        }
+        q += 8 + sz;
+    }
+    free(d); free(u);
+    int rc = XP_OK;
+    if (tiles != 64) rc = XP_ERR_FORMAT;
+    else {
+        FILE *o = fopen(out_path, "wb");
+        if (!o) rc = XP_ERR_OPEN_OUT;
+        else {
+            uint32_t hd[3] = { 0, (uint32_t)W, (uint32_t)W }; memcpy(hd, "BMAP", 4);
+            float fl[4] = { x0, y0, size, zoom };
+            int ok = fwrite(hd, 4, 3, o) == 3 && fwrite(fl, 4, 4, o) == 4 && fwrite(img, 4, (size_t)W * W, o) == (size_t)W * W;
+            if (fclose(o) != 0 || !ok) { rc = XP_ERR_WRITE; remove(out_path); }
+        }
+    }
+    free(img);
+    return rc;
+}
+
 long long xp_file_size(const char *path)
 {
     FILE *f = fopen(path, "rb"); if (!f) return -1;

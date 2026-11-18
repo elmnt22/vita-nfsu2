@@ -9,4 +9,6 @@ int xpcity_is_city(const char *track);
 int xpcity_prepare(const char *troot, const char *track);
 /* xpcity_prepare opened the window already (the boot must not open another) */
 int xpcity_window_made(void);
+/* the city's minimap file (BMAP) once xpcity_prepare found or made it, else NULL */
+const char *xpcity_map(const char *track);
 #endif

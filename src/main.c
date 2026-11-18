@@ -30018,8 +30018,10 @@ int main(int argc, char **argv) {
                    the event's track record (race table +0xac..+0xc0) */
                 int mev = g_rt.active ? g_rt.ev
                         : strstr(trackname, "L4RB") ? 4200 : strstr(trackname, "L4RC") ? 4300 : 4000;
-                const int map_beyond = beyond_is_track(trackname);   /* its own map, no TRACKMAP */
-                if (map_beyond) hud_set_trackmap_file(hud, "ux0:data/NFSU2/beyond/minimap.bin");
+                const char *xmap = xpcity_is_city(trackname) ? xpcity_map(trackname) : NULL;   /* MW / Carbon: their own map */
+                const int map_beyond = beyond_is_track(trackname) || xpcity_is_city(trackname);   /* its own map, no TRACKMAP */
+                if (xmap) hud_set_trackmap_file(hud, xmap);
+                else if (map_beyond && !xpcity_is_city(trackname)) hud_set_trackmap_file(hud, "ux0:data/NFSU2/beyond/minimap.bin");
                 for (int i = 0; !map_beyond && i < g_ai_nraces; i++) {
                     const unsigned char *r = g_ai_races + i * 0x128;
                     if ((int)(int16_t)(r[0x8a] | r[0x8b] << 8) != mev) continue;

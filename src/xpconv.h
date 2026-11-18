@@ -23,4 +23,7 @@ int xp_convert(const char *in_path, const char *out_path, int game,
 int xp_marker_write(const char *marker_path, int game, long long source_size);
 int xp_marker_ok(const char *marker_path, int game, long long source_size);
 long long xp_file_size(const char *path);
+/* The city's minimap (MW: TRACKS/L2RA/MINI_MAP.BIN) -> the game's BMAP file
+   (hud_set_trackmap_file): 1024 px RGBA + its world window. */
+int xp_minimap(const char *mini_map_bin, const char *out_path, int game);
 #endif

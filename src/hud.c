@@ -1950,23 +1950,24 @@ int hud_set_trackmap(Hud *h, const char *dataroot, int event,
    reloads when the track switches back. */
 int hud_set_trackmap_file(Hud *h, const char *path) {
     if (!h) return 0;
-    if (h->tm_event == -2 && h->tm_tex) return 1;
+    static char cur[256], bad[256];   /* the map loaded / the file that failed (one per world) */
+    if (h->tm_event == -2 && h->tm_tex && !strcmp(cur, path)) return 1;
     if (!h->pk || feng_find(h->pk, FE_MAP_SLOT) < 0) return 0;
-    static int failed;
-    if (failed) return 0;
+    if (!strcmp(bad, path)) return 0;
     long len = 0;
     unsigned char *d = n2_read_file(path, &len);
     uint32_t w = 0, hh = 0; float fl[4] = { 0 };
     if (d && len >= 28 && !memcmp(d, "BMAP", 4)) { memcpy(&w, d + 4, 4); memcpy(&hh, d + 8, 4); memcpy(fl, d + 12, 16); }
     if (!d || !w || w > 4096 || hh != w || (long)(28 + (size_t)w * hh * 4) > len || !(fl[2] > 0) || !(fl[3] > 0)) {
         printf("minimap: %s missing or unreadable\n", path);
-        free(d); failed = 1; return 0;
+        free(d); snprintf(bad, sizeof bad, "%s", path); return 0;
     }
     if (!h->tm_tex) glGenTextures(1, &h->tm_tex);
     glBindTexture(GL_TEXTURE_2D, h->tm_tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (int)w, (int)hh, 0, GL_RGBA, GL_UNSIGNED_BYTE, d + 28);
     free(d);
+    snprintf(cur, sizeof cur, "%s", path);
     glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
