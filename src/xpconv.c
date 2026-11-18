@@ -328,7 +328,8 @@ static void bake_article(const uint8_t *a, size_t an, const float *ip, int grp)
         for (int k = 0; k < 3; k++) { p0[k] -= ip[k]; p1[k] -= ip[k]; }
         mw_world(p0, w0); mw_world(p1, w1);
         float zlo = w0[2] < w1[2] ? w0[2] : w1[2], zhi = w0[2] < w1[2] ? w1[2] : w0[2];
-        if (zhi - zlo > 250.0f) zlo = zhi - 250.0f;         /* packed heights reach +-128 m from the middle */
+        /* spans over 250 m (MW's "endless" walls, article y +-576) are fitted to the
+           pack's ground in conv_carp: packed heights reach +-128 m from the middle */
         XPoly q; memset(&q, 0, sizeof q);
         q.v[0][0] = w0[0]; q.v[0][1] = w0[1]; q.v[0][2] = zlo;
         q.v[1][0] = w1[0]; q.v[1][1] = w1[1]; q.v[1][2] = zlo;
@@ -374,6 +375,28 @@ static void conv_carp(Buf *o, const uint8_t *d, size_t sz, const uint8_t *raw)
     }
     if (g_oom) return;
     if (!g_ncp) { st.cempty++; return; }
+    {   /* walls taller than the packed 250 m: MW's endless walls (-128..1024 m). Keep
+           the part around this pack's ground; keeping the top put them in the sky
+           (11-18: the car drove under them off the road north of Rockport event 7302) */
+        float gmin = 1e30f, gmax = -1e30f;
+        for (size_t i = 0; i < g_ncp; i++)
+            if (!(g_cp[i].flags & 0x10))
+                for (int k = 0; k < g_cp[i].nv; k++) {
+                    if (g_cp[i].v[k][2] < gmin) gmin = g_cp[i].v[k][2];
+                    if (g_cp[i].v[k][2] > gmax) gmax = g_cp[i].v[k][2];
+                }
+        for (size_t i = 0; i < g_ncp; i++) {
+            XPoly *q = &g_cp[i];
+            if (!(q->flags & 0x10) || q->v[2][2] - q->v[0][2] <= 250.0f) continue;
+            float lo = q->v[0][2], hi = q->v[2][2];
+            float want = gmin <= gmax ? gmin - 50.0f : -50.0f;   /* no ground here: Rockport's sea level */
+            if (lo < want) lo = want;
+            if (lo + 250.0f > hi) lo = hi - 250.0f;
+            hi = lo + 250.0f;
+            q->v[0][2] = q->v[1][2] = lo; q->v[2][2] = q->v[3][2] = hi;
+            st.ctall++;
+        }
+    }
     {   /* ground first (UG2 ends a cell's ground at its first wall); stable, so
            the PC tool and the console write the same bytes */
         XPoly *t = malloc(g_ncp * sizeof *t);

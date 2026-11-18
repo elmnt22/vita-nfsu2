@@ -24292,7 +24292,8 @@ int main(int argc, char **argv) {
 #ifdef OPENUG2_SIM_PRE_H
         if (getenv("OPENUG2_SIM_ZTRACE")) {   /* test aid (simulator): the player's position once a second (falls) */
             static Uint32 zt_t;
-            if (SDL_GetTicks() - zt_t > 1000) { zt_t = SDL_GetTicks(); printf("ztrace: player (%.1f %.1f %.2f) speed %.1f state %d\n", carpos[0], carpos[1], carpos[2], speed, race_state); }
+            int zt_ms = atoi(getenv("OPENUG2_SIM_ZTRACE"));   /* "1" = once a second, else every N ms */
+            if (SDL_GetTicks() - zt_t > (Uint32)(zt_ms > 1 ? zt_ms : 1000)) { zt_t = SDL_GetTicks(); printf("ztrace: player (%.1f %.1f %.2f) speed %.1f state %d\n", carpos[0], carpos[1], carpos[2], speed, race_state); }
         }
         {   /* test aid (simulator): OPENUG2_SIM_BEYOND_AT=<event id> puts the car on that Beyond event's start once its free roam stands */
             static int bat_done; static Uint32 bat_t;

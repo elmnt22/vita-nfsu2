@@ -113,6 +113,11 @@ struct WColl {
     int xp;                      /* (port) an expansion city (MW / Carbon, translated by xpconv.c):
                                     drivable sections x01..x39, each pack numbered as its
                                     section (no x20.. copies), MW visible-section records */
+    /* (port) expansion city: MW's packs overlap each other and their boundaries
+       (a road's ground can sit in the neighbour's pack), so the queries search
+       every pack under the point: a 128 m grid of pack lists */
+    float gx0, gy0; int gw, gh;
+    int *gstart, *glist;
 };
 
 static uint32_t rd32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -148,6 +153,63 @@ static unsigned char *read_at(FILE *f, long off, long n)
 }
 
 static int g_wc_oom;   /* an allocation failed in wcoll_load / load_bounds */
+
+/* (port) expansion city: the 128 m grid of the packs covering each cell */
+#define WC_GCELL 128.0f
+static void build_pack_grid(WColl *w)
+{
+    float mn[2] = { 1e30f, 1e30f }, mx[2] = { -1e30f, -1e30f };
+    for (int i = 0; i < w->npacks; i++) {
+        const Pack *k = &w->packs[i];
+        if (k->x0 < mn[0]) mn[0] = k->x0;
+        if (k->y0 < mn[1]) mn[1] = k->y0;
+        if (k->x0 + 32.0f * k->W > mx[0]) mx[0] = k->x0 + 32.0f * k->W;
+        if (k->y0 + 32.0f * k->H > mx[1]) mx[1] = k->y0 + 32.0f * k->H;
+    }
+    if (!(mn[0] < mx[0]) || !(mn[1] < mx[1])) return;
+    w->gx0 = mn[0]; w->gy0 = mn[1];
+    w->gw = (int)((mx[0] - mn[0]) / WC_GCELL) + 1; w->gh = (int)((mx[1] - mn[1]) / WC_GCELL) + 1;
+    int nc = w->gw * w->gh;
+    w->gstart = (int *)calloc((size_t)nc + 1, sizeof *w->gstart);
+    if (!w->gstart) { g_wc_oom = 1; return; }
+    for (int pass = 0; pass < 2; pass++) {   /* counts, then the lists */
+        int *fill = NULL;
+        if (pass) {
+            for (int c = 0; c < nc; c++) w->gstart[c + 1] += w->gstart[c];
+            w->glist = (int *)malloc((size_t)(w->gstart[nc] > 0 ? w->gstart[nc] : 1) * sizeof *w->glist);
+            fill = (int *)calloc((size_t)nc, sizeof *fill);
+            if (!w->glist || !fill) { free(fill); g_wc_oom = 1; return; }
+        }
+        for (int i = 0; i < w->npacks; i++) {
+            const Pack *k = &w->packs[i];
+            int x0 = (int)((k->x0 - w->gx0) / WC_GCELL), x1 = (int)((k->x0 + 32.0f * k->W - w->gx0) / WC_GCELL);
+            int y0 = (int)((k->y0 - w->gy0) / WC_GCELL), y1 = (int)((k->y0 + 32.0f * k->H - w->gy0) / WC_GCELL);
+            if (x1 >= w->gw) x1 = w->gw - 1;
+            if (y1 >= w->gh) y1 = w->gh - 1;
+            for (int y = y0; y <= y1; y++)
+                for (int x = x0; x <= x1; x++) {
+                    int c = y * w->gw + x;
+                    if (!pass) w->gstart[c + 1]++;
+                    else w->glist[w->gstart[c] + fill[c]++] = i;
+                }
+        }
+        free(fill);
+    }
+}
+/* the packs of the grid cell under (x, y); 0 outside */
+static int grid_packs(const WColl *w, float x, float y, const int **list)
+{
+    if (!w->gstart) return 0;
+    int gx = (int)floorf((x - w->gx0) / WC_GCELL), gy = (int)floorf((y - w->gy0) / WC_GCELL);
+    if (gx < 0 || gy < 0 || gx >= w->gw || gy >= w->gh) return 0;
+    int c = gy * w->gw + gx;
+    *list = w->glist + w->gstart[c];
+    return w->gstart[c + 1] - w->gstart[c];
+}
+static int pack_covers(const Pack *k, float x, float y, float r)
+{
+    return x + r >= k->x0 && y + r >= k->y0 && x - r < k->x0 + 32.0f * k->W && y - r < k->y0 + 32.0f * k->H;
+}
 static void load_bounds(WColl *w, const unsigned char *d, long len)
 {
     int cap = 0;
@@ -324,6 +386,7 @@ WColl *wcoll_load(const char *stream_bun, const char *track_bun)
         if (!w->vorder) w->nvis = 0;
     }
     w->enabled = (unsigned char *)calloc((size_t)(w->ngroups > 256 ? w->ngroups : 256), 1);
+    if (w->xp) build_pack_grid(w);
     /* out of memory part way (a track switch late in a session): no collision
        rather than a half-built one read through NULL every frame (audit 11-17) */
     if (g_wc_oom || !w->enabled) {
@@ -362,6 +425,7 @@ void wcoll_free(WColl *w)
     for (int i = 0; i < w->nbnd; i++) free(w->bnd[i].xy);
     free(w->packs); free(w->bnd); free(w->order); free(w->groups); free(w->enabled);
     free(w->vis); free(w->vorder);
+    free(w->gstart); free(w->glist);
     free(w);
 }
 
@@ -664,9 +728,81 @@ static void push_cache(WCollCtx *c, int poly)
     c->ncache = n;
 }
 
+/* (port) expansion city: wcoll_ground's cell search in one pack, the best
+   height so far in *bz (shared across the packs); the polygon that beat it, or
+   -1. *stop: a non-layered polygon was met (taken as it is, as the original) */
+static int pack_ground(WColl *w, int pk, const float *p, float limit, int nogroups, int mainthr,
+                       float *bz, int *stop)
+{
+    const Pack *k = &w->packs[pk];
+    int ix = (int)floorf((p[0] - k->x0) * 0.03125f), iy = (int)floorf((p[1] - k->y0) * 0.03125f);
+    if (ix < 0 || iy < 0 || ix >= k->W || iy >= k->H) return -1;
+    float ox = (float)ix * 32.0f + k->x0, oy = (float)iy * 32.0f + k->y0;
+    int sx = (int)((p[0] - ox) * 0.125f), sy = (int)((p[1] - oy) * 0.125f);
+    if (sx > 3) sx = 3;
+    if (sy > 3) sy = 3;
+    uint32_t mask = 1u << (sx + 4 * sy);
+    const unsigned char *cell = k->cells + 4 * (k->W * iy + ix);
+    int start = rd16(cell), end = start + rd16(cell + 2);
+    if (end > k->nlist) end = k->nlist;
+    int px = (int)((p[0] - k->ox) * 65536.0f), py = (int)((p[1] - k->oy) * 65536.0f);
+    int best = -1;
+    Poly tmp;
+    for (int e = start; e < end; e++) {
+        const unsigned char *le = k->list + 4 * e;
+        if (!(rd16(le + 2) & mask)) continue;
+        int pi = rd16(le);
+        if (pi >= k->npoly) continue;
+        const unsigned char *q = k->poly + 32 * pi;
+        if (q[3] & 0xa) break;                   /* walls end the ground list */
+        int sel = q[1];
+        if (px < rds16(q + 8 + (sel & 3) * 2) * 8192) continue;
+        if (py < rds16(q + 0x10 + ((sel >> 2) & 3) * 2) * 8192) continue;
+        if (px > rds16(q + 8 + ((sel >> 4) & 3) * 2) * 8192) continue;
+        if (py > rds16(q + 0x10 + (sel >> 6) * 2) * 8192) continue;
+        if (q[0] && (nogroups || !w->enabled[q[0]])) continue;
+        const Poly *op = poly_at(w, pk, q, pi, mainthr, &tmp);
+        float ed = poly_edge(op, p);
+        if (ed > 0) continue;
+        float z = poly_z(op, p);
+        if (!(op->flags & 1) && ed < 0) { *bz = z; *stop = 1; return pi; }
+        if (!(z > *bz) || !(z <= limit)) continue;
+        best = pi; *bz = z;
+        if (op->flags & 0x40) continue;
+        if (limit - z < 4.0f) break;
+    }
+    return best;
+}
+
 float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
                    int *surface, float normal[3], int *found)
 {
+    if (w && w->xp && w->gstart) {   /* (port) expansion city: every pack under the point */
+        select_pack(w, c, p);   /* keeps the section tracker (visible sections) going */
+        const int *pl; int n = grid_packs(w, p[0], p[1], &pl);
+        int mainthr = g_pc_tid && pc_self() == g_pc_tid;
+        int bpk = -1, bpi = -1, stop = 0; float bz = -99999.0f;
+        for (int pass = 0; pass < 2 && bpi < 0; pass++) {
+            float limit = pass ? FLT_MAX : p[2] + 1.0f;
+            for (int i = 0; i < n && !stop; i++) {
+                if (!pack_covers(&w->packs[pl[i]], p[0], p[1], 0.0f)) continue;
+                int r = pack_ground(w, pl[i], p, limit, c->nogroups, mainthr, &bz, &stop);
+                if (r >= 0) { bpk = pl[i]; bpi = r; }
+            }
+        }
+        if (bpi < 0) {
+            if (found) *found = 0;
+            if (surface) *surface = 1;
+            if (normal) { normal[0] = normal[1] = 0; normal[2] = -1; }
+            return p[2];
+        }
+        Poly tmp;
+        const Poly *op = poly_at(w, bpk, w->packs[bpk].poly + 32 * bpi, bpi, mainthr, &tmp);
+        if (found) *found = 1;
+        if (surface) *surface = op->surface;
+        if (normal) memcpy(normal, op->n, 12);
+        return bz;
+    }
     if (w) select_pack(w, c, p);
     if (!w || c->pack < 0) {
         if (found) *found = 0;
@@ -751,18 +887,55 @@ float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
    box [mn, mx] (8 m sub-cells), polygon bounds overlapping it, barrier
    groups switched on; ordered as the original creates its TrackPolygon
    bodies (by polygon). */
+static int gather_pack(WColl *w, WCollCtx *c, const float mn[2], const float mx[2], WCollPoly *out, int max);
 int wcoll_gather(WColl *w, WCollCtx *c, const float pos[3], const float mn[2], const float mx[2],
                  WCollPoly *out, int max)
 {
     if (!w) return 0;
+    if (w->xp && w->gstart) {   /* (port) expansion city: the packs under the box's corners */
+        select_pack(w, c, pos);
+        int pks[16], np = 0, m = 0;
+        for (int corner = 0; corner < 4; corner++) {
+            const int *pl;
+            int n = grid_packs(w, corner & 1 ? mx[0] : mn[0], corner & 2 ? mx[1] : mn[1], &pl);
+            for (int i = 0; i < n; i++) {
+                int dup = 0;
+                for (int j = 0; j < np && !dup; j++) dup = pks[j] == pl[i];
+                const Pack *k = &w->packs[pl[i]];
+                if (dup || np >= 16) continue;
+                if (mx[0] < k->x0 || mx[1] < k->y0 || mn[0] >= k->x0 + 32.0f * k->W || mn[1] >= k->y0 + 32.0f * k->H) continue;
+                pks[np++] = pl[i];
+            }
+        }
+        for (int i = 1; i < np; i++)   /* by pack, so the ids come out in one order */
+            for (int j = i; j > 0 && pks[j - 1] > pks[j]; j--) { int t = pks[j]; pks[j] = pks[j - 1]; pks[j - 1] = t; }
+        for (int i = 0; i < np && m < max; i++) {
+            int save = c->pack;
+            c->pack = pks[i];
+            m += gather_pack(w, c, mn, mx, out + m, max - m);
+            c->pack = save;
+        }
+        return m;
+    }
     select_pack(w, c, pos);
     if (c->pack < 0) return 0;
+    return gather_pack(w, c, mn, mx, out, max);
+}
+/* wcoll_gather in the pack c->pack */
+static int gather_pack(WColl *w, WCollCtx *c, const float mn[2], const float mx[2], WCollPoly *out, int max)
+{
     const Pack *k = &w->packs[c->pack];
     int ids[160], n = 0;
     int x0 = (int)((mn[0] - k->x0) * 0.03125f), x1 = (int)((mx[0] - k->x0) * 0.03125f);
     int y0 = (int)((mn[1] - k->y0) * 0.03125f), y1 = (int)((mx[1] - k->y0) * 0.03125f);
     int wbits = (1 << (1 - (int)((mx[0] - mn[0] + 8.0f) * -0.125f))) - 1;
     int hbits = (1 << (1 - (int)((mx[1] - mn[1] + 8.0f) * -0.125f))) - 1;
+    if (w->xp) {   /* (port) a box reaching past this pack's edge: its own cells only */
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > k->W - 1) x1 = k->W - 1;
+        if (y1 > k->H - 1) y1 = k->H - 1;
+    }
     for (int iy = y0; iy <= y1; iy++)
         for (int ix = x0; ix <= x1; ix++) {
             float ox = (float)ix * 32.0f + k->x0, oy = (float)iy * 32.0f + k->y0;
