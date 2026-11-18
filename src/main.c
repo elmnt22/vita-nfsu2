@@ -6587,11 +6587,12 @@ static int rt_split_gap(void)
    type-16 record (the commonest density at the traffic level) for the whole
    map -- the teleporter's distance (0x42f800) and the traffic's region */
 static unsigned char g_bey_zone16[0x44];
+static int g_rt_xpcity;   /* free roam in an expansion city (rt_roam_start) */
 static int g_bey_zone16_on;
 static const unsigned char *rt_zone16(void *u, const float pos[2])
 {
     (void)u;
-    if (!g_rt.rp && g_bey_zone16_on && beyond_is_track(g_rt.reg)) return g_bey_zone16;
+    if (!g_rt.rp && g_bey_zone16_on && (beyond_is_track(g_rt.reg) || g_rt_xpcity)) return g_bey_zone16;
     return racepath_zone(g_rt.rp ? g_rt.rp : g_rt.zones, pos, 16);
 }
 static void bey_zone16_borrow(const char *city_troot, int level)
@@ -6934,22 +6935,27 @@ static int rt_start_ai(const char *routes_path, const char *paths_path, const ch
    made once and then only teleported (0x42f910). No racers here: the
    random encounter cars (0x53f000) are not ported yet. */
 static int rt_roam_start(const char *troot, const char *dataroot, const char *carname,
-                         const float pos[3], float heading, int bey, const N2Scene *scene)
+                         const float pos[3], float heading, int bey, const N2Scene *scene, const char *track)
 {
-    const int fbit = bey ? 2 : 1;   /* the failure is per world: city 1, World Expansion 2 */
+    /* an expansion city (xpcity.h): its road net is TRACKS/ROUTES<region>/RoutesFreeRoam.bin, made from
+       its own (MW: L2RA.BUN 0x3b800 RN* tables) by xpcity; no Paths zones, so a city density zone is
+       borrowed as for the World Expansion */
+    const char *xreg = xpcity_region(track);
+    const int fbit = xreg ? 4 : bey ? 2 : 1;   /* the failure is per world: city 1, World Expansion 2, expansion city 4 */
     if (g_rt.active || g_rt.setup || (g_roam_fail & fbit)) return 0;
+    g_rt_xpcity = xreg != NULL;
     if (!g_ai_have || !g_n2rec_ok || !perf_ready() || airace_ntypes() <= 0) { g_roam_fail |= fbit; return 0; }
     char path[1024];
     /* bey: the World Expansion (beyond.h), its own road net (BeyondDev tools/events/freeroam.py,
        ROUTESBEYOND/RoutesFreeRoam.bin) under the same event 4000; no city zones or world
        animations there (its race starts and shops are beyond.c's) */
-    const char *reg = bey ? "BEYOND" : "L4RA";
-    if (bey) bey_zone16_borrow(troot, g_roam_level);
+    const char *reg = xreg ? xreg : bey ? "BEYOND" : "L4RA";
+    if (bey || xreg) bey_zone16_borrow(troot, g_roam_level);
     troot = beyond_troot(troot, reg);
     snprintf(path, sizeof path, "%s/ROUTES%s/RoutesFreeRoam.bin", troot, reg);
     g_rt.net = ainet_load(path);
     if (!g_rt.net) { printf("free roam: %s missing, no traffic%c", path, 10); g_roam_fail |= fbit; return 0; }
-    if (!bey) {
+    if (!bey && !xreg) {
         snprintf(path, sizeof path, "%s/ROUTES%s/PathsFreeRoam.bin", troot, reg);
         g_rt.zones = racepath_load_zones(path);
     }
@@ -6959,7 +6965,7 @@ static int rt_roam_start(const char *troot, const char *dataroot, const char *ca
     snprintf(g_rt.reg, sizeof g_rt.reg, "%s", reg);
     g_rt.ev = 4000;
     g_rt.scene = scene;     /* rt_ground's ground where there is no resident collision (Beyond) */
-    if (!bey) wa_start(g_rt.ev, 0);   /* StartWorldAnimations 0x43a880 for this event */
+    if (!bey && !xreg) wa_start(g_rt.ev, 0);   /* StartWorldAnimations 0x43a880 for this event */
     int ptype = airace_type_of(carname);
     g_rt.psuv = ptype >= 0 ? airace_type_suv(ptype) : 0;
     int klass = perf_class(perf_rating(g_n2rec));
@@ -23886,7 +23892,7 @@ int main(int argc, char **argv) {
                 if (g_rt.roam) rt_end();                    /* free roam's world gives way */
                 rt_go = g_rt.active && race_state != 3 && race_state != 4 && !race_place_pending;
             } else if (g_rt.roam) {                         /* free roam: driving (RCSTATE 4) */
-                if (!world2 || !(strstr(trackname, "L4RA") || (beyond_is_track(trackname) && beyond_enabled()))) rt_end();
+                if (!world2 || !(strstr(trackname, "L4RA") || xpcity_is_city(trackname) || (beyond_is_track(trackname) && beyond_enabled()))) rt_end();
                 rt_go = g_rt.active && race_state == 1 && !race_place_pending;
             } else if (g_rt.active || g_rt.setup) rt_end();
             /* not behind a front end: the boot's menus covered a free roam
@@ -23894,8 +23900,8 @@ int main(int argc, char **argv) {
                boot, all loaded again by the career's own LoadTrack) */
             else if (world2 && race_state == 1 && g_ride_ready && !race_place_pending && g_n2 && g_n2_ticked &&
                      !g_fe && !g_boot_fe && !g_shop &&
-                     (strstr(trackname, "L4RA") || (beyond_is_track(trackname) && beyond_enabled())))   /* free roam's world: once per load */
-                rt_roam_start(troot, dataroot, carname, g_n2s.pos, g_n2s.heading, beyond_is_track(trackname), &scene);
+                     (strstr(trackname, "L4RA") || xpcity_is_city(trackname) || (beyond_is_track(trackname) && beyond_enabled())))   /* free roam's world: once per load */
+                rt_roam_start(troot, dataroot, carname, g_n2s.pos, g_n2s.heading, beyond_is_track(trackname), &scene, trackname);
             /* the post-race screens decoded ahead once the race runs: 1 s into
                the countdown (the grid is in, the car stands, the race HUD's
                own load on the first frame is done) */

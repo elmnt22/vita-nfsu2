@@ -3,6 +3,7 @@
 #define XPCITY_H
 /* track is an expansion city (STREAML2RA / STREAML5RA) */
 int xpcity_is_city(const char *track);
+const char *xpcity_region(const char *track);   /* its routes region (L2RA ...): TRACKS/ROUTES<region> */
 /* Makes sure the city's translated stream is in troot (from the PC tool, or
    translated here from ux0:data/NFSU2/expansion/<game>/TRACKS behind a progress
    screen). 1 = ready (or not a city), 0 = not installed / failed. */

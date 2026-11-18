@@ -37,6 +37,7 @@ static int city_of(const char *track) {
     return -1;
 }
 int xpcity_is_city(const char *track) { return city_of(track) >= 0; }
+const char *xpcity_region(const char *track) { int c = city_of(track); return c >= 0 ? k_city[c].bun + 6 : NULL; }
 
 static int g_window;
 int xpcity_window_made(void) { return g_window; }
