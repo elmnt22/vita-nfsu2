@@ -9,7 +9,12 @@
    starts.txt, barriers.txt (main.c beyond_events_select, xpcity.c barriers). Every event
    goes through the game's own route builder (racepath.c) and is dropped if it refuses
    it. UG2 types: circuit 0, sprint 1, drag 4 (lap KO -> circuit, tollbooth /
-   speedtrap -> sprint). Geometry in doubles, as the Python. */
+   speedtrap -> sprint). Geometry in doubles, as the Python.
+   Carbon's gameplay.bin is the same VPAK of vaults with three layout changes (export
+   entries 16 bytes, entry tables 8-aligned, the inline flag 0x40); its races sit in the
+   race_bin_<tier> vaults (race_bin_muscle/2_1_1), their pieces in a vault of their own, and
+   the type is the race's parent (circuit, p2p, speedtraprace, ...), not its name. Canyon
+   duels -> sprint (port guess); drift / canyon drift races are left out, as MW's are. */
 #include "racepath.h"
 
 typedef struct { double x, y, z; } D3;
@@ -140,7 +145,7 @@ static int nm_bin(Nm *m, const uint8_t *b, size_t n, int with_last)
 enum { RT_CIRCUIT = 0, RT_SPRINT = 1, RT_DRAG = 4 };
 typedef struct { uint32_t key; int ord; D3 p; float rot; } PosE;   /* rot: F_ROT, degrees = the world heading */
 typedef struct {
-    char name[64]; int type, order;
+    char name[64]; int type, order; uint32_t par;   /* par: the parent collection (Carbon: the type) */
     uint32_t *cps, *child; int ncps, nchild;
     char (*bar)[24]; int nbar;              /* as listed ('*' kept) */
     D3 *wp; int nwp;
@@ -180,6 +185,17 @@ static int race_type(const char *name)
     if (strstr(n, "drag")) return RT_DRAG;
     if (strstr(n, "circuit") || strstr(n, "lap_ko") || strstr(n, "lapknockout") || strstr(n, "knockout")) return RT_CIRCUIT;
     if (strstr(n, "sprint") || strstr(n, "p2p") || strstr(n, "tollbooth") || strstr(n, "speedtrap")) return RT_SPRINT;
+    return -1;
+}
+static int carbon_type(uint32_t par)
+{
+    static const struct { const char *n; int t; } k[] = {
+        { "circuit", RT_CIRCUIT }, { "knockout", RT_CIRCUIT }, { "lapknockout", RT_CIRCUIT },
+        { "p2p", RT_SPRINT }, { "sprint", RT_SPRINT }, { "speedtraprace", RT_SPRINT }, { "tollboothrace", RT_SPRINT },
+        { "canyon", RT_SPRINT }, { "drag", RT_DRAG },
+    };
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (vlt_hash((const uint8_t *)k[i].n, strlen(k[i].n)) == par) return k[i].t;
     return -1;
 }
 static int is_barrier_name(const uint8_t *s, size_t n)
@@ -223,8 +239,10 @@ static void last_part(const Nm *names, uint32_t k, const uint8_t **s, int *n)
 /* races(): the race_bin_<n> collections with checkpoints -> name, type, waypoints (start
    grid, checkpoints in order, the finish line unless a circuit), barrier names */
 static void write_shops(const PosE *pos, int npos, const char *path, long *nshops);
-static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const char *shops_path, long *nshops)
+static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const char *shops_path, long *nshops, int carbon)
 {
+    const size_t xst = carbon ? 16 : 20, xoff = carbon ? 12 : 16;   /* export entry stride, its data offset */
+    const unsigned inl = carbon ? 0x40 : 0x20;
     *out = NULL; *nout = 0;
     if (gn < 0x10 || memcmp(gp, "VPAK", 4)) return 0;
     uint32_t n = u32le(gp + 4), soff = u32le(gp + 8);
@@ -244,7 +262,7 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
         const char *vname = (const char *)gp + soff + no;
         const uint8_t *b = gp + bo, *vl = gp + vo;
         int racebin = !strncmp(vname, "race_bin_", 9) && vname[9];
-        for (const char *q = vname + 9; racebin && *q; q++) if (*q < '0' || *q > '9') racebin = 0;
+        for (const char *q = vname + 9; racebin && !carbon && *q; q++) if (*q < '0' || *q > '9') racebin = 0;
         const uint8_t *exp = NULL, *ptr = NULL; size_t expn = 0, ptrn = 0;
         for (size_t o = 0; o + 8 <= vsz; ) {                             /* chunks: tag reversed, size with the header */
             uint32_t sz = u32le(vl + o + 4);
@@ -267,14 +285,15 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
         Nm vn = {0};                                                    /* this vault's own names (mwvlt) */
         if (racebin && !nm_bin(&vn, b, bsz, 1)) { free(fx); ok = 0; break; }
         uint32_t ncol = u32le(exp);
-        for (uint32_t c = 0; c < ncol && ok && 4 + (size_t)20 * (c + 1) <= expn; c++) {
-            const uint8_t *x = exp + 4 + 20 * c;
+        for (uint32_t c = 0; c < ncol && ok && 4 + xst * (c + 1) <= expn; c++) {
+            const uint8_t *x = exp + 4 + xst * c;
             if (u32le(x + 4) != VCOL) continue;
-            uint32_t off = u32le(x + 16);
+            uint32_t off = u32le(x + xoff);
             if ((size_t)off + 32 > vsz) continue;
             const uint8_t *col = vl + off;
             uint32_t key = u32le(col), ne = u32le(col + 20); int nt = u16le(col + 24);
             size_t eo = (size_t)off + 32 + 4 * (size_t)nt;
+            if (carbon) eo = (size_t)off + ((32 + 4 * (size_t)nt + 7) & ~(size_t)7);
             if (eo + (size_t)12 * ne > vsz) continue;
             /* the last entry of each field (a dict): 0 none, 1 inline, 2 pointer (de), 3 other */
             int kpos = 0, kcps = 0, kchild = 0, kbar = 0; uint32_t dpos = 0, dcps = 0, dchild = 0, dbar = 0;
@@ -282,7 +301,7 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
             for (uint32_t j = 0; j < ne; j++) {
                 const uint8_t *en = vl + eo + 12 * j;
                 uint32_t k = u32le(en), de = 0; int kind;
-                if (u16le(en + 10) & 0x20) kind = 1;
+                if (u16le(en + 10) & inl) kind = 1;
                 else kind = fix_get(fx, nfix, (uint32_t)(eo + 12 * j + 4), 0, &de) ? 2 : 3;
                 if (k == F_POS) { kpos = kind; dpos = de; }
                 else if (k == F_CPS) { kcps = kind; dcps = de; }
@@ -297,16 +316,25 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
             }
             if (!racebin || !kcps) continue;
             const NmE *nm = nm_get(&vn, key);
+            if (!nm && carbon) nm = nm_get(&names, key);
             if (!nm) continue;
             int slash = -1, nsl = 0; for (int q = 0; q < nm->n; q++) if (nm->s[q] == '/') { nsl++; slash = q; }
             if (nsl != 1) continue;
             int tl = nm->n - slash - 1; if (tl > 63) tl = 63;
             if (nr == cr) { int cc = cr ? cr * 2 : 256; Race *r2 = realloc(R, (size_t)cc * sizeof *r2); if (!r2) { ok = 0; break; } R = r2; cr = cc; }
             Race *r = &R[nr++]; memset(r, 0, sizeof *r);
-            memcpy(r->name, nm->s + slash + 1, (size_t)tl); r->order = nr - 1;
+            memcpy(r->name, nm->s + slash + 1, (size_t)tl); r->order = nr - 1; r->par = u32le(col + 8);
             if (kcps == 2) r->cps = u32_array(b, bsz, dcps, &r->ncps);
             if (kchild == 2) r->child = u32_array(b, bsz, dchild, &r->nchild);
-            if (kbar == 2 && (size_t)dbar + 8 <= bsz) {
+            if (carbon && kbar == 2 && (size_t)dbar + 8 <= bsz) {   /* Carbon: s16 numbers, negative = '*' (port guess) */
+                int cnt = u16le(b + dbar);
+                r->bar = calloc((size_t)(cnt ? cnt : 1), 24);
+                if (!r->bar) { ok = 0; break; }
+                for (int q = 0; q < cnt && (size_t)dbar + 8 + 2 * (size_t)q + 2 <= bsz; q++) {
+                    int v = (int16_t)u16le(b + dbar + 8 + 2 * q);
+                    if (v) snprintf(r->bar[r->nbar++], 24, "%sBARRIER_SPLINE_%d", v < 0 ? "*" : "", v < 0 ? -v : v);
+                }
+            } else if (kbar == 2 && (size_t)dbar + 8 <= bsz) {
                 int cnt = u16le(b + dbar);
                 r->bar = calloc((size_t)(cnt ? cnt : 1), 24);
                 if (!r->bar) { ok = 0; break; }
@@ -327,7 +355,7 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
     int w = 0;
     for (int i = 0; i < nr && ok; i++) {
         Race *r = &R[i];
-        r->type = race_type(r->name);
+        r->type = carbon ? carbon_type(r->par) : race_type(r->name);
         const PosE *sg = NULL, *fl = NULL;
         if (r->type >= 0) {
             int sgi = -1;
@@ -406,16 +434,17 @@ static int bar_names(const char *companion, Bars *B)
     B->ngid = 65536;
     B->name = calloc(65536, 24);
     if (!B->name) { free(d); return 0; }
-    enum { NK = 5000 + 10 + 100 };
+    enum { NK = 10000 + 10 + 100 };   /* Carbon numbers up to 80xx */
     static uint32_t kh[NK]; static char kn[NK][24]; static int kdone;
     if (!kdone) {
         int m = 0;
-        for (int k = 0; k < 5000; k++) { snprintf(kn[m], 24, "BARRIER_SPLINE_%d", k); kh[m] = bstr_hash(kn[m]); m++; }
+        for (int k = 0; k < 10000; k++) { snprintf(kn[m], 24, "BARRIER_SPLINE_%d", k); kh[m] = bstr_hash(kn[m]); m++; }
         for (int k = 0; k < 10; k++) { snprintf(kn[m], 24, "BARRIER_SPLINE_%02d", k); kh[m] = bstr_hash(kn[m]); m++; }
         for (int k = 0; k < 100; k++) { snprintf(kn[m], 24, "BARRIER_SPLINE_%03d", k); kh[m] = bstr_hash(kn[m]); m++; }
         kdone = 1;
     }
     for (size_t p = 0; p + 20 <= n; ) {
+        if (!u32le(d + p)) { p += 4; continue; }   /* Carbon pads between groups */
         uint32_t h = u32le(d + p + 8); int gid = u16le(d + p + 12), cnt = u16le(d + p + 14);
         for (int k = 0; k < NK; k++) if (kh[k] == h) { memcpy(B->name[gid], kn[k], 24); break; }   /* the first format (setdefault) */
         p = (p + 20 + 2 * (size_t)cnt + 3) & ~(size_t)3;
@@ -997,13 +1026,13 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
 {
     XpEventStats dummy; if (!st) st = &dummy;
     memset(st, 0, sizeof *st);
-    if (game != XP_GAME_MW) return XP_ERR_FORMAT;   /* Carbon's events: with Carbon */
+    if (game != XP_GAME_MW && game != XP_GAME_CARBON) return XP_ERR_FORMAT;
     size_t gn = 0, clen = 0; int rc = XP_ERR_FORMAT;
     uint8_t *gp = read_all(gameplay_bin, &gn);
     if (!gp) return XP_ERR_OPEN_IN;
     Race *R = NULL; int nr = 0;
     char shops[600]; snprintf(shops, sizeof shops, "%s/shops.txt", out_dir);
-    if (!read_races(gp, gn, &R, &nr, shops, &st->shops)) { free(gp); return XP_ERR_FORMAT; }
+    if (!read_races(gp, gn, &R, &nr, shops, &st->shops, game == XP_GAME_CARBON)) { free(gp); return XP_ERR_FORMAT; }
     free(gp);
     st->races = nr;
     uint8_t *chunk = read_road_chunk(raw_companion, &clen, &rc);

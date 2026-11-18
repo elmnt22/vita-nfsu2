@@ -128,7 +128,9 @@ static void make_events(int c, const char *troot)
     if (g_window) vita_progress_screen(title, "BUILDING THE RACES", "ONE TIME ONLY", 0.0f);
     Uint32 t0 = SDL_GetTicks();
     XpEventStats st;
-    int rc = xp_events(gp, rawc, raws, dir, k_city[c].game, k_city[c].name[0] == 'R' ? "Rockport" : "Palmont", 7301, &st);
+    /* event ids: Rockport 7301 on, Palmont 7601 on (beyond.c takes 4000-7999) */
+    int rc = xp_events(gp, rawc, raws, dir, k_city[c].game, k_city[c].name[0] == 'R' ? "Rockport" : "Palmont",
+                       k_city[c].game == XP_GAME_CARBON ? 7601 : 7301, &st);
     if (rc != XP_OK) remove(ev);
     vita_mark("xpcity: race events %s: %s in %.1f s (%ld MW races -> %ld events: %ld circuits %ld sprints %ld drags, %ld skipped, "
               "%ld dropped; barriers %ld on %ld off)", dir, rc == XP_OK ? "made" : "FAILED", (SDL_GetTicks() - t0) / 1000.0,

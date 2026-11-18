@@ -1042,12 +1042,22 @@ int xp_marker_ok(const char *marker_path, int game, long long source_size)
 static uint32_t xp_strhash(const char *s) { uint32_t h = 0xffffffffu; while (*s) h = h * 33u + (uint8_t)*s++; return h; }
 static void xp_group_name(uint32_t hash, int id, char *out, size_t n)
 {
-    char t[40];
-    static const char *fmt[] = { "BARRIER_SPLINE_%d", "BARRIER_SPLINE_%02d", "BARRIER_SPLINE_%03d" };   /* MW has _07 next to _7xx */
-    for (int f = 0; f < 3; f++)
-        for (int k = 0; k < (f ? (f == 1 ? 10 : 100) : 5000); k++) {
-            snprintf(t, sizeof t, fmt[f], k);
-            if (xp_strhash(t) == hash) { snprintf(out, n, "%s", t); return; }
+    /* MW has _07 next to _7xx; Carbon numbers up to 80xx */
+    enum { NK = 10000 + 10 + 100 };
+    static uint32_t kh[NK]; static int kdone;
+    if (!kdone) {
+        char t[40]; int m = 0;
+        for (int k = 0; k < 10000; k++) { snprintf(t, sizeof t, "BARRIER_SPLINE_%d", k); kh[m++] = xp_strhash(t); }
+        for (int k = 0; k < 10; k++) { snprintf(t, sizeof t, "BARRIER_SPLINE_%02d", k); kh[m++] = xp_strhash(t); }
+        for (int k = 0; k < 100; k++) { snprintf(t, sizeof t, "BARRIER_SPLINE_%03d", k); kh[m++] = xp_strhash(t); }
+        kdone = 1;
+    }
+    for (int m = 0; m < NK; m++)
+        if (kh[m] == hash) {
+            if (m < 10000) snprintf(out, n, "BARRIER_SPLINE_%d", m);
+            else if (m < 10010) snprintf(out, n, "BARRIER_SPLINE_%02d", m - 10000);
+            else snprintf(out, n, "BARRIER_SPLINE_%03d", m - 10010);
+            return;
         }
     snprintf(out, n, "XPGROUP_%d", id);   /* not a race barrier: stays as it is (shown, never solid) */
 }
