@@ -1567,6 +1567,7 @@ static void room_shaper_tick(const Shop *fe) {
 enum { MK_DIRECTION, MK_GPS, MK_N };
 static struct {
     int tried, n;
+    float rad;   /* the model's bounding radius about its origin */
     GpuMesh *gm; GLuint *tex; unsigned char *md, (*col)[4];
 } g_mk[MK_N];
 static GLuint g_mk_tex[8]; static uint32_t g_mk_key[8]; static unsigned char g_mk_mode[8]; static int g_mk_ntex;
@@ -1590,6 +1591,12 @@ static int marker_load(const char *root, int which) {
         n++;
     }
     sc.count = n;
+    for (int i = 0; i < n; i++)
+        for (int v = 0; sc.meshes[i].verts && v < sc.meshes[i].nverts; v++) {
+            const float *p = sc.meshes[i].verts + v * 5;
+            float r = sqrtf(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+            if (r > g_mk[which].rad) g_mk[which].rad = r;
+        }
     GLuint *mt = (GLuint *)calloc((size_t)(n ? n : 1), sizeof *mt);
     unsigned char *mm = (unsigned char *)calloc((size_t)(n ? n : 1), 1);
     g_mk[which].col = (unsigned char (*)[4])calloc((size_t)(n ? n : 1), 4);
@@ -1676,6 +1683,32 @@ static void marker_draw(const RProg *rp, int which, const float V[16], const flo
     float A[16] = { x[0], x[1], x[2], 0, y[0], y[1], y[2], 0, z[0], z[1], z[2], 0, pos[0], pos[1], pos[2], 1 };
     float M[16];
     mat_mul(PV, A, M);
+    {   /* its screen footprint stays out of the lite road reflection (render_prev_mask) */
+        float r = g_mk[which].rad > 0.0f ? g_mk[which].rad * 1.15f : 1.5f, rc[4] = { 2, 2, -2, -2 };
+        int ok = 1;
+        for (int s = 0; s < 4 && ok; s++) {   /* +-r along the view's right and up */
+            float p[3];
+            for (int i = 0; i < 3; i++)
+                p[i] = pos[i] + (s < 2 ? V[i * 4 + 0] : V[i * 4 + 1]) * (s & 1 ? r : -r);
+            float cx = PV[0] * p[0] + PV[4] * p[1] + PV[8] * p[2] + PV[12];
+            float cy = PV[1] * p[0] + PV[5] * p[1] + PV[9] * p[2] + PV[13];
+            float cw = PV[3] * p[0] + PV[7] * p[1] + PV[11] * p[2] + PV[15];
+            if (cw < 0.1f) { ok = 0; break; }
+            float u = cx / cw * 0.5f + 0.5f, w = cy / cw * 0.5f + 0.5f;
+            if (u < rc[0]) rc[0] = u;
+            if (u > rc[2]) rc[2] = u;
+            if (w < rc[1]) rc[1] = w;
+            if (w > rc[3]) rc[3] = w;
+        }
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_SIM_NOARROWMASK")) ok = 0;   /* test aid: the old look, for A/B shots */
+#endif
+        if (ok) {
+            float px = (rc[2] - rc[0]) * 0.1f + 0.03f, py = (rc[3] - rc[1]) * 0.1f + 0.03f;
+            rc[0] -= px; rc[2] += px; rc[1] -= py; rc[3] += py;
+            render_prev_mask(rc);
+        }
+    }
     glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, M);
     render_model(rp, A);
     glUniform1f(rp->uEmissiveTex, 1.0f); glUniform1f(rp->uAlpha, 1.0f);
@@ -28537,6 +28570,15 @@ int main(int argc, char **argv) {
                 if (g_gps.arrow_ok && (cs == 1 || cs == 2) && marker_load(dataroot, MK_GPS))
                     marker_draw(&rp, MK_GPS, V, MVP, cam_hfov, g_gps.arrow);
             }
+#ifdef OPENUG2_SIM_PRE_H
+            {   /* test aid (simulator): OPENUG2_SIM_ARROW="x y" draws the GPS arrow at that point in any free roam */
+                const char *ae = getenv("OPENUG2_SIM_ARROW");
+                float tgt[3] = { 0, 0, carpos[2] };
+                if (ae && g_rt.roam && race_state != 3 && sscanf(ae, "%f %f", &tgt[0], &tgt[1]) == 2 &&
+                    marker_load(dataroot, MK_GPS))
+                    marker_draw(&rp, MK_GPS, V, MVP, cam_hfov, tgt);
+            }
+#endif
             /* the pre-race scene's characters (0x61d150, worldbone.fx) */
             if (g_rt.nisd && g_rt.nis && !g_rt.post_done) {
                 static int nis_log; static double nis_ms;

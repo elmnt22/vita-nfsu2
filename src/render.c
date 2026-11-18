@@ -2560,7 +2560,8 @@ GLuint render_refl_texture(void) { return g_refl.failed ? 0 : g_refl.tex; }
    height's parallax) -- and (2) the car's environment cube along it where
    the mirrored ray leaves the screen. The road shader is unchanged
    (worldreflect: the target sampled at the pixel's own screen spot). */
-static struct { GLuint fbo, tex, down, prog; GLint down_step, uM, uMi, uEnvK; int w, h, failed, want, valid; } g_prev;
+static struct { GLuint fbo, tex, down, prog; GLint down_step, uM, uMi, uEnvK, uMask; int w, h, failed, want, valid;
+                float mask[4], mask_next[4]; } g_prev = { .mask = { 2, 2, -2, -2 }, .mask_next = { 2, 2, -2, -2 } };
 static const char *PREV_DOWN_FS =
     GLSL_HEADER
     "varying vec2 vUV; uniform sampler2D uTex; uniform vec2 uStep;\n"
@@ -2570,7 +2571,7 @@ static const char *PREV_DOWN_FS =
 static const char *REFL_SCREEN_FS =
     GLSL_HEADER
     "varying vec2 vUV; uniform sampler2D uTex; uniform sampler2D uScene;\n"
-    "uniform mat3 uM; uniform mat3 uMi; uniform float uEnvK;\n"
+    "uniform mat3 uM; uniform mat3 uMi; uniform float uEnvK; uniform vec4 uMask;\n"
     "vec2 cubeuv(vec3 r){\n"
     "  vec3 a=abs(r); vec2 uv; float fcol; float frow;\n"
     "  if(a.x>=a.y && a.x>=a.z){ uv=vec2(r.x>0.0?-r.y:r.y, r.z)/a.x; fcol=r.x>0.0?0.0:1.0; frow=0.0; }\n"
@@ -2585,13 +2586,31 @@ static const char *REFL_SCREEN_FS =
     "  vec3 c=uM*m; float w=0.0; vec3 s=e;\n"
     "  if(c.z>0.0){ vec2 q=c.xy/c.z*0.5+0.5;\n"
     "    w=clamp((1.0-q.y)*10.0,0.0,1.0)*clamp(q.y*20.0,0.0,1.0)*clamp(q.x*20.0,0.0,1.0)*clamp((1.0-q.x)*20.0,0.0,1.0);\n"
+    "    w*=1.0-clamp(min(min(q.x-uMask.x,uMask.z-q.x),min(q.y-uMask.y,uMask.w-q.y))*40.0,0.0,1.0);\n"
     "    s=texture2D(uTex,clamp(q,0.0,1.0)).rgb; }\n"
     "  gl_FragColor=vec4(mix(e,s,w),1.0); }\n";
 static GLuint bloom_program_vs(const char *vs, const char *fs, const char *name);
 void render_prev_want(int on) { g_prev.want = on; if (!on) g_prev.valid = 0; }
+/* A screen rectangle (0..1: x0 y0 x1 y1) of this frame that the screen
+   reflection must not mirror: the camera-locked GPS / getaway arrows
+   (Player::RenderArrow 0x5eac90). Retail redraws the world for its
+   reflection, so the arrows never reach it; the last-frame copy would
+   carry them onto the road, so their spot falls back to the env cube.
+   Several calls in one frame make one rectangle around them all. */
+void render_prev_mask(const float r[4]) {
+    float *m = g_prev.mask_next;
+    if (m[0] > m[2]) { memcpy(m, r, 4 * sizeof *m); return; }
+    if (r[0] < m[0]) m[0] = r[0];
+    if (r[1] < m[1]) m[1] = r[1];
+    if (r[2] > m[2]) m[2] = r[2];
+    if (r[3] > m[3]) m[3] = r[3];
+}
 int render_prev_valid(void) { return g_prev.valid; }
 /* render_scene_end: last frame's picture at reflection size */
 static void prev_capture(GpuMesh *quad) {
+    /* the copy taken now carries this frame's arrows: their rectangle goes with it */
+    memcpy(g_prev.mask, g_prev.mask_next, sizeof g_prev.mask);
+    g_prev.mask_next[0] = g_prev.mask_next[1] = 2.0f; g_prev.mask_next[2] = g_prev.mask_next[3] = -2.0f;
     if (!g_prev.want || g_prev.failed || !quad || !g_scene.tex) return;
     if (!g_prev.fbo) {
         g_prev.w = 240; g_prev.h = 136;
@@ -2617,6 +2636,7 @@ static void prev_capture(GpuMesh *quad) {
         g_prev.uM = glGetUniformLocation(g_prev.prog, "uM");
         g_prev.uMi = glGetUniformLocation(g_prev.prog, "uMi");
         g_prev.uEnvK = glGetUniformLocation(g_prev.prog, "uEnvK");
+        g_prev.uMask = glGetUniformLocation(g_prev.prog, "uMask");
         glUseProgram(g_prev.prog);
         glUniform1i(glGetUniformLocation(g_prev.prog, "uScene"), RENDER_ENV_UNIT);
         printf("screen reflection: %dx%d last-frame copy + env cube\n", g_prev.w, g_prev.h);
@@ -2652,6 +2672,7 @@ int render_refl_screen(GpuMesh *quad, const float VP[16], float env_k) {
     glUniformMatrix3fv(g_prev.uM, 1, GL_FALSE, mc);
     glUniformMatrix3fv(g_prev.uMi, 1, GL_FALSE, ic);
     glUniform1f(g_prev.uEnvK, env_k);
+    glUniform4f(g_prev.uMask, g_prev.mask[0], g_prev.mask[1], g_prev.mask[2], g_prev.mask[3]);
     glActiveTexture(GL_TEXTURE0 + RENDER_ENV_UNIT); glBindTexture(GL_TEXTURE_2D, render_env_texture());
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_prev.tex);
     draw_gpumesh(quad);

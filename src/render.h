@@ -105,6 +105,7 @@ void   render_refl_end(int screen_w, int screen_h);
 GLuint render_refl_texture(void);
 void render_prev_want(int on);   /* screen + env road reflection (11-15 prototype) */
 int render_prev_valid(void);
+void render_prev_mask(const float r[4]);   /* keep a screen rect (0..1) out of the screen reflection */
 int render_refl_screen(GpuMesh *quad, const float VP[16], float env_k);
 /* the rear-view mirror's target (eView 3) and its composite (0x5cbf40) */
 int    render_rvm_begin(int w, int h, const float clear_rgb[3]);
