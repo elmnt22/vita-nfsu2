@@ -48,6 +48,15 @@ int  profile_delete(const char *name);
    scores), unnamed; the options stay */
 void profile_default(void);
 
+/* World Expansion "Start fresh" (port): a city's own career (1 Rockport, 2 Palmont) in
+   place of the Bayview one, which the profile keeps saving; XPCITY<n> beside the profile */
+int  profile_xf_enter(int city);    /* the Bayview career waits, the city's comes in (new: UG2's start) */
+void profile_xf_leave(void);        /* the city's saved, the Bayview career back */
+int  profile_xf_city(void);         /* 0: the Bayview career is in */
+int  profile_xf_save(void);
+void profile_xf_win(void);          /* a first win in the city (its stage) */
+int  profile_xf_wins(void);
+
 /* AllocBackupDB 0x52a460 / IsDirty 0x52a4c0 / RestoreFromBackupDB 0x5347c0 */
 int profile_snapshot(void);   /* 0: out of memory, no snapshot */
 int  profile_dirty(void);           /* the working set differs from the snapshot */

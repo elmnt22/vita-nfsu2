@@ -138,6 +138,9 @@ static void put_block(Buf *b, const char tag[4], const void *p, long n) {
     put(b, tag, 4); put(b, &l, 4);
     if (n > 0) put(b, p, n);
 }
+/* World Expansion "Start fresh" (port): while a city's own career is in, the Bayview
+   career (its CARR / CCAR blocks) waits here and is what the profile saves */
+static unsigned char *g_xf_car, *g_xf_cc; static long g_xf_carn, g_xf_ccn; static int g_xf_city, g_xf_wins;
 static unsigned char *serialize(long *len) {
     Buf b = {0};
     char nm[32]; memset(nm, 0, sizeof nm); memcpy(nm, g_name, sizeof nm - 1);
@@ -154,12 +157,17 @@ static unsigned char *serialize(long *len) {
     put_block(&b, "GRGE", g, g ? gl : 0);
     free(g);
     put_block(&b, "HSCR", g_hs, sizeof g_hs);
+    if (g_xf_city) {   /* a city's own career is in: the Bayview one, as it waits */
+        put_block(&b, "CCAR", g_xf_cc, g_xf_ccn);
+        put_block(&b, "CARR", g_xf_car, g_xf_carn);
+    } else {
     {   long cl = career_cars_save(NULL, 0);        /* FEPlayerCarDB 0x5166b0 (the career slots) */
         unsigned char *cb = (unsigned char *)malloc((size_t)cl);
         if (cb) { career_cars_save(cb, cl); put_block(&b, "CCAR", cb, cl); free(cb); } else b.fail = 1; }
     {   long cl = career_save(NULL, 0);             /* PlayerCareerState 0x514530 */
         unsigned char *cb = (unsigned char *)malloc((size_t)cl);
         if (cb) { career_save(cb, cl); put_block(&b, "CARR", cb, cl); free(cb); } else b.fail = 1; }
+    }
     {   unsigned char tb[64];                        /* the port's trophies (trophy.c), not the original's */
         long tl = trophy_save(tb, sizeof tb);
         if (tl > 0) put_block(&b, "TRPH", tb, tl); }
@@ -201,8 +209,17 @@ static int apply(const unsigned char *p, long n) {
     /* LoadFromBuffer 80131f28: Default(true) (the cars defaulted, slot 0
        unlocked), the car DB, the career; here the career load defaults
        first, then the cars go over it */
+    if (g_xf_city) {   /* a city's career is in (a cancel's restore): the Bayview one stays waiting */
+        unsigned char *a = car && carn > 0 ? (unsigned char *)malloc((size_t)carn) : NULL;
+        unsigned char *k = cc && ccn > 0 ? (unsigned char *)malloc((size_t)ccn) : NULL;
+        if (a && k) {
+            memcpy(a, car, (size_t)carn); memcpy(k, cc, (size_t)ccn);
+            free(g_xf_car); free(g_xf_cc); g_xf_car = a; g_xf_cc = k; g_xf_carn = carn; g_xf_ccn = ccn;
+        } else { free(a); free(k); }
+    } else {
     if (!car || !career_load(car, carn)) career_default();
     if (cc && !career_cars_load(cc, ccn)) printf("profile: career cars from another build, defaulted\n");
+    }
     trophy_load(tr, trn);                        /* none (an older save): none unlocked yet */
     trophy_report_all();                         /* switched on since: tell the system what is earned */
     trophy_check();                              /* catch up with the career as saved */
@@ -269,6 +286,7 @@ static uint32_t get32(const unsigned char *p) { uint32_t v; memcpy(&v, p, 4); re
 
 int profile_save(void) {
     if (!g_named) return 0;
+    if (g_xf_city) profile_xf_save();   /* the city's own career beside it */
     long pn; unsigned char *pay = serialize(&pn);
     if (!pay) { savenote_failed(); return 0; }   /* said, not silent (audit 11-17) */
     long total = RMC_HDR + pn;
@@ -292,6 +310,72 @@ int profile_save(void) {
     if (ok) savenote_saved();   /* the corner note (port addition, savenote.c) */
     else savenote_failed();
     return ok;
+}
+
+/* ---- World Expansion "Start fresh" (port; EXPANSION_PLAN "Money, cars and progress"):
+   a city's own career -- cash, car slots, stage -- like the start of UG2's career, in
+   the profile's XPCITY<n> file ("XPF1", u32 wins, u32 career bytes, u32 car bytes, the
+   two blocks as the profile has them). It never touches the Bayview career. ---- */
+static int xf_blobs(unsigned char **car, long *carn, unsigned char **cc, long *ccn) {
+    *carn = career_save(NULL, 0); *ccn = career_cars_save(NULL, 0);
+    *car = (unsigned char *)malloc((size_t)*carn); *cc = (unsigned char *)malloc((size_t)*ccn);
+    if (!*car || !*cc) { free(*car); free(*cc); *car = *cc = NULL; return 0; }
+    career_save(*car, *carn); career_cars_save(*cc, *ccn);
+    return 1;
+}
+int profile_xf_city(void) { return g_xf_city; }
+int profile_xf_wins(void) { return g_xf_wins; }
+void profile_xf_win(void) {
+    if (!g_xf_city) return;
+    g_xf_wins++;
+    /* PORT GUESS: the city's stage (its parts / cars) goes up every 10 first wins, to stage 4 */
+    int st = g_xf_wins / 10; if (st > 4) st = 4;
+    if (st > g_career.stage) { g_career.stage = st; printf("xp fresh: city stage %d (%d wins)\n", st, g_xf_wins); }
+}
+int profile_xf_save(void) {
+    if (!g_xf_city) return 0;
+    char f[16], p[320];
+    snprintf(f, sizeof f, "XPCITY%d", g_xf_city);
+    if (!profile_file(f, p, sizeof p)) return 0;   /* unnamed: the city's career lasts the trip */
+    unsigned char *car, *cc; long carn, ccn;
+    if (!xf_blobs(&car, &carn, &cc, &ccn)) return 0;
+    long n = 16 + carn + ccn;
+    unsigned char *b = (unsigned char *)malloc((size_t)n);
+    int ok = 0;
+    if (b) {
+        memcpy(b, "XPF1", 4); put32(b + 4, (uint32_t)g_xf_wins); put32(b + 8, (uint32_t)carn); put32(b + 12, (uint32_t)ccn);
+        memcpy(b + 16, car, (size_t)carn); memcpy(b + 16 + carn, cc, (size_t)ccn);
+        ok = write_file(p, b, n);
+    }
+    free(b); free(car); free(cc);
+    printf("xp fresh: city %d career %s ($%d, %d wins)\n", g_xf_city, ok ? "saved" : "NOT saved", g_career.cash, g_xf_wins);
+    return ok;
+}
+int profile_xf_enter(int city) {
+    if (g_xf_city == city) return 1;
+    profile_xf_leave();
+    if (!xf_blobs(&g_xf_car, &g_xf_carn, &g_xf_cc, &g_xf_ccn)) return 0;
+    g_xf_city = city; g_xf_wins = 0;
+    char f[16], p[320]; long n = 0; unsigned char *b = NULL;
+    snprintf(f, sizeof f, "XPCITY%d", city);
+    if (profile_file(f, p, sizeof p)) b = read_file(p, &n);
+    int ok = b && n >= 16 && !memcmp(b, "XPF1", 4) && 16 + (long)get32(b + 8) + (long)get32(b + 12) == n &&
+             career_load(b + 16, (long)get32(b + 8)) && career_cars_load(b + 16 + get32(b + 8), (long)get32(b + 12));
+    if (ok) g_xf_wins = (int)get32(b + 4);
+    else career_default();   /* a new city career: UG2's start (no cash, the first slot, the car lot) */
+    free(b);
+    printf("xp fresh: city %d career %s ($%d, %d wins)\n", city, ok ? "loaded" : "new", g_career.cash, g_xf_wins);
+    return 1;
+}
+void profile_xf_leave(void) {
+    if (!g_xf_city) return;
+    profile_xf_save();
+    int ok = career_load(g_xf_car, g_xf_carn);
+    if (!ok) career_default();
+    career_cars_load(g_xf_cc, g_xf_ccn);
+    printf("xp fresh: city %d left, the Bayview career back%s ($%d)\n", g_xf_city, ok ? "" : " (DEFAULTED)", g_career.cash);
+    free(g_xf_car); free(g_xf_cc); g_xf_car = g_xf_cc = NULL; g_xf_carn = g_xf_ccn = 0;
+    g_xf_city = 0; g_xf_wins = 0;
 }
 
 int profile_load(const char *name) {

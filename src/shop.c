@@ -7794,13 +7794,20 @@ static void cwm_enter(Shop *s);
 static void crw_enter(Shop *s, int option);
 /* 0x451e768e: CheckMemory 800d2308 (EnterMemcard 0x151 when dirty), then
    0x9a3b571d: +0x7e3c = 1, StartCareerFreeRoam */
+static void xf_lot_enter(Shop *s);
 static void crib_play(Shop *s) {
     profile_drop_snapshot();
     if (s->trip_city) {   /* port: the World Expansion trip (main.c: SHOP_ACT_XP_TRIP) */
+        if (s->trip_share) profile_xf_leave();   /* the shared garage: the Bayview career */
+        else {   /* Start fresh: the city's own career; a new one picks its first car at the lot */
+            profile_xf_enter(s->trip_city);
+            if (!career_current_car()) { xf_lot_enter(s); return; }
+        }
         s->fe_action = SHOP_ACT_XP_TRIP;
         printf("crib: trip to %s (%s)\n", s->trip_city == 1 ? "Rockport" : "Palmont", s->trip_share ? "shared garage" : "fresh garage");
         return;
     }
+    profile_xf_leave();   /* Bayview: its own career */
     g_career.has_spawn = 1;
     career_go(s, 0);
 }
@@ -7845,7 +7852,7 @@ void xp_garage_choice_set(int city, int share) {
 }
 static void crib_trip(Shop *s, int city) {
     s->trip_city = city;
-    s->trip_share = xp_garage_choice(city) != 0;   /* fresh = the city's own garage (not built yet: QR rules) */
+    s->trip_share = xp_garage_choice(city) != 0;   /* fresh = the city's own career (profile_xf_enter) */
     if (profile_dirty()) { s->crib_play = 1; mc_enter(s, 0x151, SC_CRIB); }   /* CheckMemory first, like Play */
     else crib_play(s);
 }
@@ -8271,6 +8278,12 @@ static int lot_next(const Shop *s, int st) {                 /* CalcNextCarLotSt
 static void lot_leave(Shop *s) {
     s->qr_car_pending = 0;
     profile_drop_snapshot();
+    if (s->trip_city && profile_xf_city() == s->trip_city) {   /* port: a fresh city's first car -- to the city */
+        profile_xf_save();
+        if (career_current_car()) crib_play(s);
+        else crib_enter(s, s->crib_from_main);   /* none picked: the crib again (the city career stays in) */
+        return;
+    }
     career_go(s, 0);
 }
 /* EnterCarLotState 800d3680 (FILTERTYPE, shown with "Career Cars" in 4, is
@@ -9074,6 +9087,22 @@ static void mview_input(Shop *s, int key) {
     msel_enter(s, s->msel_mode, 1);
 }
 
+/* port: a fresh city career's first car -- UI_CareerCarLot as the career's start has it
+   (stage-0 stock cars into the empty slot, free), CARLOT01's scene */
+static void xf_lot_enter(Shop *s) {
+    s->front_end = 1;
+    s->lot_bar = 1; s->lot_new = 0;
+    lot_build(s, 1);
+    career_slot_counts(&s->lot_unlocked, &s->lot_empty);
+    lot_refresh(s);
+    s->screen = SC_CAREER_LOT;
+    s->platform = 3;   /* CARLOT01 (shop_scene_platform) */
+    s->fe_shop = NULL;
+    profile_snapshot();
+    printf("car lot: %s's first car, %d slots unlocked, %d empty\n", s->trip_city == 1 ? "Rockport" : "Palmont",
+           s->lot_unlocked, s->lot_empty);
+    lot_enter(s, lot_next(s, LOT_START));
+}
 int shop_career_shop(Shop *s, const unsigned char *shop) {
     if (!s || !shop) return 0;
     int type = (signed char)shop[0x50];

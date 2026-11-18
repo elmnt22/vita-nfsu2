@@ -5362,7 +5362,8 @@ static unsigned g_rt_zones_gen;   /* bumped on every free/load of g_rt.zones: a 
 static int g_career_mode, g_career_go, g_career_nis_pending, g_career_nis_on, g_career_zones_set;
 /* World Expansion trip (port): the career's crib sent the career car to an expansion city
    (1 Rockport, 2 Palmont). The city runs as its free roam (career mode off), its garages
-   open the career crib again; g_xp_trip_share: the garage is shared (cash / parts / cars) */
+   open the career crib again; g_xp_trip_share: the garage is shared (cash / parts / cars), else
+   the city's own career is in (profile_xf_enter: its cash / cars / stage, Start fresh) */
 static int g_xp_trip, g_xp_trip_share, g_xp_trip_go;
 static int g_xp_trip_shop;   /* a shared trip's shop is open: the career's (career mode on until it is left) */
 static int g_career_spawn_on; static float g_career_spawn[3], g_career_heading;
@@ -9797,7 +9798,7 @@ static int eng_beyond_open(const char *dataroot, int idx)
     eng_fmt_f(num, sizeof num, (float)len * 0.000625f);
     snprintf(b, sizeof b, "%s %s", num, hud_screen_string(h, g_opt.kmh ? 0xb5d640b1u : 0xac3a4f4cu));
     hud_screen_text_h(h, 0x080c9daau, b);
-    if (g_xp_trip && g_xp_trip_share) {
+    if (g_xp_trip) {   /* shared: the career's stage; fresh: the city career's own */
         int was_won = 0, full = career_stage_race_purse(type == 6 ? 0 : type);
         beyond_progress(id, &was_won, NULL, NULL);
         hud_num(num, sizeof num, was_won ? full / 4 : full);   /* a repeat win pays a quarter */
@@ -21531,7 +21532,10 @@ int main(int argc, char **argv) {
             }
             /* UI_Main (UIMain ctor): the DDAY_PLAYER_CAR preset while the career has no car,
                else BuildCurrentRideForPlayer(0), the front end's current car */
-            if (g_fe && shop_on_main_menu(g_fe)) g_xp_trip = g_xp_trip_go = 0;   /* a trip ends at the main menu (port) */
+            if (g_fe && shop_on_main_menu(g_fe)) {   /* a trip ends at the main menu (port), a city's career with it */
+                g_xp_trip = g_xp_trip_go = 0;
+                profile_xf_leave();
+            }
             if (g_fe && !g_career_mode && shop_on_main_menu(g_fe) && pending_car < 0 && !g_car_reload) {
                 if (g_garage_cur_dirty) {   /* the picked car into the profile (see g_garage_cur_dirty) */
                     g_garage_cur_dirty = 0;
@@ -21697,7 +21701,7 @@ int main(int argc, char **argv) {
                     g_fe = fe; g_fe_in = 0;
                     printf("xp trip: garage -> the career crib\n");
                 } else { world_tiles_trim(0); printf("xp trip: the crib could not be opened\n"); }
-            } else if (act == ENG_ACT_SHOP && g_eng.bshop > 1 && g_xp_trip && g_xp_trip_share && race_state == 1 &&
+            } else if (act == ENG_ACT_SHOP && g_eng.bshop > 1 && g_xp_trip && race_state == 1 &&
                        career_shop_of_type(g_eng.bshop - 1)) {
                 /* port: a shared-garage trip's shop -- the career's shop of that type (its screens, prices,
                    unlocks) on the career car with the career's cash; left, back to the city's free roam */
@@ -24371,12 +24375,15 @@ int main(int argc, char **argv) {
                     int was_won = 0, was_best = 0;
                     beyond_progress(id, &was_won, &was_best, NULL);
                     beyond_progress_record(id, won, ticks, place);
-                    if (won && g_xp_trip && g_xp_trip_share) {   /* port: a career trip's purse, into the career wallet */
+                    if (won && g_xp_trip) {   /* port: a career trip's purse, into the career (or the city's own) wallet */
                         int t = beyond_event_type(id), full = career_stage_race_purse(t == 6 ? 0 : t);
                         int pay = was_won ? full / 4 : full;
                         g_career.cash += pay;
-                        printf("xp trip: purse $%d%s, career cash $%d\n", pay, was_won ? " (a repeat win)" : "", g_career.cash);
-                        if (g_opt.autosave && profile_named())
+                        if (!was_won && profile_xf_city()) profile_xf_win();
+                        printf("xp trip: purse $%d%s, %s cash $%d\n", pay, was_won ? " (a repeat win)" : "",
+                               profile_xf_city() ? "the city career's" : "career", g_career.cash);
+                        if (profile_xf_city()) profile_xf_save();   /* the city's own file, never the Bayview save */
+                        else if (g_opt.autosave && profile_named())
                             printf("xp trip: saved (%s)\n", profile_save() ? "ok" : "FAILED");
                     }
                     printf("beyond: event %d place %d time %.2f s%s%s (%d won)\n", id, place, ticks / 4000.0,
