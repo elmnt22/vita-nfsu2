@@ -142,10 +142,11 @@ static int nm_bin(Nm *m, const uint8_t *b, size_t n, int with_last)
 #define F_CHILD 0x916e0e78u
 #define F_BARRIERS 0xe244f26bu      /* the race's own BARRIER_SPLINE_<n> scenery groups ('*' = the other way round) */
 #define VCOL 0x8e112eb7u
-enum { RT_CIRCUIT = 0, RT_SPRINT = 1, RT_DRAG = 4 };
+enum { RT_CIRCUIT = 0, RT_SPRINT = 1, RT_DRAG = 4, RT_DRIFT = 5 };   /* UG2's race types (AIRACE_*) */
 typedef struct { uint32_t key; int ord; D3 p; float rot; } PosE;   /* rot: F_ROT, degrees = the world heading */
 typedef struct {
     char name[64]; int type, order; uint32_t par;   /* par: the parent collection (Carbon: the type) */
+    int closed;                             /* laps (circuits, Carbon's drift races); else start -> finish */
     uint32_t *cps, *child; int ncps, nchild;
     char (*bar)[24]; int nbar;              /* as listed ('*' kept) */
     D3 *wp; int nwp;
@@ -192,7 +193,8 @@ static int carbon_type(uint32_t par)
     static const struct { const char *n; int t; } k[] = {
         { "circuit", RT_CIRCUIT }, { "knockout", RT_CIRCUIT }, { "lapknockout", RT_CIRCUIT },
         { "p2p", RT_SPRINT }, { "sprint", RT_SPRINT }, { "speedtraprace", RT_SPRINT }, { "tollboothrace", RT_SPRINT },
-        { "canyon", RT_SPRINT }, { "drag", RT_DRAG },
+        { "canyon", RT_SPRINT }, { "canyonsprint", RT_SPRINT }, { "drag", RT_DRAG },
+        { "driftrace", RT_DRIFT }, { "canyondrift", RT_DRIFT },   /* UG2's drift; a canyon drift = its downhill drift */
     };
     for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
         if (vlt_hash((const uint8_t *)k[i].n, strlen(k[i].n)) == par) return k[i].t;
@@ -356,6 +358,8 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
     for (int i = 0; i < nr && ok; i++) {
         Race *r = &R[i];
         r->type = carbon ? carbon_type(r->par) : race_type(r->name);
+        r->closed = r->type == RT_CIRCUIT ||
+                    (r->type == RT_DRIFT && r->par == vlt_hash((const uint8_t *)"driftrace", 9));
         const PosE *sg = NULL, *fl = NULL;
         if (r->type >= 0) {
             int sgi = -1;
@@ -372,12 +376,16 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
         }
         int ncp = 0;
         for (int j = 0; j < r->ncps; j++) if (pos_find(pos, npos, r->cps[j])) ncp++;
+        if (getenv("XP_DEBUG_TYPES") && r->type < 0) {
+            const NmE *pn = nm_get(&names, r->par);
+            fprintf(stderr, "xp type: %s par %.*s\n", r->name, pn ? (int)pn->n : 8, pn ? (const char *)pn->s : "?");
+        }
         if (r->type < 0 || !sg || !ncp) { free(r->cps); free(r->child); free(r->bar); free(r->wp); continue; }
         r->wp = malloc((size_t)(ncp + 2) * sizeof *r->wp);
         if (!r->wp) { ok = 0; break; }
         r->wp[r->nwp++] = sg->p;
         for (int j = 0; j < r->ncps; j++) { const PosE *p = pos_find(pos, npos, r->cps[j]); if (p) r->wp[r->nwp++] = p->p; }
-        if (fl && r->type != RT_CIRCUIT) r->wp[r->nwp++] = fl->p;
+        if (fl && !r->closed) r->wp[r->nwp++] = fl->p;
         free(r->cps); free(r->child); r->cps = NULL; r->child = NULL;
         R[w++] = *r;
     }
@@ -653,7 +661,7 @@ static int nl_cmp(const void *x, const void *y) { const NL *a = x, *b = y; retur
 /* the chain (lanes) into *out / *nout; 0 none, -1 out of memory. blk: stamp/tag, or NULL */
 static int chain(ChainCtx *C, const Race *r, const int *stamp, int tag, int **out, int *nout)
 {
-    const G *g = C->g; int nl = g->n, n = r->nwp, circ = r->type == RT_CIRCUIT;
+    const G *g = C->g; int nl = g->n, n = r->nwp, circ = r->closed;
     *out = NULL; *nout = 0;
     if (n < 1) return 0;
     memset(C->W, 0, (size_t)n * (size_t)nl);
@@ -1012,7 +1020,7 @@ static int routes_bin(const DPolys *S, int closed, FILE *f)
 }
 
 /* ---- the whole set ---- */
-typedef struct { int id, type, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; } EvMeta;   /* pl: the route, x y every ~15 m */
+typedef struct { int id, type, closed, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; } EvMeta;   /* pl: the route, x y every ~15 m */
 static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t *recs, const unsigned char *keep, int reread)
 {
     int nk = 0; for (int i = 0; i < nm; i++) nk += keep[i];
@@ -1103,7 +1111,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         int thru = 0; for (int i = 0; ch && i < nch; i++) thru += stamp[ch[i]] == rt;
         if (thru) st->through++;
         if (!ch || !nch || has_repeat(ch, nch, mark)) { free(ch); st->skipped++; continue; }
-        int closed = r->type == RT_CIRCUIT;
+        int closed = r->closed;
         if (!recut(&g, ch, nch, closed, &g2) || !g2.n) { free(ch); if (!g2.n) { st->skipped++; continue; } goto done; }
         const DPoly **pc = malloc((size_t)g2.n * sizeof *pc);
         if (!pc) { free(ch); goto done; }
@@ -1125,7 +1133,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         f = okw ? fopen(p, "wb") : NULL;
         if (f) { okw = routes_bin(&S, closed, f); if (fclose(f)) okw = 0; } else okw = 0;
         if (!okw) { free(ch); rc = XP_ERR_WRITE; goto done; }
-        EvMeta *m = &meta[nm]; m->id = ev; m->type = r->type; m->len = (int)pyround(L); m->partlen = part.n;
+        EvMeta *m = &meta[nm]; m->id = ev; m->type = r->type; m->closed = r->closed; m->len = (int)pyround(L); m->partlen = part.n;
         /* a barrier the route still crosses (no way round it the format holds) stays off */
         size_t bl = 0; for (int b = 0; b < r->nbar; b++) bl += strlen(r->bar[b]) + 1;
         m->bars = malloc(bl + 1); if (!m->bars) { free(ch); goto done; }
@@ -1188,14 +1196,16 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         FILE *fe = fopen(p, "w"); snprintf(p, sizeof p, "%s/starts.txt", out_dir);
         FILE *fs = fopen(p, "w"); snprintf(p, sizeof p, "%s/barriers.txt", out_dir);
         FILE *fb = fopen(p, "w");
-        int okw = fe && fs && fb, cnt[5] = {0};
+        int okw = fe && fs && fb, cnt[6] = {0};
         for (int i = 0; i < nm && okw; i++) {
-            const char *label = meta[i].type == RT_CIRCUIT ? "Circuit" : meta[i].type == RT_SPRINT ? "Sprint" : "Drag";
+            const char *label = meta[i].type == RT_CIRCUIT ? "Circuit" : meta[i].type == RT_SPRINT ? "Sprint" :
+                                meta[i].type == RT_DRIFT ? "Drift" : "Drag";
             fprintf(fe, "%d %d %d %s %s %d\n", meta[i].id, meta[i].type, meta[i].len, city, label, ++cnt[meta[i].type]);
             fputs(meta[i].start, fs);
             if (meta[i].bars && meta[i].bars[0]) fprintf(fb, "%d %s\n", meta[i].id, meta[i].bars);
             st->events++;
-            if (meta[i].type == RT_CIRCUIT) st->circuits++; else if (meta[i].type == RT_SPRINT) st->sprints++; else st->drags++;
+            if (meta[i].type == RT_CIRCUIT) st->circuits++; else if (meta[i].type == RT_SPRINT) st->sprints++;
+            else if (meta[i].type == RT_DRIFT) st->drifts++; else st->drags++;
         }
         snprintf(p, sizeof p, "%s/trackpoly.bin", out_dir);   /* "XTPL" n, then per event: id, closed, count, x y ... */
         FILE *ft = fopen(p, "wb");
@@ -1204,7 +1214,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
             uint32_t hd[2] = { 0x4c505458u, (uint32_t)nm };
             if (fwrite(hd, 4, 2, ft) != 2) okw = 0;
             for (int i = 0; i < nm && okw; i++) {
-                int32_t eh[3] = { meta[i].id, meta[i].type == RT_CIRCUIT, meta[i].pl ? meta[i].npl : 0 };
+                int32_t eh[3] = { meta[i].id, meta[i].closed, meta[i].pl ? meta[i].npl : 0 };
                 if (fwrite(eh, 4, 3, ft) != 3 || (eh[2] && fwrite(meta[i].pl, 8, (size_t)eh[2], ft) != (size_t)eh[2])) okw = 0;
             }
             if (fclose(ft)) okw = 0;

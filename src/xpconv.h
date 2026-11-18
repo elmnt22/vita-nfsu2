@@ -39,7 +39,7 @@ int xp_companion(const char *in_path, const char *out_path, int game);
    events.txt, starts.txt, barriers.txt; ids from first_id, city names the event labels.
    Needs the raw MW files: gameplay.bin, the companion (L2RA.BUN) and the stream
    (STREAML2RA.BUN, for the race barrier walls). */
-typedef struct { long races, events, circuits, sprints, drags, fallback, through, skipped, dropped,
+typedef struct { long races, events, circuits, sprints, drags, drifts, fallback, through, skipped, dropped,
                  barriers_on, barriers_off, barrier_segs, shops; } XpEventStats;
 int xp_events(const char *gameplay_bin, const char *raw_companion, const char *raw_stream,
               const char *out_dir, int game, const char *city, int first_id, XpEventStats *stats);

@@ -7113,6 +7113,8 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
             const unsigned char *t = g_ai_races + i * 0x128;
             if ((int)(int16_t)(t[0x8a] | t[0x8b] << 8) == e->id) g_rt.downhill = n2_u32(t + 0x80) == 1;
         }
+    if (g_rt.drift && beyond_event_type(e->id) >= 0)   /* port: a Carbon canyon drift (start -> finish) = UG2's downhill drift */
+        g_rt.downhill = !e->circuit;
     int pos[1 + AIRACE_MAX];
     if (g_rt_keep.on) {                                 /* a restart: the same field */
         g_rt_keep.on = 0;
