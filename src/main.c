@@ -59,6 +59,7 @@
 #include "jumpcam.h"
 #include "skyline.h"
 #include "beyond.h"
+#include "canyon.h"
 #include "xpcity.h"
 static int n2_find_record(const unsigned char *g, long len, const char *name, unsigned char *out);
 #include "ai.h"
@@ -5551,6 +5552,48 @@ static struct {
         HudStyle hud;
     } sty;
 } g_rt;
+/* port: a canyon duel's state (canyon.c): on for this race (cleared with the race), leg 2 asked
+   for by leg 1's results, the duel's end (1 leg 1 over the line, 2 decided; places set) */
+static Canyon g_cyn;
+static int g_cyn_on, g_cyn_next_leg, g_cyn_done;
+/* leg 1 finished on the road: its results, then leg 2 (no win / loss recorded yet) */
+static int cyn_between_legs(void) { return g_cyn_on && g_cyn.leg == 1 && g_cyn_done == 1; }
+/* the duel's score panel, in UG2's HUD font at the top of the screen (port: Carbon's canyon
+   HUD -- the points, the zone multiplier, the gap, the pass / lose count-downs, the leg) */
+static void cyn_hud_draw(Hud *h, const RProg *rp, GpuMesh *quad, int W, int H)
+{
+    char l0[48], l1[64], l2[64], a[24], b[24];
+    int ch = canyon_chaser(&g_cyn), z = g_cyn.zone;
+    snprintf(l0, sizeof l0, "CANYON DUEL  -  LEG %d", g_cyn.leg);
+    hud_num(a, sizeof a, (int)g_cyn.score[0]);
+    hud_num(b, sizeof b, (int)g_cyn.score[1]);
+    if (g_cyn.leg == 1) snprintf(l1, sizeof l1, "%s", a);
+    else snprintf(l1, sizeof l1, "YOU %s   RIVAL %s", a, b);
+    uint32_t c2 = 0xffffffffu;
+    float m = canyon_zone_mult(z), gap = g_cyn.gap < 0.0f ? -g_cyn.gap : g_cyn.gap;
+    if (g_cyn.ztime[0] > 0.0f) {
+        snprintf(l2, sizeof l2, "%s  %d", ch == 0 ? "PASSED - HOLD IT" : "RIVAL PASSED YOU",
+                 (int)ceilf(CANYON_PASS_TIME - g_cyn.ztime[0]));
+        c2 = ch == 0 ? 0xff40e040u : 0xffff4030u;
+    } else if (g_cyn.ztime[CANYON_NZONE - 1] > 0.0f) {
+        snprintf(l2, sizeof l2, "%s  %d", ch == 0 ? "TOO FAR BEHIND" : "RIVAL LOSING YOU",
+                 (int)ceilf(CANYON_LOSE_TIME - g_cyn.ztime[CANYON_NZONE - 1]));
+        c2 = ch == 0 ? 0xffff4030u : 0xff40e040u;
+    } else if (m > 0.0f) {
+        snprintf(l2, sizeof l2, "%sx%.1f   %d m", ch == 0 ? "" : "RIVAL ", m, (int)(gap + 0.5f));
+        c2 = m >= 2.0f ? 0xff40e040u : m >= 1.0f ? 0xffffffffu : 0xffffc040u;
+    } else {
+        snprintf(l2, sizeof l2, "%sx0   %d m", ch == 0 ? "" : "RIVAL ", (int)(gap + 0.5f));
+        c2 = 0xffa0a0a0u;
+    }
+    HudLine ln[3] = {
+        { l0, 0.0f, -214.0f, 0.55f, 1, 0xffd8d8e0u },
+        { l1, 0.0f, -190.0f, g_cyn.leg == 1 ? 1.35f : 0.95f, 1, 0xffffcc33u },
+        { l2, 0.0f, -164.0f, 0.70f, 1, c2 },
+    };
+    static const float plate[4] = { 0.0f, -190.0f, 250.0f, 76.0f };
+    hud_draw_lines(h, rp, quad, W, H, ln, 3, plate);
+}
 static int g_rt_watch;   /* race ticks of per-car state logged after a scene skip */
 /* the player's car and race for the jump cams (jumpcam.c) */
 static const AiRacer *jc_fp(void) { return g_rt.human ? g_rt.human : g_rt.pdrag ? g_rt.pdrag : g_rt.pdrv; }
@@ -6327,6 +6370,7 @@ static void rt_end(void)
     /* the race's or free roam's world goes: the next one spawns every
        smokeable again (World::World -> SpawnSmokeables 0x5b4220) */
     smk_world_reset();
+    g_cyn_on = 0;                       /* a canyon duel goes with its race (g_cyn kept for leg 2) */
     g_pose_ring_clear = 1; g_reset_blink = 0.0f;   /* the Player goes with the world */
     rain_world_reset();                 /* ResetWorldTime 0x576cf0 + a new Rain */
     jumpcam_reset();                    /* ClearZone, time scale 1 */
@@ -7184,6 +7228,18 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
             rt_random_rides(dataroot, &rng);
         }
     }
+    /* port: a Carbon canyon duel (canyon.c) -- one opponent (ai_racer_canyon); CanyonRaceSetup
+       0x656980: leg 1 the opponent leads (0x645f40(0, 1)), leg 2 (EnterRepeatRace) the player */
+    g_cyn_on = beyond_event_mode(e->id) == BX_MODE_CANYON_DUEL && g_rt.nopp >= 1;
+    if (g_cyn_on) {
+        if (g_rt.nopp > 1) g_rt.nopp = 1;
+        int leg = g_cyn_next_leg ? 2 : 1;
+        g_cyn_next_leg = 0; g_cyn_done = 0;
+        canyon_begin(&g_cyn, leg);
+        pos[0] = leg == 1 ? 2 : 1; pos[1] = leg == 1 ? 1 : 2;
+        printf("canyon duel %d: leg %d (the player %s), points %.0f / %.0f\n", e->id, leg,
+               leg == 1 ? "chases" : "leads", g_cyn.score[0], g_cyn.score[1]);
+    } else g_cyn_next_leg = 0;
     g_rt_keep.nopp = g_rt.nopp;
     memcpy(g_rt_keep.opp, g_rt.opp, sizeof g_rt_keep.opp);
     memcpy(g_rt_keep.pos, pos, sizeof g_rt_keep.pos);
@@ -7298,6 +7354,18 @@ static int rt_race_setup(const char *troot, const char *dataroot, const char *ca
         printf("garage race %d: %d start markers for %d cars -- the field along the race route\n",
                e->id, g_rt.ngrid, n);
         g_rt.ngrid = n;
+    }
+    if (g_cyn_on) {
+        /* 0x620900: both on the start grid's spot in line, the chaser 8 m behind the leader */
+        float h = g_rt.gridh[0], b[3] = { g_rt.grid[0][0] - 8.0f * cosf(h), g_rt.grid[0][1] - 8.0f * sinf(h), g_rt.grid[0][2] };
+        if (g_wcoll) {
+            WCollCtx c; wcoll_ctx_init(&c);
+            int found = 0; float zq[3] = { b[0], b[1], b[2] + 2.0f };
+            float z = wcoll_ground(g_wcoll, &c, zq, NULL, NULL, &found);
+            if (found) b[2] = z;
+        }
+        memcpy(g_rt.grid[1], b, sizeof b); g_rt.gridh[1] = h;
+        if (g_rt.ngrid < 2) g_rt.ngrid = 2;
     }
     g_rt.setup = 1;
     RT_CRUMB("race setup: done, %d opponents", g_rt.nopp);
@@ -8344,24 +8412,25 @@ static void rt_stats_build(const char *me, const char *carname);
 /* the results screen's own state (0x4f3be0): +0x68 gaps shown, +0x70 the
    time in this view, +0x74 its length (4.5 s of times, 1.75 s of gaps),
    the rows' times in their order */
-static struct { int gap; float t, len; int n, time[1 + AIRACE_MAX + 3]; } g_resalt;
+static struct { int gap; float t, len; int n, time[1 + AIRACE_MAX + 3], pts; } g_resalt;   /* pts: a points list (port: canyon duel) */
 static void rt_results(const char *dataroot, const char *carname)
 {
     hud_free(&g_results);
     hud_free(&g_post.menu); hud_free(&g_post.dlg);
     snprintf(g_post.dataroot, sizeof g_post.dataroot, "%s", dataroot);
-    g_results = hud_init_screen(dataroot, g_rt.drift ? "GLOBAL/InGameDrift.bun" : "GLOBAL/InGameRace.bun",
+    int pts = g_rt.drift || g_cyn_on;   /* port: a canyon duel lists its points (RankPlayersByPoints) */
+    g_results = hud_init_screen(dataroot, pts ? "GLOBAL/InGameDrift.bun" : "GLOBAL/InGameRace.bun",
                                 "UI_PostRaceResults.fng");
     if (!g_results) return;
     struct { const char *name, *car; float score; int me, place, time; } row[1 + AIRACE_MAX + 3];
     int n = 0;
     const char *me = player_name();
     row[n].name = me ? me : ""; row[n].car = carname; row[n].me = 1;
-    row[n].score = g_rt.drift ? drift_score(&g_rt.acc[0]) : 0;
+    row[n].score = g_rt.drift ? drift_score(&g_rt.acc[0]) : g_cyn_on ? g_cyn.score[0] : 0;
     row[n].place = g_rt.ent[0].place; row[n++].time = g_rt.ftime[0];
     for (int k = 1; k <= g_rt.n && k <= g_rt.nopp; k++) {
         row[n].name = g_rt.opp[k - 1].name; row[n].car = g_rt.opp[k - 1].car; row[n].me = 0;
-        row[n].score = g_rt.drift ? drift_score(&g_rt.acc[k]) : 0;
+        row[n].score = g_rt.drift ? drift_score(&g_rt.acc[k]) : g_cyn_on && k == 1 ? g_cyn.score[1] : 0;
         row[n].place = g_rt.ent[k].place; row[n++].time = g_rt.ftime[k];
     }
     for (int k = 0; k < g_rt.nvirt; k++) {               /* set-score downhill opponents */
@@ -8392,7 +8461,7 @@ static void rt_results(const char *dataroot, const char *carname)
             hud_screen_label(g_results, nm, feng_hash(b));
         } else hud_screen_hide(g_results, nm, 1);       /* no car: a set score */
         snprintf(nm, sizeof nm, "TIME_DATA_%d", i);
-        if (g_rt.drift) hud_num(b, sizeof b, (int)row[i - 1].score);
+        if (pts) hud_num(b, sizeof b, (int)row[i - 1].score);
         else hud_time_str(b, row[i - 1].time);
         hud_screen_text(g_results, nm, b);
     }
@@ -8443,6 +8512,8 @@ static void rt_results(const char *dataroot, const char *carname)
     }
     hud_screen_script_all(g_results, "FadeIn");
     g_resalt.n = n; g_resalt.gap = 0; g_resalt.t = 0.0f; g_resalt.len = 4.5f;   /* 0x4f3be0: +0x74 = 0x78dff0 */
+    g_resalt.pts = pts;
+    if (g_cyn_on) hud_screen_label_h(g_results, 0xa4ec03beu, 0x70802830u);   /* the column: "Points" (English.bin) */
     for (int i = 0; i < n; i++) g_resalt.time[i] = row[i].time;
     rt_stats_build(me ? me : "", carname);
     printf("results: %d racers, player \"%s\"%c", n, me ? me : "", 10);
@@ -9127,7 +9198,14 @@ static void post_key_screen(int key)
         if (key == PK_OK) tour_open_standings();
         return;
     }
-    if (g_results && key == PK_OK && tun_active()) {
+    if (g_results && key == PK_OK && cyn_between_legs()) {
+        /* port: a canyon duel's leg 1 results (Carbon postrace EnterRepeatRace: canyonFirstPass
+           false, HideRaceOverSummary, intronis) -> the same road again, the roles swapped */
+        g_cyn_next_leg = 1;
+        g_post.action = PR_RESTART;
+        printf("canyon duel: leg 1 done (%.0f points), on to leg 2%c", g_cyn.leg1[0], 10);
+    }
+    else if (g_results && key == PK_OK && tun_active()) {
         /* a test run (NotificationMessage 800f4af0, 0x406415e3): drag ->
            StoreTempTuningSettingsForSwitchingDynoAndTesting + race message 9
            (the run again); else ChangeToNextScreen 800f6040 -- the results are
@@ -9147,7 +9225,7 @@ static void post_key_screen(int key)
    with a sign, 0x577240 flag 2) */
 static void post_results_tick(float dt)
 {
-    if (!g_results || g_prace.drift) return;
+    if (!g_results || g_prace.drift || g_resalt.pts) return;
     if (g_resalt.t <= g_resalt.len) { g_resalt.t += dt; return; }
     g_resalt.t = 0.0f;
     g_resalt.gap = !g_resalt.gap;
@@ -12850,6 +12928,53 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
                     }
                     printf("race: %s knocked out, place %d%c", k ? g_rt.opp[k - 1].name : "player", j + 1, 10);
                 }
+            }
+        }
+        /* port: a canyon duel (canyon.c, Carbon 0x62bd50 every sim tick): the chaser's points,
+           the pass / lose timers, leg 2's catch on points; the duel decided -> both racers out,
+           placed by the duel (RankPlayersByPoints) */
+        if (g_cyn_on && g_rt.n >= 1 && !g_cyn_done && g_rt.start >= 0.0f && g_rt.t >= g_rt.start) {
+            int st = g_cyn.state;
+            if (!g_rt.pfinished) {
+                float L = racepath_lap(g_rt.rp);
+                int ce = canyon_chaser(&g_cyn), le = 1 - ce;       /* race entry 0 the player, 1 the opponent */
+                float cs = ce == 0 ? g_n2s.speed : g_rt.car[0].st.speed;
+                st = canyon_update(&g_cyn, dt, (g_rt.ent[le].dist - g_rt.ent[ce].dist) * L,
+                                   g_rt.ent[ce].dist * L, fabsf(cs));
+            }
+            int over = st != CANYON_RACING || g_rt.pfinished;
+            if (over) {
+                /* who won: the player over the line (leg 1: on to leg 2; leg 2: kept the points);
+                   the chaser 10 s ahead wins / 10 s gone loses; the opponent caught the points;
+                   over the edge loses */
+                int pwin = st == CANYON_RACING ? 1
+                         : st == CANYON_CAUGHT ? 0
+                         : st == CANYON_PASSED ? canyon_chaser(&g_cyn) == 0
+                         : st == CANYON_LOST ? canyon_chaser(&g_cyn) == 1
+                         : g_cyn.overboard_who == 1;
+                g_cyn_done = st == CANYON_RACING && g_cyn.leg == 1 ? 1 : 2;
+                if (g_cyn_done == 1) { g_cyn.leg1[0] = g_cyn.score[0]; g_cyn.leg1[1] = g_cyn.score[1]; }
+                static const char *const k_why[6] = { "over the line", "?", "caught on points", "over the edge",
+                                                      "passed and held 10 s", "lost the leader 10 s" };
+                printf("canyon duel: leg %d over (%s), points player %.0f opponent %.0f -- %s\n", g_cyn.leg,
+                       k_why[st >= 0 && st < 6 ? st : 1], g_cyn.score[0], g_cyn.score[1],
+                       g_cyn_done == 1 ? "leg 2 next" : pwin ? "the player wins" : "the opponent wins");
+                for (int k = 0; k <= 1; k++) if (!g_rt.ent[k].place) g_rt.ftime[k] = rt_project_time(k);
+                for (int k = 0; k <= 1; k++) {
+                    g_rt.ent[k].place = (k == 0) == pwin ? 1 : 2;
+                    if (k > 0) airacer_park(g_rt.car[0].r);
+                    else if (!g_rt.pfinished) {
+                        g_rt.pfinished = 1;
+                        g_rt.pfin_tick = g_rt.ticks;
+                        g_rt.pdrv = airacer_take_over(g_rt.w, g_rt.human, g_n2, g_rt.psuv, player_half_wid);
+                        airacer_free(g_rt.human); g_rt.human = NULL;
+                        g_n2_dsteer_on = 0;
+                        if (g_rt.pdrv) airacer_park(g_rt.pdrv);
+                    }
+                }
+                g_rt.places = 2;
+                race_standings(order, g_rt.n + 1);
+                g_rt.ppos = g_rt.ent[0].pos;
             }
         }
         /* RCSTATE_RACE_IN_PROGRESS (0x60b3a0): every human finished and the
@@ -24336,7 +24461,7 @@ int main(int argc, char **argv) {
                 g_rt.field_gone = 1; g_rt.ndraw = 0;
                 nisdraw_free(g_rt.nisd); g_rt.nisd = NULL;   /* 0x43b640: the scene stops */
                 rt_results(dataroot, carname);
-                if (g_career_mode && g_eng.commit && g_career.engaged_event) {
+                if (g_career_mode && g_eng.commit && g_career.engaged_event && !cyn_between_legs()) {
                     /* the engaged event's result, committed only when the post-race
                        screens are left (MarkCurrentEventComplete 80126768): a
                        Restart races it again uncommitted */
@@ -24366,11 +24491,11 @@ int main(int argc, char **argv) {
                            career_string((uint16_t)(g_career.engaged_event[0] | g_career.engaged_event[1] << 8)),
                            g_rt.ent[0].place, g_eng.won ? "won" : "lost");
                 }
-                if (g_bey_freerace && !g_career_mode) {   /* World Expansion (port): its own progress file */
+                if (g_bey_freerace && !g_career_mode && !cyn_between_legs()) {   /* World Expansion (port): its own progress file */
                     int id = world.city.ev[world.city.race.ev].id;
                     int place = g_rt.drift ? rt_drift_place() : g_rt.dstatus[0] ? 0 : g_rt.ent[0].place;
                     int won = place == 1;
-                    int ticks = g_rt.drift || !place ? 0 : g_rt.ftime[0];
+                    int ticks = g_rt.drift || g_cyn_on || !place ? 0 : g_rt.ftime[0];
 #ifdef OPENUG2_SIM_PRE_H
                     if (getenv("OPENUG2_SIM_WIN")) won = 1;   /* test aid (simulator): count the race as won */
 #endif
@@ -24393,7 +24518,7 @@ int main(int argc, char **argv) {
                            ticks && (!was_best || ticks < was_best) ? " -- best time" : "",
                            beyond_progress_won_count());
                 }
-                {   /* trophies (trophy.c, the port's own): a won race with underglow, a career drift */
+                if (!cyn_between_legs()) {   /* trophies (trophy.c, the port's own): a won race with underglow, a career drift */
                     int career_ev = g_career_mode && g_eng.commit && g_career.engaged_event;
                     int won = career_ev ? g_eng.won
                             : g_rt.drift ? rt_drift_place() == 1 : g_rt.ent[0].place == 1 && !g_rt.dstatus[0];
@@ -24402,7 +24527,7 @@ int main(int argc, char **argv) {
                 }
                 for (int i = 0; i < g_nstat; i++) {   /* the player's time / score to the high scores */
                     const RtStat *r = &g_stat[i];
-                    if (r->k != 0 || !g_rt.ent[0].place || g_rt.dstatus[0]) continue;
+                    if (r->k != 0 || !g_rt.ent[0].place || g_rt.dstatus[0] || g_cyn_on) continue;   /* a duel's legs: no lap times */
                     int v = g_rt.drift ? (int)r->dscore : r->best;
                     if (v > 0 && hs_commit(g_rt.drift ? HS_DRIFT : HS_LAP, g_rt.ev, g_rt_reverse, v))
                         printf("high score: event %d %s %d\n", g_rt.ev, g_rt.drift ? "drift" : "lap", v);
@@ -24760,6 +24885,23 @@ int main(int argc, char **argv) {
             if (!g_ride.contact_mask) {
                 if (air_run++ == 0) memcpy(lost, carpos, sizeof lost);
             } else air_run = 0;
+            /* port: a canyon duel -- off the cliff (0.5 s in the air, 6 m under the road) is
+               PlayerWentOverboardInCanyonDuel (0x64c2f0): the duel lost, no reset */
+            if (g_cyn_on && !g_cyn_done && g_rt.active && have_good && air_run > 30 &&
+                carpos[2] < good[0][2] - 6.0f && g_cyn.state == CANYON_RACING) {
+                /* a road still overhead (within 4 m of where the car last stood) is a hole
+                   in the collision, not the cliff: the normal reset below handles it */
+                float gz = good[0][2];
+                int cat = world_ground_at(&scene, carpos[0], carpos[1], 1e9f, &gz);
+                if (cat != WSURF_NONE && gz > carpos[2] + 1.0f && fabsf(gz - good[0][2]) < 4.0f) {
+                    static int said;
+                    if (!said) { said = 1; printf("canyon duel: fell under the road at (%.0f, %.0f) -- a collision hole, not the edge\n", carpos[0], carpos[1]); }
+                } else {
+                    canyon_overboard(&g_cyn, 0);
+                    printf("canyon duel: the player went over the edge at (%.0f, %.0f), %.1f m down\n",
+                           carpos[0], carpos[1], good[0][2] - carpos[2]);
+                }
+            }
             if (have_good && air_run > 90 && carpos[2] < good[0][2] - 10.0f) {
                 const float *r = good[have_good - 1];
                 float gz_ref = r[2], gz_top = r[2];
@@ -30631,7 +30773,8 @@ int main(int argc, char **argv) {
             if (hs.dyno && hs.race_over && !g_rt.drag) hud_postrace = 1;   /* IsFinishedRacing: mask 0 */
             /* DetermineHudFeatures 0x600090: player zone 6 / 7 (the jump cams) -> 0, no HUD */
             if (jumpcam_zone() == 6 || jumpcam_zone() == 7) hud_postrace = 1;
-            if (VITA_PROBE(10) && !g_rt.nis_cam && !hud_postrace) hud_draw(hud_now, &rp, &quad, &hs, W, H);   }
+            if (VITA_PROBE(10) && !g_rt.nis_cam && !hud_postrace) hud_draw(hud_now, &rp, &quad, &hs, W, H);
+            if (g_cyn_on && g_rt.active && hud && !g_rt.nis_cam && !hud_postrace) cyn_hud_draw(hud, &rp, &quad, W, H);   }
             pf_mark(PF_PD_HUD);
 #ifdef __vita__
             if (world2 && race_state == 0 && world.city.race.active && race_place_pending)

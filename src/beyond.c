@@ -194,7 +194,7 @@ void beyond_close(void) {
    calls (beyond_event_count/_at/_start) see the set beyond_events_select picked (default BEYOND). */
 #define BX_MAXEV 512
 #define BX_XP_ROUTES "ux0:data/NFSU2/TRACKS"
-static struct { int id, type, len, has_start; float start[3], head; char name[40], stem[8]; } g_bx_ev[BX_MAXEV];
+static struct { int id, type, len, mode, has_start; float start[3], head; char name[40], stem[8]; } g_bx_ev[BX_MAXEV];
 static int g_bx_nev = -1;
 static short g_bx_view[BX_MAXEV];
 static int g_bx_nview = -1;
@@ -234,7 +234,17 @@ static void bx_events_set(const char *dir, const char *stem) {
         }
         fclose(f);
     }
-    printf("beyond: %s: %d race events, %d free-roam starts\n", stem, g_bx_nev - first, ns);
+    int nmo = 0;
+    snprintf(p, sizeof p, "%s/modes.txt", dir);
+    if ((f = fopen(p, "r")) != NULL) {   /* "id mode": the event's own MW / Carbon rules (BX_MODE_*) */
+        while (fgets(line, sizeof line, f)) {
+            int id, mo;
+            if (sscanf(line, "%d %d", &id, &mo) != 2 || mo <= 0 || mo >= BX_MODE_COUNT) continue;
+            for (int i = first; i < g_bx_nev; i++) if (g_bx_ev[i].id == id) { g_bx_ev[i].mode = mo; nmo++; }
+        }
+        fclose(f);
+    }
+    printf("beyond: %s: %d race events, %d free-roam starts, %d own-rule events\n", stem, g_bx_nev - first, ns, nmo);
 }
 static void bx_events_load(void) {
     if (g_bx_nev >= 0) return;
@@ -332,6 +342,7 @@ int beyond_event_start(int i, float p[3], float *head) {
     return 1;
 }
 int beyond_event_type(int id) { int i = bx_ev_index(id); return i < 0 ? -1 : g_bx_ev[i].type; }
+int beyond_event_mode(int id) { int i = bx_ev_index(id); return i < 0 ? 0 : g_bx_ev[i].mode; }
 const char *beyond_event_name(int id) { int i = bx_ev_index(id); return i < 0 ? NULL : g_bx_ev[i].name; }
 /* the Quick Race track map of a Beyond event: ROUTESBEYOND/TRACKMAP<id>.bin
    (BeyondDev tools/events/trackmaps.py, the minimap's BMAP format), RGBA,

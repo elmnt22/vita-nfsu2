@@ -143,10 +143,16 @@ static int nm_bin(Nm *m, const uint8_t *b, size_t n, int with_last)
 #define F_BARRIERS 0xe244f26bu      /* the race's own BARRIER_SPLINE_<n> scenery groups ('*' = the other way round) */
 #define VCOL 0x8e112eb7u
 enum { RT_CIRCUIT = 0, RT_SPRINT = 1, RT_DRAG = 4, RT_DRIFT = 5 };   /* UG2's race types (AIRACE_*) */
+/* the event's own rules where MW / Carbon differ from UG2's type (modes.txt "id mode"; xpmode.h) */
+enum { XM_NONE = 0, XM_CANYON_DUEL = 1, XM_CANYON_SPRINT = 2, XM_CANYON_DRIFT = 3, XM_CHECKPOINT = 4,
+       XM_TOLLBOOTH = 5, XM_SPEEDTRAP = 6, XM_LAPKO = 7, XM_NMODES = 8 };
+static const char *const k_mode_label[XM_NMODES] = { NULL, "Canyon Duel", "Canyon Sprint", "Canyon Drift",
+                                                      "Checkpoint", "Tollbooth", "Speedtrap", "Lap Knockout" };
 typedef struct { uint32_t key; int ord; D3 p; float rot; } PosE;   /* rot: F_ROT, degrees = the world heading */
 typedef struct {
     char name[64]; int type, order; uint32_t par;   /* par: the parent collection (Carbon: the type) */
     int closed;                             /* laps (circuits, Carbon's drift races); else start -> finish */
+    int mode;                               /* XM_*: the game's own event (canyon duel, speedtrap, ...) */
     uint32_t *cps, *child; int ncps, nchild;
     char (*bar)[24]; int nbar;              /* as listed ('*' kept) */
     D3 *wp; int nwp;
@@ -199,6 +205,26 @@ static int carbon_type(uint32_t par)
     for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
         if (vlt_hash((const uint8_t *)k[i].n, strlen(k[i].n)) == par) return k[i].t;
     return -1;
+}
+static int carbon_mode(uint32_t par)
+{
+    static const struct { const char *n; int m; } k[] = {
+        { "canyon", XM_CANYON_DUEL }, { "canyonsprint", XM_CANYON_SPRINT }, { "canyondrift", XM_CANYON_DRIFT },
+        { "tollboothrace", XM_CHECKPOINT }, { "speedtraprace", XM_SPEEDTRAP },
+    };
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (vlt_hash((const uint8_t *)k[i].n, strlen(k[i].n)) == par) return k[i].m;
+    return XM_NONE;
+}
+static int mw_mode(const char *name)
+{
+    char n[64]; int i = 0;
+    for (; name[i] && i < 63; i++) n[i] = (char)(name[i] >= 'A' && name[i] <= 'Z' ? name[i] + 32 : name[i]);
+    n[i] = 0;
+    if (strstr(n, "tollbooth")) return XM_TOLLBOOTH;
+    if (strstr(n, "speedtrap")) return XM_SPEEDTRAP;
+    if (strstr(n, "lap_ko") || strstr(n, "lapknockout") || strstr(n, "knockout")) return XM_LAPKO;
+    return XM_NONE;
 }
 static int is_barrier_name(const uint8_t *s, size_t n)
 {
@@ -358,6 +384,7 @@ static int read_races(const uint8_t *gp, size_t gn, Race **out, int *nout, const
     for (int i = 0; i < nr && ok; i++) {
         Race *r = &R[i];
         r->type = carbon ? carbon_type(r->par) : race_type(r->name);
+        r->mode = carbon ? carbon_mode(r->par) : mw_mode(r->name);
         r->closed = r->type == RT_CIRCUIT ||
                     (r->type == RT_DRIFT && r->par == vlt_hash((const uint8_t *)"driftrace", 9));
         const PosE *sg = NULL, *fl = NULL;
@@ -1020,7 +1047,7 @@ static int routes_bin(const DPolys *S, int closed, FILE *f)
 }
 
 /* ---- the whole set ---- */
-typedef struct { int id, type, closed, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; } EvMeta;   /* pl: the route, x y every ~15 m */
+typedef struct { int id, type, closed, mode, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; } EvMeta;   /* pl: the route, x y every ~15 m */
 static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t *recs, const unsigned char *keep, int reread)
 {
     int nk = 0; for (int i = 0; i < nm; i++) nk += keep[i];
@@ -1133,7 +1160,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         f = okw ? fopen(p, "wb") : NULL;
         if (f) { okw = routes_bin(&S, closed, f); if (fclose(f)) okw = 0; } else okw = 0;
         if (!okw) { free(ch); rc = XP_ERR_WRITE; goto done; }
-        EvMeta *m = &meta[nm]; m->id = ev; m->type = r->type; m->closed = r->closed; m->len = (int)pyround(L); m->partlen = part.n;
+        EvMeta *m = &meta[nm]; m->id = ev; m->type = r->type; m->closed = r->closed; m->mode = r->mode; m->len = (int)pyround(L); m->partlen = part.n;
         /* a barrier the route still crosses (no way round it the format holds) stays off */
         size_t bl = 0; for (int b = 0; b < r->nbar; b++) bl += strlen(r->bar[b]) + 1;
         m->bars = malloc(bl + 1); if (!m->bars) { free(ch); goto done; }
@@ -1195,12 +1222,16 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         char p[600]; snprintf(p, sizeof p, "%s/events.txt", out_dir);
         FILE *fe = fopen(p, "w"); snprintf(p, sizeof p, "%s/starts.txt", out_dir);
         FILE *fs = fopen(p, "w"); snprintf(p, sizeof p, "%s/barriers.txt", out_dir);
-        FILE *fb = fopen(p, "w");
-        int okw = fe && fs && fb, cnt[6] = {0};
+        FILE *fb = fopen(p, "w"); snprintf(p, sizeof p, "%s/modes.txt", out_dir);
+        FILE *fmo = fopen(p, "w");
+        int okw = fe && fs && fb && fmo, cnt[6 * XM_NMODES] = {0};
         for (int i = 0; i < nm && okw; i++) {
-            const char *label = meta[i].type == RT_CIRCUIT ? "Circuit" : meta[i].type == RT_SPRINT ? "Sprint" :
+            const char *label = meta[i].mode ? k_mode_label[meta[i].mode] :
+                                meta[i].type == RT_CIRCUIT ? "Circuit" : meta[i].type == RT_SPRINT ? "Sprint" :
                                 meta[i].type == RT_DRIFT ? "Drift" : "Drag";
-            fprintf(fe, "%d %d %d %s %s %d\n", meta[i].id, meta[i].type, meta[i].len, city, label, ++cnt[meta[i].type]);
+            fprintf(fe, "%d %d %d %s %s %d\n", meta[i].id, meta[i].type, meta[i].len, city, label,
+                    ++cnt[meta[i].mode * 6 + meta[i].type]);
+            if (meta[i].mode) fprintf(fmo, "%d %d\n", meta[i].id, meta[i].mode);
             fputs(meta[i].start, fs);
             if (meta[i].bars && meta[i].bars[0]) fprintf(fb, "%d %s\n", meta[i].id, meta[i].bars);
             st->events++;
@@ -1222,6 +1253,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         if (fe && fclose(fe)) okw = 0;
         if (fs && fclose(fs)) okw = 0;
         if (fb && fclose(fb)) okw = 0;
+        if (fmo && fclose(fmo)) okw = 0;
         rc = okw ? XP_OK : XP_ERR_WRITE;
     }
 done:

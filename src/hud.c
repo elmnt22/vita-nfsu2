@@ -5005,6 +5005,46 @@ void hud_draw_banner(Hud *h, const RProg *rp, GpuMesh *quad, const char *text,
     glBlendFunc((GLenum)blend_src, (GLenum)blend_dst);
 }
 
+/* Lines of text in the game's HUD font (the banner's): FEng point (x, y), scale, justification
+   (0 left, 1 centre, 2 right), colour 0xAARRGGBB; an optional dark plate behind (plate[4]: centre
+   x, y, w, h in FEng units, w <= 0 none) -- the canyon duel's score panel (port) */
+void hud_draw_lines(Hud *h, const RProg *rp, GpuMesh *quad, int width, int height,
+                    const HudLine *ln, int n, const float *plate) {
+    if (!h || !rp || !quad || !ln || n <= 0 || width <= 0 || height <= 0) return;
+    HudDC dc; dc.rp = rp; dc.quad = quad; dc.asp = (float)width / (float)height;
+    GLboolean depth_on = glIsEnabled(GL_DEPTH_TEST), blend_on = glIsEnabled(GL_BLEND);
+    GLint blend_src = GL_SRC_ALPHA, blend_dst = GL_ONE_MINUS_SRC_ALPHA;
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &blend_src);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &blend_dst);
+    GLboolean depth_mask = GL_TRUE; glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+    GLfloat fog_density = 0.0f; glGetUniformfv(rp->prog, rp->uFogDensity, &fog_density);
+    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUniform1f(rp->uVColor, 0.0f); glUniform1f(rp->uFogDensity, 0.0f);
+    glUniform1f(rp->uDecal, 0.0f); glUniform1f(rp->uAlphaTest, 0.0f);
+    glUniform1f(rp->uTextureAlpha, 1.0f); glUniform1f(rp->uVista, 0.0f);
+    glUniform3f(rp->uEmissive, 0.0f, 0.0f, 0.0f);
+    if (plate && plate[2] > 0.0f && plate[3] > 0.0f) {
+        float nx, ny; fe_ndc(dc.asp, 0, plate[0], plate[1], &nx, &ny);
+        hud_blit(&dc, 0, plate[2] / 240.0f, plate[3] / 240.0f, nx, ny, 0.0f, 0.0f, 0.0f, 0.0f, 0.55f);
+    }
+    int fi = hud_menu_font(h);
+    for (int i = 0; i < n; i++) {
+        uint32_t c = ln[i].argb;
+        float rgba[4] = { (float)((c >> 16) & 255) / 255.0f, (float)((c >> 8) & 255) / 255.0f,
+                          (float)(c & 255) / 255.0f, (float)(c >> 24) / 255.0f };
+        hud_menu_text(h, &dc, fi, ln[i].txt, ln[i].x, ln[i].y, ln[i].scale, ln[i].just, rgba);
+    }
+    glUniform1f(rp->uUseTex, 0.0f); glUniform1f(rp->uUnlit, 0.0f);
+    glUniform1f(rp->uEmissiveTex, 0.0f); glUniform1f(rp->uAlpha, 1.0f);
+    glUniform1f(rp->uTextureAlpha, 0.0f); glUniform1f(rp->uFogDensity, fog_density);
+    glUniform3f(rp->uColor, 1.0f, 1.0f, 1.0f);
+    glDepthMask(depth_mask);
+    if (depth_on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (blend_on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    glBlendFunc((GLenum)blend_src, (GLenum)blend_dst);
+}
+
 /* A polyline in FEng screen space (640x480, origin at the centre, y down),
    n points xy[2n], colour 0xAARRGGBB, `width` FEng units: the FEGraph lines
    (DynoRunChartScreen::SetupGraph PC 0x53d0a0) */

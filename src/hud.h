@@ -474,6 +474,10 @@ void hud_fe_lines(const RProg *rp, GpuMesh *quad, int width, int height,
 void hud_draw_movie(const RProg *rp, GpuMesh *quad, GLuint tex, int tw, int th, int width, int height);
 void hud_draw_banner(Hud *h, const RProg *rp, GpuMesh *quad, const char *text,
                      const char *sub, int width, int height);
+/* text lines in the HUD font at FEng points (640x480 centred, y down); plate: x, y, w, h or NULL */
+typedef struct { const char *txt; float x, y, scale; int just; uint32_t argb; } HudLine;
+void hud_draw_lines(Hud *h, const RProg *rp, GpuMesh *quad, int width, int height,
+                    const HudLine *ln, int n, const float *plate);
 
 /* Clearly-labelled sample values for layout review. Off by default. */
 void hud_set_preview(Hud *h, int on);
