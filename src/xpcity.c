@@ -77,8 +77,10 @@ static void make_map(int c, const char *troot)
     snprintf(g_map, sizeof g_map, "%s/%s.MAP", troot, k_city[c].companion);
     if (xp_file_size(g_map) > 0) return;
     snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s/MINI_MAP.BIN", k_city[c].dir, k_city[c].companion);
+    if (k_city[c].game == XP_GAME_CARBON)   /* no map art for the city: drawn from its road collision */
+        snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
     int rc = xp_file_size(raw) > 0 ? xp_minimap(raw, g_map, k_city[c].game) : XP_ERR_OPEN_IN;
-    vita_mark("xpcity: minimap %s: %s", g_map, rc == XP_OK ? "made" : "none (no raw MINI_MAP.BIN)");
+    vita_mark("xpcity: minimap %s: %s", g_map, rc == XP_OK ? "made" : "none (no raw MINI_MAP.BIN / stream)");
 }
 /* the free-roam road net (TRACKS/ROUTES<companion>/RoutesFreeRoam.bin): from the PC tool, or
    made here from the companion bundle's road network (xproads.c, well under a second) */

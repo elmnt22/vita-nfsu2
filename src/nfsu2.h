@@ -4450,7 +4450,9 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             int is_p8   = fmt == N2_TEXFMT_P8   && palsz >= 1024;
             int is_dxt1 = fmt == N2_TEXFMT_DXT1 && palsz <  1024;
             int is_dxt3 = fmt == N2_TEXFMT_DXT3 && palsz <  1024;
-            if (!is_p8 && !is_dxt1 && !is_dxt3) continue;   /* unknown/contradictory tag */
+            /* DXT5: no UG2 pack has it; the World Expansion's translated Carbon packs do */
+            int is_dxt5 = fmt == N2_TEXFMT_DXT5 && palsz <  1024;
+            if (!is_p8 && !is_dxt1 && !is_dxt3 && !is_dxt5) continue;   /* unknown/contradictory tag */
             /* the Vita's kept-DXT path never decodes: no w*h*3 + w*h buffers to
                allocate and free again (they fragmented the heap); elsewhere a
                failed allocation skips the texture instead of writing through
@@ -4515,7 +4517,7 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                  * inside n2_dxt3. blocks_x/y use ceil-to-4 so a non-multiple-
                  * of-4 dimension (the source data is not guaranteed aligned)
                  * still gets a correct, slightly-padded block count. */
-                long dxt3 = is_dxt3;   /* format choice: from the proven +0x3e tag, not size */
+                long dxt3 = is_dxt3 || is_dxt5;   /* 16-byte blocks; format from the proven +0x3e tag, not size */
                 long bx = ((long)w + 3) / 4, by = ((long)hh + 3) / 4;
                 long need = bx * by * (dxt3 ? 16 : 8);
                 long pb = dbase >= 0 ? dbase : 0;
@@ -4558,14 +4560,15 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
 #ifdef __vita__
                 if (n2_tpk_keep_dxt && n2_tpk_skip_pixels) {
                     free(tex->rgb); tex->rgb = NULL; free(alf); alf = NULL;
-                    tex->afmt = dxt3 ? 3 : 1;
+                    tex->afmt = is_dxt5 ? 5 : dxt3 ? 3 : 1;
                 } else
 #endif
-                if (dxt3) { n2_dxt3(src, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                if (is_dxt5) { n2_dxt5(src, w, hh, tex->rgb, alf); tex->afmt = 5; }
+                else if (dxt3) { n2_dxt3(src, w, hh, tex->rgb, alf); tex->afmt = 3; }
                 else      { n2_dxt1(src, w, hh, tex->rgb, alf); tex->afmt = 1; }
 #ifdef __vita__
                 if (n2_tpk_keep_dxt) {   /* ownership of the chain moves to tex */
-                    tex->dxt = fsrc; tex->dxtlen = (int)chain; tex->dxtfmt = dxt3 ? 3 : 1;
+                    tex->dxt = fsrc; tex->dxtlen = (int)chain; tex->dxtfmt = is_dxt5 ? 5 : dxt3 ? 3 : 1;
                     fsrc = NULL;
                 }
 #endif

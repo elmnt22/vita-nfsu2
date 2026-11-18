@@ -72,6 +72,11 @@ static XpStats st;
 /* the night relight (X4): MW's daytime vertex colours x these (B, G, R): a cool,
    dim night like Bayview's prelight; 0 for the sky solids */
 static int g_night, g_relight;
+/* shading group record: MW 0x68 B (+0x3c vertices, +0x40 triangles); Carbon 0x90 B
+   (+0x40 vertices, +0x60 triangles, +0x64 index start, +0x7c index count). Both:
+   +0 bmin, +0xc bmax, +0x18 texture slots, +0x30 effect (a new vertex stream at each
+   change; Carbon strides 36/44/48/52 B, the first 36 B always pos/normal/colour/uv) */
+static size_t g_grec = 0x68, g_gvo = 0x3c, g_gto = 0x40;
 static const float k_night[3] = { 0.50f, 0.40f, 0.36f };
 static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
 {
@@ -83,7 +88,7 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
         const uint8_t *d = p + q + 8;
         if (q + 8 + sz > n) { st.bad++; return; }
         if (id == 0x134b01 && nvb < MAXS) { size_t f = skip_fill(d, sz); vb[nvb] = d + f; vbn[nvb] = sz - f; nvb++; }
-        else if (id == 0x134b02) { size_t f = skip_fill(d, sz); grp = d + f; ngrp = (sz - f) / 0x68; }
+        else if (id == 0x134b02) { size_t f = skip_fill(d, sz); grp = d + f; ngrp = (sz - f) / g_grec; }
         else if (id == 0x134b03) { size_t f = skip_fill(d, sz); idx = d + f; nidx = (sz - f) / 2; }
         q += 8 + sz;
     }
@@ -94,11 +99,11 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
     uint32_t svert[MAXS] = {0};
     int s = 0;
     for (size_t g = 0; g < ngrp; g++) {
-        const uint8_t *r = grp + g * 0x68;
+        const uint8_t *r = grp + g * g_grec;
         eff[g] = rd32(r + 0x30);
         if (g > 0 && eff[g] != eff[g - 1]) s++;
         if (s >= nvb) { st.bad++; return; }
-        gs[g] = s; gv[g] = rd32(r + 0x3c); gt[g] = rd32(r + 0x40);
+        gs[g] = s; gv[g] = rd32(r + g_gvo); gt[g] = rd32(r + g_gto);
         svert[s] += gv[g];
         if (eff[g] < 32) st.effects[eff[g]]++;
     }
@@ -141,7 +146,7 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
     {   size_t c = open_chunk(o, 0x134b02); align_fill(o, 0x10);
         uint32_t start = 0;
         for (size_t g = 0; g < ngrp; g++) {
-            const uint8_t *r = grp + g * 0x68;
+            const uint8_t *r = grp + g * g_grec;
             uint8_t u[60]; memset(u, 0, sizeof u);
             uint32_t cnt = gt[g] * 3, tex = r[0x18], mat = r[0x1d];
             memcpy(u + 0, r + 0, 12); memcpy(u + 12, &cnt, 4); memcpy(u + 16, r + 12, 12);
@@ -222,8 +227,32 @@ static void conv_infos(Buf *o, const uint8_t *d, size_t sz)
     }
     close_chunk(o, c);
 }
+static int g_game;
+/* Carbon instance (0x60 B): +0 bmin, +0xc flags, +0x10 bmax, +0x1c s16 preculler, +0x20 position,
+   +0x2c float 3x3 (scale included), +0x50 key, +0x54 scenery info number */
+static void conv_insts_carbon(Buf *o, const uint8_t *d, size_t sz)
+{
+    size_t f = skip_fill(d, sz); size_t n = (sz - f) / 0x60;
+    size_t c = open_chunk(o, 0x34103); align_fill(o, 0x10);
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t *r = d + f + i * 0x60;
+        uint8_t u[0x40]; memset(u, 0, sizeof u);
+        memcpy(u, r, 12); memcpy(u + 12, r + 0x10, 12);    /* bbox */
+        memcpy(u + 24, r + 0x54, 2);                       /* scenery info number */
+        int32_t pc = (int16_t)(r[0x1c] | r[0x1d] << 8); memcpy(u + 28, &pc, 4);
+        memcpy(u + 32, r + 0x20, 12);                      /* position */
+        for (int k = 0; k < 9; k++) {                      /* rotation: s16, 0x2000 = 1 */
+            float m; memcpy(&m, r + 0x2c + 4 * k, 4);
+            long q = lroundf(m * 8192.0f); int16_t v = (int16_t)(q < -32768 ? -32768 : q > 32767 ? 32767 : q);
+            memcpy(u + 44 + 2 * k, &v, 2);
+        }
+        put(o, u, sizeof u); st.insts++;
+    }
+    close_chunk(o, c);
+}
 static void conv_insts(Buf *o, const uint8_t *d, size_t sz)
 {
+    if (g_game == XP_GAME_CARBON) { conv_insts_carbon(o, d, sz); return; }
     size_t f = skip_fill(d, sz); size_t n = (sz - f) / 0x40;
     size_t c = open_chunk(o, 0x34103); align_fill(o, 0x10);
     for (size_t i = 0; i < n; i++) {
@@ -280,6 +309,21 @@ static int mw_surface(uint32_t key, int wall)
 static void mw_world(const float *ph, float *w) { w[0] = ph[2]; w[1] = -ph[0]; w[2] = ph[1]; }
 static int16_t q16(float v) { long k = lroundf(v); return (int16_t)(k < -32768 ? -32768 : k > 32767 ? 32767 : k); }
 
+/* the minimap collector (Carbon has no map art for its city): every ground triangle's
+   xy + its surface key, instead of the collision pack */
+typedef struct { float xy[6]; uint32_t key; } MmTri;
+static MmTri *g_mm; static size_t g_mmn, g_mmcap; static int g_mm_on;
+static void mm_add(const float *a, const float *b, const float *c, uint32_t key)
+{
+    if (g_mmn == g_mmcap) {
+        size_t n = g_mmcap ? g_mmcap * 2 : 65536;
+        MmTri *t = realloc(g_mm, n * sizeof *t); if (!t) { g_oom = 1; return; }
+        g_mm = t; g_mmcap = n;
+    }
+    MmTri *t = &g_mm[g_mmn++];
+    t->xy[0] = a[0]; t->xy[1] = a[1]; t->xy[2] = b[0]; t->xy[3] = b[1]; t->xy[4] = c[0]; t->xy[5] = c[1];
+    t->key = key;
+}
 static void bake_article(const uint8_t *a, size_t an, const float *ip, int grp)
 {
     if (an < 16) { st.bad++; return; }
@@ -314,6 +358,7 @@ static void bake_article(const uint8_t *a, size_t an, const float *ip, int grp)
             memcpy(t.v[3], t.v[2], 12);
             t.nv = 3;
             int si = v[8 * (i + 2) + 6];
+            if (g_mm_on) { if (nz / l >= 0.25f) mm_add(t.v[0], t.v[1], t.v[2], si < nsf ? rd32(sf + 4 * si) : 0); continue; }
             t.surf = mw_surface(si < nsf ? rd32(sf + 4 * si) : 0, 0);
             t.flags = nz / l < 0.25f ? 0x08 : 0x01;          /* steep: UG2's 0x8 wall triangles; ground: layered */
             t.grp = grp;
@@ -321,7 +366,7 @@ static void bake_article(const uint8_t *a, size_t an, const float *ip, int grp)
         }
     }
     const uint8_t *b = a + 16 + ssz;
-    for (int i = 0; i < nb && 32 * (i + 1) <= bsz; i++) {
+    for (int i = 0; !g_mm_on && i < nb && 32 * (i + 1) <= bsz; i++) {
         const uint8_t *r = b + 32 * i;
         float p0[3], p1[3], w0[3], w1[3];
         memcpy(p0, r, 12); memcpy(p1, r + 16, 12);
@@ -373,7 +418,7 @@ static void conv_carp(Buf *o, const uint8_t *d, size_t sz, const uint8_t *raw)
         bake_article(g_art[ai], g_artn[ai], ip, grp);
         if (grp) st.cgrouped++;
     }
-    if (g_oom) return;
+    if (g_oom || g_mm_on) return;   /* the minimap collector wants the triangles only */
     if (!g_ncp) { st.cempty++; return; }
     {   /* walls taller than the packed 250 m: MW's endless walls (-128..1024 m). Keep
            the part around this pack's ground; keeping the top put them in the sky
@@ -578,6 +623,80 @@ static void lamp_pack(Buf *o, const uint8_t *d, size_t n)
     close_chunk(o, rc); close_chunk(o, pk);
     st.lights += nf;
 }
+/* Carbon texture packs (TPK version 8) -> the UG2 layout the loader reads (n2_tpk_decode):
+   Carbon's 0x33310004 rows are 0x58 bytes (12 zero, then +0 key, +8 pixel offset, +0x10
+   size, +0x1c w/h u16, +0x22 format 0x22/0x24/0x26, +0x29 alpha usage, +0x2a alpha blend)
+   + a length byte + the name. UG2 rows are 0x7c: 12 bytes, a 24-byte name, then the key at
+   name+0x18, offset +0x24, size +0x2c, w/h +0x38, format +0x3e, order/usage/blend/wz
+   +0x45/+0x49/+0x4a/+0x4b. The pixel block is UG2's already (0x78 bytes of 0x11 filler,
+   offsets from the end of it).
+   Alpha (port guess from the names): usage 4/6 = cut out (fences, lit windows), 5/7 =
+   blended (flares, neon, water), blend 2 = additive. Carbon sets most cut-outs in the
+   material, not the texture: its DXT3 textures are all cut-outs (railings, chain-link,
+   foliage, panoramas) and so are its DXT5 ORG_ (plant) ones; other DXT5 alpha is not. */
+static long g_tpk_tex, g_tpk_alpha;
+static void tpk_rows_carbon(Buf *o, const uint8_t *d, size_t n)
+{
+    size_t c = open_chunk(o, 0x33310004);
+    for (size_t q = 0; q + 0x59 <= n; ) {
+        const uint8_t *C = d + q + 0xc;
+        size_t L = d[q + 0x58];
+        if (q + 0x59 + L > n) { st.bad++; break; }
+        uint8_t r[0x7c]; memset(r, 0, sizeof r);
+        uint8_t *N = r + 12;
+        const char *nm = (const char *)d + q + 0x59;
+        size_t k = 0;
+        if (!(nm[0] >= 'A' && nm[0] <= 'Z')) N[k++] = 'X';   /* the loader finds a row by its capital */
+        for (size_t j = 0; j < L && nm[j] && k < 23; j++) N[k++] = (uint8_t)nm[j];
+        memcpy(N + 0x18, C, 4);            /* key */
+        memcpy(N + 0x1c, C + 4, 4);        /* class */
+        memcpy(N + 0x24, C + 8, 4);        /* pixel offset */
+        memcpy(N + 0x2c, C + 0x10, 4);     /* size (whole mip chain) */
+        memcpy(N + 0x38, C + 0x1c, 4);     /* w, h */
+        N[0x3e] = C[0x22];
+        int au = C[0x29], ab = C[0x2a];
+        if (au == 4 || au == 6) { N[0x45] = 5; N[0x49] = 1; N[0x4b] = 1; }
+        else if (au == 5 || au == 7) { N[0x45] = 6; N[0x49] = 2; N[0x4a] = ab == 2 ? 2 : 1; }
+        else if (C[0x22] == 0x24 || (C[0x22] == 0x26 && L > 4 && !memcmp(nm, "ORG_", 4))) { N[0x45] = 5; N[0x49] = 1; N[0x4b] = 1; }
+        else N[0x4b] = 1;
+        if (ab == 2) N[0x4a] = 2;
+        if (N[0x49] || N[0x4a]) g_tpk_alpha++;
+        put(o, r, sizeof r); g_tpk_tex++;
+        q += 0x59 + L;
+    }
+    close_chunk(o, c);
+}
+static void conv_tpk_carbon(Buf *o, const uint8_t *d, size_t sz)
+{
+    size_t top = open_chunk(o, 0xb3300000);
+    for (size_t q = 0; q + 8 <= sz; ) {
+        uint32_t id = rd32(d + q), n = rd32(d + q + 4);
+        if (q + 8 + n > sz) { st.bad++; break; }
+        const uint8_t *p = d + q + 8;
+        if (id == 0xb3310000) {
+            size_t h = open_chunk(o, id);
+            for (size_t r = 0; r + 8 <= n; ) {
+                uint32_t cid = rd32(p + r), cn = rd32(p + r + 4);
+                if (r + 8 + cn > n) { st.bad++; break; }
+                if (cid == 0x33310004) tpk_rows_carbon(o, p + r + 8, cn);
+                else if (cid != 0x33310005) put(o, p + r, 8 + cn);   /* 0x33310005: Carbon's per-texture FourCCs */
+                r += 8 + cn;
+            }
+            close_chunk(o, h);
+        } else if (id == 0xb3320000) {
+            size_t h = open_chunk(o, id);
+            for (size_t r = 0; r + 8 <= n; ) {
+                uint32_t cid = rd32(p + r), cn = rd32(p + r + 4);
+                if (r + 8 + cn > n) { st.bad++; break; }
+                if (cid) put(o, p + r, 8 + cn);   /* its alignment padding goes */
+                r += 8 + cn;
+            }
+            close_chunk(o, h);
+        } else put(o, d + q, 8 + n);
+        q += 8 + n;
+    }
+    close_chunk(o, top);
+}
 static int is_walked(uint32_t id) { return id == 0x80134000 || id == 0x80034100; }
 static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const uint8_t *raw);
 static void walk(Buf *o, const uint8_t *p, size_t n)
@@ -595,6 +714,7 @@ static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const u
     else if (id == 0x34102) conv_infos(o, d, sz);
     else if (id == 0x34103) conv_insts(o, d, sz);
     else if (id == 0x3b801) conv_carp(o, d, sz, raw);
+    else if (id == 0xb3300000 && g_game == XP_GAME_CARBON) conv_tpk_carbon(o, d, sz);
     else if (is_walked(id)) { size_t c = open_chunk(o, id); walk(o, d, sz); close_chunk(o, c); }
     else put(o, raw, 8 + sz);
     if (id == 0x80034100 && g_relight) lamp_pack(o, d, sz);   /* after its section */
@@ -607,7 +727,10 @@ int xp_convert(const char *in_path, const char *out_path, int game,
                XpProgress progress, void *ud, XpStats *out_stats)
 {
     g_relight = game == XP_GAME_MW;   /* Carbon is a night city already */
-    memset(&st, 0, sizeof st); g_oom = 0;
+    g_game = game;
+    if (game == XP_GAME_MW) { g_grec = 0x68; g_gvo = 0x3c; g_gto = 0x40; }
+    else { g_grec = 0x90; g_gvo = 0x40; g_gto = 0x60; }
+    memset(&st, 0, sizeof st); g_oom = 0; g_tpk_tex = g_tpk_alpha = 0;
     FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
     FILE *w = fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }
     fseek(f, 0, SEEK_END);
@@ -647,6 +770,7 @@ int xp_convert(const char *in_path, const char *out_path, int game,
     free(o.p); free(chunk); fclose(f);
     if (fclose(w) && rc == XP_OK) rc = XP_ERR_WRITE;
     if (rc != XP_OK) remove(out_path);   /* never leave a half-written stream */
+    if (g_tpk_tex) printf("xp_convert: %ld Carbon textures translated (%ld with alpha)\n", g_tpk_tex, g_tpk_alpha);
     if (out_stats) *out_stats = st;
     return rc;
 }
@@ -683,8 +807,133 @@ static const uint8_t *find_id(const uint8_t *p, size_t n, uint32_t id)
     for (size_t i = 0; i + 8 <= n; i += 4) if (rd32(p + i) == id) return p + i;
     return NULL;
 }
+/* Carbon: Palmont's map drawn from its own collision in MW's map style -- road
+   surfaces light grey on dark grey; the window
+   squares the city's roads (+6%). in_path = the raw STREAML5RA.BUN */
+static int is_road_key(uint32_t k) { return k == 0x19db2f1eu || k == 0x35187254u || k == 0x6ca26f9bu; }
+static void mm_fill(uint8_t *img, int W, const float *xy, float x0, float y0, float px, const uint8_t *rgb)
+{
+    float X[3], Y[3];
+    for (int k = 0; k < 3; k++) { X[k] = (xy[2*k] - x0) / px; Y[k] = (y0 - xy[2*k+1]) / px; }
+    float mnx = fminf(X[0], fminf(X[1], X[2])), mxx = fmaxf(X[0], fmaxf(X[1], X[2]));
+    float mny = fminf(Y[0], fminf(Y[1], Y[2])), mxy = fmaxf(Y[0], fmaxf(Y[1], Y[2]));
+    int ix0 = (int)floorf(mnx), ix1 = (int)ceilf(mxx), iy0 = (int)floorf(mny), iy1 = (int)ceilf(mxy);
+    if (ix1 < 0 || iy1 < 0 || ix0 >= W || iy0 >= W) return;
+    if (ix0 < 0) ix0 = 0;
+    if (iy0 < 0) iy0 = 0;
+    if (ix1 >= W) ix1 = W - 1;
+    if (iy1 >= W) iy1 = W - 1;
+    float d = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+    int any = 0;
+    if (fabsf(d) > 1e-9f)
+        for (int y = iy0; y <= iy1; y++)
+            for (int x = ix0; x <= ix1; x++) {
+                float cx = x + 0.5f, cy = y + 0.5f;
+                float a = ((X[1] - cx) * (Y[2] - cy) - (X[2] - cx) * (Y[1] - cy)) / d;
+                float b = ((X[2] - cx) * (Y[0] - cy) - (X[0] - cx) * (Y[2] - cy)) / d;
+                if (a < 0 || b < 0 || a + b > 1) continue;
+                memcpy(img + ((size_t)y * W + x) * 4, rgb, 3); any = 1;
+            }
+    if (!any) {   /* thinner than a pixel: its middle */
+        int x = (int)((X[0] + X[1] + X[2]) / 3), y = (int)((Y[0] + Y[1] + Y[2]) / 3);
+        if (x >= 0 && y >= 0 && x < W && y < W) memcpy(img + ((size_t)y * W + x) * 4, rgb, 3);
+    }
+}
+static void conv_carp(Buf *o, const uint8_t *d, size_t sz, const uint8_t *raw);
+static int minimap_carbon(const char *in_path, const char *out_path)
+{
+    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    g_mmn = 0; g_mm_on = 1; g_oom = 0;
+    uint8_t *chunk = NULL; size_t cap = 0; int rc = XP_OK;
+    Buf scratch = {0};
+    for (;;) {
+        uint8_t h[8];
+        if (fread(h, 1, 8, f) != 8) break;
+        uint32_t id = rd32(h), sz = rd32(h + 4);
+        if (id != 0x3b801) { if (fseek(f, (long)sz, SEEK_CUR)) break; continue; }
+        if (8 + (size_t)sz > cap) { uint8_t *n = realloc(chunk, 8 + (size_t)sz); if (!n) { rc = XP_ERR_MEMORY; break; } chunk = n; cap = 8 + sz; }
+        memcpy(chunk, h, 8);
+        if (fread(chunk + 8, 1, sz, f) != sz) { rc = XP_ERR_READ; break; }
+        conv_carp(&scratch, chunk + 8, sz, chunk);
+        scratch.n = 0;
+        if (g_oom) { rc = XP_ERR_MEMORY; break; }
+    }
+    fclose(f); free(chunk); free(scratch.p);
+    g_mm_on = 0;
+    free(g_cp); g_cp = NULL; g_ncp = g_cpcap = 0;
+    size_t nr = 0;
+    for (size_t i = 0; i < g_mmn; i++) nr += is_road_key(g_mm[i].key);
+    if (rc == XP_OK && nr < 100) rc = XP_ERR_FORMAT;
+    float *xs = NULL, *ys = NULL;
+    if (rc == XP_OK) { xs = malloc(nr * sizeof *xs); ys = malloc(nr * sizeof *ys); if (!xs || !ys) rc = XP_ERR_MEMORY; }
+    const int W = 1024;
+    uint8_t *img = rc == XP_OK ? malloc((size_t)W * W * 4) : NULL;
+    if (rc == XP_OK && !img) rc = XP_ERR_MEMORY;
+    if (rc == XP_OK) {
+        size_t k = 0;
+        for (size_t i = 0; i < g_mmn; i++)
+            if (is_road_key(g_mm[i].key)) { xs[k] = (g_mm[i].xy[0] + g_mm[i].xy[2] + g_mm[i].xy[4]) / 3; ys[k] = (g_mm[i].xy[1] + g_mm[i].xy[3] + g_mm[i].xy[5]) / 3; k++; }
+        /* the city = the largest 8-connected cluster of 256 m cells with road in them (Carbon's
+           canyon tracks lie kilometres away, outside it) */
+        float gx0 = 1e30f, gy0 = 1e30f, gx1 = -1e30f, gy1 = -1e30f;
+        for (size_t i = 0; i < nr; i++) { gx0 = fminf(gx0, xs[i]); gx1 = fmaxf(gx1, xs[i]); gy0 = fminf(gy0, ys[i]); gy1 = fmaxf(gy1, ys[i]); }
+        int GW = (int)((gx1 - gx0) / 256.0f) + 1, GH = (int)((gy1 - gy0) / 256.0f) + 1;
+        int *lab = calloc((size_t)GW * GH, sizeof *lab), *stk = malloc((size_t)GW * GH * sizeof *stk);
+        float ax = 0, bx = 0, ay = 0, by = 0;
+        if (!lab || !stk) { ax = gx0; bx = gx1; ay = gy0; by = gy1; }   /* no room: every road */
+        else {
+            for (size_t i = 0; i < nr; i++) lab[(int)((ys[i] - gy0) / 256.0f) * GW + (int)((xs[i] - gx0) / 256.0f)] = -1;
+            int best = 0, bestn = 0, nl = 0;
+            for (int c = 0; c < GW * GH; c++) {
+                if (lab[c] != -1) continue;
+                int sp = 0, n = 0; lab[c] = ++nl; stk[sp++] = c;
+                while (sp) {
+                    int e = stk[--sp], ex = e % GW, ey = e / GW; n++;
+                    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                        int nx = ex + dx, ny = ey + dy;
+                        if (nx < 0 || ny < 0 || nx >= GW || ny >= GH || lab[ny * GW + nx] != -1) continue;
+                        lab[ny * GW + nx] = nl; stk[sp++] = ny * GW + nx;
+                    }
+                }
+                if (n > bestn) { bestn = n; best = nl; }
+            }
+            ax = ay = 1e30f; bx = by = -1e30f;
+            for (size_t i = 0; i < nr; i++)
+                if (lab[(int)((ys[i] - gy0) / 256.0f) * GW + (int)((xs[i] - gx0) / 256.0f)] == best) {
+                    ax = fminf(ax, xs[i]); bx = fmaxf(bx, xs[i]); ay = fminf(ay, ys[i]); by = fmaxf(by, ys[i]);
+                }
+        }
+        free(lab); free(stk);
+        float size = fmaxf(bx - ax, by - ay) * 1.06f;
+        size = ceilf(size / 64.0f) * 64.0f;
+        float x0 = (ax + bx) * 0.5f - size * 0.5f, y0 = (ay + by) * 0.5f + size * 0.5f, px = size / W;
+        const uint8_t land[3] = { 41, 41, 41 }, road[3] = { 139, 138, 139 };
+        for (int i = 0; i < W * W; i++) { memcpy(img + 4 * (size_t)i, land, 3);   /* Palmont is land all round (collision is mostly roads) */
+            img[4 * (size_t)i + 3] = 255; }
+        for (size_t i = 0; i < g_mmn; i++) if (!is_road_key(g_mm[i].key)) mm_fill(img, W, g_mm[i].xy, x0, y0, px, land);
+        for (size_t i = 0; i < g_mmn; i++) if (is_road_key(g_mm[i].key)) mm_fill(img, W, g_mm[i].xy, x0, y0, px, road);
+        const float zoom = 1.5f * size / 5633.0f;   /* Bayview's radar reach (TRACKMAP4000: 5633 m, 1.5) */
+        printf("xp_minimap carbon: %zu ground triangles (%zu road), %.0f m from (%.0f, %.0f)\n", g_mmn, nr, size, x0, y0);
+        FILE *o = fopen(out_path, "wb");
+        if (!o) rc = XP_ERR_OPEN_OUT;
+        else {
+            uint32_t hd[3] = { 0, (uint32_t)W, (uint32_t)W }; memcpy(hd, "BMAP", 4);
+            float fl[4] = { x0, y0, size, zoom };
+            int ok = fwrite(hd, 4, 3, o) == 3 && fwrite(fl, 4, 4, o) == 4 && fwrite(img, 4, (size_t)W * W, o) == (size_t)W * W;
+            if (fclose(o) != 0 || !ok) { rc = XP_ERR_WRITE; remove(out_path); }
+        }
+    } else {
+        printf("xp_minimap carbon: %zu ground triangles, %zu road -- keys:", g_mmn, nr);
+        for (size_t i = 0; i < g_mmn && i < 200000; i += 20000) printf(" %08x", g_mm[i].key);
+        printf("\n");
+    }
+    free(xs); free(ys); free(img);
+    free(g_mm); g_mm = NULL; g_mmn = g_mmcap = 0;
+    return rc;
+}
 int xp_minimap(const char *in_path, const char *out_path, int game)
 {
+    if (game == XP_GAME_CARBON) return minimap_carbon(in_path, out_path);
     if (game != XP_GAME_MW) return XP_ERR_FORMAT;
     const float x0 = -1222.4f, y0 = 5063.4f, size = 6656.0f;
     const float zoom = 1.5f * 6656.0f / 5633.0f;              /* Bayview's radar reach (TRACKMAP4000: 5633 m, 1.5) */
@@ -802,9 +1051,34 @@ static void xp_group_name(uint32_t hash, int id, char *out, size_t n)
         }
     snprintf(out, n, "XPGROUP_%d", id);   /* not a race barrier: stays as it is (shown, never solid) */
 }
+/* Carbon's track-section boundaries (0x34152 in 0x80034150): MW's record (+8 s16 section,
+   +10 u8 points, +0xc bbox, +0x1c 2 floats, +0x24 points) with 12 zero bytes more at +0xc
+   -> MW/UG2's layout, the rest of 0x80034150 as it is */
+static void put_sections_carbon(Buf *o, const uint8_t *p, uint32_t n)
+{
+    size_t top = open_chunk(o, 0x80034150);
+    for (uint32_t q = 0; q + 8 <= n; ) {
+        uint32_t id = rd32(p + q), sz = rd32(p + q + 4);
+        if (q + 8 + sz > n) break;
+        if (id != 0x34152) { put(o, p + q, 8 + sz); q += 8 + sz; continue; }
+        const uint8_t *t = p + q + 8;
+        size_t c = open_chunk(o, 0x34152);
+        for (uint32_t r = 0; r + 4 <= sz; ) {
+            uint32_t w = rd32(t + r);
+            if (w == 0 || w == 0x11111111u) { put(o, t + r, 4); r += 4; continue; }
+            uint32_t k = r + 0x30 <= sz ? t[r + 10] : 0;
+            if (!k || r + 0x30 + 8 * k > sz) { put(o, t + r, sz - r); break; }
+            put(o, t + r, 0xc); put(o, t + r + 0x18, 0x18 + 8 * k);
+            r += 0x30 + 8 * k;
+        }
+        close_chunk(o, c);
+        q += 8 + sz;
+    }
+    close_chunk(o, top);
+}
 int xp_companion(const char *in_path, const char *out_path, int game)
 {
-    if (game != XP_GAME_MW) return XP_ERR_FORMAT;
+    if (game != XP_GAME_MW && game != XP_GAME_CARBON) return XP_ERR_FORMAT;
     FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     uint8_t *d = n > 0 ? malloc((size_t)n) : NULL;
@@ -826,6 +1100,7 @@ int xp_companion(const char *in_path, const char *out_path, int game)
         int maxid = 0;
         if (!refs) { free(d); return XP_ERR_MEMORY; }
         for (uint32_t p = 0; p + 20 <= grn; ) {                    /* pass 1: references, ids */
+            if (!rd32(gr + p)) { p += 4; continue; }                 /* Carbon: records 8-aligned */
             uint32_t cnt = (uint32_t)(gr[p + 14] | gr[p + 15] << 8); int gid = gr[p + 12] | gr[p + 13] << 8;
             if (p + 20 + 2 * cnt > grn) { rc = XP_ERR_FORMAT; break; }
             for (uint32_t j = 0; j < cnt; j++) { unsigned m = gr[p + 20 + 2*j] | gr[p + 21 + 2*j] << 8; if (m < np) refs[m]++; }
@@ -836,7 +1111,8 @@ int xp_companion(const char *in_path, const char *out_path, int game)
         for (long q = 0; rc == XP_OK && q + 8 <= n; ) {
             uint32_t id = rd32(d + q), sz = rd32(d + q + 4);
             if (q + 8 + (long)sz > n) break;
-            if (id != 0x34108 && id != 0x34109) put(&o, d + q, 8 + sz);
+            if (id == 0x80034150 && game == XP_GAME_CARBON) put_sections_carbon(&o, d + q + 8, sz);
+            else if (id != 0x34108 && id != 0x34109) put(&o, d + q, 8 + sz);
             q += 8 + (long)sz;
         }
         size_t c = open_chunk(&o, 0x34107);
@@ -848,6 +1124,7 @@ int xp_companion(const char *in_path, const char *out_path, int game)
         if (!rec) { free(refs); free(d); free(o.p); return XP_ERR_MEMORY; }
         c = open_chunk(&o, 0x34108);
         for (uint32_t p = 0; rc == XP_OK && p + 20 <= grn; ) {
+            if (!rd32(gr + p)) { p += 4; continue; }
             uint32_t cnt = (uint32_t)(gr[p + 14] | gr[p + 15] << 8); int gid = gr[p + 12] | gr[p + 13] << 8;
             char nm[32]; xp_group_name(rd32(gr + p + 8), gid, nm, sizeof nm);
             uint8_t h[52]; memset(h, 0, sizeof h);
