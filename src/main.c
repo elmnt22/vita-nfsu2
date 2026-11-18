@@ -27159,8 +27159,9 @@ int main(int argc, char **argv) {
         }
 #endif
         if (lastmode == N2_DRAW_CUTOUT) glUniform1f(rp.uAlphaTest, 0.0f);
-        if (g_dbg.show_track && (passmode == 0 || passmode == 1) && active_resident) {
-            /* the smokeable props: their meshes are out of the batches */
+        if (g_dbg.show_track && (passmode == 0 || passmode == 1) && active_resident && !g_showroom) {
+            /* the smokeable props: their meshes are out of the batches. None in the
+               garage: it stands on the car's world spot, so nearby signs showed in it (GH #28) */
             smk_resident(&active_resident->world.scene, active_resident->resources.mesh_textures,
                          active_resident->resources.mesh_modes, active_resident->generation);
             #ifdef __vita__
@@ -27173,7 +27174,10 @@ int main(int argc, char **argv) {
             smk_draw(&rp, MVP, cam, VIEW_DIST, NULL);
             wa_draw(&rp, MVP, NULL);
             #endif
-            if (tun_active() && tun_on_dyno()) dyroll_draw(&rp, MVP);   /* RenderCars -> RenderRollers */
+            lasttex = (GLuint)-1; lastmode = -1;
+        }
+        if (g_dbg.show_track && (passmode == 0 || passmode == 1) && active_resident && tun_active() && tun_on_dyno()) {
+            dyroll_draw(&rp, MVP);   /* RenderCars -> RenderRollers */
             lasttex = (GLuint)-1; lastmode = -1;
         }
         cb3 = SDL_GetPerformanceCounter();
