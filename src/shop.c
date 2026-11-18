@@ -803,6 +803,8 @@ struct Shop {
     Scroller crib; ShopEntry crib_e[8];
     int platform;             /* PlatformNameMap index, 0 = the default (SHOWROOM) */
     int crib_from_main;       /* uiCareerCrib::bCameFromCareerMain: BACK asks for the main menu, not gameplay */
+    int crib_city;            /* port: the crib opened at an expansion city's garage (xpcity), 0 Bayview */
+    int trip_city, trip_share;   /* port: the expansion trip Play picked (SHOP_ACT_XP_TRIP) */
     int crib_play;            /* the memcard save is CheckMemory's: gameplay after it */
     /* uiCribReward_Sponsors: the stages' chosen sponsors, the current one,
        its contract terms broken into lines and the CTextScroller's top line */
@@ -1862,7 +1864,7 @@ enum { DA_NONE, DA_PAINT_ADD, DA_PART, DA_RIM, DA_PERF_PKG, DA_PERF_STOCK, DA_PE
        DA_LOT_BUY, DA_LOT_TRADE, DA_LOT_BROWSE, DA_LOT_EXIT,
        DA_CRIB_PLAY, DA_CRIB_MAIN, DA_CRIB_TEST, DA_CRIB_SWITCH,
        DA_PART_BUY, DA_RIM_BUY, DA_SHOP_LEAVE, DA_PERF_PKG_BUY, DA_PERF_PART_BUY, DA_GEN_BUY,
-       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_MAG_SAVE, DA_MAG_NOSAVE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY, DA_QR_DELETE, DA_QR_BAYVIEW, DA_QR_BEYOND, DA_QR_ROCKPORT, DA_QR_PALMONT, DA_QR_CITIES };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
+       DA_UQ_PICK, DA_UQ_LEAVE, DA_CWM_RACE, DA_MAG_SAVE, DA_MAG_NOSAVE, DA_TRANS_MANUAL, DA_TRANS_AUTO, DA_BRAND_BUY, DA_QR_DELETE, DA_QR_BAYVIEW, DA_QR_BEYOND, DA_QR_ROCKPORT, DA_QR_PALMONT, DA_QR_CITIES, DA_CRIB_BAYVIEW, DA_CRIB_CITIES, DA_CRIB_ROCKPORT, DA_CRIB_PALMONT, DA_XP_SHARE, DA_XP_FRESH };   /* the crib: 0x451e768e 0x30ed2368 0x34dc1bec */   /* the Car Lot: 0xd05fc3a3 0x526adefc 0x75d1e35e 0x51123592 */
 static void dlg_act(Shop *s, int act);
 static void dialog(Shop *s, int pk, int nbtn, uint32_t msg, int act, uint32_t b1, uint32_t b2);
 /* PartSelectionScreen 801615f8 in the career: a part to buy -- too little
@@ -7794,12 +7796,86 @@ static void crw_enter(Shop *s, int option);
    0x9a3b571d: +0x7e3c = 1, StartCareerFreeRoam */
 static void crib_play(Shop *s) {
     profile_drop_snapshot();
+    if (s->trip_city) {   /* port: the World Expansion trip (main.c: SHOP_ACT_XP_TRIP) */
+        s->fe_action = SHOP_ACT_XP_TRIP;
+        printf("crib: trip to %s (%s)\n", s->trip_city == 1 ? "Rockport" : "Palmont", s->trip_share ? "shared garage" : "fresh garage");
+        return;
+    }
     g_career.has_spawn = 1;
     career_go(s, 0);
+}
+/* ---- World Expansion trips (port; EXPANSION_PLAN "Money, cars and progress"): the
+   crib's Play asks where once a city is installed; the first trip to a city asks
+   "Share Your Garage?" -- the answer per profile in ux0:data/NFSU2/xpgarage.txt,
+   lines "<city> <share> <profile name>" ---- */
+#define XP_GARAGE_FILE "ux0:data/NFSU2/xpgarage.txt"
+int xp_garage_choice(int city) {
+    FILE *f = fopen(XP_GARAGE_FILE, "r");
+    if (!f) return -1;
+    char l[160]; int r = -1;
+    const char *me = profile_name();
+    while (fgets(l, sizeof l, f)) {
+        int c, sh, n = 0;
+        if (sscanf(l, "%d %d %n", &c, &sh, &n) < 2 || c != city) continue;
+        char *nm = l + n; nm[strcspn(nm, "\r\n")] = 0;
+        if (!strcmp(nm, me)) r = sh != 0;
+    }
+    fclose(f);
+    return r;
+}
+void xp_garage_choice_set(int city, int share) {
+    char lines[64][160]; int n = 0;
+    const char *me = profile_name();
+    FILE *f = fopen(XP_GARAGE_FILE, "r");
+    if (f) {
+        char l[160];
+        while (n < 63 && fgets(l, sizeof l, f)) {
+            int c, sh, k = 0;
+            if (sscanf(l, "%d %d %n", &c, &sh, &k) < 2) continue;
+            char nm[128]; snprintf(nm, sizeof nm, "%s", l + k); nm[strcspn(nm, "\r\n")] = 0;
+            if (c == city && !strcmp(nm, me)) continue;
+            snprintf(lines[n++], sizeof lines[0], "%s", l);
+        }
+        fclose(f);
+    }
+    snprintf(lines[n++], sizeof lines[0], "%d %d %s\n", city, share ? 1 : 0, me);
+    if (!(f = fopen(XP_GARAGE_FILE, "w"))) { printf("xp garage: %s not written\n", XP_GARAGE_FILE); return; }
+    for (int i = 0; i < n; i++) fputs(lines[i], f);
+    fclose(f);
+}
+static void crib_trip(Shop *s, int city) {
+    s->trip_city = city;
+    s->trip_share = xp_garage_choice(city) != 0;   /* fresh = the city's own garage (not built yet: QR rules) */
+    if (profile_dirty()) { s->crib_play = 1; mc_enter(s, 0x151, SC_CRIB); }   /* CheckMemory first, like Play */
+    else crib_play(s);
+}
+static void crib_city(Shop *s, int city) {
+    if (xp_garage_choice(city) >= 0) { crib_trip(s, city); return; }
+    s->trip_city = city;
+    char b[256];
+    snprintf(b, sizeof b, "Share Your Garage? Bring your garage to %s. Your cars, parts and cash are shared with your career.",
+             city == 1 ? "Rockport" : "Palmont");
+    dialog_text(s, DLG_AUTO, 2, b, DA_XP_SHARE, STR_YES, STR_NO);
+    s->dlg_l1 = "Share"; s->dlg_l2 = "Start fresh";
+    s->dlg_act2 = DA_XP_FRESH;
+    s->dlg_sel = 0; dlg_focus(s);
+}
+/* Play / Back to gameplay: where, once a city is installed (Bayview first, the default) */
+static int crib_where(Shop *s) {
+    if (!xpcity_installed(1) && !xpcity_installed(2)) return 0;
+    int both = xpcity_installed(1) && xpcity_installed(2);
+    dialog_text(s, DLG_AUTO, 2, "Where do you want to drive?", DA_CRIB_BAYVIEW, STR_YES, STR_NO);
+    s->dlg_l1 = "Bayview";
+    s->dlg_l2 = both ? "Another city" : xpcity_installed(1) ? "Rockport" : "Palmont";
+    s->dlg_act2 = both ? DA_CRIB_CITIES : xpcity_installed(1) ? DA_CRIB_ROCKPORT : DA_CRIB_PALMONT;
+    s->dlg_sel = s->crib_city ? 1 : 0;   /* at a city's garage: that city first */
+    dlg_focus(s);
+    return 1;
 }
 static void crib_dlg(Shop *s, int act) {
     switch (act) {
     case DA_CRIB_PLAY:
+        s->trip_city = 0;
         if (profile_dirty()) { s->crib_play = 1; mc_enter(s, 0x151, SC_CRIB); }
         else crib_play(s);
         break;
@@ -7824,8 +7900,8 @@ static void crib_input(Shop *s, int key) {
     else if (key == SHOP_KEY_RIGHT) scroller_move(&s->crib, 1);
     else if (key == SHOP_KEY_OK && !s->crib.locked[s->crib.sel]) {
         switch (s->crib.e[s->crib.sel].group) {
-        case CR_PLAY:         /* 0x60b42afb, Accept / Decline */
-            dialog(s, DLG_AUTO, 2, 0x60b42afbu, DA_CRIB_PLAY, 0x88579775u, 0xbe503981u);
+        case CR_PLAY:         /* 0x60b42afb, Accept / Decline (port: where first, with an expansion city) */
+            if (!crib_where(s)) dialog(s, DLG_AUTO, 2, 0x60b42afbu, DA_CRIB_PLAY, 0x88579775u, 0xbe503981u);
             break;
         case CR_MAIN:         /* 0xcb5e3178 */
             dialog(s, DLG_AUTO, 2, 0xcb5e3178u, DA_CRIB_MAIN, 0x88579775u, 0xbe503981u);
@@ -7853,7 +7929,7 @@ static void crib_input(Shop *s, int key) {
     }
     else if (key == SHOP_KEY_BACK) {   /* 0x911ab364: gameplay, or the main menu when it came from there */
         if (s->crib_from_main) dialog(s, DLG_AUTO, 2, 0xcb5e3178u, DA_CRIB_MAIN, 0x88579775u, 0xbe503981u);
-        else dialog(s, DLG_AUTO, 2, 0x60b42afbu, DA_CRIB_PLAY, 0x88579775u, 0xbe503981u);
+        else if (!crib_where(s)) dialog(s, DLG_AUTO, 2, 0x60b42afbu, DA_CRIB_PLAY, 0x88579775u, 0xbe503981u);
     }
 }
 
@@ -8350,6 +8426,13 @@ void shop_crib_return_map(Shop *s, int from_main) {
     crib_return(s, CR_WORLD_MAP);
 }
 int shop_crib_from_main(const Shop *s) { return s && s->crib_from_main; }
+void shop_crib_open(Shop *s, int city) {
+    if (!s) return;
+    crib_enter(s, 0);
+    s->crib_city = city;
+}
+int shop_trip_city(const Shop *s) { return s ? s->trip_city : 0; }
+int shop_trip_share(const Shop *s) { return s ? s->trip_share : 0; }
 
 /* ---------------------------------------------------------------- the uniques shop */
 
@@ -9624,6 +9707,19 @@ static void dlg_act(Shop *s, int act) {
         break;
     case DA_PERF_PART: perf_part_yes(s); break;
     case DA_CTL_RESET: options_ctl_preset(&g_opt, 0); break;
+    case DA_CRIB_BAYVIEW: crib_dlg(s, DA_CRIB_PLAY); break;
+    case DA_CRIB_CITIES:
+        dialog_text(s, DLG_AUTO, 2, "Which city?", DA_CRIB_ROCKPORT, STR_YES, STR_NO);
+        s->dlg_l1 = "Rockport"; s->dlg_l2 = "Palmont"; s->dlg_act2 = DA_CRIB_PALMONT;
+        s->dlg_sel = s->crib_city == 2 ? 1 : 0; dlg_focus(s);
+        break;
+    case DA_CRIB_ROCKPORT: crib_city(s, 1); break;
+    case DA_CRIB_PALMONT: crib_city(s, 2); break;
+    case DA_XP_SHARE: case DA_XP_FRESH:
+        xp_garage_choice_set(s->trip_city, act == DA_XP_SHARE);
+        printf("xp garage: %s -> %s\n", s->trip_city == 1 ? "Rockport" : "Palmont", act == DA_XP_SHARE ? "share" : "start fresh");
+        crib_trip(s, s->trip_city);
+        break;
     case DA_QR_CITIES:   /* Free Run, another city: which one */
         dialog_text(s, DLG_AUTO, 2, "Which city?", DA_QR_ROCKPORT, STR_YES, STR_NO);
         s->dlg_l1 = "Rockport"; s->dlg_l2 = "Palmont"; s->dlg_act2 = DA_QR_PALMONT;

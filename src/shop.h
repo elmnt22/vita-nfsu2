@@ -42,6 +42,7 @@ enum { SHOP_ACT_NONE, SHOP_ACT_PREVIEW, SHOP_ACT_RIM, SHOP_ACT_EXIT,
        SHOP_ACT_CAREER_RIDE,     /* the crib from the career menu: the career car on the platform */
        SHOP_ACT_CAREER_PARTS,    /* the crib's Change Parts: the Car Shop on the career car (shop_career_customize 1) */
        SHOP_ACT_CAREER_EVENT,    /* the crib World Map's Yes: StartCareerEventFromWorldMap(event) */
+       SHOP_ACT_XP_TRIP,         /* port: the crib's Play to an expansion city (shop_trip_city / shop_trip_share) */
        SHOP_ACT_TEST_TRACK,      /* the crib's Test Track: DoStartTuning -> BeginCarTuning(entry 0) */
        SHOP_ACT_DELETE_CAR };    /* F2.4: the Customize car select's Square + Yes: DeleteTunedCar(slot) */
 
@@ -205,6 +206,15 @@ int   shop_career_customize(Shop *s, int entry, const unsigned char *shop);
 void  shop_crib_return(Shop *s, int from_main);
 void  shop_crib_return_map(Shop *s, int from_main);
 int   shop_crib_from_main(const Shop *s);
+/* World Expansion trips (port): the crib opened at a city's garage (city 1 Rockport,
+   2 Palmont; its Back / Play-there go back to that city), and the trip the crib's
+   Play asked for (SHOP_ACT_XP_TRIP): its city and garage choice (1 share, 0 fresh) */
+void  shop_crib_open(Shop *s, int city);
+int   shop_trip_city(const Shop *s);
+int   shop_trip_share(const Shop *s);
+/* the profile's "Share Your Garage?" answer for a city: 1 share, 0 start fresh, -1 not asked */
+int   xp_garage_choice(int city);
+void  xp_garage_choice_set(int city, int share);
 /* the UniquesBrowser ended the world challenge (a part chosen or forfeited): the save is due */
 int   shop_uniques_done(const Shop *s);
 float shop_rate(const Shop *s, const N2CarConfig *c, const char *rim_folder, int rim_style);   /* 0x5234c0 */

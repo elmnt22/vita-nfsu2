@@ -5360,6 +5360,10 @@ static unsigned g_rt_zones_gen;   /* bumped on every free/load of g_rt.zones: a 
    spawn the track switch puts the car on; the preset ride (BuildRideForPlayer)
    and the car to go back to when the career is left */
 static int g_career_mode, g_career_go, g_career_nis_pending, g_career_nis_on, g_career_zones_set;
+/* World Expansion trip (port): the career's crib sent the career car to an expansion city
+   (1 Rockport, 2 Palmont). The city runs as its free roam (career mode off), its garages
+   open the career crib again; g_xp_trip_share: the garage is shared (cash / parts / cars) */
+static int g_xp_trip, g_xp_trip_share, g_xp_trip_go;
 static int g_career_spawn_on; static float g_career_spawn[3], g_career_heading;
 static int g_career_preset_on, g_career_preset_rs, g_career_prev_car = -1;
 static char g_career_preset_car[32], g_career_preset_rim[16];
@@ -21369,9 +21373,23 @@ int main(int argc, char **argv) {
                         else garage_restore_car(carname);
                     }
                     g_career_prev_car = -1;
+                } else if (sa.kind == SHOP_ACT_XP_TRIP) {   /* port: the crib's Play to an expansion city */
+                    int city = shop_trip_city(g_fe);
+                    g_xp_trip_share = shop_trip_share(g_fe);
+                    shop_close(&g_fe);
+                    g_fe_in = 0;
+                    if (g_career_mode) career_wc_exit_to_frontend();
+                    g_career_mode = 0; g_career_go = 0; g_career_nis_pending = 0; g_career_spawn_on = 0;
+                    hud_event_reset();
+                    gps_stop();
+                    g_xp_trip = city; g_xp_trip_go = 1; g_xpcity_pick = city;
+                    world_tiles_trim(0);
+                    printf("xp trip: %s with the career car (%s garage, $%d)\n", city == 1 ? "Rockport" : "Palmont",
+                           g_xp_trip_share ? "shared" : "fresh", g_career.cash);
                 } else if (sa.kind == SHOP_ACT_CAREER) {   /* StartCareerFreeRoam 8011cbac */
                     shop_close(&g_fe);
                     g_fe_in = 0;
+                    g_xp_trip = 0; g_xp_trip_go = 0;
                     g_career_mode = 1; g_career_go = 1; g_career_nis_pending = sa.career_nis;
 #ifdef OPENUG2_SIM_PRE_H
                     if (getenv("OPENUG2_WATEST_NIS")) g_career_nis_pending = 1;   /* test aid (simulator): the career start scene */
@@ -21395,7 +21413,7 @@ int main(int argc, char **argv) {
                     printf("career: free roam start (stage %d, owns a car %d, started %d, has spawn %d, start NIS %d)\n",
                            g_career.stage, g_career.b873d, g_career.started, g_career.has_spawn, sa.career_nis);
                 }
-                if (sa.kind == SHOP_ACT_CAREER || sa.kind == SHOP_ACT_CAREER_RIDE) {
+                if (sa.kind == SHOP_ACT_CAREER || sa.kind == SHOP_ACT_CAREER_RIDE || sa.kind == SHOP_ACT_XP_TRIP) {
                     {   /* BuildRideForPlayer 8012731c: the shop event's preset ride, else the career car */
                         uint32_t pr = career_ride_preset();
                         char pcar[32] = ""; N2CarConfig pc; char prim[16] = ""; int prs = 0;
@@ -21494,6 +21512,7 @@ int main(int argc, char **argv) {
             }
             /* UI_Main (UIMain ctor): the DDAY_PLAYER_CAR preset while the career has no car,
                else BuildCurrentRideForPlayer(0), the front end's current car */
+            if (g_fe && shop_on_main_menu(g_fe)) g_xp_trip = g_xp_trip_go = 0;   /* a trip ends at the main menu (port) */
             if (g_fe && !g_career_mode && shop_on_main_menu(g_fe) && pending_car < 0 && !g_car_reload) {
                 if (g_garage_cur_dirty) {   /* the picked car into the profile (see g_garage_cur_dirty) */
                     g_garage_cur_dirty = 0;
@@ -21642,6 +21661,23 @@ int main(int argc, char **argv) {
                     printf("showcase: the front end could not be opened\n");
                     world_tiles_trim(0);
                 }
+            } else if (act == ENG_ACT_SHOP && g_eng.bshop == 1 && g_xp_trip && race_state == 1) {
+                /* port: a trip's garage (type 0) -- the career crib; its Play goes to Bayview or back here */
+                g_eng.bshop = 0;
+                if (g_bey_szone >= 0) hud_event_remove(bey_shop_indicator(0));
+                g_bey_szone = -1;
+                world_tiles_trim(1);
+                Shop *fe = shop_open(dataroot, carname, &carcfg, modification, wheel_brands[wheel_brand], wheel_style);
+                if (fe) {
+                    fe_quick_race_data(fe, carname, carlist, ncars);
+                    rt_end();
+                    hud_event_reset();
+                    g_career_mode = 1;
+                    shop_crib_open(fe, g_xp_trip);
+                    g_crib_from_main = 0;
+                    g_fe = fe; g_fe_in = 0;
+                    printf("xp trip: garage -> the career crib\n");
+                } else { world_tiles_trim(0); printf("xp trip: the crib could not be opened\n"); }
             } else if (act == ENG_ACT_SHOP && g_eng.bshop && race_state == 1) {
                 /* a World Expansion shop / garage (port): the front end's Customize over its scene */
                 int t = g_eng.bshop - 1;
@@ -21763,6 +21799,15 @@ int main(int argc, char **argv) {
         /* StartCareerFreeRoam: once the ride is in, LoadTrack -- free roam
            (event 4000) on L4RA, traffic 3 (TheRaceParameters +8), the car on
            the saved respawn (has_spawn) or event 4000's start line */
+        if (g_xp_trip_go && pending_car < 0 && !race_start_pending) {   /* port: the career car is in -- to the city */
+            g_xp_trip_go = 0;
+            g_roam_level = 3;
+            if (g_rt.n || g_rt.active) rt_end();
+            const char *xt = xpcity_track(g_xp_trip);
+            if (xt && strncmp(trackname, xt, strlen(xt))) venue_go(xt, 0);
+            else { race_state = 1; g_ride_ready = 0; }
+            printf("xp trip: LoadTrack %s\n", xt ? xt : "?");
+        }
         if (g_career_go && pending_car < 0 && !race_start_pending) {
             g_career_go = 0;
             career_reset_engaged();   /* NotifyFreeRoamBegun: ResetEngagedTriggerZone 80126a90 */
