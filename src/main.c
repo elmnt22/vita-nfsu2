@@ -9414,6 +9414,7 @@ static int map_zone_filter(const CareerZone *z)                       /* 0x500de
     if (z->wc) return 0xf;
     return 0;
 }
+float g_dbg_carpos[4];   /* the player car x y z heading (sim screenshots log it) */
 static int map_zone_type(int f)                                       /* 0x4ac1e0 */
 {
     static const signed char t[16] = { 0xc, 0xd, 0xe, 0xf, 0x10, 0x11, 5, 0x12, 5, 7, 8, 9, 10, 0xb, 6, 5 };
@@ -30493,6 +30494,7 @@ int main(int argc, char **argv) {
                 hs.map_off = mm == 0; hs.map_static = mm == 1;
             }
             hs.car_x = carpos[0]; hs.car_y = carpos[1];
+            g_dbg_carpos[0] = carpos[0]; g_dbg_carpos[1] = carpos[1]; g_dbg_carpos[2] = carpos[2]; g_dbg_carpos[3] = heading;
             hs.car_heading = heading;
             RT_FCRUMB("frame: hud");
             HudMapCar map_cars[N_OPENWORLD_AI + AIRACE_MAX];
@@ -30596,17 +30598,46 @@ int main(int argc, char **argv) {
             static HudMapZone map_zones[64];
             hs.map_zone_n = 0; hs.map_zones = NULL;
             if (g_bey_roam) {   /* the World Expansion's race starts (port): every event's icon */
-                for (int i = 0; i < beyond_event_count() && hs.map_zone_n < 64; i++) {
+                /* a city has far more events than the HUD's pools (64 zones, 9 icons
+                   per type): the nearest ones get them, or nearby starts showed no
+                   icon while far ones used the pool up (user report 11-19) */
+                static HudMapZone all[512]; static float d2[512]; static int ord[512];
+                int na = 0, tn[16] = { 0 }, nostart = 0, notype = 0;
+                static int mz_logged = -1;
+                for (int i = 0; i < beyond_event_count() && na < 512; i++) {
                     int id, t, l, k; float p[3];
-                    if (!beyond_event_at(i, &id, &t, &l) || !beyond_event_start(i, p, NULL) || (k = bey_trig_k(t)) < 0) continue;
-                    HudMapZone *m = &map_zones[hs.map_zone_n++];
+                    if (!beyond_event_at(i, &id, &t, &l)) continue;
+                    if (t >= 0 && t < 16) tn[t]++;
+                    if (!beyond_event_start(i, p, NULL)) { nostart++; continue; }
+                    if ((k = bey_trig_k(t)) < 0) { notype++; continue; }
+                    HudMapZone *m = &all[na++];
                     m->x = p[0]; m->y = p[1]; m->type = map_zone_type(k); m->cross = 0; m->blink = 0;
                 }
-                for (int i = 0; i < beyond_shop_count() && hs.map_zone_n < 64; i++) {
+                for (int i = 0; i < beyond_shop_count() && na < 512; i++) {
                     int t; float p[3];
                     if (!beyond_shop_at(i, &t, p, NULL)) continue;
-                    HudMapZone *m = &map_zones[hs.map_zone_n++];
+                    HudMapZone *m = &all[na++];
                     m->x = p[0]; m->y = p[1]; m->type = map_zone_type(bey_shop_filter(t)); m->cross = 0; m->blink = 0;
+                }
+                if (mz_logged != beyond_event_count()) {
+                    mz_logged = beyond_event_count();
+                    printf("minimap: %d events (types 0:%d 1:%d 2:%d 4:%d 5:%d 6:%d other:%d), %d without a start, %d without an icon type; %d icons to place\n",
+                           mz_logged, tn[0], tn[1], tn[2], tn[4], tn[5], tn[6],
+                           mz_logged - tn[0] - tn[1] - tn[2] - tn[4] - tn[5] - tn[6], nostart, notype, na);
+                }
+                for (int i = 0; i < na; i++) {   /* insertion sort by distance (a few hundred) */
+                    float dx = all[i].x - hs.car_x, dy = all[i].y - hs.car_y, d = dx * dx + dy * dy;
+                    int j = i;
+                    while (j > 0 && d2[j - 1] > d) { d2[j] = d2[j - 1]; ord[j] = ord[j - 1]; j--; }
+                    d2[j] = d; ord[j] = i;
+                }
+                int per[32] = { 0 };
+                for (int j = 0; j < na && hs.map_zone_n < 64; j++) {
+                    const HudMapZone *z = &all[ord[j]];
+                    int t = z->type - 5;
+                    if (t >= 0 && t < 32 && per[t] >= 9) continue;   /* that type's pool is spent */
+                    if (t >= 0 && t < 32) per[t]++;
+                    map_zones[hs.map_zone_n++] = *z;
                 }
                 hs.map_zones = map_zones;
             } else

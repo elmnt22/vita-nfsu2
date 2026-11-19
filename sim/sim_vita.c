@@ -357,9 +357,9 @@ enum { P_CROSS = 1 << 0, P_CIRCLE = 1 << 1, P_SQUARE = 1 << 2, P_TRIANGLE = 1 <<
        P_LS_LEFT = 1 << 24, P_LS_RIGHT = 1 << 25, P_RT_UL = 1 << 26, P_RT_UR = 1 << 27,
        P_RT_LL = 1 << 28, P_RT_LR = 1 << 29 };
 static const struct { const char *name; uint32_t bit; SDL_Scancode key; } g_btn[] = {
-    { "CROSS", P_CROSS, SDL_SCANCODE_Z }, { "CIRCLE", P_CIRCLE, SDL_SCANCODE_X },
-    { "SQUARE", P_SQUARE, SDL_SCANCODE_A }, { "TRIANGLE", P_TRIANGLE, SDL_SCANCODE_S },
-    { "L", P_L, SDL_SCANCODE_Q }, { "R", P_R, SDL_SCANCODE_W },
+    { "CROSS", P_CROSS, SDL_SCANCODE_W }, { "CIRCLE", P_CIRCLE, SDL_SCANCODE_X },
+    { "SQUARE", P_SQUARE, SDL_SCANCODE_S }, { "TRIANGLE", P_TRIANGLE, SDL_SCANCODE_C },
+    { "L", P_L, SDL_SCANCODE_Q }, { "R", P_R, SDL_SCANCODE_SPACE },
     { "UP", P_UP, SDL_SCANCODE_UP }, { "DOWN", P_DOWN, SDL_SCANCODE_DOWN },
     { "LEFT", P_LEFT, SDL_SCANCODE_LEFT }, { "RIGHT", P_RIGHT, SDL_SCANCODE_RIGHT },
     { "START", P_START, SDL_SCANCODE_RETURN }, { "SELECT", P_SELECT, SDL_SCANCODE_RSHIFT } };
@@ -454,8 +454,8 @@ static void poll_pad(void) {
     vita_rstick_x = g_script_rx; vita_rstick_y = g_script_ry;
     vita_lstick_y = g_script_ly;
     float lxf = g_script_lx;
-    if (k[SDL_SCANCODE_J]) lxf = -1.0f;
-    if (k[SDL_SCANCODE_L]) lxf = 1.0f;
+    if (k[SDL_SCANCODE_A] || k[SDL_SCANCODE_J]) lxf = -1.0f;   /* WASD (user 11-19): W Cross, S Square, A/D stick */
+    if (k[SDL_SCANCODE_D] || k[SDL_SCANCODE_L]) lxf = 1.0f;
     if (k[SDL_SCANCODE_U]) vita_rstick_x = -1.0f;   /* showroom turntable */
     if (k[SDL_SCANCODE_O]) vita_rstick_x = 1.0f;
     int lx = (int)(lxf * 127.0f);
@@ -591,7 +591,9 @@ static void save_shot(const char *name) {
     char p[256], b[1024];
     snprintf(p, sizeof p, "ux0:shots/%s.png", name);
     write_png(sim_path(p, b, sizeof b), SIM_W, SIM_H, rgb);
-    printf("sim: screenshot %s (frame %u)\n", b, g_frame);
+    { extern float g_dbg_carpos[4];
+      printf("sim: screenshot %s (frame %u) car at %.1f %.1f %.1f heading %.2f\n", b, g_frame,
+             g_dbg_carpos[0], g_dbg_carpos[1], g_dbg_carpos[2], g_dbg_carpos[3]); }
     free(rgba); free(rgb);
 }
 /* "probe X Y" (screenshot pixel coords): for the next frame, log every draw
