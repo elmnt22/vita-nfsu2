@@ -1160,6 +1160,7 @@ static int winst_build_visit_uncached(const WInstPlacement *placement,
          * origin, up to 855 m from where the record puts it. */
         if (ground && !proto->instanced) continue;
         N2Mesh source = *mesh;
+        if (strstr(source.sname, "REFBLOCKER") || strstr(source.sname, "_REFLECTIONS")) continue;   /* Carbon reflection blockers: never drawn (11-19 black blocks) */
         if (low != proto) {
             /* Collision copy; its prelighting is kept so a build that places
                it near the car can draw it instead of the stand-in. */
@@ -1173,6 +1174,7 @@ static int winst_build_visit_uncached(const WInstPlacement *placement,
         const N2Scene *simple = &low->scene;
         for (int i = 0; i < simple->count; i++) {
             N2Mesh source = simple->meshes[i];
+            if (strstr(source.sname, "REFBLOCKER") || strstr(source.sname, "_REFLECTIONS")) continue;
             source.world_role = 2;
             if (!winst_place_mesh(dst, &source, placement->matrix, type_name, build->stats)) return 0;
         }

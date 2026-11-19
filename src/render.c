@@ -2097,6 +2097,14 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
         const N2Mesh *mesh = &s->meshes[i];
         /* role 3: a smokeable prop, drawn by smokeable.c */
         if (mesh->world_role == 1 || mesh->world_role == 3 || mesh->world_role == 4 || mesh->cat == N2_SKY || mesh->cat == N2_GLOW) continue;
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_MESHDUMP_KEY=<hex texkey> also names the batched world meshes */
+            const char *e = getenv("OPENUG2_MESHDUMP_KEY");
+            if (e && strtoul(e, NULL, 16) == mesh->texkey)
+                printf("MESHDUMP batch %.31s / %.27s role %d nv %d at %.0f %.0f\n", mesh->sname, mesh->aname, mesh->world_role,
+                       mesh->nverts, (double)(mbb[i][0]+mbb[i][2])*0.5, (double)(mbb[i][1]+mbb[i][3])*0.5);
+        }
+#endif
         GLuint tex = mtex[i];
         if (!tex && mesh->cat == N2_TERRAIN) tex = texTerr;   /* fallback baked in */
         float cx = (mbb[i][0]+mbb[i][2])*0.5f, cy = (mbb[i][1]+mbb[i][3])*0.5f;

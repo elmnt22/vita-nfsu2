@@ -1069,6 +1069,11 @@ static volatile long long g_wt_geo_live;
 /* a ready tile (see wt_ready_payload): one LZ4 pass straight into the
    block the meshes live in; a reduced (ground / far) load copies only the
    meshes it keeps out of the scratch */
+/* geometry the source game never shows: Carbon's reflection blockers (all-black
+   vertex colours, ~190 m up: the "black blocks" over Palmont 11-19) */
+static int wt_never_drawn(const WTileMesh *h) {
+    return strstr(h->sname, "REFBLOCKER") != NULL || strstr(h->sname, "_REFLECTIONS") != NULL;
+}
 static int wt_decode_ready(unsigned char *data, long len, const uint32_t *hdr, int tx, int ty,
                            WtLoaded *out, WtScratch *scr, int ground_only) {
     size_t plen = hdr[5];
@@ -1091,7 +1096,7 @@ static int wt_decode_ready(unsigned char *data, long len, const uint32_t *hdr, i
         if (h.nverts == 0 || h.nverts > 65536 || h.nidx == 0 || h.nidx > (1u << 22)) { ok = 0; break; }
         gp += wt_dec_size(&h);
         if (16 + gp > rh[2]) { ok = 0; break; }
-        if (ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) continue;
+        if ((ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) || wt_never_drawn(&h)) continue;
         total += wt_dec_size(&h); nsel++;
     }
     N2GeomBlock *blk = NULL; N2SharedGeometry *geoms = NULL; unsigned char *geo = NULL;
@@ -1121,7 +1126,7 @@ static int wt_decode_ready(unsigned char *data, long len, const uint32_t *hdr, i
     for (uint32_t k = 0; k < nm; k++) {
         const WTileMesh h = hs[k];
         size_t ds = wt_dec_size(&h);
-        if (ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) { sp += ds; continue; }
+        if ((ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) || wt_never_drawn(&h)) { sp += ds; continue; }
         if (ground_only) memcpy(geo + dp, buf + sp, ds);
         int nv = (int)h.nverts;
         unsigned char *base = geo + dp;
@@ -1184,7 +1189,7 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
         if (h.nverts == 0 || h.nverts > 65536 || h.nidx == 0 || h.nidx > (1u << 22)) { ok = 0; break; }
         pos += sizeof h + wt_enc_size(&h);
         if (pos > plen) { ok = 0; break; }
-        if (ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) continue;
+        if ((ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) || wt_never_drawn(&h)) continue;
         total += wt_dec_size(&h); nsel++;
     }
     N2GeomBlock *blk = NULL; N2SharedGeometry *geoms = NULL; unsigned char *geo = NULL;
@@ -1208,7 +1213,7 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
     for (uint32_t k = 0; k < hdr[4]; k++) {
         WTileMesh h;
         memcpy(&h, payload + pos, sizeof h); pos += sizeof h;
-        if (ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) { pos += wt_enc_size(&h); continue; }
+        if ((ground_only && !wt_reduced_keep(ground_only, h.cat, h.world_role, h.world_bounds)) || wt_never_drawn(&h)) { pos += wt_enc_size(&h); continue; }
         int nv = (int)h.nverts;
         float *v = (float *)(geo + gp);
         for (int c = 0; c < 5; c++) {
