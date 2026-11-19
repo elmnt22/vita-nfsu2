@@ -53,6 +53,8 @@ void smk_begin(float dt, WColl *w);
 /* MaybeCreateWitnesses for a moving body with an xy box of +-rad round pos:
    virgins it touches become live props. */
 void smk_touch(const float pos[3], float rad);
+/* most live props at once (retail's pool is 32; the World Expansion's dense streets use fewer) */
+void smk_set_live_cap(int cap);
 /* The live props as collision bodies (cars[] entries with ops set); with
    polygons (wc) for the run that owns them. Returns the count added. */
 int  smk_bodies(CarCollCar *out, int max, int with_polygons);

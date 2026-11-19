@@ -30005,6 +30005,10 @@ int main(int argc, char **argv) {
             /* the World Expansion's race starts (port): free roam there, the zone the car is in */
             g_glow_cells = beyond_is_track(trackname);
             g_bey_xp = xpcity_is_city(trackname);                         /* Rockport / Palmont: their MW / Carbon events */
+            /* their streets hold ~25x Bayview's props: 16 live at most kept the
+               player's tick near Bayview's (hwxp6: 2.0-2.3 ms vs 1.0) */
+            smk_set_live_cap(g_bey_xp ? 16 : 32);
+            carcoll_set_prop_world_cap(g_bey_xp ? 4 : 1000);   /* hwxp6: 20-resolve passes of 15-22 ms */
             beyond_events_select(g_bey_xp ? xpcity_region(trackname) : NULL);
             g_bey_roam = ((beyond_enabled() && beyond_is_track(trackname)) || g_bey_xp) && race_state == 1 && !RT_RACE && !g_fe && !g_shop;
             g_bey_scene = &scene;

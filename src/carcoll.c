@@ -1267,6 +1267,9 @@ int carcoll_car_pairs(int (*ab)[2], float *dist, int *touch, int max)
     return n;
 }
 
+static int g_prop_world_cap = 1000;
+void carcoll_set_prop_world_cap(int cap) { g_prop_world_cap = cap; }
+
 int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int maxhits,
                     CarCollWake wake, void *user)
 {
@@ -1293,11 +1296,18 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
         if (narrow(&W, i, &k)) insert_contact(list, &nl, &k);
     }
     Uint64 c2 = SDL_GetPerformanceCounter();
-    int iters = 0, it_world = 0, it_prop = 0, it_car = 0;
+    int iters = 0, it_world = 0, it_prop = 0, it_car = 0, it_pw = 0;
     for (int iter = 0; nl > 0 && iter < 20; iter++) {     /* DAT_802080 */
         iters++;
         Contact k = list[0];
         CPair *p = &pairs[k.pair];
+        if (p->b < 0 && cars[p->a].ops && it_pw >= g_prop_world_cap) {
+            /* a prop against the world past the cap: left as it is this tick
+               (it rests a little inside; the next tick tries again) */
+            for (int i = 1; i < nl; i++) list[i - 1] = list[i];
+            nl--; iters--; continue;
+        }
+        if (p->b < 0 && cars[p->a].ops) it_pw++;
         if (p->b < 0) it_world++; else if (cars[p->a].ops || cars[p->b].ops) it_prop++; else it_car++;
         if (resolve(&W, &k, done < maxhits && hits ? &hits[done] : NULL, wake, user))
             done++;

@@ -101,6 +101,8 @@ typedef struct {
 } CarCollCar;
 /* carcoll_begin for a body that is not a car */
 void carcoll_begin_body(CarColl *c, const N2Body *b, float dt);
+/* most prop-against-world resolves in one contacts pass (default: no limit) */
+void carcoll_set_prop_world_cap(int cap);
 /* a hull by its exact name from a 0x80034020 container in memory (the
    smokeables' hulls in <track>.BUN); NULL when there is none */
 CarColl *carcoll_load_named(const unsigned char *bun, long len, const char *name);

@@ -554,13 +554,16 @@ static float spawner_radius(const SmkSpawner *S)
     return 0.5f * len3(d);
 }
 
+static int g_live_cap = SMK_LIVE_MAX;
+void smk_set_live_cap(int cap) { g_live_cap = cap < 1 ? 1 : cap > SMK_LIVE_MAX ? SMK_LIVE_MAX : cap; }
+
 /* VirginSmokeable::ConvertToSmokeable 0x5b1390 */
 static void convert(int si)
 {
     SmkSpawner *S = &g_sp[si];
-    int li = -1;
-    for (int i = 0; i < SMK_LIVE_MAX && li < 0; i++) if (!g_live[i].used) li = i;
-    if (li < 0) return;                                 /* pool full: the virgin stays */
+    int li = -1, used = 0;
+    for (int i = 0; i < SMK_LIVE_MAX; i++) { if (g_live[i].used) used++; else if (li < 0) li = i; }
+    if (li < 0 || used >= g_live_cap) return;           /* pool full: the virgin stays */
     const SmkInfo *I = &g_info[S->info];
     SmkLive *L = &g_live[li];
     memset(L, 0, sizeof *L);
