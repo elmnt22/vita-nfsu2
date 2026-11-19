@@ -646,6 +646,14 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                             return N2_ROAD;
                         if ((L >= 9 && !memcmp(n, "L5RA_TRN_", 9)) ||
                             (L >= 12 && !memcmp(n, "L5RA_TN_TRN_", 12))) return N2_TERRAIN;
+                        /* canyon rock under the touge roads, the campus / south
+                           city blocks and the block-in pieces: the only ground
+                           there (sim XYDUMP 11-19; none in UG2 bundles) */
+                        if (L >= 3 && !memcmp(n, "TN_", 3) && n2_contains(n, L, "_STUMP_"))
+                            return N2_TERRAIN;
+                        if ((L >= 13 && !memcmp(n, "TN_SF_CAMPUS_", 13)) ||
+                            (L >= 16 && !memcmp(n, "TN_SF_SOUTHCITY_", 16)) ||
+                            (L >= 15 && !memcmp(n, "L5RA_TN_BLOCKIN", 15))) return N2_TERRAIN;
                     }
                     /* The airport apron the runway feeds into: paved concrete,
                        driven continuously with the runway (measured: L4RB left
@@ -994,6 +1002,7 @@ typedef struct {
     float dom[3];             /* area-weighted mean normal, normalized */
     float planarity;          /* area-weighted mean |dot(n_i, dom)|: 1 = one flat sheet */
     float area;
+    float ctr[3];             /* world AABB centre */
 } N2Geom;
 
 /* A solid's vertex stride. Most carry 24-byte prelit vertices (pos, colour
@@ -1078,6 +1087,7 @@ static int n2_obj_geom(const unsigned char *d, long beg, long end,
     float sx = mx[0]-mn[0], sy = mx[1]-mn[1];
     g->xyspan = sx > sy ? sx : sy;
     g->zspan  = mx[2]-mn[2];
+    for (int q = 0; q < 3; q++) g->ctr[q] = 0.5f * (mn[q] + mx[q]);
     g->area   = (float)asum;
     double dl = sqrt(nsum[0]*nsum[0]+nsum[1]*nsum[1]+nsum[2]*nsum[2]);
     if (dl < 1e-12) return 1;                          /* normals cancel: a shell */

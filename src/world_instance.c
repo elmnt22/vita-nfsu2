@@ -388,7 +388,14 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     {   /* OPENUG2_CAT_DUMP: every prototype's name and category (library scan only) */
         static const char *dump = (const char *)1;
         if (dump == (const char *)1) dump = getenv("OPENUG2_CAT_DUMP");
-        if (dump && !reload) fprintf(stderr, "CATDUMP %d %d %s\n", cat, scen, name);
+        if (dump && !reload) {   /* + shape: flat wide ground has small z, up ~1, plan ~1 */
+            N2Geom gd; float mtx[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            n2_obj_matrix(data, begin, end, mtx);
+            if (n2_obj_geom(data, begin, end, mtx, &gd))
+                fprintf(stderr, "CATDUMP %d %d %s xy %.0f z %.1f up %.2f plan %.2f area %.0f at %.0f %.0f %.1f\n", cat, scen, name,
+                        gd.xyspan, gd.zspan, gd.dom[2], gd.planarity, gd.area, gd.ctr[0], gd.ctr[1], gd.ctr[2]);
+            else fprintf(stderr, "CATDUMP %d %d %s\n", cat, scen, name);
+        }
     }
     float matrix[16];
     int has_matrix = n2_obj_matrix(data, begin, end, matrix);
