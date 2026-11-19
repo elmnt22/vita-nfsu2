@@ -586,20 +586,64 @@ static int sent_same(const SendFile *f) {   /* the last record of this file matc
         if (!strcmp(g_sent[i].remote, f->remote)) return g_sent[i].size == f->size && g_sent[i].mtime == f->mtime && f->mtime;
     return 0;
 }
+static int sent_known(const SendFile *f) {   /* any record of this file */
+    for (int i = g_nsent - 1; i >= 0; i--) if (!strcmp(g_sent[i].remote, f->remote)) return 1;
+    return 0;
+}
+/* An imported PC save on the Vita is the player's live save from then on: it goes
+   only when the Vita has none of that name, or it was imported again on the PC since
+   it was last sent here (11-19: a resend used to put the old import over the Vita's
+   newer progress). */
+static int is_profile(const SendFile *f) { return !strncmp(f->remote, VITA_PROFILES "/", sizeof VITA_PROFILES); }
+static int g_kept_profiles;
 static void sent_note(const SendFile *f) {
     FILE *fp = fopen(g_sent_file, "a");
     if (!fp) return;
     fprintf(fp, "%lld\t%lld\t%s\n", f->size, f->mtime, f->remote);
     fclose(fp);
 }
+/* the Vita's folders, each listed once per send (the files alternate between cache
+   and cache/tiles, and a listing is a round trip over Wi-Fi) */
+typedef struct { char dir[256]; int n; RemoteEnt *e; } RemoteDir;
+static RemoteDir g_rdirs[24]; static int g_nrdirs;
+static void remote_dirs_reset(void) {
+    for (int i = 0; i < g_nrdirs; i++) free(g_rdirs[i].e);
+    g_nrdirs = 0;
+}
 static long long remote_size(HINTERNET c, const char *remote) {   /* -1: not there */
     if (!c) { char p[MAX_PATH + 300]; dest_path(p, sizeof p, remote); return file_exists(p) ? file_size(p) : -1; }
     char dir[256]; snprintf(dir, sizeof dir, "%s", remote);
     char *s = strrchr(dir, '/'); if (!s) return -1;
     *s = 0;
-    remote_list(c, dir);
-    for (int i = 0; i < g_nrent; i++)
-        if (!_stricmp(g_rent[i].name, s + 1)) return g_rent[i].size;
+    RemoteDir *d = NULL;
+    for (int i = 0; i < g_nrdirs && !d; i++) if (!strcmp(g_rdirs[i].dir, dir)) d = &g_rdirs[i];
+    if (!d) {
+        if (g_nrdirs == (int)(sizeof g_rdirs / sizeof g_rdirs[0])) remote_dirs_reset();
+        d = &g_rdirs[g_nrdirs++];
+        snprintf(d->dir, sizeof d->dir, "%s", dir);
+        d->n = 0; d->e = NULL;
+        int cap = 0;
+        if (FtpSetCurrentDirectoryA(c, dir)) {
+            WIN32_FIND_DATAA fd;
+            HINTERNET f = FtpFindFirstFileA(c, NULL, &fd, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+            if (f) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    if (d->n == cap) {
+                        int nc = cap ? cap * 2 : 256;
+                        RemoteEnt *m = realloc(d->e, (size_t)nc * sizeof *m); if (!m) break;
+                        d->e = m; cap = nc;
+                    }
+                    snprintf(d->e[d->n].name, sizeof d->e[0].name, "%s", fd.cFileName);
+                    d->e[d->n++].size = ((long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                } while (InternetFindNextFileA(f, &fd));
+                InternetCloseHandle(f);
+            }
+            FtpSetCurrentDirectoryA(c, "/");
+        }
+    }
+    for (int i = 0; i < d->n; i++)
+        if (!_stricmp(d->e[i].name, s + 1)) return d->e[i].size;
     return -1;
 }
 static int is_marker(const SendFile *f) { return strstr(f->remote, ".idx") || strstr(f->remote, ".xp"); }
@@ -683,13 +727,21 @@ static void send_all(void) {
            here before, unchanged, and still there. A set's index (or a city's .xp
            marker) goes again whenever any file of its set does. */
         static unsigned char keep[SEND_CAP];
+        g_kept_profiles = 0;
         sent_load();
+        remote_dirs_reset();
         for (int i = 0, start = 0; i < n; i++) {
             if (files[i].game) { keep[i] = (unsigned char)already_there(c, &files[i]); start = i + 1; continue; }
+            if (is_profile(&files[i])) {
+                long long rs = remote_size(c, files[i].remote);
+                keep[i] = rs >= 0 && (sent_same(&files[i]) || !sent_known(&files[i]));
+                if (keep[i] && !sent_same(&files[i])) g_kept_profiles++;
+                continue;   /* no marker after the profiles */
+            }
             keep[i] = sent_same(&files[i]) && remote_size(c, files[i].remote) == files[i].size;
-            if (is_marker(&files[i])) {
+            if (is_marker(&files[i])) {   /* a set ends at its tile index (a city: ... .xp, .idx) */
                 for (int k = start; k < i; k++) if (!files[k].game && !keep[k]) keep[i] = 0;
-                start = i + 1;
+                if (strstr(files[i].remote, ".idx")) start = i + 1;
             }
         }
         /* the old indexes go first: a set cut off half way reads as missing
@@ -723,10 +775,12 @@ static void send_all(void) {
         char skip[96] = "";
         if (g_send.skipped) snprintf(skip, sizeof skip, " (%d file%s already there, skipped)", g_send.skipped,
                                      g_send.skipped == 1 ? "" : "s");
-        if (ok) snprintf(g_send.msg, sizeof g_send.msg, "%s %.0f MB%s%s. Start NFS Underground 2%s.%s",
+        if (ok) snprintf(g_send.msg, sizeof g_send.msg, "%s %.0f MB%s%s. Start NFS Underground 2%s.%s%s",
                          to_dir ? "Copied" : "Sent", moved / 1048576.0,
                          to_dir ? "" : " to the Vita", skip,
                          track_done(0) ? " -- it skips \"Optimizing world data\"" : "",
+                         g_kept_profiles ? "\n\nYour profile already on the Vita was kept (not replaced by the "
+                                           "PC import). To replace it, import the PC save again, then send." : "",
                          g_send.xp_sent ? "\n\nTo drive Rockport and Palmont: on the game's LiveArea screen press "
                                           "Settings (or hold L+R while it starts), tick \"Rockport and Palmont\" "
                                           "under World Expansion, then pick the city in Free Run." : "");
