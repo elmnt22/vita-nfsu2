@@ -1320,6 +1320,10 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
             float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
             uint32_t slot[64];
             int nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
+            /* Carbon's reflection barriers (Malibu*_ReflectionBarrier): geometry for
+               its reflection pass only; drawn, a giant black wall in Palmont (11-19).
+               Bayview has none. */
+            if (strstr(anm, "ReflectionBarri") || strstr(anm, "REFLECTIONBARRI")) { o = ds + size; continue; }
             if (!strncmp(anm, "PAN", 3) || !strncmp(anm, "TRN_PANO", 8)) {   /* + Carbon's district panoramas */
                 /* ...except the water surface, which wears the same prefix and
                    is ordinary world ground. n2_is_ground_sheet measures that

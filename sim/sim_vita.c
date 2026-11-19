@@ -578,6 +578,7 @@ static uint32_t btn_bit(const char *n) {
 }
 /* test aid: game code asks for a named screenshot at the next frame end */
 void sim_shot_named(const char *name) { snprintf(g_shot_name, sizeof g_shot_name, "%s", name); }
+const char *sim_shot_pending(void) { return g_shot_name[0] ? g_shot_name : NULL; }   /* for OPENUG2_SIM_PICK */
 static void save_shot(const char *name) {
     unsigned char *rgba = malloc(SIM_W * SIM_H * 4), *rgb = malloc(SIM_W * SIM_H * 3);
     if (!rgba || !rgb) { free(rgba); free(rgb); return; }

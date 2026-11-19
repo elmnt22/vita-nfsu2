@@ -2723,6 +2723,11 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                 for (int k = 0; k < nidr && !vis; k++) vis = wg_selection_visible(&sel, idr[k][0], idr[k][1]);
                 if (nidr && !vis) { hidden++; continue; }
             }
+            /* Carbon's reflection barriers (Malibu*_ReflectionBarrier): geometry for
+               its reflection pass only. Drawn, they were a giant black wall in
+               Palmont (11-19). Packs converted before then still hold them;
+               nfsu2.h drops them from new conversions. Bayview has none. */
+            if (strstr(m->sname, "REFLECTIONBARRI") && m->world_role != 1 && m->world_role != 4) continue;
             int role = m->world_role, drop_vcol = 0;
             if (role == 1 || role == 2) {   /* a LOD pair: full model (1) + stand-in (2) */
                 if (near && role == 2) {

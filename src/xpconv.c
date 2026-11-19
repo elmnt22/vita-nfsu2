@@ -73,15 +73,15 @@ static XpStats st;
 /* ---- one MW mesh (0x80134100) -> UG2 ---- */
 #define MAXG 256
 #define MAXS 16
-/* the night relight (X4): MW's daytime vertex colours x these (B, G, R): a cool,
-   dim night like Bayview's prelight; 0 for the sky solids */
+/* the night relight (X4): MW's daytime vertex colours x these (B, G, R), clamped:
+   a cool night as bright as Palmont's / Bayview's; not the sky solids */
 static int g_night, g_relight;
 /* shading group record: MW 0x68 B (+0x3c vertices, +0x40 triangles); Carbon 0x90 B
    (+0x40 vertices, +0x60 triangles, +0x64 index start, +0x7c index count). Both:
    +0 bmin, +0xc bmax, +0x18 texture slots, +0x30 effect (a new vertex stream at each
    change; Carbon strides 36/44/48/52 B, the first 36 B always pos/normal/colour/uv) */
 static size_t g_grec = 0x68, g_gvo = 0x3c, g_gto = 0x40;
-static const float k_night[3] = { 0.50f, 0.40f, 0.36f };
+static const float k_night[3] = { 1.60f, 1.40f, 1.25f };   /* 11-19: was 0.50/0.40/0.36, far too dark (user) */
 static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
 {
     const uint8_t *vb[MAXS]; size_t vbn[MAXS]; int nvb = 0;
@@ -155,7 +155,7 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
                     st.relaid++;
                 }
                 if (g_night)   /* Rockport is daytime: its prelight down to a night level (B, G, R, A) */
-                    for (int ch = 0; ch < 3; ch++) vx[24 + ch] = (uint8_t)(vx[24 + ch] * k_night[ch] + 0.5f);
+                    for (int ch = 0; ch < 3; ch++) { float v = vx[24 + ch] * k_night[ch] + 0.5f; vx[24 + ch] = (uint8_t)(v > 255.0f ? 255.0f : v); }
                 put(o, vx, 36);
             }
         close_chunk(o, c); }
@@ -191,6 +191,7 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
 }
 
 /* ---- one MW solid object (0x80134010) ---- */
+
 static void conv_object(Buf *o, const uint8_t *p, size_t n)
 {
     g_night = g_relight;   /* the sky keeps its colours */

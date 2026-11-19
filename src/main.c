@@ -27127,6 +27127,50 @@ int main(int argc, char **argv) {
                     mat_mul(Psky, VT, MVPsky);
                 }
             }
+#ifdef OPENUG2_SIM_PRE_H
+            {   /* test aid (simulator): OPENUG2_SIM_PICK=1 -- at each screenshot, what does a ray through
+                   a few screen points hit first (black wall hunt) */
+                const char *sim_shot_pending(void);
+                static char lastshot[64]; const char *sp = getenv("OPENUG2_SIM_PICK") ? sim_shot_pending() : NULL;
+                if (sp && strcmp(sp, lastshot) && active_resident) {
+                    snprintf(lastshot, sizeof lastshot, "%s", sp);
+                    static const float pts[][2] = {{0.0f,0.3f},{-0.5f,0.3f},{0.5f,0.3f},{-0.5f,0.6f},{0.0f,0.1f},{0.5f,0.1f}};
+                    float th = tanf(cam_fovy * 0.5f);
+                    for (int pi = 0; pi < 6; pi++) {
+                        float d[3];
+                        for (int c = 0; c < 3; c++)
+                            d[c] = -V[c*4+2] + pts[pi][0] * th * cam_aspect * V[c*4+0] + pts[pi][1] * th * V[c*4+1];
+                        const N2Scene *scs[2] = { &active_resident->world.scene, &active_resident->world.vista };
+                        float best = 1e30f; const N2Mesh *bm = NULL; int bsc = 0, bv = 0;
+                        for (int sc = 0; sc < 2; sc++)
+                            for (int mi = 0; mi < scs[sc]->count; mi++) {
+                                const N2Mesh *m = &scs[sc]->meshes[mi];
+                                if (m->cat == N2_SKY || !m->verts || !m->idx) continue;
+                                for (int t = 0; t + 2 < m->nidx; t += 3) {
+                                    const float *a0 = m->verts + m->idx[t]*5, *a1 = m->verts + m->idx[t+1]*5, *a2 = m->verts + m->idx[t+2]*5;
+                                    float e1[3], e2[3], pv[3], tv[3], qv[3];
+                                    for (int c = 0; c < 3; c++) { e1[c] = a1[c]-a0[c]; e2[c] = a2[c]-a0[c]; tv[c] = view_cam[c]-a0[c]; }
+                                    pv[0]=d[1]*e2[2]-d[2]*e2[1]; pv[1]=d[2]*e2[0]-d[0]*e2[2]; pv[2]=d[0]*e2[1]-d[1]*e2[0];
+                                    float det = e1[0]*pv[0]+e1[1]*pv[1]+e1[2]*pv[2];
+                                    if (fabsf(det) < 1e-9f) continue;
+                                    float inv = 1.0f/det, u = (tv[0]*pv[0]+tv[1]*pv[1]+tv[2]*pv[2])*inv;
+                                    if (u < 0 || u > 1) continue;
+                                    qv[0]=tv[1]*e1[2]-tv[2]*e1[1]; qv[1]=tv[2]*e1[0]-tv[0]*e1[2]; qv[2]=tv[0]*e1[1]-tv[1]*e1[0];
+                                    float v = (d[0]*qv[0]+d[1]*qv[1]+d[2]*qv[2])*inv;
+                                    if (v < 0 || u + v > 1) continue;
+                                    float tt = (e2[0]*qv[0]+e2[1]*qv[1]+e2[2]*qv[2])*inv;
+                                    if (tt > 0.5f && tt < best) { best = tt; bm = m; bsc = sc; bv = m->idx[t]; }
+                                }
+                            }
+                        if (bm) printf("pick %s pt %d: %s %s aname=%s cat=%d role=%d tex=%08x dist %.0f vcol %d %d %d %d fade %d%c", sp, pi,
+                                       bsc ? "vista" : "world", bm->sname, bm->aname, bm->cat, bm->world_role, bm->texkey, best,
+                                       bm->vcol ? bm->vcol[bv*4] : -1, bm->vcol ? bm->vcol[bv*4+1] : -1, bm->vcol ? bm->vcol[bv*4+2] : -1,
+                                       bm->vcol ? bm->vcol[bv*4+3] : -1, bm->fade_in, 10);
+                        else printf("pick %s pt %d: nothing (cam %.0f %.0f %.0f)%c", sp, pi, view_cam[0], view_cam[1], view_cam[2], 10);
+                    }
+                }
+            }
+#endif
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
             glUniform1f(uUnlit, 0.0f);
             glUniform1f(rp.uEmissiveTex, 1.0f);
