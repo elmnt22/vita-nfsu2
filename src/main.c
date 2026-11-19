@@ -12809,10 +12809,13 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         smk_touch(cb.pos, carcoll_radius(cs[i].c));
     }
     int ncars = nc;
+    hitch_mark("rc.touch");
     nc += smk_bodies(cs + nc, CARCOLL_MAXCARS - nc, 0);
+    hitch_mark("rc.bodies");
     for (int i = ncars; i < nc; i++) g_rt.csmap[i] = -1000;
     CarCollHit h[32];
     int nh = nc ? carcoll_run_all(cs, nc, usew ? g_wcoll : NULL, h, 32, rt_wake, NULL) : 0;
+    hitch_mark("rc.runall");
     if (nh > 32) nh = 32;
     if (nc) rt_style_near(ncars); else g_rt.sty.nnear = 0;
     if (nc > ncars) {
@@ -12821,6 +12824,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         smk_coll_sounds(3, cs, nc, h, nh, ids);
         smk_hit_fx(cs, nc, h, nh);
     } else sfx_coll_pairs(3, NULL, 0);
+    hitch_mark("rc.sounds");
     {   /* the props' hits are not the race's cars' */
         int k = 0;
         for (int i = 0; i < nh; i++)

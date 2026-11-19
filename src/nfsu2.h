@@ -626,6 +626,23 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                        -> 81 km/h). Paved is a road surface; the generic TRN_
                        ground below is not. */
                     if (L >= 7 && !memcmp(n, "TRN_RDP", 7)) return N2_ROAD;
+                    /* World Expansion (Carbon's names; no UG2 bundle has these
+                       prefixes, scanned 11-19): road chops RD_EXOTIC_ /
+                       RD_RUNOFF / RD_TNDRIFTC_TOUGE_ / RD_SHORTCUT, shoulders
+                       RUNOFF_ and TD_*_RUNOFF / SHORTCUT / INTERSECTION / RAMP,
+                       ground L5RA_TRN_ / L5RA_TN_TRN_. As N2_OTHER they had
+                       no ground: every resident rebuild over them failed */
+                    if (!n2_contains(n, L, "WALL") && !n2_contains(n, L, "RAIL") &&
+                        !n2_contains(n, L, "PIPE")) {
+                        if (L >= 3 && !memcmp(n, "RD_", 3)) return N2_ROAD;
+                        if (L >= 7 && !memcmp(n, "RUNOFF_", 7)) return N2_ROAD;
+                        if (L >= 3 && !memcmp(n, "TD_", 3) &&
+                            (n2_contains(n, L, "RUNOFF") || n2_contains(n, L, "SHORTCUT") ||
+                             n2_contains(n, L, "INTERSECTION") || n2_contains(n, L, "RAMP")))
+                            return N2_ROAD;
+                        if ((L >= 9 && !memcmp(n, "L5RA_TRN_", 9)) ||
+                            (L >= 12 && !memcmp(n, "L5RA_TN_TRN_", 12))) return N2_TERRAIN;
+                    }
                     /* The airport apron the runway feeds into: paved concrete,
                        driven continuously with the runway (measured: L4RB left
                        TRN_RDP_RUNWAY at f302 straight onto

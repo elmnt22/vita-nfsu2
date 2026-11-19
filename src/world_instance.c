@@ -385,6 +385,11 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     char name[40];
     uint32_t model_key = winst_model_identity(data, begin, end, name, sizeof name);
     int scen = n2_scen_class(name);
+    {   /* OPENUG2_CAT_DUMP: every prototype's name and category (library scan only) */
+        static const char *dump = (const char *)1;
+        if (dump == (const char *)1) dump = getenv("OPENUG2_CAT_DUMP");
+        if (dump && !reload) fprintf(stderr, "CATDUMP %d %d %s\n", cat, scen, name);
+    }
     float matrix[16];
     int has_matrix = n2_obj_matrix(data, begin, end, matrix);
     int is_vista = 0;

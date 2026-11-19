@@ -959,9 +959,36 @@ int world_resident_validate_cpu(const WorldResident *resident,
         !isfinite(player_z)) return 0;
     if (!resident->meshes_validated && !resident_validate_meshes(resident)) return 0;
     WGroundHit hit;
-    return world_ground_hit_grid(&resident->world.grid, &resident->world.scene,
-                                player_x, player_y, player_z, &hit) !=
-           WSURF_NONE;
+    if (world_ground_hit_grid(&resident->world.grid, &resident->world.scene,
+                              player_x, player_y, player_z, &hit) != WSURF_NONE) return 1;
+    {
+        WGroundHit any; int c2 = world_ground_hit_grid(&resident->world.grid, &resident->world.scene,
+                                                      player_x, player_y, N2_GROUND_HIGHEST, &any);
+        WGroundHit nogrid; int c3 = world_ground_hit_grid(NULL, &resident->world.scene,
+                                                          player_x, player_y, player_z, &nogrid);
+        printf("resident validate: no ground under the car in the new set (highest: %s z %.1f; brute: %s z %.1f; car z %.1f)\n",
+               c2 != WSURF_NONE ? "hit" : "none", c2 != WSURF_NONE ? any.z : 0.0f,
+               c3 != WSURF_NONE ? "hit" : "none", c3 != WSURF_NONE ? nogrid.z : 0.0f, player_z);
+        /* every mesh of any category with a triangle under the car */
+        const N2Scene *sc = &resident->world.scene; int shown = 0, near = 0;
+        for (int m = 0; m < sc->count && shown < 6; m++) {
+            const N2Mesh *me = &sc->meshes[m];
+            if (!me->verts || !me->idx) continue;
+            for (int t = 0; t + 2 < me->nidx; t += 3) {
+                const float *a = me->verts + me->idx[t]*5, *b = me->verts + me->idx[t+1]*5, *c = me->verts + me->idx[t+2]*5;
+                float d1 = (b[0]-a[0])*(player_y-a[1]) - (b[1]-a[1])*(player_x-a[0]);
+                float d2 = (c[0]-b[0])*(player_y-b[1]) - (c[1]-b[1])*(player_x-b[0]);
+                float d3 = (a[0]-c[0])*(player_y-c[1]) - (a[1]-c[1])*(player_x-c[0]);
+                if ((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0)) continue;
+                printf("  under the car: mesh %d cat %d z %.1f %.1f %.1f, %d tris\n", m, me->cat, a[2], b[2], c[2], me->nidx / 3);
+                shown++; break;
+            }
+            if (me->world_bounds_valid && fabsf(me->world_bounds[0] + me->world_bounds[3] - 2*player_x) < 200 &&
+                fabsf(me->world_bounds[1] + me->world_bounds[4] - 2*player_y) < 200 && (me->cat == N2_ROAD || me->cat == N2_TERRAIN)) near++;
+        }
+        printf("  ground meshes with centres within 100 m: %d of %d meshes\n", near, sc->count);
+    }
+    return 0;
 }
 
 static int resident_validate_meshes(const WorldResident *resident) {
@@ -992,21 +1019,21 @@ static int resident_validate_meshes(const WorldResident *resident) {
     for (int i = 0; i < scene->count; i++) {
         const N2Mesh *mesh = &scene->meshes[i];
         if (!mesh->verts || !mesh->idx || mesh->nverts <= 0 || mesh->nidx <= 0)
-            return 0;
+            { printf("resident validate: mesh %d empty\n", i); return 0; }
         if (mesh->cat == N2_ROAD || mesh->cat == N2_TERRAIN) ground_meshes++;
         if (mesh->world_bounds_valid) {
-            for (int k = 0; k < 6; k++) if (!isfinite(mesh->world_bounds[k])) return 0;
+            for (int k = 0; k < 6; k++) if (!isfinite(mesh->world_bounds[k])) { printf("resident validate: mesh %d bounds not finite\n", i); return 0; }
             for (int k = 0; k < 3; k++)
-                if (mesh->world_bounds[k] > mesh->world_bounds[k+3]) return 0;
+                if (mesh->world_bounds[k] > mesh->world_bounds[k+3]) { printf("resident validate: mesh %d bounds inverted\n", i); return 0; }
         } else {
             for (int j = 0; j < mesh->nverts; j++)
                 for (int k = 0; k < 3; k++)
-                    if (!isfinite(mesh->verts[j*5+k])) return 0;
+                    if (!isfinite(mesh->verts[j*5+k])) { printf("resident validate: mesh %d vertex not finite\n", i); return 0; }
         }
         for (int j = 0; j < mesh->nidx; j++)
-            if (mesh->idx[j] >= mesh->nverts) return 0;
+            if (mesh->idx[j] >= mesh->nverts) { printf("resident validate: mesh %d index %d of %d verts\n", i, (int)mesh->idx[j], mesh->nverts); return 0; }
         for (int j = 0; j < 4; j++)
-            if (!isfinite(world->mbb[i][j])) return 0;
+            if (!isfinite(world->mbb[i][j])) { printf("resident validate: mesh %d box not finite\n", i); return 0; }
     }
     if (!ground_meshes) printf("resident validate: no ground meshes\n");
     return ground_meshes > 0;

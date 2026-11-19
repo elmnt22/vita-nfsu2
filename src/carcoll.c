@@ -1293,11 +1293,12 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
         if (narrow(&W, i, &k)) insert_contact(list, &nl, &k);
     }
     Uint64 c2 = SDL_GetPerformanceCounter();
-    int iters = 0;
+    int iters = 0, it_world = 0, it_prop = 0, it_car = 0;
     for (int iter = 0; nl > 0 && iter < 20; iter++) {     /* DAT_802080 */
         iters++;
         Contact k = list[0];
         CPair *p = &pairs[k.pair];
+        if (p->b < 0) it_world++; else if (cars[p->a].ops || cars[p->b].ops) it_prop++; else it_car++;
         if (resolve(&W, &k, done < maxhits && hits ? &hits[done] : NULL, wake, user))
             done++;
         p->count++;
@@ -1330,6 +1331,19 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
         tw += (double)g_bp_world * f; g_bp_world = 0;
         tb += (double)(c1 - c0) * f; tn += (double)(c2 - c1) * f; tr += (double)(c3 - c2) * f;
         pairs_sum += W.npairs; iters_sum += iters;
+        {   /* the worst run of the window and what its resolves were against */
+            static double wms; static int wit, ww, wp, wc, wn, wpairs, wpolys;
+            double ms = (double)(c3 - c0) * f;
+            if (ms > wms) {
+                int polys = 0; for (int i = 0; i < n; i++) polys += np[i];
+                wms = ms; wit = iters; ww = it_world; wp = it_prop; wc = it_car; wn = n; wpairs = W.npairs; wpolys = polys;
+            }
+            if (n > 1 && runs + 1 >= 1200 && wms > 0) {
+                printf("contacts worst run: %.2f ms, %d resolves (%d world, %d prop, %d car), %d pairs, %d bodies, %d world polys\n",
+                       wms, wit, ww, wp, wc, wpairs, wn, wpolys);
+                wms = 0;
+            }
+        }
         if (n > 1 && ++runs >= 1200) {
             printf("contacts over %ld runs: broadphase %.3f (world %.3f) narrow %.3f resolve %.3f ms/run, %.1f pairs, %.2f resolves (%d bodies)\n",
                    runs, tb / runs, tw / runs, tn / runs, tr / runs, (double)pairs_sum / runs, (double)iters_sum / runs, n);

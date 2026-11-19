@@ -65,7 +65,13 @@ typedef struct {
        NULL when the scene is too large to pack; queries then use `list`. */
     int tgw, tgh;
     int *tstart;
-    uint32_t *tlist;
+    uint32_t *tlist;          /* band 0 (non-NULL = the fine level exists) */
+    /* the list in row bands of at most ~1 MB: a 4.7 MB single array found
+       no hole in a fragmented heap (World Expansion, hwxp5) */
+    int nband;
+    uint32_t **tband;         /* band b's entries, from tstart[first cell of b] */
+    int *trow_band;           /* tgh: the band of each row */
+    int *tband_base;          /* nband: tstart index of the band's first entry */
 } WGroundGrid;
 
 typedef struct {

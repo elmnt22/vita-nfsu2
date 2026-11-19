@@ -1151,7 +1151,9 @@ void world_ground_grid_free(WGroundGrid *grid) {
     free(grid->start);
     free(grid->list);
     free(grid->tstart);
-    free(grid->tlist);
+    if (grid->tband) { for (int b = 0; b < grid->nband; b++) free(grid->tband[b]); free(grid->tband); }
+    else free(grid->tlist);
+    free(grid->trow_band); free(grid->tband_base);
     memset(grid, 0, sizeof *grid);
 }
 
@@ -1171,8 +1173,15 @@ static void tri_box(const N2Mesh *me, int t, float b[4]) {
     float mg = 0.04f*((mxx-mnx)+(mxy-mny)) + 0.01f;
     b[0] = mnx-mg; b[1] = mny-mg; b[2] = mxx+mg; b[3] = mxy+mg;
 }
+#define TBAND_ENTRIES (256 * 1024)
+static void tri_bands_free(uint32_t **band, int nband, int *rowb, int *base) {
+    if (band) for (int b = 0; b < nband; b++) free(band[b]);
+    free(band); free(rowb); free(base);
+}
 static void ground_tri_grid_build(WGroundGrid *g, const N2Scene *scene, float x1, float y1) {
     g->tgw = g->tgh = 0; g->tstart = NULL; g->tlist = NULL;
+    g->nband = 0; g->tband = NULL; g->trow_band = NULL; g->tband_base = NULL;
+    uint32_t **band = NULL; int *rowb = NULL, *base = NULL, nband = 0;
     if (scene->count >= (1 << 17)) return;
     int tgw = (int)((x1 - g->x0)/TCELL) + 1, tgh = (int)((y1 - g->y0)/TCELL) + 1;
     if (tgw <= 0 || tgh <= 0 || (long long)tgw * tgh > 4000000) return;
@@ -1184,16 +1193,37 @@ static void ground_tri_grid_build(WGroundGrid *g, const N2Scene *scene, float x1
         if (pass == 1) {
             for (size_t c = 0; c < cells; c++) tstart[c+1] += tstart[c];
             if (!tstart[cells]) { free(tstart); return; }
-            tlist = (uint32_t *)malloc((size_t)tstart[cells] * sizeof *tlist);
+            /* rows into bands of at most TBAND_ENTRIES (a row is never split) */
+            rowb = (int *)malloc((size_t)tgh * sizeof *rowb);
+            base = (int *)malloc(((size_t)tgh + 1) * sizeof *base);
+            band = (uint32_t **)calloc((size_t)tgh + 1, sizeof *band);
             cursor = (int *)malloc(cells * sizeof *cursor);
-            if (!tlist || !cursor) { free(tlist); free(cursor); free(tstart); return; }
+            if (!rowb || !base || !band || !cursor) {
+                tri_bands_free(band, 0, rowb, base); free(cursor); free(tstart); return;
+            }
+            for (int cy = 0; cy < tgh; cy++) {
+                int row0 = tstart[(size_t)cy * tgw];
+                int row1 = tstart[(size_t)(cy + 1) * tgw];   /* end of this row */
+                /* a new band when this row would push a non-empty band past the cap */
+                if (!nband || (row0 > base[nband - 1] && row1 - base[nband - 1] > TBAND_ENTRIES))
+                    base[nband++] = row0;
+                rowb[cy] = nband - 1;
+            }
+            int ok = 1;
+            for (int b = 0; b < nband && ok; b++) {
+                int end = b + 1 < nband ? base[b + 1] : tstart[cells];
+                band[b] = (uint32_t *)malloc((size_t)(end - base[b] > 0 ? end - base[b] : 1) * sizeof **band);
+                if (!band[b]) ok = 0;
+            }
+            if (!ok) { tri_bands_free(band, nband, rowb, base); free(cursor); free(tstart); return; }
+            tlist = band[0];
             memcpy(cursor, tstart, cells * sizeof *cursor);
         }
         for (int i = 0; i < scene->count; i++) {
             const N2Mesh *me = &scene->meshes[i];
             if (me->cat != N2_ROAD && me->cat != N2_TERRAIN) continue;
             if (me->nidx / 3 >= (1 << 15)) {      /* cannot pack: no fine level */
-                free(tlist); free(cursor); free(tstart); return;
+                tri_bands_free(band, nband, rowb, base); free(cursor); free(tstart); return;
             }
             for (int t = 0; t + 2 < me->nidx; t += 3) {
                 float b[4]; tri_box(me, t, b);
@@ -1205,15 +1235,17 @@ static void ground_tri_grid_build(WGroundGrid *g, const N2Scene *scene, float x1
                     for (int cx = cx0; cx <= cx1; cx++) {
                         size_t c = (size_t)cy*tgw + cx;
                         if (pass == 0) tstart[c+1]++;
-                        else tlist[cursor[c]++] = ((uint32_t)i << 15) | (uint32_t)(t/3);
+                        else { int b = rowb[cy];
+                               band[b][cursor[c]++ - base[b]] = ((uint32_t)i << 15) | (uint32_t)(t/3); }
                     }
             }
         }
     }
     free(cursor);
     g->tgw = tgw; g->tgh = tgh; g->tstart = tstart; g->tlist = tlist;
-    printf("ground triangle grid: %dx%d cells of %.0f m, %d entries (%ld KB)\n",
-           tgw, tgh, (double)TCELL, tstart[cells],
+    g->nband = nband; g->tband = band; g->trow_band = rowb; g->tband_base = base;
+    printf("ground triangle grid: %dx%d cells of %.0f m, %d entries in %d bands (%ld KB)\n",
+           tgw, tgh, (double)TCELL, tstart[cells], nband,
            (long)(((size_t)tstart[cells] * 4 + (cells + 1) * 4) >> 10));
 }
 
@@ -1225,7 +1257,9 @@ static const uint32_t *tri_cell_grid(const WGroundGrid *grid, float x, float y, 
     if (cx < 0 || cy < 0 || cx >= grid->tgw || cy >= grid->tgh) return grid->tlist;
     int c = cy*grid->tgw + cx;
     *n = grid->tstart[c+1] - grid->tstart[c];
-    return grid->tlist + grid->tstart[c];
+    if (!grid->tband) return grid->tlist + grid->tstart[c];
+    int b = grid->trow_band[cy];
+    return grid->tband[b] + (grid->tstart[c] - grid->tband_base[b]);
 }
 
 int world_predecoded_texture_info(uint32_t key, unsigned char *mode) {
