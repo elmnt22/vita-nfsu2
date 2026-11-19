@@ -26288,6 +26288,13 @@ int main(int argc, char **argv) {
                                                            ftol(I x rain[k] + (1 - I) x base[k])), k = 2, 3, 4 */
                 if (fm) rain_set_fog_colour((int)fm[2], (int)fm[3], (int)fm[4]);
                 g_fog_linear = 1;
+                if (xpcity_is_city(trackname)) {
+                    /* Bayview's regional tables, looked up at a translated
+                       city's coordinates, gave a pale beige (~98,98,85) that
+                       turned every far building into a light slab against the
+                       dark dome. Use the dome's own horizon colour instead. */
+                    frgb[0] = 0.07f; frgb[1] = 0.10f; frgb[2] = 0.14f;
+                }
                 g_dbg.fog_r = frgb[0]; g_dbg.fog_g = frgb[1]; g_dbg.fog_b = frgb[2];
                 g_dbg.fog_density = 1.0f / (250.0f - fstart);
                 fog_k = fstart * g_dbg.fog_density; fog_floor = ffloor;
@@ -27177,6 +27184,12 @@ int main(int argc, char **argv) {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
             GLuint vlast = (GLuint)-1;
+            /* the MW city is relit for night in its vertex colours (xpconv
+               k_night), which this pass never reads: its daytime backdrops
+               take the same tint here (render.c: texture x uColor). Everywhere
+               else 1, so Bayview is unchanged. */
+            const int vnight = strstr(trackname, "L2RA") && xpcity_is_city(trackname);
+            const float vtint[3] = { vnight ? 0.36f : 1.0f, vnight ? 0.40f : 1.0f, vnight ? 0.50f : 1.0f };
             for (int k = 0; k < nvista; k++) {
                 N2Batch *b = &vbatch[k];
                 /* A backdrop is by definition BEHIND the ordinary world, and
@@ -27244,7 +27257,7 @@ int main(int argc, char **argv) {
                            b->index_count/3, sqrtf(near2), hi, cam[2]);
                 }
                 if (b->tex != vlast) {
-                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glUniform3f(uColor, vtint[0], vtint[1], vtint[2]); glBindTexture(GL_TEXTURE_2D, b->tex); }
                     else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.30f, 0.32f, 0.38f); }
                     vlast = b->tex;
                 }

@@ -337,7 +337,7 @@ static const char *FS =
        write depth-adjacent artefacts or fringe. */
     "  if(uVista>0.5){\n"
     "    vec4 t = texture2D(uTex, vUV);\n"
-    "    vec3 c = uUseTex>0.5 ? t.rgb : uColor;\n"
+    "    vec3 c = uUseTex>0.5 ? t.rgb*uColor : uColor;\n"
     "    float a = (uUseTex>0.5 ? t.a : 1.0) * vColor.a;\n"
     "    if(a < 0.02) discard;\n"
     "    gl_FragColor = vec4(mix(uFogColor, c, fog), a);\n"
