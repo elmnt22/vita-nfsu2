@@ -106,6 +106,7 @@ static void ta_save(void) {
 static void rgb565(uint16_t c, int *r, int *g, int *b) {
     *r = ((c >> 11) & 31) * 255 / 31; *g = ((c >> 5) & 63) * 255 / 63; *b = (c & 31) * 255 / 31;
 }
+#ifndef SKYLINE_PREP   /* the Expansion Prep Tool has its own stub (conv_stubs.c) */
 void skyline_texavg_note(uint32_t key, const N2Tex *t) {
     if (!key || !t || t->w <= 0 || t->h <= 0) return;
     ta_load();
@@ -136,6 +137,7 @@ void skyline_texavg_note(uint32_t key, const N2Tex *t) {
     g_ta[h].rgb[0] = (unsigned char)(sr / n); g_ta[h].rgb[1] = (unsigned char)(sg / n); g_ta[h].rgb[2] = (unsigned char)(sb / n);
     g_ta_dirty = 1;
 }
+#endif
 
 /* ---- the loader thread ---- */
 static int grow(void **p, long *cap, long need, size_t el) {
@@ -173,7 +175,8 @@ static void collect(void *ctx, const N2Mesh *m) {
     free(nor);
 }
 static int sky_beyond(void) { return beyond_is_track(S.track); }
-static int sky_xp(void) { return xpcity_is_city(S.track); }
+static int g_sky_force_xp;   /* skyline_build_file / skyline_cache_file: the Prep Tool (its xpcity stub says no) */
+static int sky_xp(void) { return g_sky_force_xp || xpcity_is_city(S.track); }
 /* keep the tallest stand-ins whose vertices + indices fit `budget` bytes (in their collected order) */
 static float *g_trim_h;
 static int trim_cmp(const void *a, const void *b) {
@@ -363,6 +366,31 @@ void skyline_reset(void) {
     SDL_AtomicSet(&S.state, 0); SDL_AtomicSet(&S.abort, 0);
 }
 
+/* the Expansion Prep Tool: <track>'s stand-in cache built on the PC from its new tiles,
+   so the Vita does not spend ~70 s of the first drive building it (hwxp12 11-19); the
+   colours come from the textures on the Vita, at upload. out: the file's path. */
+void skyline_cache_file(const char *track, char *out, size_t n) {
+    g_sky_force_xp = 1;
+    char keep[sizeof S.track]; memcpy(keep, S.track, sizeof keep);
+    snprintf(S.track, sizeof S.track, "%s", track);
+    cache_path(out, n);
+    memcpy(S.track, keep, sizeof keep);
+}
+int skyline_build_file(const char *track, char *out, size_t n) {
+    if (S.thread || !track || !track[0]) return 0;
+    g_sky_force_xp = 1;
+    free_cpu();
+    snprintf(S.track, sizeof S.track, "%s", track);
+    SDL_AtomicSet(&S.abort, 0);
+    int tiles = world_tiles_each_standin(S.track, sky_min_h(), collect, NULL, &S.abort);
+    int ok = tiles > 0 && S.nmesh > 0;
+    if (ok && (sky_beyond() || sky_xp())) trim_budget(SKYLINE_BEYOND_BUDGET);
+    if (ok) cache_write();
+    if (out) cache_path(out, n);
+    printf("skyline: %s: %d stand-ins from %d tiles%s\n", track, S.nmesh, tiles, ok ? "" : " -- FAILED");
+    free_cpu(); S.track[0] = 0;
+    return ok;
+}
 void skyline_start(const char *track) {
     if (S.off == 0) {
         FILE *f = fopen("ux0:data/NFSU2/noskyline.txt", "r");

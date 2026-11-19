@@ -31,6 +31,8 @@ float skyline_inner(void);
 float skyline_outer(void);
 /* Main thread: forget the GL buffers (a track switch / GL teardown). */
 void skyline_reset(void);
+void skyline_cache_file(const char *track, char *out, size_t n);   /* its cache file path */
+int  skyline_build_file(const char *track, char *out, size_t n);   /* Expansion Prep Tool */
 void skyline_forget(const char *track);   /* drop its stand-in cache */
 /* Main thread, from the world texture binder: note a decoded texture's mean colour. */
 void skyline_texavg_note(uint32_t key, const N2Tex *t);

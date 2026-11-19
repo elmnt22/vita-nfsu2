@@ -273,6 +273,11 @@ int smk_load(const char *root, const char *stem)
     int nhull = 0;
     for (int i = 0; i < g_ninfo; i++)
         if ((g_info[i].hull = carcoll_load_named(d, n, g_info[i].name)) != NULL) nhull++;
+    {   /* hull census (perf 11-19): a prop's world test walks every hull vertex */
+        int mx = 0, tot = 0;
+        for (int i = 0; i < g_ninfo; i++) { int v = carcoll_vertex_count(g_info[i].hull); tot += v; if (v > mx) mx = v; }
+        printf("smokeables: hulls %.1f vertices on average, %d at most\n", g_ninfo ? (double)tot / g_ninfo : 0.0, mx);
+    }
     /* the override table stays needed for the spawners: copy what we use */
     uint16_t (*ovr)[2] = NULL;
     if (ov && nov > 0) {

@@ -2802,6 +2802,7 @@ int world_tiles_each_standin(const char *track, float minh,
                              SDL_atomic_t *abort_flag) {
     WtIndexEntry *idx = NULL; int n = 0;
     if (!wt_index_read(track, &idx, &n)) return -1;
+    wt_pack_probe(track, 0);   /* the pack opens with the streaming; the Prep Tool has none */
     int read = 0;
     for (int i = 0; i < n; i++) {
         if (abort_flag && SDL_AtomicGet(abort_flag)) break;
