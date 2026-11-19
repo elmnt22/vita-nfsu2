@@ -18525,6 +18525,25 @@ int main(int argc, char **argv) {
             if (hl<0.5f) hl=2.20f;
             if (hw<0.5f) hw=0.90f;
             float safe[3], safe_heading=0.0f;
+#ifdef OPENUG2_SIM_PRE_H
+            if (getenv("OPENUG2_SIM_XYDUMP")) {   /* test aid: every mesh with a triangle over x y */
+                float qx = 0, qy = 0; sscanf(getenv("OPENUG2_SIM_XYDUMP"), "%f %f", &qx, &qy);
+                for (int m = 0; m < scene.count; m++) {
+                    const N2Mesh *me = &scene.meshes[m];
+                    if (!me->verts || !me->idx) continue;
+                    for (int t = 0; t + 2 < me->nidx; t += 3) {
+                        const float *a = me->verts + me->idx[t]*5, *b = me->verts + me->idx[t+1]*5, *c = me->verts + me->idx[t+2]*5;
+                        float d1 = (b[0]-a[0])*(qy-a[1]) - (b[1]-a[1])*(qx-a[0]);
+                        float d2 = (c[0]-b[0])*(qy-b[1]) - (c[1]-b[1])*(qx-b[0]);
+                        float d3 = (a[0]-c[0])*(qy-c[1]) - (a[1]-c[1])*(qx-c[0]);
+                        if ((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0)) continue;
+                        printf("XYDUMP mesh %d cat %d role %d z %.1f %.1f %.1f tris %d (%.31s / %.27s)\n", m, me->cat,
+                               me->world_role, a[2], b[2], c[2], me->nidx / 3, me->sname, me->aname);
+                        break;
+                    }
+                }
+            }
+#endif
             if (ss_nearest_safe_road(&scene,
                     (const float (*)[4])world.neighborhood.mbb,
                     obst,nobst,world_options.focus_x,world_options.focus_y,

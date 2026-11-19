@@ -980,7 +980,7 @@ int world_resident_validate_cpu(const WorldResident *resident,
                 float d2 = (c[0]-b[0])*(player_y-b[1]) - (c[1]-b[1])*(player_x-b[0]);
                 float d3 = (a[0]-c[0])*(player_y-c[1]) - (a[1]-c[1])*(player_x-c[0]);
                 if ((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0)) continue;
-                printf("  under the car: mesh %d cat %d z %.1f %.1f %.1f, %d tris\n", m, me->cat, a[2], b[2], c[2], me->nidx / 3);
+                printf("  under the car: mesh %d cat %d z %.1f %.1f %.1f, %d tris (%.31s / %.27s)\n", m, me->cat, a[2], b[2], c[2], me->nidx / 3, me->sname, me->aname);
                 shown++; break;
             }
             if (me->world_bounds_valid && fabsf(me->world_bounds[0] + me->world_bounds[3] - 2*player_x) < 200 &&

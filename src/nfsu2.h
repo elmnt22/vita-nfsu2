@@ -635,6 +635,10 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                     if (!n2_contains(n, L, "WALL") && !n2_contains(n, L, "RAIL") &&
                         !n2_contains(n, L, "PIPE")) {
                         if (L >= 3 && !memcmp(n, "RD_", 3)) return N2_ROAD;
+                        /* RDI_ intersections and SHORTCUT_ pieces: 11-19, every failed
+                           Palmont rebuild sat on one (none in UG2 bundles) */
+                        if (L >= 4 && !memcmp(n, "RDI_", 4)) return N2_ROAD;
+                        if (L >= 9 && !memcmp(n, "SHORTCUT_", 9)) return N2_ROAD;
                         if (L >= 7 && !memcmp(n, "RUNOFF_", 7)) return N2_ROAD;
                         if (L >= 3 && !memcmp(n, "TD_", 3) &&
                             (n2_contains(n, L, "RUNOFF") || n2_contains(n, L, "SHORTCUT") ||
