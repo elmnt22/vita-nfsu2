@@ -308,6 +308,26 @@ Carbon's pursuit knockout events.
 Turning the switch off hides the cities again. Your Underground 2 career is
 untouched either way.
 
+### Without the Prep Tool
+
+The Vita can translate a city itself from the game's raw files. It's slower
+(the first trip into each city shows a progress screen) and has had less
+testing than the Prep Tool. Copy these files from your PC install to the
+memory card, keeping the folders:
+
+| City | From your PC install | To the Vita |
+|---|---|---|
+| Rockport | `TRACKS\STREAML2RA.BUN`, `TRACKS\L2RA.BUN`, `TRACKS\L2RA\MINI_MAP.BIN`, `GLOBAL\gameplay.bin` (Most Wanted) | `ux0:data/NFSU2/expansion/mw/` |
+| Palmont | `TRACKS\STREAML5RA.BUN`, `TRACKS\L5RA.BUN`, `TRACKS\L5RA\MINI_MAP.BIN`, `GLOBAL\gameplay.bin` (Carbon) | `ux0:data/NFSU2/expansion/carbon/` |
+
+For example, Rockport's stream ends up at
+`ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN`. The two `.BUN` files are
+required. Without `MINI_MAP.BIN` the city has no minimap, and without
+`gameplay.bin` it has no race events. Then turn on the switch in
+[Settings](#settings) as in step 4 above. Leave the raw files there: when a
+later release changes the cities' format, the Vita translates them again
+from those files.
+
 ### Good to know
 
 - The World Expansion is **new and has had little hardware testing**. Some
