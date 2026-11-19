@@ -533,6 +533,14 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
         }
         free(boxes);
     }
+    {   /* test aid: OPENUG2_CONVCELL="x y" converts only the cell holding that point */
+        const char *cc = getenv("OPENUG2_CONVCELL"); float qx, qy;
+        if (cc && sscanf(cc, "%f %f", &qx, &qy) == 2) {
+            int qc = (int)floorf(qx / cell) - cx0, qr = (int)floorf(qy / cell) - cy0;
+            memset(want, 0, (size_t)(ncols * nrows)); p->cells_total = 0;
+            if (qc >= 0 && qr >= 0 && qc < ncols && qr < nrows) { want[qr * ncols + qc] = 1; p->cells_total = 1; }
+        }
+    }
     printf("tiles: converting %s, bounds (%.0f %.0f)-(%.0f %.0f), %d cells of %.0f m\n",
            trackname, bb[0], bb[1], bb[2], bb[3], p->cells_total, cell);
     VMARK("tiles: conversion start, %d cells", p->cells_total);
@@ -547,6 +555,8 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
     if (!wt_pw_open(&pw, trackname)) { printf("tiles: cannot write the %s pack\n", trackname); ok = 0; }
     g_wt_raw_total = g_wt_stored_total = g_wt_reflect_meshes = 0;
     world_instance_set_convert(1);
+    /* the translated cities only: Bayview's tiles stay byte-identical */
+    world_instance_set_compact(strstr(trackname, "L5RA") || strstr(trackname, "L2RA"));
     g_wt_converting = 1;
     /* a cell needs every mesh whose centre lies inside it; any such mesh's
        box reaches within the cell's half diagonal of the centre */
@@ -575,6 +585,10 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
             float mx, my; wt_mesh_centre(m, &mx, &my);
             int tx = (int)floorf(mx / WTILE_SIZE), ty = (int)floorf(my / WTILE_SIZE);
             int lx = tx - cx * WTILE_CELL, ly = ty - cy * WTILE_CELL;
+            {   static const char *cf = (const char *)1; if (cf == (const char *)1) cf = getenv("OPENUG2_CONVFIND");
+                if (cf && strstr(m->sname, cf)) printf("convfind: cell (%d %d) %s cat=%d role=%d centre (%.0f %.0f) tile (%d %d)%s\n",
+                    cx, cy, m->sname, m->cat, m->world_role, mx, my, tx, ty,
+                    (lx < 0 || ly < 0 || lx >= WTILE_CELL || ly >= WTILE_CELL) ? " another cell's" : ""); }
             if (lx < 0 || ly < 0 || lx >= WTILE_CELL || ly >= WTILE_CELL) continue;   /* another cell's */
             ok = wt_put_mesh(&tiles[ly * WTILE_CELL + lx], m, 0);
         }
@@ -619,7 +633,7 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
                cx, cy, written, cell_meshes, (unsigned)(cell_bytes >> 10), wt_ms() - t0,
                p->cells_done, p->cells_total);
     }
-    world_instance_set_convert(0);
+    world_instance_set_convert(0); world_instance_set_compact(0);
     g_wt_converting = 0;
     g_wt_enabled = -1;   /* decide again now that the tile set exists */
 #ifdef __vita__
@@ -2467,6 +2481,28 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         }
     }
 #ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_SIM_TILEFIND=<name part> -- every tile mesh whose name has it */
+        static int done;
+        const char *tf = getenv("OPENUG2_SIM_TILEFIND");
+        if (!done && tf) {
+            done = 1;
+            for (int k = 0; k < g_wt_nindex; k++) {
+                const WtIndexEntry *e = &g_wt_index[k];
+                WtLoaded t; memset(&t, 0, sizeof t);
+                if (!wt_read_decode(track, e->x, e->y, &t, 0)) continue;
+                for (int i = 0; i < t.n; i++) {
+                    const N2Mesh *m = &t.m[i];
+                    if (!strstr(m->sname, tf)) continue;
+                    const float *b = m->world_bounds;
+                    printf("tilefind: tile (%d %d) %s cat=%d role=%d tex %08x verts %d tris %d scen %d %d:%d box (%.0f %.0f %.0f)-(%.0f %.0f %.0f)\n",
+                           e->x, e->y, m->sname, m->cat, m->world_role, m->texkey, m->nverts, m->nidx / 3,
+                           m->scen_has, m->scen_region, m->scen_index, b[0], b[1], b[2], b[3], b[4], b[5]);
+                }
+                wt_release(&t);
+            }
+            printf("tilefind: done\n");
+        }
+    }
     {   /* test aid (simulator): OPENUG2_SKY_CENSUS -- the skyline's candidates over every tile */
         static int done;
         if (!done && getenv("OPENUG2_SKY_CENSUS")) {

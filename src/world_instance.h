@@ -82,6 +82,7 @@ void world_instance_set_detail(int low);
    the collision copy beside its stand-in, so a tile can choose either at
    load), and a focus outside every district borrows the nearest one. */
 void world_instance_set_convert(int on);
+void world_instance_set_compact(int on);   /* per-submesh vertex compaction (expansion cities) */
 /* Union of the companion's district boxes (minx, miny, maxx, maxy). */
 int world_instance_bounds(const char *track_root, const char *bundle, float out[4]);
 /* Every district box (minx, miny, maxx, maxy); caller frees *boxes. */

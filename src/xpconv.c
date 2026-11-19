@@ -58,6 +58,10 @@ static void putfill(Buf *b, size_t k) { need(b, k); if (g_oom) return; memset(b-
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 /* opens a chunk; returns where its size word is */
 static size_t open_chunk(Buf *b, uint32_t id) { put32(b, id); size_t at = b->n; put32(b, 0); return at; }
+/* ends a chunk's payload on a 4-byte multiple (zeros), so the chunk after it starts
+   4-aligned: UG2's reader skips 0x11 filler only in 4-byte steps, and an odd 2-byte
+   tail (an odd index count) left the next chunk's filler 2 bytes short of its data */
+static void pad4(Buf *b, size_t at) { size_t k = (b->n - at - 4) & 3; if (k) putz(b, 4 - k); }
 static void close_chunk(Buf *b, size_t at) { if (g_oom) return; uint32_t s = (uint32_t)(b->n - at - 4); memcpy(b->p + at, &s, 4); }
 /* 0x11 filler so the data after it starts at an absolute multiple of a (EA's
    AlignReader); the reader skips it in 4-byte steps */
@@ -167,7 +171,7 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
                 put(o, &z, 2);
             }
         }
-        close_chunk(o, c); }
+        pad4(o, c); close_chunk(o, c); }
     close_chunk(o, mesh);
     st.groups += (long)ngrp; st.verts += total; st.tris += (long)(tot_idx / 3);
 }
@@ -201,7 +205,7 @@ static void conv_object(Buf *o, const uint8_t *p, size_t n)
                 memcpy(u, h, 0x94); memcpy(u + 0x94, h + 0x98, 8);
                 put(o, u, sizeof u);
                 put(o, h + 0xa0, hn - 0xa0);          /* the name (+ its padding) */
-                close_chunk(o, c);
+                pad4(o, c); close_chunk(o, c);
             }
         } else if (id == 0x80134100) { conv_mesh(o, d, sz); st.solids++; }
         else if (id == 0x134c02 || id == 0x134017 || id == 0x134018 || id == 0x134019) { /* not in UG2's reader */ }

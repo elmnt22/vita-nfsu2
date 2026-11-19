@@ -24801,6 +24801,20 @@ int main(int argc, char **argv) {
                 sscanf(mdv, "%f %f %f %x", &mx, &my, &mr, &mk);
                 md_done = 1;
                 const N2Scene *hs = &active_resident->world.scene;
+                {   /* unresolved textures over the whole resident (broken-texture hunt) */
+                    static uint32_t seen[512]; int ns = 0, miss = 0;
+                    for (int mi = 0; mi < hs->count; mi++) {
+                        const N2Mesh *m = &hs->meshes[mi]; unsigned char md;
+                        if (m->world_role == 1 || m->world_role == 4 || world_predecoded_texture_info(m->texkey, &md)) continue;
+                        miss++;
+                        int f = 0; for (int q = 0; q < ns && !f; q++) f = seen[q] == m->texkey;
+                        if (f || ns >= 512) continue;
+                        seen[ns++] = m->texkey;
+                        const float *bb = active_resident->world.mbb[mi];
+                        printf("texmiss: %08x %s cat=%d at (%.0f %.0f)%c", m->texkey, m->sname, m->cat, bb[0], bb[1], 10);
+                    }
+                    printf("texmiss: %d drawn meshes, %d keys unresolved%c", miss, ns, 10);
+                }
                 printf("meshdump: box (%.0f %.0f) r %.0f key %08x, %d meshes%c", mx, my, mr, mk, hs->count, 10);
                 for (int mi = 0; mi < hs->count; mi++) {
                     const float *bb = active_resident->world.mbb[mi];
@@ -27027,13 +27041,32 @@ int main(int argc, char **argv) {
            first with a deep frustum and no depth writes; the ordinary world
            then overwrites it normally. Missing textures leave the fog clear
            colour as the conservative fallback. */
-        if (nsky && (passmode == 0 || passmode == 3 || passbatch >= 0) && VITA_PROBE(1)) {   /* M78/M79 */
+        static int nosky_t = -1; if (nosky_t < 0) nosky_t = getenv("OPENUG2_NOSKY") != NULL;   /* test aid */
+        if (nsky && !nosky_t && (passmode == 0 || passmode == 3 || passbatch >= 0) && VITA_PROBE(1)) {   /* M78/M79 */
 #ifdef __vita__
             vita_use_lite(1);   /* the dome covers most of the screen: cheap FS */
 #endif
             float MVPsky[16], Psky[16];
             mat_persp(cam_fovy, cam_aspect, znear, 30000.0f, Psky);
             mat_mul(Psky, V, MVPsky);
+            if (xpcity_is_city(trackname)) {
+                /* the translated cities run 25-33 km across, far past the
+                   ~11 km dome authored at one spot: off it the sky went black.
+                   Carry the dome's centre over the camera (x, y only). */
+                float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
+                for (int k = 0; k < nsky; k++)
+                    for (int c = 0; c < 2; c++) {
+                        if (skybatch[k].bbox_min[c] < lo[c]) lo[c] = skybatch[k].bbox_min[c];
+                        if (skybatch[k].bbox_max[c] > hi[c]) hi[c] = skybatch[k].bbox_max[c];
+                    }
+                if (lo[0] < hi[0] && lo[1] < hi[1]) {
+                    float T[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}, VT[16];
+                    T[12] = view_cam[0] - 0.5f * (lo[0] + hi[0]);
+                    T[13] = view_cam[1] - 0.5f * (lo[1] + hi[1]);
+                    mat_mul(V, T, VT);
+                    mat_mul(Psky, VT, MVPsky);
+                }
+            }
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
             glUniform1f(uUnlit, 0.0f);
             glUniform1f(rp.uEmissiveTex, 1.0f);

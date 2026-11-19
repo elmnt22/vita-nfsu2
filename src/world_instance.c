@@ -31,6 +31,8 @@ static int g_world_low_detail;
 void world_instance_set_detail(int low) { g_world_low_detail = !!low; }
 static int g_winst_convert;
 void world_instance_set_convert(int on) { g_winst_convert = !!on; }
+static int g_winst_compact;
+void world_instance_set_compact(int on) { g_winst_compact = !!on; }
 
 /* Prototype meshes are parsed lazily. The library scan records only what the
  * resolver and ownership passes need (identity, category flags, mesh count);
@@ -378,6 +380,7 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
                                 WInstProto *reload) {
     N2Scene local;
     memset(&local, 0, sizeof local);
+    local.compact = (unsigned char)g_winst_compact;
     int cat = n2_mesh_category(data, begin, end);
     char name[40];
     uint32_t model_key = winst_model_identity(data, begin, end, name, sizeof name);
@@ -395,7 +398,9 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
        surface, not a billboard, and three unnamed leftovers are backdrop that
        no name rule can see -- both are decided by measurement/material. */
     N2Geom geometry;
-    if (!strncmp(name, "PAN", 3)) {
+    /* Carbon's district panoramas (TRN_PANO_*, Palmont only) are backdrop rings
+       like UG2's PAN_ models; as TERRAIN they stood as a dark wall over the sky */
+    if (!strncmp(name, "PAN", 3) || !strncmp(name, "TRN_PANO", 8)) {
         is_vista = !(n2_obj_geom(data, begin, end, matrix, &geometry) &&
                      n2_is_ground_sheet(&geometry));
     } else if (n2_impostor_atlas(slot, nslot)) {
@@ -502,6 +507,12 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
         any_ground |= g;
         all_ground &= g;
         index_count += local.meshes[i].nidx;
+    }
+    {   static const char *probe = (const char *)1;
+        if (probe == (const char *)1) probe = getenv("OPENUG2_SLOT_PROBE");
+        if (probe && name[0] && n2_icontains((const unsigned char *)name, (long)strlen(name), probe))
+            fprintf(stderr, "SLOTPROBE %s key %08x meshes %d idx %d vs %d vsize %ld isize %ld\n", name, model_key, count, index_count, vs,
+                    nv ? (long)vtx[0].size : -1L, ni ? (long)idx[0].size : -1L);
     }
     winst_free_scene(&local);
     N2Scene empty;
@@ -1097,6 +1108,9 @@ static int winst_build_visit_uncached(const WInstPlacement *placement,
 #endif
     const WInstProto *proto = winst_library_resolve(build->library, placement,
                                                     type_name, build->stats);
+    {   static const char *cf = (const char *)1; if (cf == (const char *)1) cf = getenv("OPENUG2_CONVFIND");
+        if (cf && strstr(type_name, "RD_Exotic")) printf("convfind: visit %s keys %08x %08x %08x -> %s\n", type_name,
+            placement->model_keys[0], placement->model_keys[1], placement->model_keys[2], proto ? proto->name : "(none)"); }
     if (!proto) return 1;
     const N2Scene *meshes = winst_proto_load(build->library, (WInstProto *)proto);
     const WInstProto *low = proto;
@@ -1122,6 +1136,9 @@ static int winst_build_visit_uncached(const WInstPlacement *placement,
         }
     }
     N2Scene *dst = proto->is_vista ? build->vista : build->scene;
+    {   static const char *cf = (const char *)1; if (cf == (const char *)1) cf = getenv("OPENUG2_CONVFIND");
+        if (cf && strstr(proto->name, cf)) printf("convfind: place %s key %08x meshes %d instanced %d vista %d low %s\n",
+            proto->name, proto->model_key, meshes->count, proto->instanced, proto->is_vista, low != proto ? low->name : "-"); }
     for (int i = 0; i < meshes->count; i++) {
         const N2Mesh *mesh = &meshes->meshes[i];
         int ground = mesh->cat == N2_ROAD || mesh->cat == N2_TERRAIN;

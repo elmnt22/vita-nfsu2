@@ -200,6 +200,9 @@ static void n2_mesh_bias_terrain(N2Mesh *m) {
 typedef struct {
     N2Mesh *meshes;
     int     count, cap;
+    unsigned char compact;   /* 1: n2_add_pair keeps only the vertices a submesh's
+                                own indices use (the expansion cities, whose many
+                                groups per object each copied the whole list) */
 } N2Scene;
 
 /* Total order for exact mesh payload identity. World dedup first groups by
@@ -835,6 +838,29 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
                 if (vbad[i]) memcpy(m.verts + i*5, m.verts + good*5, 3*sizeof(float));
     }
     if (vbad != vbad_small) free(vbad);
+    if (scene->compact) {   /* drop the vertices no index of this submesh uses */
+        int *map = (int *)malloc((size_t)n * sizeof *map), k = 0;
+        if (map) {
+            for (int i = 0; i < n; i++) map[i] = -1;
+            for (int i = 0; i < m.nidx; i++) if (map[m.idx[i]] < 0) map[m.idx[i]] = k++;
+            int fl = m.authored_normals ? 8 : 5;
+            float *nv = k < n ? (float *)malloc((size_t)k * fl * sizeof(float)) : NULL;
+            unsigned char *nc = nv && m.vcol ? (unsigned char *)malloc((size_t)k * 4) : NULL;
+            if (nv && (!m.vcol || nc)) {
+                for (int i = 0; i < n; i++) {
+                    int j = map[i]; if (j < 0) continue;
+                    memcpy(nv + j*5, m.verts + i*5, 5*sizeof(float));
+                    if (m.authored_normals) memcpy(nv + k*5 + j*3, m.verts + n*5 + i*3, 3*sizeof(float));
+                    if (nc) memcpy(nc + j*4, m.vcol + i*4, 4);
+                }
+                for (int i = 0; i < m.nidx; i++) m.idx[i] = (uint16_t)map[m.idx[i]];
+                free(m.verts); m.verts = nv;
+                if (nc) { free(m.vcol); m.vcol = nc; }
+                m.nverts = k; nv = NULL; nc = NULL;
+            }
+            free(nv); free(nc); free(map);
+        }
+    }
     n2_push_mesh(scene, m);
 }
 
@@ -1263,7 +1289,7 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
             float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
             uint32_t slot[64];
             int nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
-            if (!strncmp(anm, "PAN", 3)) {
+            if (!strncmp(anm, "PAN", 3) || !strncmp(anm, "TRN_PANO", 8)) {   /* + Carbon's district panoramas */
                 /* ...except the water surface, which wears the same prefix and
                    is ordinary world ground. n2_is_ground_sheet measures that
                    apart instead of spelling it. */
