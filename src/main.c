@@ -30849,7 +30849,7 @@ int main(int argc, char **argv) {
                    the event's track record (race table +0xac..+0xc0) */
                 int mev = g_rt.active ? g_rt.ev
                         : strstr(trackname, "L4RB") ? 4200 : strstr(trackname, "L4RC") ? 4300 : 4000;
-                const char *xmap = xpcity_is_city(trackname) ? xpcity_map(trackname) : NULL;   /* MW / Carbon: their own map */
+                const char *xmap = xpcity_is_city(trackname) ? xpcity_map_at(trackname, hs.car_x, hs.car_y) : NULL;   /* MW / Carbon: their own map (Carbon: the area's the car is in) */
                 if (xmap && RT_RACE) {   /* MW: the race's own map, its route drawn in (xpcity_race_map) */
                     const char *rmap = xpcity_race_map(trackname, g_rt.ev);
                     if (rmap) xmap = rmap;
@@ -30974,7 +30974,7 @@ int main(int argc, char **argv) {
                     hs.route_loop = hs.circuit;
 #ifdef __vita__
                     /* WRONG WAY: see below, once the route line exists */
-                    if (RT_RACE && xpcity_is_city(trackname)) {   /* Carbon: its own minimap route (xpcity_race_route), white over the city map */
+                    if (RT_RACE && xpcity_is_city(trackname) && !xpcity_race_map(trackname, g_rt.ev)) {   /* Carbon: its route is drawn into the race's map; only without one, over the city map */
                         int mrn = 0; const float *mrv = xpcity_race_route(trackname, g_rt.ev, &mrn);
                         if (mrv) { hs.route_line = mrv; hs.route_line_n = mrn; hs.route_loop = 0; }
                     }

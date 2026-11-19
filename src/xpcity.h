@@ -17,6 +17,8 @@ int xpcity_prepare(const char *troot, const char *track);
 int xpcity_window_made(void);
 /* the city's minimap file (BMAP) once xpcity_prepare found or made it, else NULL */
 const char *xpcity_map(const char *track);
+/* the map holding (x, y): the city's, or an area apart from it (<map>_A<k>.MAP); NULL as xpcity_map */
+const char *xpcity_map_at(const char *track, float x, float y);
 /* MW: that race's own map (its route drawn in), made once from MINI_MAP_<race>.BIN; else NULL */
 const char *xpcity_race_map(const char *track, int event_id);
 /* Carbon: the race's minimap route (its own search, the converter's mmroute.bin): x y pairs; else NULL */

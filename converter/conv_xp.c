@@ -461,6 +461,11 @@ int xpp_send_files(XppSendFn add, void *ud, int cap) {
         snprintf(l, sizeof l, "%s\\stage\\TRACKS\\%s.SEA", g_out, k_city[c].companion);
         if (GetFileAttributesA(l) != INVALID_FILE_ATTRIBUTES) {   /* the sea mask (Carbon; none: the sea is not cut) */
             snprintf(r, sizeof r, VITA_DATA "/TRACKS/%s.SEA", k_city[c].companion); n += add(ud, l, r); }
+        for (int ar = 0; ar < 64; ar++) {   /* Carbon: the maps of the areas apart from the city (<comp>_A<k>.MAP) */
+            snprintf(l, sizeof l, "%s\\stage\\TRACKS\\%s_A%d.MAP", g_out, k_city[c].companion, ar);
+            if (GetFileAttributesA(l) == INVALID_FILE_ATTRIBUTES) break;
+            snprintf(r, sizeof r, VITA_DATA "/TRACKS/%s_A%d.MAP", k_city[c].companion, ar); n += add(ud, l, r);
+        }
         snprintf(l, sizeof l, "%s\\stage\\TRACKS\\ROUTES%s\\RoutesFreeRoam.bin", g_out, k_city[c].companion);
         if (GetFileAttributesA(l) != INVALID_FILE_ATTRIBUTES) {   /* the road net (none: no traffic) */
             snprintf(r, sizeof r, VITA_DATA "/TRACKS/ROUTES%s/RoutesFreeRoam.bin", k_city[c].companion); n += add(ud, l, r); }

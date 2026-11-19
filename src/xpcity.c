@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <SDL.h>
 #include "xpconv.h"
@@ -94,12 +96,20 @@ static void make_map(int c, const char *troot)
     char raw[256];
     snprintf(g_map, sizeof g_map, "%s/%s.MAP", troot, k_city[c].companion);
     char sea[1100]; snprintf(sea, sizeof sea, "%s/%s.SEA", troot, k_city[c].companion);
-    if (xp_file_size(g_map) > 0 && (k_city[c].game != XP_GAME_CARBON || xp_file_size(sea) > 0)) return;   /* Carbon: + its sea mask (11-19) */
+    char area0[1100]; snprintf(area0, sizeof area0, "%s/%s_A0.MAP", troot, k_city[c].companion);
+    if (xp_file_size(g_map) > 0 && (k_city[c].game != XP_GAME_CARBON || (xp_file_size(sea) > 0 && xp_file_size(area0) > 0))) return;   /* Carbon: + its sea mask, its areas' maps (11-19) */
     snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s/MINI_MAP.BIN", k_city[c].dir, k_city[c].companion);
     if (k_city[c].game == XP_GAME_CARBON)   /* no map art for the city: drawn from its road collision */
         snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
     int rc = xp_file_size(raw) > 0 ? xp_minimap(raw, g_map, k_city[c].game) : XP_ERR_OPEN_IN;
     vita_mark("xpcity: minimap %s: %s", g_map, rc == XP_OK ? "made" : "none (no raw MINI_MAP.BIN / stream)");
+    if (rc == XP_OK) {   /* a race map drawn on the old one: gone (xpcity_race_map makes it again) */
+        char side[1100], op[1100]; int old = -1;
+        snprintf(side, sizeof side, "%s/%s_RACE.txt", troot, k_city[c].companion);
+        FILE *sf = fopen(side, "r");
+        if (sf) { if (fscanf(sf, "%d", &old) != 1) old = -1; fclose(sf); }
+        if (old >= 0) { snprintf(op, sizeof op, "%s/%s_RACE%d.MAP", troot, k_city[c].companion, old); remove(op); }
+    }
 }
 /* the free-roam road net (TRACKS/ROUTES<companion>/RoutesFreeRoam.bin): from the PC tool, or
    made here from the companion bundle's road network (xproads.c, well under a second) */
@@ -180,6 +190,50 @@ const char *xpcity_map(const char *track)
     return c >= 0 && g_map[0] && strstr(g_map, k_city[c].companion) ? g_map : NULL;
 }
 
+/* the map holding (x, y): the city's, or one of the areas apart from it (Carbon's west
+   district, canyons, drift tracks: <map>_A<k>.MAP, xpconv minimap_carbon), read once */
+static int map_box(const char *path, float box[3])   /* x0, y0 (top), size */
+{
+    FILE *f = fopen(path, "rb"); if (!f) return 0;
+    uint8_t h[28]; int ok = fread(h, 1, 28, f) == 28 && !memcmp(h, "BMAP", 4);
+    fclose(f);
+    if (ok) memcpy(box, h + 12, 12);
+    return ok && box[2] > 0;
+}
+const char *xpcity_map_at(const char *track, float x, float y)
+{
+    const char *m = xpcity_map(track);
+    if (!m) return NULL;
+    static char base[1024], out[1100]; static int na = -1, last = -1; static float mb[3], ab[64][3];
+    if (na < 0 || strcmp(base, m)) {
+        snprintf(base, sizeof base, "%s", m); na = 0;
+        if (!map_box(m, mb)) mb[2] = 0;
+        const char *dot = strrchr(m, '.'); int bl = dot ? (int)(dot - m) : (int)strlen(m);
+        for (int a = 0; a < 64; a++) {
+            snprintf(out, sizeof out, "%.*s_A%d.MAP", bl, m, a);
+            if (!map_box(out, ab[a])) break;
+            na = a + 1;
+        }
+        vita_mark("xpcity: %s + %d area maps", m, na); last = -1;
+    }
+    const char *dot0 = strrchr(m, '.'); int bl0 = dot0 ? (int)(dot0 - m) : (int)strlen(m);
+    if (last >= 0 && last < na && x >= ab[last][0] && x <= ab[last][0] + ab[last][2] && y <= ab[last][1] && y >= ab[last][1] - ab[last][2]) {
+        snprintf(out, sizeof out, "%.*s_A%d.MAP", bl0, m, last); return out;   /* still in the area's (no flicking at an edge) */
+    }
+    const float in = 100.0f;   /* well inside, not at the very edge */
+    if (mb[2] > 0 && x >= mb[0] + in && x <= mb[0] + mb[2] - in && y <= mb[1] - in && y >= mb[1] - mb[2] + in) { last = -1; return m; }
+    int best = -1; float bd = 1e30f;
+    for (int a = 0; a < na; a++) {
+        if (x < ab[a][0] || x > ab[a][0] + ab[a][2] || y > ab[a][1] || y < ab[a][1] - ab[a][2]) continue;
+        float cx = ab[a][0] + ab[a][2] * 0.5f, cy = ab[a][1] - ab[a][2] * 0.5f, d = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+        if (d < bd) { bd = d; best = a; }
+    }
+    last = best;
+    if (best < 0) return m;
+    snprintf(out, sizeof out, "%.*s_A%d.MAP", bl0, m, best);
+    return out;
+}
+
 /* MW's race map (11-19): Most Wanted shows a race on a map of its own,
    TRACKS/L2RA/MINI_MAP_<race>.BIN (its race 1.2.3: MINI_MAP_1_2_3.BIN): the city map
    with that race's route drawn in white and its start in green (64 tiles, as
@@ -222,17 +276,98 @@ const float *xpcity_race_route(const char *track, int event_id, int *n_out)
     return bn > 1 ? buf : NULL;
 }
 
+/* Carbon's race map (11-19, user: "look like Bayview or Rockport"): the city map with the
+   race's route (xpcity_race_route) drawn into it as MW's race maps have theirs -- a white line
+   ~2.6 px wide in a dark edge, the start a green bar across the road (MINI_MAP_7_2_2.BIN:
+   white 251, edge ~(8,28,16), start (57,165,74) ~20 x 2 px) -- instead of over it. */
+static void rm_line(uint8_t *img, int W, float ax, float ay, float bx, float by, float rad, const uint8_t col[3])
+{
+    int x0 = (int)floorf(fminf(ax, bx) - rad - 1), x1 = (int)ceilf(fmaxf(ax, bx) + rad + 1);
+    int y0 = (int)floorf(fminf(ay, by) - rad - 1), y1 = (int)ceilf(fmaxf(ay, by) + rad + 1);
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > W - 1) x1 = W - 1; if (y1 > W - 1) y1 = W - 1;
+    float ex = bx - ax, ey = by - ay, l2 = ex * ex + ey * ey;
+    for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++) {
+        float px = x + 0.5f - ax, py = y + 0.5f - ay, t = l2 > 0 ? (px * ex + py * ey) / l2 : 0;
+        if (t < 0) t = 0; if (t > 1) t = 1;
+        float dx = px - ex * t, dy = py - ey * t, d = sqrtf(dx * dx + dy * dy), cov = rad + 0.5f - d;
+        if (cov <= 0) continue;
+        if (cov > 1) cov = 1;
+        uint8_t *q = img + ((size_t)y * W + x) * 4;
+        for (int k = 0; k < 3; k++) q[k] = (uint8_t)(q[k] + (col[k] - q[k]) * cov + 0.5f);
+        if (q[3] < 255) q[3] = (uint8_t)(q[3] + (255 - q[3]) * cov + 0.5f);
+    }
+}
+static int bake_route_map(int c, const char *troot, int event_id, const char *dst)
+{
+    int n = 0; const float *pt = xpcity_race_route(k_city[c].bun, event_id, &n);
+    if (!pt || n < 2) return 0;
+    float st[4]; int have_st = 0;   /* the start: starts.txt "id x y z heading" */
+    {
+        char p[1100]; snprintf(p, sizeof p, "%s/ROUTES%s/starts.txt", troot, k_city[c].companion);
+        FILE *sf = fopen(p, "r"); int id; float x, y, z, h;
+        while (sf && fscanf(sf, "%d %f %f %f %f", &id, &x, &y, &z, &h) == 5) if (id == event_id) { st[0] = x; st[1] = y; st[3] = h; have_st = 1; break; }
+        if (sf) fclose(sf);
+    }
+    if (!have_st) { st[0] = pt[0]; st[1] = pt[1]; st[3] = 0; }
+    const char *base = xpcity_map_at(k_city[c].bun, st[0], st[1]);   /* the city's, or the area's it is in */
+    if (!base) return 0;
+    long long len = xp_file_size(base);
+    FILE *f = fopen(base, "rb");
+    if (!f || len < 28) { if (f) fclose(f); return 0; }
+    uint8_t *d = malloc((size_t)len);
+    int ok = d && fread(d, 1, (size_t)len, f) == (size_t)len; fclose(f);
+    uint32_t W = 0, H = 0; float fl[4];
+    if (ok) { memcpy(&W, d + 4, 4); memcpy(&H, d + 8, 4); memcpy(fl, d + 12, 16); }
+    if (!ok || memcmp(d, "BMAP", 4) || !W || W != H || W > 4096 || 28 + (long long)W * W * 4 > len || !(fl[2] > 0)) { free(d); return 0; }
+    uint8_t *img = d + 28;
+    const float sc = (float)W / fl[2];
+    static const uint8_t edge[3] = { 8, 28, 16 }, white[3] = { 251, 251, 251 }, green[3] = { 57, 165, 74 };
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i + 1 < n; i++) {
+            const float *a = pt + 2 * i, *b = a + 2;
+            if (a[0] > 1e8f || b[0] > 1e8f) continue;   /* the runs' break */
+            float gx = b[0] - a[0], gy = b[1] - a[1];
+            if (gx * gx + gy * gy > 80.0f * 80.0f) continue;
+            rm_line(img, (int)W, (a[0] - fl[0]) * sc, (fl[1] - a[1]) * sc, (b[0] - fl[0]) * sc, (fl[1] - b[1]) * sc,
+                    pass ? 1.3f : 2.4f, pass ? white : edge);
+        }
+    if (have_st) {   /* the start: a bar across the road */
+        float px = (st[0] - fl[0]) * sc, py = (fl[1] - st[1]) * sc, r = st[3] * 3.14159265f / 180.0f;
+        float ux = -sinf(r), uy = -cosf(r);   /* across the heading (map y runs down) */
+        for (int pass = 0; pass < 2; pass++)
+            rm_line(img, (int)W, px - ux * 10, py - uy * 10, px + ux * 10, py + uy * 10, pass ? 1.0f : 2.0f, pass ? green : edge);
+    }
+    f = fopen(dst, "wb");
+    ok = f && fwrite(d, 1, (size_t)len, f) == (size_t)len;
+    if (f && fclose(f)) ok = 0;
+    if (!ok) remove(dst);
+    free(d);
+    return ok;
+}
+
 const char *xpcity_race_map(const char *track, int event_id)
 {
     static char out[1100]; static int out_ev = -1;
     static int bad_ev = -1;
     int c = city_of(track);
-    if (c < 0 || k_city[c].game != XP_GAME_MW || !g_map[0] || !strstr(g_map, k_city[c].companion)) return NULL;
+    if (c < 0 || !g_map[0] || !strstr(g_map, k_city[c].companion)) return NULL;
     if (event_id == out_ev && out[0]) return out;
     if (event_id == bad_ev) return NULL;
     char troot[1024]; snprintf(troot, sizeof troot, "%s", g_map);
     char *sl = strrchr(troot, '/'); if (!sl) return NULL;
     *sl = 0;
+    char dst[1100];
+    if (k_city[c].game == XP_GAME_CARBON) {   /* its route drawn into the city map (bake_route_map) */
+        bad_ev = event_id;
+        snprintf(dst, sizeof dst, "%s/%s_RACE%d.MAP", troot, k_city[c].companion, event_id);
+        if (xp_file_size(dst) <= 0) {
+            Uint32 t0 = SDL_GetTicks();
+            int okb = bake_route_map(c, troot, event_id, dst);
+            vita_mark("xpcity: race map %s: %s in %u ms", dst, okb ? "route drawn in" : "FAILED (no route?)", (unsigned)(SDL_GetTicks() - t0));
+            if (!okb) return NULL;
+        }
+        goto keep;
+    }
     char p[1100], name[64] = "";
     snprintf(p, sizeof p, "%s/ROUTES%s/names.txt", troot, k_city[c].companion);
     FILE *f = fopen(p, "r");
@@ -252,7 +387,7 @@ const char *xpcity_race_map(const char *track, int event_id)
         }
         snprintf(name, sizeof name, "%s%s", b, rev ? "_R" : "");
     }
-    char dst[1100]; snprintf(dst, sizeof dst, "%s/%s_RACE%d.MAP", troot, k_city[c].companion, event_id);
+    snprintf(dst, sizeof dst, "%s/%s_RACE%d.MAP", troot, k_city[c].companion, event_id);
     if (xp_file_size(dst) <= 0) {
         char src[1100];
         snprintf(src, sizeof src, "%s/RACEMAPS%s/MINI_MAP_%s.BIN", troot, k_city[c].companion, name);
@@ -269,6 +404,7 @@ const char *xpcity_race_map(const char *track, int event_id)
         vita_mark("xpcity: race map %s from %s: %s in %u ms", dst, src, rc == XP_OK ? "made" : "FAILED", (unsigned)(SDL_GetTicks() - t0));
         if (rc != XP_OK) return NULL;
     }
+keep:
     {   /* one at a time (4 MB each): <companion>_RACE.txt holds the id of the one on the card */
         char side[1100]; snprintf(side, sizeof side, "%s/%s_RACE.txt", troot, k_city[c].companion);
         FILE *sf = fopen(side, "r"); int old = -1;

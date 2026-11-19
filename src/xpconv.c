@@ -829,7 +829,10 @@ static const uint8_t *find_id(const uint8_t *p, size_t n, uint32_t id)
 /* Carbon: Palmont's map drawn from its own collision in MW's map style -- road
    surfaces light grey on dark grey; the window
    squares the city's roads (+6%). in_path = the raw STREAML5RA.BUN */
-static int is_road_key(uint32_t k) { return k == 0x19db2f1eu || k == 0x35187254u || k == 0x6ca26f9bu; }
+/* asphalt, asphalt_no_leaves, concrete; 6d30229b + 05173529 (names unknown): Carbon's canyon
+   roads, their middle and their sides (11-19, drawn by key: nowhere else) */
+static int is_road_key(uint32_t k) { return k == 0x19db2f1eu || k == 0x35187254u || k == 0x6ca26f9bu || k == 0x6d30229bu || k == 0x05173529u; }
+static int is_sea_road_key(uint32_t k) { return k == 0x19db2f1eu || k == 0x35187254u || k == 0x6ca26f9bu; }   /* the sea mask's seeds: the city's roads only (as verified) */
 static void mm_fill(uint8_t *img, int W, const float *xy, float x0, float y0, float px, const uint8_t *rgb)
 {
     float X[3], Y[3];
@@ -890,7 +893,7 @@ static int sea_mask_write(const char *map_path)
         for (size_t i = 0; i < g_mmn; i++) {
             const MmTri *t = &g_mm[i];
             if (!(t->ztop < -0.3f)) continue;
-            int road = is_road_key(t->key);
+            int road = is_sea_road_key(t->key);
             if (pass != road) continue;
             float X[3], Y[3];
             for (int k = 0; k < 3; k++) { X[k] = (t->xy[2*k] - x0) / SEA_CELL; Y[k] = (t->xy[2*k+1] - ymin) / SEA_CELL; }
@@ -945,6 +948,27 @@ static int sea_mask_write(const char *map_path)
     printf("xp_minimap carbon: sea mask %dx%d, %ld cells of dry land below the sea\n", W, H, ncut);
     return rc;
 }
+/* one Carbon map: the bounds (ax..bx, ay..by) made square (+6%), the ground drawn at W x W */
+static int mm_carbon_write(const char *path, uint8_t *img, int W, float ax, float bx, float ay, float by, size_t nr)
+{
+    float size = fmaxf(bx - ax, by - ay) * 1.06f;
+    size = ceilf(size / 64.0f) * 64.0f;
+    float x0 = (ax + bx) * 0.5f - size * 0.5f, y0 = (ay + by) * 0.5f + size * 0.5f, px = size / W;
+    const uint8_t land[3] = { 41, 41, 41 }, road[3] = { 139, 138, 139 };
+    for (int i = 0; i < W * W; i++) { memcpy(img + 4 * (size_t)i, land, 3);   /* Palmont is land all round (collision is mostly roads) */
+        img[4 * (size_t)i + 3] = 255; }
+    for (size_t i = 0; i < g_mmn; i++) if (!is_road_key(g_mm[i].key)) mm_fill(img, W, g_mm[i].xy, x0, y0, px, land);
+    for (size_t i = 0; i < g_mmn; i++) if (is_road_key(g_mm[i].key)) mm_fill(img, W, g_mm[i].xy, x0, y0, px, road);
+    const float zoom = 1.5f * size / 5633.0f;   /* Bayview's radar reach (TRACKMAP4000: 5633 m, 1.5) */
+    printf("xp_minimap carbon: %s: %zu ground triangles (%zu road), %.0f m from (%.0f, %.0f), %d px\n", path, g_mmn, nr, size, x0, y0, W);
+    FILE *o = fopen(path, "wb");
+    if (!o) return XP_ERR_OPEN_OUT;
+    uint32_t hd[3] = { 0, (uint32_t)W, (uint32_t)W }; memcpy(hd, "BMAP", 4);
+    float fl[4] = { x0, y0, size, zoom };
+    int ok = fwrite(hd, 4, 3, o) == 3 && fwrite(fl, 4, 4, o) == 4 && fwrite(img, 4, (size_t)W * W, o) == (size_t)W * W;
+    if (fclose(o) != 0 || !ok) { remove(path); return XP_ERR_WRITE; }
+    return XP_OK;
+}
 static int minimap_carbon(const char *in_path, const char *out_path)
 {
     FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
@@ -979,14 +1003,17 @@ static int minimap_carbon(const char *in_path, const char *out_path)
         for (size_t i = 0; i < g_mmn; i++)
             if (is_road_key(g_mm[i].key)) { xs[k] = (g_mm[i].xy[0] + g_mm[i].xy[2] + g_mm[i].xy[4]) / 3; ys[k] = (g_mm[i].xy[1] + g_mm[i].xy[3] + g_mm[i].xy[5]) / 3; k++; }
         /* the city = the largest 8-connected cluster of 256 m cells with road in them (Carbon's
-           canyon tracks lie kilometres away, outside it) */
+           canyon tracks lie kilometres away, outside it); every other cluster (11-19: the west
+           district, the canyons, the drift tracks -- 53 of the 140 races) gets a map of its own,
+           <map>_A<k>.MAP, clusters within 1.5 km of each other made one (xpcity_map_at) */
         float gx0 = 1e30f, gy0 = 1e30f, gx1 = -1e30f, gy1 = -1e30f;
         for (size_t i = 0; i < nr; i++) { gx0 = fminf(gx0, xs[i]); gx1 = fmaxf(gx1, xs[i]); gy0 = fminf(gy0, ys[i]); gy1 = fmaxf(gy1, ys[i]); }
         int GW = (int)((gx1 - gx0) / 256.0f) + 1, GH = (int)((gy1 - gy0) / 256.0f) + 1;
         int *lab = calloc((size_t)GW * GH, sizeof *lab), *stk = malloc((size_t)GW * GH * sizeof *stk);
-        float ax = 0, bx = 0, ay = 0, by = 0;
-        if (!lab || !stk) { ax = gx0; bx = gx1; ay = gy0; by = gy1; }   /* no room: every road */
-        else {
+        float ax = gx0, bx = gx1, ay = gy0, by = gy1;
+        enum { MAXA = 256 };
+        static float abox[MAXA][4]; int na = 0;
+        if (lab && stk) {
             for (size_t i = 0; i < nr; i++) lab[(int)((ys[i] - gy0) / 256.0f) * GW + (int)((xs[i] - gx0) / 256.0f)] = -1;
             int best = 0, bestn = 0, nl = 0;
             for (int c = 0; c < GW * GH; c++) {
@@ -1002,32 +1029,52 @@ static int minimap_carbon(const char *in_path, const char *out_path)
                 }
                 if (n > bestn) { bestn = n; best = nl; }
             }
-            ax = ay = 1e30f; bx = by = -1e30f;
-            for (size_t i = 0; i < nr; i++)
-                if (lab[(int)((ys[i] - gy0) / 256.0f) * GW + (int)((xs[i] - gx0) / 256.0f)] == best) {
-                    ax = fminf(ax, xs[i]); bx = fmaxf(bx, xs[i]); ay = fminf(ay, ys[i]); by = fmaxf(by, ys[i]);
+            float (*bb)[4] = malloc((size_t)(nl + 1) * sizeof *bb);
+            if (bb) {
+                for (int l = 0; l <= nl; l++) { bb[l][0] = bb[l][2] = 1e30f; bb[l][1] = bb[l][3] = -1e30f; }
+                for (size_t i = 0; i < nr; i++) {
+                    int l = lab[(int)((ys[i] - gy0) / 256.0f) * GW + (int)((xs[i] - gx0) / 256.0f)];
+                    if (l <= 0) continue;
+                    bb[l][0] = fminf(bb[l][0], xs[i]); bb[l][1] = fmaxf(bb[l][1], xs[i]); bb[l][2] = fminf(bb[l][2], ys[i]); bb[l][3] = fmaxf(bb[l][3], ys[i]);
                 }
+                ax = bb[best][0]; bx = bb[best][1]; ay = bb[best][2]; by = bb[best][3];
+                for (int l = 1; l <= nl; l++) {   /* the others, merged by nearness */
+                    if (l == best || bb[l][0] > bb[l][1]) continue;
+                    float q[4] = { bb[l][0], bb[l][1], bb[l][2], bb[l][3] };
+                    if (q[0] >= ax - 300 && q[1] <= bx + 300 && q[2] >= ay - 300 && q[3] <= by + 300) continue;   /* on the city's map */
+                    int into = -1;
+                    for (int a = 0; a < na && into < 0; a++)
+                        if (q[0] <= abox[a][1] + 1500 && q[1] >= abox[a][0] - 1500 && q[2] <= abox[a][3] + 1500 && q[3] >= abox[a][2] - 1500) into = a;
+                    if (into < 0) { if (na == MAXA) continue; into = na++; memcpy(abox[into], q, sizeof q); }
+                    else { abox[into][0] = fminf(abox[into][0], q[0]); abox[into][1] = fmaxf(abox[into][1], q[1]); abox[into][2] = fminf(abox[into][2], q[2]); abox[into][3] = fmaxf(abox[into][3], q[3]); }
+                }
+                for (int pass = 0; pass < 4; pass++)   /* merges can bring two areas near: again */
+                    for (int a = 0; a < na; a++) for (int b2 = a + 1; b2 < na; b2++)
+                        if (abox[b2][0] <= abox[a][1] + 1500 && abox[b2][1] >= abox[a][0] - 1500 && abox[b2][2] <= abox[a][3] + 1500 && abox[b2][3] >= abox[a][2] - 1500) {
+                            abox[a][0] = fminf(abox[a][0], abox[b2][0]); abox[a][1] = fmaxf(abox[a][1], abox[b2][1]);
+                            abox[a][2] = fminf(abox[a][2], abox[b2][2]); abox[a][3] = fmaxf(abox[a][3], abox[b2][3]);
+                            memcpy(abox[b2], abox[--na], sizeof abox[0]); b2--;
+                        }
+                free(bb);
+            }
         }
         free(lab); free(stk);
-        float size = fmaxf(bx - ax, by - ay) * 1.06f;
-        size = ceilf(size / 64.0f) * 64.0f;
-        float x0 = (ax + bx) * 0.5f - size * 0.5f, y0 = (ay + by) * 0.5f + size * 0.5f, px = size / W;
-        const uint8_t land[3] = { 41, 41, 41 }, road[3] = { 139, 138, 139 };
-        for (int i = 0; i < W * W; i++) { memcpy(img + 4 * (size_t)i, land, 3);   /* Palmont is land all round (collision is mostly roads) */
-            img[4 * (size_t)i + 3] = 255; }
-        for (size_t i = 0; i < g_mmn; i++) if (!is_road_key(g_mm[i].key)) mm_fill(img, W, g_mm[i].xy, x0, y0, px, land);
-        for (size_t i = 0; i < g_mmn; i++) if (is_road_key(g_mm[i].key)) mm_fill(img, W, g_mm[i].xy, x0, y0, px, road);
-        const float zoom = 1.5f * size / 5633.0f;   /* Bayview's radar reach (TRACKMAP4000: 5633 m, 1.5) */
-        printf("xp_minimap carbon: %zu ground triangles (%zu road), %.0f m from (%.0f, %.0f)\n", g_mmn, nr, size, x0, y0);
-        FILE *o = fopen(out_path, "wb");
-        if (!o) rc = XP_ERR_OPEN_OUT;
-        else {
-            uint32_t hd[3] = { 0, (uint32_t)W, (uint32_t)W }; memcpy(hd, "BMAP", 4);
-            float fl[4] = { x0, y0, size, zoom };
-            int ok = fwrite(hd, 4, 3, o) == 3 && fwrite(fl, 4, 4, o) == 4 && fwrite(img, 4, (size_t)W * W, o) == (size_t)W * W;
-            if (fclose(o) != 0 || !ok) { rc = XP_ERR_WRITE; remove(out_path); }
-        }
+        rc = mm_carbon_write(out_path, img, W, ax, bx, ay, by, nr);
         if (rc == XP_OK) rc = sea_mask_write(out_path);
+        {   /* the areas' maps: the old ones first gone */
+            char ap[1100]; size_t bl = strlen(out_path); const char *dot = strrchr(out_path, '.');
+            if (dot) bl = (size_t)(dot - out_path);
+            for (int a = 0; a < 64; a++) { snprintf(ap, sizeof ap, "%.*s_A%d.MAP", (int)bl, out_path, a); remove(ap); }
+            int made = 0;
+            for (int a = 0; a < na && a < 64 && rc == XP_OK; a++) {
+                float pad = 250.0f, sz = fmaxf(abox[a][1] - abox[a][0], abox[a][3] - abox[a][2]) + 2 * pad;
+                int aw = 256; while (aw < 1024 && sz / aw > 6.0f) aw *= 2;   /* ~6 m a pixel, as the city's */
+                snprintf(ap, sizeof ap, "%.*s_A%d.MAP", (int)bl, out_path, made);
+                rc = mm_carbon_write(ap, img, aw, abox[a][0] - pad, abox[a][1] + pad, abox[a][2] - pad, abox[a][3] + pad, nr);
+                made++;
+            }
+            printf("xp_minimap carbon: %d area maps beside the city's\n", made);
+        }
     } else {
         printf("xp_minimap carbon: %zu ground triangles, %zu road -- keys:", g_mmn, nr);
         for (size_t i = 0; i < g_mmn && i < 200000; i += 20000) printf(" %08x", g_mm[i].key);
