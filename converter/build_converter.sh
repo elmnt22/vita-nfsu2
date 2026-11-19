@@ -52,7 +52,7 @@ for p in "${pids[@]}"; do wait "$p" || fail=1; done
 
 echo "LD NFSU2VitaPrep.exe"
 "${CC[@]}" -g "${OBJS[@]}" "$ROOT/converter/ug2conv.rc" "$SDL2_DIR/lib/libSDL2.a" \
-    -lwininet -lcomctl32 -lcomdlg32 -lshell32 -lole32 -loleaut32 -luuid -ladvapi32 -lgdi32 -luser32 \
+    -lwininet -lgdiplus -lcomctl32 -lcomdlg32 -lshell32 -lole32 -loleaut32 -luuid -ladvapi32 -lgdi32 -luser32 \
     -lwinmm -limm32 -lsetupapi -lversion -lcfgmgr32 \
     -Wl,--subsystem,windows -Wl,--stack,8388608 -o "$OUT/NFSU2VitaPrep.exe"
 echo "built $OUT/NFSU2VitaPrep.exe"

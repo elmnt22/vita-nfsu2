@@ -70,8 +70,11 @@ that's not writable. **Open output folder** shows it.
 Leave it ticked the first time (about **1.7 GB**). Only the files the Vita
 needs go over: the `Support`, `Uninstall` and `#JIMBO` folders and other
 files the port never opens are left out. Game files that are already on
-the Vita at the right size are skipped, so sending again later only takes
-the converted data (about 330 MB).
+the Vita at the right size are skipped. The converted data is skipped too
+when it hasn't changed since the last send to that Vita (or memory card)
+and is still there: the Prep Tool keeps a list of what it sent,
+`sent_<where>.txt`, in its output folder. Adding the World Expansion later
+only sends the new cities. Delete that file to send everything again.
 
 ### Over USB (Copy to memory card)
 
@@ -96,8 +99,8 @@ to copy to the Vita later.
 Everything goes to `ux0:data/NFSU2`. The Vita's old track index files are
 deleted first, and each track's index is sent last. If the transfer is cut
 off, the Vita sees that track as "not converted" and converts it itself, so
-you never end up with a half-copied track. Send again to finish: the game
-files already sent are skipped.
+you never end up with a half-copied track. Send again to finish: files
+already sent are skipped.
 
 ### By hand
 

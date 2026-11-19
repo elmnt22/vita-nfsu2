@@ -38,6 +38,7 @@
 #include <shellapi.h>
 #include <wininet.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include "world_tiles.h"
@@ -398,7 +399,7 @@ static void convert_all(void) {
 static DWORD WINAPI convert_thread(LPVOID a) { (void)a; convert_all(); return 0; }
 
 /* ---- sending to the Vita over FTP (worker thread) ------------------------- */
-typedef struct { char local[MAX_PATH + 160], remote[256]; long long size; int game; } SendFile;
+typedef struct { char local[MAX_PATH + 160], remote[256]; long long size, mtime; int game; } SendFile;
 static struct {
     volatile int busy, done, ok;
     volatile long long sent, total;
@@ -502,7 +503,12 @@ static int send_list(SendFile *f, int cap, const char *game) {
         g_send.xp_sent = xpp_send_files(xp_add, &a, cap - n) > 0;
         n = a.n;
     }
-    for (int i = 0; i < n; i++) f[i].size = file_size(f[i].local);
+    for (int i = 0; i < n; i++) {
+        f[i].size = file_size(f[i].local);
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        f[i].mtime = GetFileAttributesExA(f[i].local, GetFileExInfoStandard, &a)
+                   ? ((long long)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime : 0;
+    }
     return n;
 }
 
@@ -546,6 +552,57 @@ static int already_there(HINTERNET c, const SendFile *f) {
         if (!_stricmp(g_rent[i].name, s + 1)) return g_rent[i].size == f->size;
     return 0;
 }
+
+/* What was last sent to each Vita / memory card: OUT\sent_<where>.txt, one line per
+   file (size, PC write time, remote path; later lines win). A converted file goes
+   again only when it changed since, or is not on the Vita at that size (11-19:
+   adding the World Expansion no longer resends the Underground 2 data). */
+typedef struct { char remote[256]; long long size, mtime; } SentRec;
+static SentRec *g_sent; static int g_nsent, g_sent_cap;
+static char g_sent_file[MAX_PATH + 160];
+static void sent_load(void) {
+    char key[MAX_PATH + 8];
+    snprintf(key, sizeof key, "%s%s", g_send.dest[0] ? "card_" : "vita_", g_send.dest[0] ? g_send.dest : g_send.ip);
+    for (char *q = key; *q; q++) if (!isalnum((unsigned char)*q) && *q != '.' && *q != '_') *q = '_';
+    snprintf(g_sent_file, sizeof g_sent_file, "%s\\sent_%s.txt", g_out, key);
+    g_nsent = 0;
+    FILE *fp = fopen(g_sent_file, "r");
+    if (!fp) return;
+    char line[400];
+    while (fgets(line, sizeof line, fp)) {
+        SentRec r; char *e = strchr(line, '\n'); if (e) *e = 0;
+        if (sscanf(line, "%lld\t%lld\t%255[^\n]", &r.size, &r.mtime, r.remote) != 3) continue;
+        if (g_nsent == g_sent_cap) {
+            int cap = g_sent_cap ? g_sent_cap * 2 : 256;
+            SentRec *m = realloc(g_sent, (size_t)cap * sizeof *m); if (!m) break;
+            g_sent = m; g_sent_cap = cap;
+        }
+        g_sent[g_nsent++] = r;
+    }
+    fclose(fp);
+}
+static int sent_same(const SendFile *f) {   /* the last record of this file matches it */
+    for (int i = g_nsent - 1; i >= 0; i--)
+        if (!strcmp(g_sent[i].remote, f->remote)) return g_sent[i].size == f->size && g_sent[i].mtime == f->mtime && f->mtime;
+    return 0;
+}
+static void sent_note(const SendFile *f) {
+    FILE *fp = fopen(g_sent_file, "a");
+    if (!fp) return;
+    fprintf(fp, "%lld\t%lld\t%s\n", f->size, f->mtime, f->remote);
+    fclose(fp);
+}
+static long long remote_size(HINTERNET c, const char *remote) {   /* -1: not there */
+    if (!c) { char p[MAX_PATH + 300]; dest_path(p, sizeof p, remote); return file_exists(p) ? file_size(p) : -1; }
+    char dir[256]; snprintf(dir, sizeof dir, "%s", remote);
+    char *s = strrchr(dir, '/'); if (!s) return -1;
+    *s = 0;
+    remote_list(c, dir);
+    for (int i = 0; i < g_nrent; i++)
+        if (!_stricmp(g_rent[i].name, s + 1)) return g_rent[i].size;
+    return -1;
+}
+static int is_marker(const SendFile *f) { return strstr(f->remote, ".idx") || strstr(f->remote, ".xp"); }
 
 /* every folder on the way to the file (made once each per send) */
 static char g_made[256];
@@ -622,17 +679,30 @@ static void send_all(void) {
         snprintf(g_send.msg, sizeof g_send.msg, "Could not reach the Vita at %s. Is its FTP server on "
                  "(VitaShell: press SELECT) and the IP right?", g_send.ip);
     } else if (ok) {
+        /* what can stay: game files there at the same size; converted files sent
+           here before, unchanged, and still there. A set's index (or a city's .xp
+           marker) goes again whenever any file of its set does. */
+        static unsigned char keep[SEND_CAP];
+        sent_load();
+        for (int i = 0, start = 0; i < n; i++) {
+            if (files[i].game) { keep[i] = (unsigned char)already_there(c, &files[i]); start = i + 1; continue; }
+            keep[i] = sent_same(&files[i]) && remote_size(c, files[i].remote) == files[i].size;
+            if (is_marker(&files[i])) {
+                for (int k = start; k < i; k++) if (!files[k].game && !keep[k]) keep[i] = 0;
+                start = i + 1;
+            }
+        }
         /* the old indexes go first: a set cut off half way reads as missing
            (and the Vita converts it) instead of as whole */
         for (int i = 0; i < n; i++)   /* (and the World Expansion's .xp markers) */
-            if (strstr(files[i].remote, ".idx") || strstr(files[i].remote, ".xp")) {
+            if (is_marker(&files[i]) && !keep[i]) {
                 if (c) FtpDeleteFileA(c, files[i].remote);
                 else { char p[MAX_PATH + 300]; dest_path(p, sizeof p, files[i].remote); DeleteFileA(p); }
             }
         static char buf[256 << 10];
         for (int i = 0; i < n && ok; i++) {
             g_send.file = i;
-            if (already_there(c, &files[i])) { g_send.sent += files[i].size; g_send.skipped++; continue; }
+            if (keep[i]) { g_send.sent += files[i].size; g_send.skipped++; continue; }
             long long sent0 = g_send.sent;
             make_dirs(c, files[i].remote);
             ok = put_file(c, &files[i], buf, sizeof buf);
@@ -643,7 +713,7 @@ static void send_all(void) {
                 if (c) { make_dirs(c, files[i].remote); ok = put_file(c, &files[i], buf, sizeof buf); }
                 else snprintf(g_why, sizeof g_why, "the Vita stopped answering");
             }
-            if (ok) moved += files[i].size;
+            if (ok) { moved += files[i].size; if (!files[i].game) sent_note(&files[i]); }
             if (!ok) snprintf(g_send.msg, sizeof g_send.msg, to_dir
                               ? "Copying %s failed: %s. Is the memory card still connected, with enough free space?"
                               : "Sending %s failed: %s. Check the Wi-Fi, keep the Vita awake (Settings > Power Save: "
@@ -651,7 +721,7 @@ static void send_all(void) {
                               files[i].remote + 5, g_why[0] ? g_why : "unknown reason");
         }
         char skip[96] = "";
-        if (g_send.skipped) snprintf(skip, sizeof skip, " (%d game file%s already there, skipped)", g_send.skipped,
+        if (g_send.skipped) snprintf(skip, sizeof skip, " (%d file%s already there, skipped)", g_send.skipped,
                                      g_send.skipped == 1 ? "" : "s");
         if (ok) snprintf(g_send.msg, sizeof g_send.msg, "%s %.0f MB%s%s. Start NFS Underground 2%s.%s",
                          to_dir ? "Copied" : "Sent", moved / 1048576.0,
@@ -687,29 +757,123 @@ static void setting_put(const char *name, const char *v) {
 /* ---- the window ----------------------------------------------------------- */
 enum { ID_GAME = 100, ID_BROWSE, ID_CONVERT, ID_PROGRESS, ID_STATUS, ID_IP, ID_SEND, ID_OPEN, ID_TIMER, ID_IMPORT,
        ID_CHECK, ID_GAMEFILES, ID_COPY, ID_XPDIR0, ID_XPDIR1, ID_XPBROWSE0, ID_XPBROWSE1, ID_XPSTATUS, ID_XPFILES };
-static HWND g_game_ed, g_browse, g_convert, g_bar, g_status, g_ip_ed, g_send_btn, g_open, g_import,
+static HWND g_game_ed, g_browse, g_convert, g_bar, g_ip_ed, g_send_btn, g_open, g_import,
             g_check, g_gamefiles, g_copy;
-static HWND g_xp_ed[XPP_NCITY], g_xp_browse[XPP_NCITY], g_xp_status, g_xpfiles;   /* the World Expansion */
-static HFONT g_font, g_bold, g_title;
+static HWND g_xp_ed[XPP_NCITY], g_xp_browse[XPP_NCITY], g_xpfiles;   /* the World Expansion */
+static HFONT g_font, g_bold, g_title, g_small, g_head, g_sub, g_btnf, g_btnbig, g_glyph, g_glyph_s, g_glyph_l;
+static HBRUSH g_white;
 static int g_dpi = 96;
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
 
+/* ---- the look (11-19 redesign): painted cards, icon-font glyphs, GDI+ for the
+   smooth shapes. Every position below is in 96-dpi units; S() scales it. ---- */
+typedef struct { UINT32 GdiplusVersion; void *DebugEventCallback; BOOL SuppressBackgroundThread; BOOL SuppressExternalCodecs; } GpStartupIn;
+int WINAPI GdiplusStartup(ULONG_PTR *token, const GpStartupIn *in, void *out);
+int WINAPI GdipCreateFromHDC(HDC dc, void **g);
+int WINAPI GdipDeleteGraphics(void *g);
+int WINAPI GdipSetSmoothingMode(void *g, int mode);
+int WINAPI GdipSetPixelOffsetMode(void *g, int mode);
+int WINAPI GdipCreateSolidFill(DWORD argb, void **brush);
+int WINAPI GdipDeleteBrush(void *brush);
+int WINAPI GdipCreatePen1(DWORD argb, float width, int unit, void **pen);
+int WINAPI GdipDeletePen(void *pen);
+int WINAPI GdipCreatePath(int fillmode, void **path);
+int WINAPI GdipDeletePath(void *path);
+int WINAPI GdipAddPathArc(void *path, float x, float y, float w, float h, float start, float sweep);
+int WINAPI GdipClosePathFigure(void *path);
+int WINAPI GdipFillPath(void *g, void *brush, void *path);
+int WINAPI GdipDrawPath(void *g, void *pen, void *path);
+int WINAPI GdipFillEllipse(void *g, void *brush, float x, float y, float w, float h);
+int WINAPI GdipDrawLine(void *g, void *pen, float x1, float y1, float x2, float y2);
+
+#define ARGB(a, r, g, b) (((DWORD)(a) << 24) | ((DWORD)(r) << 16) | ((DWORD)(g) << 8) | (DWORD)(b))
+static void *gp_begin(HDC dc) {
+    void *g = NULL;
+    if (GdipCreateFromHDC(dc, &g) || !g) return NULL;
+    GdipSetSmoothingMode(g, 4);      /* anti-alias */
+    GdipSetPixelOffsetMode(g, 4);    /* half */
+    return g;
+}
+static void *gp_round_path(float x, float y, float w, float h, float r) {
+    void *p = NULL; GdipCreatePath(0, &p);
+    if (!p) return NULL;
+    float d = r * 2;
+    if (d > h) d = h;
+    if (d > w) d = w;
+    GdipAddPathArc(p, x, y, d, d, 180, 90);
+    GdipAddPathArc(p, x + w - d, y, d, d, 270, 90);
+    GdipAddPathArc(p, x + w - d, y + h - d, d, d, 0, 90);
+    GdipAddPathArc(p, x, y + h - d, d, d, 90, 90);
+    GdipClosePathFigure(p);
+    return p;
+}
+/* a rounded box in 96-dpi units: fill (0 = none) and a 1 px border (0 = none) */
+static void gp_box(void *g, int x, int y, int w, int h, int r, DWORD fill, DWORD border, float bw) {
+    if (!g) return;
+    float o = border ? 0.5f : 0.0f;
+    void *p = gp_round_path(S(x) + o, S(y) + o, S(w) - 2 * o, S(h) - 2 * o, (float)S(r));
+    if (!p) return;
+    if (fill) { void *b = NULL; GdipCreateSolidFill(fill, &b); if (b) { GdipFillPath(g, b, p); GdipDeleteBrush(b); } }
+    if (border) { void *pen = NULL; GdipCreatePen1(border, bw * g_dpi / 96.0f, 2, &pen); if (pen) { GdipDrawPath(g, pen, p); GdipDeletePen(pen); } }
+    GdipDeletePath(p);
+}
+static void gp_circle(void *g, float cx, float cy, float d, DWORD fill) {
+    if (!g) return;
+    float k = g_dpi / 96.0f;   /* centre and diameter in 96-dpi units */
+    void *b = NULL; GdipCreateSolidFill(fill, &b);
+    if (b) { GdipFillEllipse(g, b, (cx - d / 2) * k, (cy - d / 2) * k, d * k, d * k); GdipDeleteBrush(b); }
+}
+/* text in 96-dpi units */
+static void text_at(HDC dc, HFONT f, COLORREF c, int x, int y, int w, int h, const wchar_t *s, UINT fmt) {
+    RECT r = { S(x), S(y), S(x + w), S(y + h) };
+    SelectObject(dc, f); SetTextColor(dc, c); SetBkMode(dc, TRANSPARENT);
+    DrawTextW(dc, s, -1, &r, fmt | DT_NOPREFIX);
+}
+static int text_w(HDC dc, HFONT f, const wchar_t *s) {   /* in pixels */
+    SIZE z; SelectObject(dc, f); GetTextExtentPoint32W(dc, s, (int)wcslen(s), &z); return z.cx;
+}
+
+/* the layout: the header, then five cards */
+enum { CW = 600, CX0 = 16, CX1 = 584, CL = 80, CR = 564 };
+enum { HDR_H = 112 };
+static const int k_card_y[5] = { 112, 252, 420, 578, 788 }, k_card_h[5] = { 132, 160, 150, 202, 72 };
+#define CLIENT_H (788 + 72 + 14)
+#define CY(i) (k_card_y[i])
+
+static HWND g_wnd_focus_ed;   /* the edit box with the keyboard: its frame turns blue */
+typedef struct { HWND ed; int x, y, w, h; } EdFrame;
+static EdFrame g_frames[8]; static int g_nframes;
+
 static HWND mk(const char *cls, const char *text, DWORD style, int x, int y, int w, int h, int id, HFONT f) {
     if (strcmp(cls, "STATIC") && strcmp(cls, PROGRESS_CLASSA)) style |= WS_TABSTOP;
-    HWND c = CreateWindowExA(!strcmp(cls, "EDIT") ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style,
+    HWND c = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
                              S(x), S(y), S(w), S(h), g_wnd, (HMENU)(INT_PTR)id, GetModuleHandleA(NULL), NULL);
     SendMessageA(c, WM_SETFONT, (WPARAM)f, TRUE);
     return c;
 }
-static void set_status(const char *s) { SetWindowTextA(g_status, s); }
+/* a borderless edit box inside a painted rounded frame */
+static HWND mk_edit(int x, int y, int w, int h, int id) {
+    HWND e = mk("EDIT", "", ES_AUTOHSCROLL, x + 9, y + (h - 18) / 2, w - 18, 18, id, g_font);
+    if (g_nframes < 8) { EdFrame *f = &g_frames[g_nframes++]; f->ed = e; f->x = x; f->y = y; f->w = w; f->h = h; }
+    return e;
+}
+static void inval(int x, int y, int w, int h) {
+    RECT r = { S(x), S(y), S(x + w), S(y + h) };
+    InvalidateRect(g_wnd, &r, FALSE);
+}
+
+/* the status line under the progress bar, and the result beside it */
+static char g_status_txt[600];
+static void set_status(const char *s) {
+    snprintf(g_status_txt, sizeof g_status_txt, "%s", s);
+    inval(CL, CY(2) + 122, CR - CL, 20);
+}
 /* the result label beside the progress bar: 0 blank, 1 working, 2 done, 3 failed */
-static HWND g_done; static int g_done_state;
+static int g_done_state;
 static void set_done(int st) {
     if (st == g_done_state) return;
     g_done_state = st;
-    static const char *t[4] = { "", "Working...", "Done!", "Failed" };
-    SetWindowTextA(g_done, t[st]);
-    InvalidateRect(g_done, NULL, TRUE);
+    inval(CL + 400, CY(2) + 100, CR - CL - 400, 24);
     if (st >= 2 && GetForegroundWindow() != g_wnd) {   /* a long job ended: flash the taskbar button */
         FLASHWINFO fw = { sizeof fw, g_wnd, FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0 };
         FlashWindowEx(&fw);
@@ -725,20 +889,34 @@ static void ui_idle(void) {
     for (int c = 0; c < XPP_NCITY; c++) { EnableWindow(g_xp_ed[c], !busy); EnableWindow(g_xp_browse[c], !busy); }
     EnableWindow(g_xpfiles, !busy);
 }
-/* the World Expansion line: each city's state, from its folder box and the output */
+/* the World Expansion pills: each city's state, from its folder box and the output
+   (0 not set, 1 found, 2 ready to send, 3 folder not right) */
+static int g_city_st[XPP_NCITY];
 static void xp_status_update(void) {
-    char m[300] = "", dir[MAX_PATH];
+    char dir[MAX_PATH];
     for (int c = 0; c < XPP_NCITY; c++) {
         GetWindowTextA(g_xp_ed[c], dir, sizeof dir);
-        const char *st;
-        if (xpp_city_done(c)) st = "ready to send";
-        else if (!dir[0]) st = "not set";
-        else if (xpp_dir_fix(c, dir)) st = "found -- press Convert";
-        else st = "folder not right";
-        size_t n = strlen(m);
-        snprintf(m + n, sizeof m - n, "%s%s: %s", c ? "      " : "", xpp_city_name(c), st);
+        if (xpp_city_done(c)) g_city_st[c] = 2;
+        else if (!dir[0]) g_city_st[c] = 0;
+        else if (xpp_dir_fix(c, dir)) g_city_st[c] = 1;
+        else g_city_st[c] = 3;
     }
-    SetWindowTextA(g_xp_status, m);
+    inval(CL, CY(1) + 118, CR - CL, 30);
+}
+/* the line beside Check Game Files: 0 no folder, 1 found, 2 checked OK, 3 check failed,
+   4 not the game's folder, 5 converted */
+static int g_game_st, g_chk_res;   /* g_chk_res: 0 not checked, 1 OK, 2 problems */
+static void game_state_update(void) {
+    char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
+    int st;
+    if (!game[0]) st = 0;
+    else if (!game_dir_fix(game, sizeof game)) st = 4;
+    else if (g_chk_res == 2) st = 3;
+    else {
+        int all = 1; for (int t = 0; t < NTRACKS; t++) all &= track_done(t);
+        st = all ? 5 : g_chk_res == 1 ? 2 : 1;
+    }
+    if (st != g_game_st) { g_game_st = st; inval(CL + 150, CY(0) + 88, CR - CL - 150, 30); }
 }
 /* the World Expansion folder boxes -> conv_xp.c (and the settings). 0 = one is wrong
    (says so; the player fixes or clears it) */
@@ -965,6 +1143,7 @@ static void on_timer(void) {
         SendMessageA(g_bar, PBM_SETPOS, 1000, 0);
         set_status(g_chk.ok ? "Game files OK." : "Some game files are missing or changed.");
         set_done(g_chk.ok ? 2 : 3);
+        g_chk_res = g_chk.ok ? 1 : 2; game_state_update();
         ui_idle();
         MessageBoxA(g_wnd, g_chk.msg, TOOL_NAME, g_chk.ok ? MB_ICONINFORMATION : MB_ICONWARNING);
     } else if (g_job.busy && g_job.in_xp) {   /* the World Expansion, after the tracks */
@@ -1006,6 +1185,7 @@ static void on_timer(void) {
         set_done(g_job.ok ? 2 : 3);
         ui_idle();
         xp_status_update();
+        game_state_update();
         if (!g_job.ok) MessageBoxA(g_wnd, g_job.msg, TOOL_NAME, MB_ICONERROR);
     }
     if (g_send.busy && g_send.total > 0) {
@@ -1023,63 +1203,228 @@ static void on_timer(void) {
 }
 
 static void build_ui(void) {
-    int y = 14;
-    mk("STATIC", TOOL_NAME, 0, 20, y, 500, 28, 0, g_title); y += 32;
-    mk("STATIC", "Gets your NFSU2 PC files ready for the Vita: checks them, does the Vita's one-time "
-       "\"Optimizing world data\" step here, and puts everything on the Vita.", 0, 20, y, 500, 34, 0, g_font); y += 46;
+    int y;
+    y = CY(0);   /* 1. the game folder */
+    g_game_ed = mk_edit(CL, y + 52, 374, 30, ID_GAME);
+    g_browse = mk("BUTTON", "Browse...", BS_OWNERDRAW, 464, y + 52, 100, 30, ID_BROWSE, g_btnf);
+    g_check = mk("BUTTON", "Check Game Files", BS_OWNERDRAW, CL, y + 90, 140, 30, ID_CHECK, g_btnf);
 
-    mk("STATIC", "1.  Your Need for Speed Underground 2 folder", 0, 20, y, 500, 18, 0, g_bold); y += 22;
-    g_game_ed = mk("EDIT", "", ES_AUTOHSCROLL, 20, y, 400, 24, ID_GAME, g_font);
-    g_browse = mk("BUTTON", "Browse...", BS_PUSHBUTTON, 428, y, 92, 24, ID_BROWSE, g_font); y += 30;
-    g_check = mk("BUTTON", "Check game files", BS_PUSHBUTTON, 20, y, 140, 24, ID_CHECK, g_font);
-    mk("STATIC", "Makes sure your copy is complete and unmodified.", 0, 170, y + 4, 350, 18,
-       0, g_font); y += 36;
-
-    mk("STATIC", "Optional:  World Expansion -- Rockport and Palmont", 0, 20, y, 500, 18, 0, g_bold); y += 21;
-    mk("STATIC", "Have Need for Speed Most Wanted (2005) or Carbon on your PC? Pick its folder to drive its "
-       "city in Free Run too. Leave a box empty to skip it.", 0, 20, y, 500, 34, 0, g_font); y += 38;
+    y = CY(1);   /* the World Expansion */
     for (int c = 0; c < XPP_NCITY; c++) {
-        mk("STATIC", c ? "Carbon:" : "Most Wanted:", 0, 20, y + 4, 90, 18, 0, g_font);
-        g_xp_ed[c] = mk("EDIT", "", ES_AUTOHSCROLL, 112, y, 308, 24, ID_XPDIR0 + c, g_font);
-        g_xp_browse[c] = mk("BUTTON", "Browse...", BS_PUSHBUTTON, 428, y, 92, 24, ID_XPBROWSE0 + c, g_font); y += 28;
+        int ry = y + 52 + c * 36;
+        g_xp_ed[c] = mk_edit(CL + 96, ry, 278, 30, ID_XPDIR0 + c);
+        g_xp_browse[c] = mk("BUTTON", "Browse...", BS_OWNERDRAW, 464, ry, 100, 30, ID_XPBROWSE0 + c, g_btnf);
     }
-    g_xp_status = mk("STATIC", "", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 20, y + 1, 500, 18, ID_XPSTATUS, g_font); y += 32;
+    SendMessageW(g_xp_ed[0], EM_SETCUEBANNER, FALSE, (LPARAM)L"Need for Speed Most Wanted folder (optional)");
+    SendMessageW(g_xp_ed[1], EM_SETCUEBANNER, FALSE, (LPARAM)L"Need for Speed Carbon folder (optional)");
+    SendMessageW(g_game_ed, EM_SETCUEBANNER, FALSE, (LPARAM)L"Pick your Need for Speed Underground 2 folder");
 
-    mk("STATIC", "2.  Convert", 0, 20, y, 500, 18, 0, g_bold); y += 22;
-    g_convert = mk("BUTTON", "Convert", BS_DEFPUSHBUTTON, 20, y, 140, 30, ID_CONVERT, g_bold);
-    mk("STATIC", "About 2 minutes (longer with the World Expansion). Your game files are only read, never "
-       "changed.", 0, 172, y - 1, 348, 34, 0, g_font); y += 40;
-    g_bar = mk(PROGRESS_CLASSA, "", 0, 20, y, 400, 16, ID_PROGRESS, g_font);
-    g_done = mk("STATIC", "", SS_CENTER, 428, y - 3, 92, 22, 0, g_bold);
-    SendMessageA(g_bar, PBM_SETRANGE32, 0, 1000); y += 22;
-    g_status = mk("STATIC", "", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 20, y, 500, 18, ID_STATUS, g_font); y += 36;
+    y = CY(2);   /* 2. Convert */
+    g_convert = mk("BUTTON", "Convert", BS_OWNERDRAW, CL, y + 56, 190, 40, ID_CONVERT, g_btnbig);
+    g_bar = mk(PROGRESS_CLASSA, "", 0, CL, y + 108, 392, 10, ID_PROGRESS, g_font);
+    SendMessageA(g_bar, PBM_SETRANGE32, 0, 1000);
 
-    mk("STATIC", "3.  Put it on your Vita", 0, 20, y, 500, 18, 0, g_bold); y += 24;
+    y = CY(3);   /* 3. Put it on your Vita */
     g_gamefiles = mk("BUTTON", "Game files too (1.7 GB the first time, then skipped)",
-                     BS_AUTOCHECKBOX, 20, y, 300, 20, ID_GAMEFILES, g_font);
-    g_xpfiles = mk("BUTTON", "World Expansion too", BS_AUTOCHECKBOX, 330, y, 190, 20, ID_XPFILES, g_font); y += 28;
-    mk("STATIC", "Vita IP address:", 0, 20, y + 4, 104, 18, 0, g_font);
-    g_ip_ed = mk("EDIT", "", ES_AUTOHSCROLL, 126, y, 150, 24, ID_IP, g_font);
-    g_send_btn = mk("BUTTON", "Send to Vita", BS_PUSHBUTTON, 284, y, 120, 24, ID_SEND, g_font); y += 30;
-    mk("STATIC", "Open VitaShell on the Vita and press SELECT to see its IP (vitacompanion works too). "
-       "Close NFS Underground 2 on the Vita first.", 0, 20, y, 500, 34, 0, g_font); y += 42;
-    g_copy = mk("BUTTON", "Copy to memory card...", BS_PUSHBUTTON, 20, y, 140, 24, ID_COPY, g_font);
-    mk("STATIC", "Faster than Wi-Fi: in VitaShell press START, pick USB, then pick the memory card's "
-       "drive here.", 0, 170, y - 2, 350, 34, 0, g_font); y += 36;
-    g_open = mk("BUTTON", "Open output folder", BS_PUSHBUTTON, 20, y, 140, 24, ID_OPEN, g_font);
-    mk("STATIC", "The converted data and the logs.", 0, 170, y + 4, 350, 18, 0, g_font); y += 44;
+                     BS_AUTOCHECKBOX, CL, y + 56, 316, 22, ID_GAMEFILES, g_font);
+    g_xpfiles = mk("BUTTON", "World Expansion too", BS_AUTOCHECKBOX, CL + 326, y + 56, 158, 22, ID_XPFILES, g_font);
+    g_ip_ed = mk_edit(CL + 104, y + 90, 196, 30, ID_IP);
+    g_send_btn = mk("BUTTON", "Send to Vita", BS_OWNERDRAW, CL + 312, y + 90, CR - CL - 312, 30, ID_SEND, g_btnf);
+    g_copy = mk("BUTTON", "Copy to Memory Card...", BS_OWNERDRAW, 36, y + 152, 180, 32, ID_COPY, g_btnf);
+    g_open = mk("BUTTON", "Open Output Folder", BS_OWNERDRAW, 412, y + 152, 152, 32, ID_OPEN, g_btnf);
 
-    mk("STATIC", "Optional:  bring your PC career", 0, 20, y, 500, 18, 0, g_bold); y += 24;
-    g_import = mk("BUTTON", "Import PC save...", BS_PUSHBUTTON, 20, y, 140, 24, ID_IMPORT, g_font);
-    mk("STATIC", "Turns a profile of the PC game into a Vita profile (career, cars, options, "
-       "high scores). Sending or copying takes it along.", 0, 170, y - 2, 350, 34, 0, g_font);
+    y = CY(4);   /* bring your PC career */
+    g_import = mk("BUTTON", "Import PC Save...", BS_OWNERDRAW, CR - 160, y + 20, 160, 32, ID_IMPORT, g_btnf);
+}
+
+/* the card icons: glyphs of the Windows icon font, the handheld drawn */
+static void glyph_at(HDC dc, HFONT f, COLORREF c, int x, int y, int w, int h, wchar_t g) {
+    wchar_t s[2] = { g, 0 };
+    text_at(dc, f, c, x, y, w, h, s, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+static void icon_check(void *g, HDC dc, int cx, int cy, int d, COLORREF bg) {   /* a ticked circle */
+    gp_circle(g, (float)cx, (float)cy, (float)d, ARGB(255, GetRValue(bg), GetGValue(bg), GetBValue(bg)));
+    HFONT f = d >= 16 ? g_glyph_s : g_small;
+    (void)f;
+    glyph_at(dc, g_glyph_s, RGB(255, 255, 255), cx - d / 2, cy - d / 2, d, d, 0xE73E);
+}
+static void card(void *g, HDC dc, int i, const wchar_t *head, const wchar_t *sub, int subw) {
+    int y = CY(i), h = k_card_h[i];
+    gp_box(g, CX0, y + 1, CX1 - CX0, h, 12, ARGB(14, 20, 40, 80), 0, 0);   /* a faint shadow */
+    gp_box(g, CX0, y, CX1 - CX0, h, 12, ARGB(255, 255, 255, 255), ARGB(255, 218, 225, 235), 1.0f);
+    text_at(dc, g_head, RGB(16, 30, 54), CL, y + 12, CR - CL, 24, head, DT_SINGLELINE | DT_END_ELLIPSIS);
+    text_at(dc, g_sub, RGB(72, 84, 102), CL, y + 34, subw ? subw : CR - CL, 36, sub, DT_WORDBREAK);
+}
+static void paint_all(HDC dc, int cw, int chh) {
+    {   /* the background: a soft blue-grey wash */
+        for (int y = 0; y < chh; y++) {
+            float t = (float)y / (chh > 1 ? chh - 1 : 1);
+            HBRUSH b = CreateSolidBrush(RGB(240 - (int)(8 * t), 245 - (int)(6 * t), 252 - (int)(3 * t)));
+            RECT r = { 0, y, cw, y + 1 }; FillRect(dc, &r, b); DeleteObject(b);
+        }
+    }
+    void *g = gp_begin(dc);
+    /* the header: soft light shapes on the right, the tile, the title */
+    gp_circle(g, 520, -10, 300, ARGB(70, 255, 255, 255));
+    gp_circle(g, 600, 40, 220, ARGB(60, 214, 230, 252));
+    gp_box(g, 24, 18, 80, 80, 16, ARGB(255, 22, 36, 64), 0, 0);
+    gp_box(g, 24, 18, 80, 40, 16, ARGB(40, 120, 180, 255), 0, 0);
+    glyph_at(dc, g_glyph_l, RGB(120, 214, 255), 24, 22, 80, 56, 0xE804);   /* a car */
+    text_at(dc, g_small, RGB(170, 200, 235), 24, 74, 80, 16, L"VITA", DT_CENTER | DT_SINGLELINE);
+    text_at(dc, g_title, RGB(14, 28, 52), 124, 20, 450, 36, L"NFSU2 Vita Prep Tool", DT_SINGLELINE);
+    text_at(dc, g_sub, RGB(56, 70, 92), 124, 58, 450, 40,
+            L"Gets your NFSU2 PC files ready for the Vita: checks them, does the Vita’s one-time "
+            L"“Optimizing world data” step here, and puts everything on the Vita.", DT_WORDBREAK);
+
+    /* the cards */
+    card(g, dc, 0, L"1.  Your Need for Speed Underground 2 Folder", L"Pick the folder NFSU2 is installed in.", 0);
+    card(g, dc, 1, L"Optional:  World Expansion — Rockport and Palmont",
+         L"Own Need for Speed Most Wanted (2005) or Carbon? Drive its city in Free Run too.", 0);
+    card(g, dc, 2, L"2.  Convert", L"Prepares the world data for the Vita. Your game files are only read, never changed.", 0);
+    card(g, dc, 3, L"3.  Put It on Your Vita", L"Send the converted files to your PS Vita, over Wi-Fi or USB.", 0);
+    card(g, dc, 4, L"Optional:  Bring Your PC Career",
+         L"Import a PC save to continue your progress on the Vita (career, cars, options, high scores).", CR - 172 - CL);
+
+    /* card icons */
+    glyph_at(dc, g_glyph, RGB(47, 123, 224), CX0 + 14, CY(0) + 12, 40, 36, 0xE8B7);   /* folder */
+    glyph_at(dc, g_glyph, RGB(123, 97, 255), CX0 + 14, CY(1) + 12, 40, 36, 0xEA86);   /* puzzle piece */
+    gp_circle(g, CX0 + 34, CY(2) + 30, 32, ARGB(255, 37, 110, 230));                  /* play */
+    glyph_at(dc, g_glyph_s, RGB(255, 255, 255), CX0 + 21, CY(2) + 16, 30, 28, 0xF5B0);
+    {   /* a handheld */
+        int x = CX0 + 17, y = CY(3) + 20;
+        gp_box(g, x, y, 34, 20, 7, 0, ARGB(255, 37, 110, 230), 2.2f);
+        gp_box(g, x + 10, y + 5, 14, 10, 2, ARGB(255, 37, 110, 230), 0, 0);
+        gp_circle(g, x + 5.5f, y + 10, 3.5f, ARGB(255, 37, 110, 230));
+        gp_circle(g, x + 28.5f, y + 10, 3.5f, ARGB(255, 37, 110, 230));
+    }
+    glyph_at(dc, g_glyph, RGB(37, 110, 230), CX0 + 14, CY(4) + 18, 40, 36, 0xE7FC);   /* gamepad */
+
+    /* the edit frames */
+    for (int i = 0; i < g_nframes; i++) {
+        const EdFrame *f = &g_frames[i];
+        int foc = f->ed == g_wnd_focus_ed;
+        gp_box(g, f->x, f->y, f->w, f->h, 6, ARGB(255, 255, 255, 255),
+               foc ? ARGB(255, 47, 123, 224) : ARGB(255, 197, 206, 218), foc ? 1.6f : 1.0f);
+    }
+
+    /* card 1: the game folder's state */
+    {
+        static const wchar_t *t[6] = { L"Pick your NFSU2 folder.", L"Game files found — ready to convert.",
+                                       L"Game files OK — ready to convert.", L"Some game files are missing or changed.",
+                                       L"That folder has no TRACKS folder.", L"Converted — ready to send." };
+        int st = g_game_st, y = CY(0) + 105, x = CL + 156;
+        if (st == 1 || st == 2 || st == 5) icon_check(g, dc, x + 9, y, 18, RGB(34, 160, 80));
+        else if (st == 0) gp_circle(g, (float)x + 9, (float)y, 8, ARGB(255, 150, 160, 175));
+        else { gp_circle(g, (float)x + 9, (float)y, 18, ARGB(255, 214, 54, 54));
+               text_at(dc, g_bold, RGB(255, 255, 255), x, y - 9, 18, 18, L"!", DT_CENTER | DT_VCENTER | DT_SINGLELINE); }
+        COLORREF c = st == 0 ? RGB(90, 100, 115) : (st == 3 || st == 4) ? RGB(190, 30, 30) : RGB(22, 128, 60);
+        text_at(dc, g_font, c, x + 26, y - 10, CR - x - 26, 20, t[st], DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+    /* card 2: the labels and the city pills */
+    for (int c = 0; c < XPP_NCITY; c++)
+        text_at(dc, g_font, RGB(40, 52, 70), CL, CY(1) + 52 + c * 36, 94, 30, c ? L"Carbon:" : L"Most Wanted:",
+                DT_SINGLELINE | DT_VCENTER);
+    {
+        int x = CL, y = CY(1) + 122;
+        for (int c = 0; c < XPP_NCITY; c++) {
+            static const wchar_t *st[4] = { L"Not set", L"Found — press Convert", L"Ready to send", L"Folder not right" };
+            wchar_t s[80]; swprintf(s, 80, L"%hs: %ls", xpp_city_name(c), st[g_city_st[c]]);
+            int k = g_city_st[c];
+            int w = text_w(dc, g_font, s) * 96 / g_dpi + 44;
+            DWORD bg = k == 0 ? ARGB(255, 236, 239, 243) : k == 3 ? ARGB(255, 253, 236, 236) : ARGB(255, 228, 244, 233);
+            COLORREF fg = k == 0 ? RGB(70, 80, 96) : k == 3 ? RGB(180, 35, 24) : RGB(22, 120, 58);
+            gp_box(g, x, y, w, 26, 13, bg, 0, 0);
+            if (k == 1 || k == 2) icon_check(g, dc, x + 17, y + 13, 16, RGB(34, 160, 80));
+            else gp_circle(g, (float)x + 17, (float)y + 13, 8, k == 3 ? ARGB(255, 214, 54, 54) : ARGB(255, 140, 150, 165));
+            text_at(dc, g_font, fg, x + 31, y, w - 31, 26, s, DT_SINGLELINE | DT_VCENTER);
+            x += w + 10;
+        }
+    }
+    /* card 3: the time note, the result, the status line */
+    {
+        int y = CY(2);
+        HPEN p = CreatePen(PS_SOLID, 1, RGB(214, 221, 231)); HGDIOBJ op = SelectObject(dc, p);
+        MoveToEx(dc, S(CL + 208), S(y + 62), NULL); LineTo(dc, S(CL + 208), S(y + 92));
+        SelectObject(dc, op); DeleteObject(p);
+        glyph_at(dc, g_glyph, RGB(40, 52, 70), CL + 222, y + 58, 30, 36, 0xE823);   /* clock */
+        text_at(dc, g_bold, RGB(16, 30, 54), CL + 260, y + 58, 220, 18, L"About 2 minutes", DT_SINGLELINE);
+        text_at(dc, g_small, RGB(72, 84, 102), CL + 260, y + 77, 230, 18, L"(longer with the World Expansion)", DT_SINGLELINE);
+        static const wchar_t *dt[4] = { L"", L"Working…", L"✔ Done!", L"✖ Failed" };
+        COLORREF dc2 = g_done_state == 2 ? RGB(22, 140, 60) : g_done_state == 3 ? RGB(200, 30, 30) : RGB(110, 118, 130);
+        text_at(dc, g_bold, dc2, CL + 400, y + 102, CR - CL - 400, 22, dt[g_done_state], DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+        wchar_t w[600]; MultiByteToWideChar(CP_ACP, 0, g_status_txt, -1, w, 600);
+        text_at(dc, g_small, RGB(72, 84, 102), CL, y + 124, CR - CL, 18, w, DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    /* card 4: the IP label and hint, the USB note, the output folder's caption */
+    {
+        int y = CY(3);
+        text_at(dc, g_font, RGB(40, 52, 70), CL, y + 90, 104, 30, L"Vita IP address:", DT_SINGLELINE | DT_VCENTER);
+        text_at(dc, g_small, RGB(96, 106, 122), CL, y + 124, CR - CL, 18,
+                L"VitaShell shows the IP when you press SELECT. Close NFS Underground 2 on the Vita first.",
+                DT_SINGLELINE | DT_END_ELLIPSIS);
+        text_at(dc, g_small, RGB(72, 84, 102), 226, y + 150, 170, 48,
+                L"Faster than Wi-Fi: in VitaShell press START, pick USB, then pick the card here.", DT_WORDBREAK);
+        HPEN p = CreatePen(PS_SOLID, 1, RGB(214, 221, 231)); HGDIOBJ op = SelectObject(dc, p);
+        MoveToEx(dc, S(404), S(y + 152), NULL); LineTo(dc, S(404), S(y + 184));
+        SelectObject(dc, op); DeleteObject(p);
+        text_at(dc, g_small, RGB(96, 106, 122), 412, y + 186, CR - 412, 16, L"Converted data and logs",
+                DT_SINGLELINE | DT_CENTER);
+    }
+    if (g) GdipDeleteGraphics(g);
+}
+
+/* the owner-drawn buttons: rounded, a glyph before the text; Convert is the blue one */
+static wchar_t btn_glyph(int id) {
+    switch (id) {
+    case ID_BROWSE: case ID_XPBROWSE0: case ID_XPBROWSE1: return 0xE8B7;
+    case ID_SEND: return 0xE701;
+    case ID_COPY: return 0xE7F1;
+    case ID_OPEN: return 0xE838;
+    case ID_IMPORT: return 0xE898;
+    case ID_CONVERT: return 0xF5B0;
+    }
+    return 0;
+}
+static void draw_button(const DRAWITEMSTRUCT *d) {
+    HDC dc = d->hDC; RECT r = d->rcItem;
+    int primary = d->CtlID == ID_CONVERT;
+    int dis = (d->itemState & ODS_DISABLED) != 0, down = (d->itemState & ODS_SELECTED) != 0;
+    FillRect(dc, &r, g_white);
+    void *g = gp_begin(dc);
+    float k = 96.0f / g_dpi;   /* gp_box works in 96-dpi units */
+    int w = (int)((r.right - r.left) * k + 0.5f), h = (int)((r.bottom - r.top) * k + 0.5f);
+    if (primary)
+        gp_box(g, 0, 0, w, h, 8, dis ? ARGB(255, 157, 183, 227) : down ? ARGB(255, 21, 84, 184) : ARGB(255, 26, 102, 224), 0, 0);
+    else
+        gp_box(g, 0, 0, w, h, 6, down ? ARGB(255, 236, 241, 247) : ARGB(255, 255, 255, 255),
+               dis ? ARGB(255, 222, 227, 234) : ARGB(255, 190, 200, 214), 1.0f);
+    if (g) GdipDeleteGraphics(g);
+    wchar_t t[64]; GetWindowTextW(d->hwndItem, t, 64);
+    wchar_t gl = btn_glyph((int)d->CtlID);
+    HFONT f = primary ? g_btnbig : g_btnf;
+    COLORREF c = primary ? RGB(255, 255, 255) : dis ? RGB(160, 168, 180) : RGB(24, 36, 56);
+    int tw = text_w(dc, f, t), gw = gl ? S(primary ? 18 : 16) + S(10) : 0;
+    int x = (r.left + r.right - tw - gw) / 2;
+    SetBkMode(dc, TRANSPARENT);
+    if (gl) {
+        wchar_t s[2] = { gl, 0 };
+        RECT gr = { x, r.top, x + S(primary ? 18 : 16), r.bottom };
+        SelectObject(dc, g_glyph_s); SetTextColor(dc, primary ? c : dis ? c : RGB(40, 52, 70));
+        DrawTextW(dc, s, 1, &gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    RECT tr = { x + gw, r.top, r.right, r.bottom };
+    SelectObject(dc, f); SetTextColor(dc, c);
+    DrawTextW(dc, t, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
+        RECT fr = r; InflateRect(&fr, -S(4), -S(4)); DrawFocusRect(dc, &fr);
+    }
 }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case ID_BROWSE: on_browse(); return 0;
+        case ID_BROWSE: on_browse(); g_chk_res = 0; game_state_update(); return 0;
         case ID_CONVERT: on_convert(); return 0;
         case ID_SEND: on_send(); return 0;
         case ID_COPY: on_copy(); return 0;
@@ -1087,15 +1432,38 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_IMPORT: on_import(); return 0;
         case ID_OPEN: ShellExecuteA(h, "open", g_out, NULL, NULL, SW_SHOWNORMAL); return 0;
         case ID_XPBROWSE0: case ID_XPBROWSE1: on_xp_browse(LOWORD(wp) - ID_XPBROWSE0); return 0;
-        case ID_XPDIR0: case ID_XPDIR1: if (HIWORD(wp) == EN_KILLFOCUS) xp_status_update(); return 0;
         }
+        if (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS) {   /* the focused frame turns blue */
+            g_wnd_focus_ed = HIWORD(wp) == EN_SETFOCUS ? (HWND)lp : NULL;
+            for (int i = 0; i < g_nframes; i++)
+                if (g_frames[i].ed == (HWND)lp) inval(g_frames[i].x - 2, g_frames[i].y - 2, g_frames[i].w + 4, g_frames[i].h + 4);
+            if (HIWORD(wp) == EN_KILLFOCUS && (LOWORD(wp) == ID_XPDIR0 || LOWORD(wp) == ID_XPDIR1)) xp_status_update();
+            return 0;
+        }
+        if (HIWORD(wp) == EN_CHANGE && LOWORD(wp) == ID_GAME) { g_chk_res = 0; game_state_update(); return 0; }
+        if (HIWORD(wp) == EN_CHANGE && (LOWORD(wp) == ID_XPDIR0 || LOWORD(wp) == ID_XPDIR1)) { xp_status_update(); return 0; }
         break;
     case WM_TIMER: on_timer(); return 0;
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = (HDC)wp; SetBkMode(dc, TRANSPARENT);
-        if ((HWND)lp == g_done)
-            SetTextColor(dc, g_done_state == 2 ? RGB(0, 140, 40) : g_done_state == 3 ? RGB(200, 0, 0) : RGB(110, 110, 110));
-        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    case WM_DRAWITEM: draw_button((const DRAWITEMSTRUCT *)lp); return TRUE;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT cr; GetClientRect(h, &cr);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bm = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
+        HGDIOBJ ob = SelectObject(mem, bm);
+        paint_all(mem, cr.right, cr.bottom);
+        BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+               mem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+        SelectObject(mem, ob); DeleteObject(bm); DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT: case WM_CTLCOLORSTATIC: {   /* the edit boxes and the check boxes sit on white */
+        HDC dc = (HDC)wp; SetBkColor(dc, RGB(255, 255, 255));
+        if (msg == WM_CTLCOLORSTATIC && !IsWindowEnabled((HWND)lp)) SetTextColor(dc, RGB(150, 158, 170));
+        else SetTextColor(dc, RGB(24, 36, 56));
+        return (LRESULT)g_white;
     }
     case WM_CLOSE:
         if ((g_job.busy || g_send.busy || g_chk.busy) &&
@@ -1114,6 +1482,29 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 static HFONT font(int pt, int weight) {
     return CreateFontA(-MulDiv(pt, g_dpi, 72), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
                        0, "Segoe UI");
+}
+static HFONT font_px(int px, int weight, const char *face) {
+    return CreateFontA(-S(px), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
+}
+/* the icon font: Segoe Fluent Icons (Windows 11), else Segoe MDL2 Assets (Windows 10) */
+static const char *icon_face(void) {
+    static char face[40];
+    if (face[0]) return face;
+    HDC dc = GetDC(NULL);
+    HFONT f = CreateFontA(-16, 0, 0, 0, 0, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, "Segoe Fluent Icons");
+    HGDIOBJ o = SelectObject(dc, f);
+    char got[40] = ""; GetTextFaceA(dc, sizeof got, got);
+    SelectObject(dc, o); DeleteObject(f); ReleaseDC(NULL, dc);
+    snprintf(face, sizeof face, "%s", !_stricmp(got, "Segoe Fluent Icons") ? got : "Segoe MDL2 Assets");
+    return face;
+}
+static void make_fonts(void) {
+    g_font = font(9, FW_NORMAL); g_bold = font(9, FW_SEMIBOLD); g_title = font(19, FW_SEMIBOLD);
+    g_small = font(8, FW_NORMAL); g_head = font(12, FW_SEMIBOLD); g_sub = font(9, FW_NORMAL);
+    g_btnf = font(9, FW_NORMAL); g_btnbig = font(11, FW_SEMIBOLD);
+    g_glyph = font_px(26, FW_NORMAL, icon_face()); g_glyph_s = font_px(14, FW_NORMAL, icon_face());
+    g_glyph_l = font_px(38, FW_NORMAL, icon_face());
+    g_white = CreateSolidBrush(RGB(255, 255, 255));
 }
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
@@ -1172,19 +1563,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     InitCommonControlsEx(&icc);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     {   /* a screen too short for the window (a 1080p laptop at 150%): scale it down to fit */
-        RECT wa; int need = 764 + 40;   /* the client height + the caption */
+        RECT wa; int need = CLIENT_H + 40;   /* the client height + the caption */
         if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0) && MulDiv(need, g_dpi, 96) > wa.bottom - wa.top)
             g_dpi = MulDiv(wa.bottom - wa.top, 96, need);
     }
-    g_font = font(9, FW_NORMAL); g_bold = font(9, FW_SEMIBOLD); g_title = font(14, FW_SEMIBOLD);
+    { ULONG_PTR tok; GpStartupIn in = { 1, NULL, FALSE, FALSE }; GdiplusStartup(&tok, &in, NULL); }
+    make_fonts();
 
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = wndproc; wc.hInstance = inst; wc.lpszClassName = "NFSU2VitaPrep";
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = NULL;
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(1));
     RegisterClassA(&wc);
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r = { 0, 0, S(540), S(764) };
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+    RECT r = { 0, 0, S(CW), S(CLIENT_H) };
     AdjustWindowRect(&r, style, FALSE);
     g_wnd = CreateWindowA("NFSU2VitaPrep", TOOL_NAME, style, CW_USEDEFAULT, CW_USEDEFAULT,
                           r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
@@ -1211,6 +1603,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     xpp_set_out(g_out);
     conv_set_folders("", g_out);   /* track_done reads the output's cache */
     xp_status_update();
+    game_state_update();
     ui_initial_status();
     ui_idle();
     SetTimer(g_wnd, ID_TIMER, 200, NULL);
