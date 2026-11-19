@@ -29,6 +29,7 @@ Disclosure: Whilst I know a bit of programming and coding, I used AI to help acc
 - [Installation](#installation)
 - [NFSU2 Vita Prep Tool (PC)](#nfsu2-vita-prep-tool-pc)
 - [Bringing over a PC save](#bringing-over-a-pc-save)
+- [World Expansion: Rockport and Palmont](#world-expansion-rockport-and-palmont)
 - [Settings](#settings)
 - [Reporting problems](#reporting-problems)
 - [Building from source](#building-from-source)
@@ -71,6 +72,10 @@ Disclosure: Whilst I know a bit of programming and coding, I used AI to help acc
   When it is on, choosing **No** on the World Map's GPS prompt puts you at
   that place. Off by default; turn it on in [Settings](#settings).
 - **World streaming.** The whole city streams in while you drive.
+- **World Expansion (optional).** Drive Rockport (from Need for Speed Most
+  Wanted, 2005) and Palmont (from Need for Speed Carbon) at night in Free Run,
+  with their races. Needs your own PC copy of those games. See
+  [World Expansion](#world-expansion-rockport-and-palmont).
 - **Languages.** The game uses the Vita's system language when the original
   game has it. That covers English, French, German, Italian, Spanish, Dutch,
   Swedish and Danish. Other languages fall back to English.
@@ -229,6 +234,31 @@ sent or copied to `ux0:data/NFSU2/profiles` with the rest. Load it from the
 
 ---
 
+## World Expansion: Rockport and Palmont
+
+If you also own **Need for Speed Most Wanted (2005)** or **Need for Speed
+Carbon** for PC, you can drive their cities in the port, at night: Rockport
+and Palmont, with their traffic, minimap, world map, shops and race events.
+No data from those games is included; the Prep Tool converts your own copy.
+
+1. In the Prep Tool, under **Optional: World Expansion**, pick your Most
+   Wanted and/or Carbon folder (the one with `TRACKS` in it). The tool finds
+   installed copies by itself. Leave a box empty to skip that city.
+2. Click **Convert**. After the Underground 2 tracks it checks those games'
+   files and converts each city. This takes a while longer than the
+   Underground 2 tracks, and the cities need about 2.7 GB more on the memory
+   card.
+3. Send or copy as usual with **World Expansion too** ticked.
+4. On the Vita, open [Settings](#settings) and tick **Rockport and Palmont**
+   under **World Expansion**.
+5. In the game, pick **Quick Race → Free Run**. It asks which city you want.
+
+The first time you drive into a city, the game asks whether to **share your
+garage** with it (your cars, parts and cash) or **start fresh** there with
+its own career. You can change this later.
+
+---
+
 ## Settings
 
 Tap **Settings** on the game's LiveArea screen, or hold **L + R** while the
@@ -241,6 +271,7 @@ game starts. A small menu opens before the game loads:
 | **Fast travel** | Off by default. On: on the World Map, choosing **No** on the GPS prompt takes you straight to that place (`fasttravel.txt`). |
 | **Trophies** | Off by default. On: trophies are reported to the system (`trophies.txt`; needs the NoTrpDrm plugin). Off, progress is still saved in your profile and is reported when you turn them on. |
 | **Full detail** | Off by default: the lighter mix for a steady 30 FPS downtown (road reflection redrawn every second frame, fewer traffic cars, half the particle rate). On: the original rates (`fulldetail.txt`). |
+| **World Expansion: Rockport and Palmont** | Off by default. On: Free Run offers Rockport and Palmont (`expansion/enable.txt`). The right side shows which cities are on the memory card; send them with the [Prep Tool](#world-expansion-rockport-and-palmont) first. |
 | **Reset caches** | Deletes `ux0:data/NFSU2/cache`: the converted world data, shaders and shop lists. Your profiles and options are kept. On the next boot the game converts the world again, or you can send it again from the Prep Tool. |
 
 **Start Game** (or START) saves the settings and restarts the game.

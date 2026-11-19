@@ -15,7 +15,13 @@
  *
  *   NFSU2VitaPrep.exe                          the window
  *   NFSU2VitaPrep.exe --check GAME             check the game files (report on stderr)
- *   NFSU2VitaPrep.exe --cli GAME OUT           check + convert without the window
+ *  - optionally, the World Expansion (conv_xp.c): Rockport from Need for Speed
+ *    Most Wanted (2005) and Palmont from Carbon, translated and converted here
+ *    and sent with the rest; the player switches it on in the Vita's Settings.
+ *
+ *   NFSU2VitaPrep.exe --cli GAME OUT [MW|- [CARBON|-]]
+ *                                              check + convert without the window
+ *                                              (+ the World Expansion from MW / CARBON)
  *   NFSU2VitaPrep.exe --send IP OUT [GAME]     send OUT's cache (+ GAME's files) to the Vita
  *   NFSU2VitaPrep.exe --copy DEST OUT [GAME]   the same into DEST (ux0's root, or any folder)
  *   NFSU2VitaPrep.exe --import-save SAVE GAME OUT
@@ -36,6 +42,7 @@
 #include <string.h>
 #include "world_tiles.h"
 #include "pcsave.h"
+#include "conv_xp.h"
 
 void conv_set_folders(const char *game, const char *out);
 unsigned char *res_bundle(const char *path, long *len);
@@ -153,7 +160,8 @@ static struct {
     volatile int busy, done, ok;   /* ok: every file there and matching */
     volatile long long bytes, total;
     int missing, bad;
-    char msg[2048];
+    volatile int xp;   /* checking the World Expansion's files (after the game's) */
+    char msg[4200];
 } g_chk;
 
 /* A fingerprint of the install as the file system sees it (sizes + write
@@ -170,7 +178,7 @@ static unsigned game_fingerprint(const char *game) {
     }
     return c;
 }
-static void setting_get(const char *name, char *out, DWORD cap);
+static int setting_get(const char *name, char *out, DWORD cap);
 static void setting_put(const char *name, const char *v);
 
 /* Checks GAME against the manifest. Returns 1 when everything matches; the
@@ -272,6 +280,8 @@ static struct {
     char extra[128];   /* the first-use cache being made after the tracks */
     int gui;           /* the window: ask before converting a folder that failed the check */
     volatile int checking;
+    volatile int in_xp;   /* on the World Expansion (conv_xp.c), after the tracks */
+    XppJob xp;
 } g_job;
 static HWND g_wnd;
 
@@ -367,6 +377,19 @@ static void convert_all(void) {
                          n, n == 1 ? "" : "s", secs / 60, secs % 60, missing ? " (some tracks were missing)" : "");
     else snprintf(g_job.msg, sizeof g_job.msg, "Everything is already converted. Now send it to your Vita.");
     printf("converter: %s\n", g_job.msg);
+    /* then the World Expansion cities whose game folders are picked */
+    if (ok && xpp_any_dir()) {
+        g_job.in_xp = 1;
+        int xok = xpp_convert(&g_job.xp, g_job.gui, g_wnd);
+        conv_set_folders(g_job.game, g_out);
+        g_job.in_xp = 0;
+        char m[sizeof g_job.msg];
+        if (xok) snprintf(m, sizeof m, "Done: %s Now send it to your Vita.", g_job.xp.msg);
+        else snprintf(m, sizeof m, "Underground 2 is ready, but: %s", g_job.xp.msg);
+        snprintf(g_job.msg, sizeof g_job.msg, "%s", m);
+        printf("converter: %s\n", g_job.msg);
+        ok = xok;
+    }
     fflush(stdout);
     g_job.ok = ok;
     g_job.done = 1;
@@ -383,10 +406,12 @@ static struct {
     char ip[64];
     char dest[MAX_PATH];   /* set: copy into this folder (the memory card's root) instead of FTP */
     char game[MAX_PATH];   /* set: the game files go too */
-    char msg[512];
+    int xp;                /* the converted World Expansion cities go too */
+    volatile int xp_sent;  /* ...and some did */
+    char msg[768];
 } g_send;
 
-#define SEND_CAP (NGAME + 5 * NTRACKS + 64 + 16)
+#define SEND_CAP (NGAME + 5 * NTRACKS + 64 + 16 + XPP_NCITY * XPP_FILES_PER_CITY)
 #define VITA_DATA "ux0:/data/NFSU2"
 #define VITA_PROFILES "ux0:/data/NFSU2/profiles"
 /* the imported PC saves: OUT\profiles\<NAME>\<NAME> */
@@ -430,6 +455,16 @@ static int send_add(SendFile *f, int n, const char *name) {   /* a cache file, i
     snprintf(f[n].remote, sizeof f[n].remote, VITA_CACHE "/%s", name);
     return file_exists(f[n].local) ? n + 1 : n;
 }
+typedef struct { SendFile *f; int n, cap; } XpAdd;
+static int xp_add(void *ud, const char *local, const char *remote) {
+    XpAdd *a = ud;
+    if (a->n >= a->cap || !file_exists(local)) return 0;
+    SendFile *s = &a->f[a->n++];
+    snprintf(s->local, sizeof s->local, "%s", local);
+    snprintf(s->remote, sizeof s->remote, "%s", remote);
+    s->game = 0;   /* always sent: a new translation can keep a file's size */
+    return 1;
+}
 static int send_list(SendFile *f, int cap, const char *game) {
     int n = 0;
     char name[128];
@@ -461,6 +496,12 @@ static int send_list(SendFile *f, int cap, const char *game) {
     }
     if (n < cap) n = send_add(f, n, conv_shop_file());
     n = send_profiles(f, n, cap);
+    g_send.xp_sent = 0;
+    if (g_send.xp) {   /* the World Expansion (conv_xp.c), each city's index last */
+        XpAdd a = { f, n, cap };
+        g_send.xp_sent = xpp_send_files(xp_add, &a, cap - n) > 0;
+        n = a.n;
+    }
     for (int i = 0; i < n; i++) f[i].size = file_size(f[i].local);
     return n;
 }
@@ -583,8 +624,8 @@ static void send_all(void) {
     } else if (ok) {
         /* the old indexes go first: a set cut off half way reads as missing
            (and the Vita converts it) instead of as whole */
-        for (int i = 0; i < n; i++)
-            if (strstr(files[i].remote, ".idx")) {
+        for (int i = 0; i < n; i++)   /* (and the World Expansion's .xp markers) */
+            if (strstr(files[i].remote, ".idx") || strstr(files[i].remote, ".xp")) {
                 if (c) FtpDeleteFileA(c, files[i].remote);
                 else { char p[MAX_PATH + 300]; dest_path(p, sizeof p, files[i].remote); DeleteFileA(p); }
             }
@@ -612,10 +653,13 @@ static void send_all(void) {
         char skip[96] = "";
         if (g_send.skipped) snprintf(skip, sizeof skip, " (%d game file%s already there, skipped)", g_send.skipped,
                                      g_send.skipped == 1 ? "" : "s");
-        if (ok) snprintf(g_send.msg, sizeof g_send.msg, "%s %.0f MB%s%s. Start NFS Underground 2%s.",
+        if (ok) snprintf(g_send.msg, sizeof g_send.msg, "%s %.0f MB%s%s. Start NFS Underground 2%s.%s",
                          to_dir ? "Copied" : "Sent", moved / 1048576.0,
                          to_dir ? "" : " to the Vita", skip,
-                         track_done(0) ? " -- it skips \"Optimizing world data\"" : "");
+                         track_done(0) ? " -- it skips \"Optimizing world data\"" : "",
+                         g_send.xp_sent ? "\n\nTo drive Rockport and Palmont: on the game's LiveArea screen press "
+                                          "Settings (or hold L+R while it starts), tick \"Rockport and Palmont\" "
+                                          "under World Expansion, then pick the city in Free Run." : "");
     } else snprintf(g_send.msg, sizeof g_send.msg, "Nothing to send yet: convert first, or tick \"Game files too\".");
     if (c) InternetCloseHandle(c);
     if (net) InternetCloseHandle(net);
@@ -627,9 +671,12 @@ static DWORD WINAPI send_thread(LPVOID a) { (void)a; send_all(); return 0; }
 
 /* ---- settings ------------------------------------------------------------- */
 #define REG_KEY "Software\\NFSU2Vita\\PrepTool"
-static void setting_get(const char *name, char *out, DWORD cap) {
-    if (RegGetValueA(HKEY_CURRENT_USER, REG_KEY, name, RRF_RT_REG_SZ, NULL, out, &cap) != ERROR_SUCCESS) out[0] = 0;
+static int setting_get_key(const char *key, const char *name, char *out, DWORD cap) {
+    if (RegGetValueA(HKEY_CURRENT_USER, key, name, RRF_RT_REG_SZ, NULL, out, &cap) == ERROR_SUCCESS) return 1;
+    out[0] = 0;
+    return 0;
 }
+static int setting_get(const char *name, char *out, DWORD cap) { return setting_get_key(REG_KEY, name, out, cap); }
 static void setting_put(const char *name, const char *v) {
     HKEY k;
     if (RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) return;
@@ -639,9 +686,10 @@ static void setting_put(const char *name, const char *v) {
 
 /* ---- the window ----------------------------------------------------------- */
 enum { ID_GAME = 100, ID_BROWSE, ID_CONVERT, ID_PROGRESS, ID_STATUS, ID_IP, ID_SEND, ID_OPEN, ID_TIMER, ID_IMPORT,
-       ID_CHECK, ID_GAMEFILES, ID_COPY };
+       ID_CHECK, ID_GAMEFILES, ID_COPY, ID_XPDIR0, ID_XPDIR1, ID_XPBROWSE0, ID_XPBROWSE1, ID_XPSTATUS, ID_XPFILES };
 static HWND g_game_ed, g_browse, g_convert, g_bar, g_status, g_ip_ed, g_send_btn, g_open, g_import,
             g_check, g_gamefiles, g_copy;
+static HWND g_xp_ed[XPP_NCITY], g_xp_browse[XPP_NCITY], g_xp_status, g_xpfiles;   /* the World Expansion */
 static HFONT g_font, g_bold, g_title;
 static int g_dpi = 96;
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
@@ -661,6 +709,46 @@ static void ui_idle(void) {
     EnableWindow(g_send_btn, !busy); EnableWindow(g_copy, !busy); EnableWindow(g_ip_ed, !busy);
     EnableWindow(g_gamefiles, !busy);
     EnableWindow(g_import, !busy);
+    for (int c = 0; c < XPP_NCITY; c++) { EnableWindow(g_xp_ed[c], !busy); EnableWindow(g_xp_browse[c], !busy); }
+    EnableWindow(g_xpfiles, !busy);
+}
+/* the World Expansion line: each city's state, from its folder box and the output */
+static void xp_status_update(void) {
+    char m[300] = "", dir[MAX_PATH];
+    for (int c = 0; c < XPP_NCITY; c++) {
+        GetWindowTextA(g_xp_ed[c], dir, sizeof dir);
+        const char *st;
+        if (xpp_city_done(c)) st = "ready to send";
+        else if (!dir[0]) st = "not set";
+        else if (xpp_dir_fix(c, dir)) st = "found -- press Convert";
+        else st = "folder not right";
+        size_t n = strlen(m);
+        snprintf(m + n, sizeof m - n, "%s%s: %s", c ? "      " : "", xpp_city_name(c), st);
+    }
+    SetWindowTextA(g_xp_status, m);
+}
+/* the World Expansion folder boxes -> conv_xp.c (and the settings). 0 = one is wrong
+   (says so; the player fixes or clears it) */
+static int xp_read_dirs(int warn) {
+    for (int c = 0; c < XPP_NCITY; c++) {
+        char d[MAX_PATH]; GetWindowTextA(g_xp_ed[c], d, sizeof d);
+        char *a = d; while (*a == ' ' || *a == '"') a++;
+        char *e = a + strlen(a); while (e > a && (e[-1] == ' ' || e[-1] == '"')) *--e = 0;
+        if (*a && !xpp_dir_fix(c, a)) {
+            if (warn) {
+                char q[600];
+                snprintf(q, sizeof q, "The %s folder has no TRACKS\\%s.BUN.\n\nPick the folder %s is installed "
+                         "in, or clear the box to leave %s out.", xpp_game_name(c), xpp_bun(c), xpp_game_name(c),
+                         xpp_city_name(c));
+                MessageBoxA(g_wnd, q, TOOL_NAME, MB_ICONWARNING);
+            }
+            return 0;
+        }
+        SetWindowTextA(g_xp_ed[c], a);
+        setting_put(c ? "CarbonDir" : "MWDir", a);
+        xpp_set_dir(c, a);
+    }
+    return 1;
 }
 static void ui_initial_status(void) {
     char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
@@ -691,6 +779,27 @@ static void on_browse(void) {
     CoTaskMemFree(id);
     ui_initial_status();
 }
+static void on_xp_browse(int c) {
+    char title[200];
+    snprintf(title, sizeof title, "Pick your %s folder (the one with the TRACKS folder in it)", xpp_game_name(c));
+    BROWSEINFOA bi = {0};
+    bi.hwndOwner = g_wnd;
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST id = SHBrowseForFolderA(&bi);
+    if (!id) return;
+    char p[MAX_PATH];
+    if (SHGetPathFromIDListA(id, p)) {
+        if (!xpp_dir_fix(c, p)) {
+            char q[600];
+            snprintf(q, sizeof q, "That folder has no TRACKS\\%s.BUN.\n\nPick the folder %s is installed in "
+                     "(or the folder you copied its game data to).", xpp_bun(c), xpp_game_name(c));
+            MessageBoxA(g_wnd, q, TOOL_NAME, MB_ICONWARNING);
+        } else { SetWindowTextA(g_xp_ed[c], p); setting_put(c ? "CarbonDir" : "MWDir", p); }
+    }
+    CoTaskMemFree(id);
+    xp_status_update();
+}
 static void on_convert(void) {
     char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
     if (!game_dir_fix(game, sizeof game)) {
@@ -698,6 +807,7 @@ static void on_convert(void) {
                     TOOL_NAME, MB_ICONWARNING);
         return;
     }
+    if (!xp_read_dirs(1)) return;
     SetWindowTextA(g_game_ed, game);
     setting_put("GameDir", game);
     memset(&g_job, 0, sizeof g_job);
@@ -724,6 +834,8 @@ static void start_send(const char *ip, const char *dest) {
     if (ip) snprintf(g_send.ip, sizeof g_send.ip, "%s", ip);
     if (dest) snprintf(g_send.dest, sizeof g_send.dest, "%s", dest);
     if (with_game) snprintf(g_send.game, sizeof g_send.game, "%s", game);
+    g_send.xp = SendMessageA(g_xpfiles, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    setting_put("XpFiles", g_send.xp ? "1" : "0");
     g_send.busy = 1;
     SendMessageA(g_bar, PBM_SETPOS, 0, 0);
     set_status(dest ? "Copying..." : "Connecting to the Vita...");
@@ -766,7 +878,16 @@ static void on_copy(void) {
 }
 /* Check game files: the same check Convert runs first, on its own */
 static DWORD WINAPI check_thread(LPVOID a) {
-    check_game((const char *)a);
+    int ok = check_game((const char *)a);
+    if (xpp_any_dir()) {
+        static char m[2048];
+        g_chk.xp = 1;
+        int x = xpp_check(&g_chk.bytes, &g_chk.total, m, sizeof m);
+        g_chk.xp = 0;
+        size_t n = strlen(g_chk.msg);
+        snprintf(g_chk.msg + n, sizeof g_chk.msg - n, "\n\nWorld Expansion: %s", m);
+        g_chk.ok = ok && x != 0;
+    }
     g_chk.done = 1; g_chk.busy = 0;
     return 0;
 }
@@ -778,6 +899,7 @@ static void on_check(void) {
                     TOOL_NAME, MB_ICONWARNING);
         return;
     }
+    if (!xp_read_dirs(1)) return;
     SetWindowTextA(g_game_ed, game);
     setting_put("GameDir", game);
     g_chk.done = 0; g_chk.busy = 1;
@@ -821,7 +943,8 @@ static void on_timer(void) {
     if (g_chk.busy || (g_job.busy && g_job.checking)) {
         long long t = g_chk.total > 0 ? g_chk.total : 1;
         SendMessageA(g_bar, PBM_SETPOS, (WPARAM)(g_chk.bytes * 1000 / t), 0);
-        snprintf(m, sizeof m, "Checking your game files: %d%%", (int)(g_chk.bytes * 100 / t));
+        snprintf(m, sizeof m, g_chk.xp ? "Checking your Most Wanted / Carbon files: %d%%" : "Checking your game files: %d%%",
+                 (int)(g_chk.bytes * 100 / t));
         set_status(m);
     } else if (g_chk.done) {
         g_chk.done = 0;
@@ -829,6 +952,26 @@ static void on_timer(void) {
         set_status(g_chk.ok ? "Game files OK." : "Some game files are missing or changed.");
         ui_idle();
         MessageBoxA(g_wnd, g_chk.msg, TOOL_NAME, g_chk.ok ? MB_ICONINFORMATION : MB_ICONWARNING);
+    } else if (g_job.busy && g_job.in_xp) {   /* the World Expansion, after the tracks */
+        XppJob *x = &g_job.xp;
+        unsigned secs = (GetTickCount() - x->start) / 1000;
+        if (x->checking) {
+            long long t = x->chk_total > 0 ? x->chk_total : 1;
+            SendMessageA(g_bar, PBM_SETPOS, (WPARAM)(x->chk_bytes * 1000 / t), 0);
+            snprintf(m, sizeof m, "Checking your Most Wanted / Carbon files: %d%%", (int)(x->chk_bytes * 100 / t));
+            set_status(m);
+        } else if (x->extra[0]) set_status(x->extra);
+        else if (x->todo) {
+            float f;   /* translating is the first third, the world conversion the rest */
+            if (x->phase == 1) f = x->xp_total > 0 ? (float)x->xp_done / (float)x->xp_total / 3.0f : 0.0f;
+            else f = 1.0f / 3.0f + (x->prog.cells_total > 0 ? (float)x->prog.cells_done / (float)x->prog.cells_total : 0.0f) * 2.0f / 3.0f;
+            if (f > 1.0f) f = 1.0f;
+            SendMessageA(g_bar, PBM_SETPOS, (WPARAM)((x->cur + f) / (float)x->todo * 1000.0f), 0);
+            snprintf(m, sizeof m, "World Expansion %d of %d: %s  -  %s  %d%%      (%u:%02u)", x->cur + 1, x->todo,
+                     xpp_city_name(x->ncur), x->phase == 1 ? "translating" : "building the world", (int)(f * 100.0f),
+                     secs / 60, secs % 60);
+            set_status(m);
+        } else set_status("World Expansion: starting...");
     } else if (g_job.busy && g_job.todo && !g_job.extra[0]) {
         const WTileProgress *p = &g_job.prog;
         float f = p->cells_total > 0 ? (float)p->cells_done / (float)p->cells_total : 0.0f;
@@ -846,6 +989,7 @@ static void on_timer(void) {
         if (g_job.ok) SendMessageA(g_bar, PBM_SETPOS, 1000, 0);
         set_status(g_job.msg);
         ui_idle();
+        xp_status_update();
         if (!g_job.ok) MessageBoxA(g_wnd, g_job.msg, TOOL_NAME, MB_ICONERROR);
     }
     if (g_send.busy && g_send.total > 0) {
@@ -872,18 +1016,30 @@ static void build_ui(void) {
     g_browse = mk("BUTTON", "Browse...", BS_PUSHBUTTON, 428, y, 92, 24, ID_BROWSE, g_font); y += 30;
     g_check = mk("BUTTON", "Check game files", BS_PUSHBUTTON, 20, y, 140, 24, ID_CHECK, g_font);
     mk("STATIC", "Makes sure your copy is complete and unmodified.", 0, 170, y + 4, 350, 18,
-       0, g_font); y += 38;
+       0, g_font); y += 36;
+
+    mk("STATIC", "Optional:  World Expansion -- Rockport and Palmont", 0, 20, y, 500, 18, 0, g_bold); y += 21;
+    mk("STATIC", "Have Need for Speed Most Wanted (2005) or Carbon on your PC? Pick its folder to drive its "
+       "city in Free Run too. Leave a box empty to skip it.", 0, 20, y, 500, 34, 0, g_font); y += 38;
+    for (int c = 0; c < XPP_NCITY; c++) {
+        mk("STATIC", c ? "Carbon:" : "Most Wanted:", 0, 20, y + 4, 90, 18, 0, g_font);
+        g_xp_ed[c] = mk("EDIT", "", ES_AUTOHSCROLL, 112, y, 308, 24, ID_XPDIR0 + c, g_font);
+        g_xp_browse[c] = mk("BUTTON", "Browse...", BS_PUSHBUTTON, 428, y, 92, 24, ID_XPBROWSE0 + c, g_font); y += 28;
+    }
+    g_xp_status = mk("STATIC", "", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 20, y + 1, 500, 18, ID_XPSTATUS, g_font); y += 32;
 
     mk("STATIC", "2.  Convert", 0, 20, y, 500, 18, 0, g_bold); y += 22;
     g_convert = mk("BUTTON", "Convert", BS_DEFPUSHBUTTON, 20, y, 140, 30, ID_CONVERT, g_bold);
-    mk("STATIC", "About 2 minutes. Your game files are only read, never changed.", 0, 172, y + 7, 348, 18, 0, g_font); y += 40;
+    mk("STATIC", "About 2 minutes (longer with the World Expansion). Your game files are only read, never "
+       "changed.", 0, 172, y - 1, 348, 34, 0, g_font); y += 40;
     g_bar = mk(PROGRESS_CLASSA, "", 0, 20, y, 500, 16, ID_PROGRESS, g_font);
     SendMessageA(g_bar, PBM_SETRANGE32, 0, 1000); y += 22;
     g_status = mk("STATIC", "", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 20, y, 500, 18, ID_STATUS, g_font); y += 36;
 
     mk("STATIC", "3.  Put it on your Vita", 0, 20, y, 500, 18, 0, g_bold); y += 24;
-    g_gamefiles = mk("BUTTON", "Game files too (about 1.7 GB the first time; files already there are skipped)",
-                     BS_AUTOCHECKBOX, 20, y, 500, 20, ID_GAMEFILES, g_font); y += 28;
+    g_gamefiles = mk("BUTTON", "Game files too (1.7 GB the first time, then skipped)",
+                     BS_AUTOCHECKBOX, 20, y, 300, 20, ID_GAMEFILES, g_font);
+    g_xpfiles = mk("BUTTON", "World Expansion too", BS_AUTOCHECKBOX, 330, y, 190, 20, ID_XPFILES, g_font); y += 28;
     mk("STATIC", "Vita IP address:", 0, 20, y + 4, 104, 18, 0, g_font);
     g_ip_ed = mk("EDIT", "", ES_AUTOHSCROLL, 126, y, 150, 24, ID_IP, g_font);
     g_send_btn = mk("BUTTON", "Send to Vita", BS_PUSHBUTTON, 284, y, 120, 24, ID_SEND, g_font); y += 30;
@@ -912,6 +1068,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_CHECK: on_check(); return 0;
         case ID_IMPORT: on_import(); return 0;
         case ID_OPEN: ShellExecuteA(h, "open", g_out, NULL, NULL, SW_SHOWNORMAL); return 0;
+        case ID_XPBROWSE0: case ID_XPBROWSE1: on_xp_browse(LOWORD(wp) - ID_XPBROWSE0); return 0;
+        case ID_XPDIR0: case ID_XPDIR1: if (HIWORD(wp) == EN_KILLFOCUS) xp_status_update(); return 0;
         }
         break;
     case WM_TIMER: on_timer(); return 0;
@@ -945,6 +1103,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
         snprintf(g_out, sizeof g_out, "%s", __argv[3]);
         CreateDirectoryA(g_out, NULL);
         if (!game_dir_fix(g_job.game, sizeof g_job.game)) return 2;
+        xpp_set_out(g_out);
+        for (int c = 0; c < XPP_NCITY && 4 + c < __argc; c++) {   /* MW, CARBON ("-" = none) */
+            char d[MAX_PATH]; snprintf(d, sizeof d, "%s", __argv[4 + c]);
+            if (!strcmp(d, "-")) continue;
+            if (!xpp_dir_fix(c, d)) { fprintf(stderr, "no %s folder at %s\n", xpp_game_name(c), __argv[4 + c]); return 2; }
+            xpp_set_dir(c, d);
+        }
         convert_all();
         return g_job.ok ? 0 : 1;
     }
@@ -974,6 +1139,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
             if (!game_dir_fix(g_send.game, sizeof g_send.game)) { fprintf(stderr, "no NFSU2 game folder at %s\n", __argv[4]); return 2; }
         }
         conv_set_folders("", g_out);
+        xpp_set_out(g_out);
+        g_send.xp = 1;   /* the World Expansion cities converted in OUT, if any */
         send_all();
         fprintf(stderr, "%s\n", g_send.msg);
         return g_send.ok ? 0 : 1;
@@ -984,6 +1151,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    {   /* a screen too short for the window (a 1080p laptop at 150%): scale it down to fit */
+        RECT wa; int need = 764 + 40;   /* the client height + the caption */
+        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0) && MulDiv(need, g_dpi, 96) > wa.bottom - wa.top)
+            g_dpi = MulDiv(wa.bottom - wa.top, 96, need);
+    }
     g_font = font(9, FW_NORMAL); g_bold = font(9, FW_SEMIBOLD); g_title = font(14, FW_SEMIBOLD);
 
     WNDCLASSA wc = {0};
@@ -992,7 +1164,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(1));
     RegisterClassA(&wc);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r = { 0, 0, S(540), S(640) };
+    RECT r = { 0, 0, S(540), S(764) };
     AdjustWindowRect(&r, style, FALSE);
     g_wnd = CreateWindowA("NFSU2VitaPrep", TOOL_NAME, style, CW_USEDEFAULT, CW_USEDEFAULT,
                           r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
@@ -1006,7 +1178,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     SetWindowTextA(g_ip_ed, v);
     setting_get("GameFiles", v, sizeof v);
     SendMessageA(g_gamefiles, BM_SETCHECK, strcmp(v, "0") ? BST_CHECKED : BST_UNCHECKED, 0);
+    for (int c = 0; c < XPP_NCITY; c++) {   /* the World Expansion: as last time, else where the installer put it */
+        const char *name = c ? "CarbonDir" : "MWDir";
+        if (!setting_get(name, v, sizeof v) &&
+            !setting_get_key("Software\\NFSU2Vita\\ExpansionPrep", name, v, sizeof v))
+            xpp_dir_detect(c, v, sizeof v);
+        SetWindowTextA(g_xp_ed[c], v);
+        if (v[0] && xpp_dir_fix(c, v)) xpp_set_dir(c, v);
+    }
+    setting_get("XpFiles", v, sizeof v);
+    SendMessageA(g_xpfiles, BM_SETCHECK, strcmp(v, "0") ? BST_CHECKED : BST_UNCHECKED, 0);
+    xpp_set_out(g_out);
     conv_set_folders("", g_out);   /* track_done reads the output's cache */
+    xp_status_update();
     ui_initial_status();
     ui_idle();
     SetTimer(g_wnd, ID_TIMER, 200, NULL);

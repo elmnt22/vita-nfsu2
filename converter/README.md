@@ -59,6 +59,16 @@ World detail is set to low, as the Vita's default.
 Command line: `--check GAME`, `--cli GAME OUT` (check + convert, log in
 `OUT/convert_log.txt`), `--send IP OUT [GAME]`, `--copy DEST OUT [GAME]`.
 
+World Expansion (`conv_xp.c`, merged from the separate Expansion Prep Tool
+11-19): optional Most Wanted / Carbon folders (`--cli GAME OUT [MW|- [CARBON|-]]`).
+It checks them against `xp_manifest.inc` (`tools/gen_xp_manifest.py`),
+translates each city with `src/xpconv.c` / `xproads.c` into `OUT/stage/TRACKS`,
+runs the same world conversion plus the skyline on it, and adds the files to
+the send list (stream, companion, caches, minimap, road net, props, events,
+then the `.xp` marker and the tile index last). It does not send
+`expansion/enable.txt`: the player switches the cities on in the Vita's
+Settings.
+
 When sending, the Vita's old `.idx` files are deleted first and each track's
 index goes up last, so a cut-off transfer reads as "not converted" (the Vita
 then converts that track itself) instead of as a broken set.

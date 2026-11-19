@@ -122,12 +122,34 @@ title screen without the "OPTIMIZING WORLD DATA" screen.
    `ux0:data/NFSU2/profiles`. Or copy the `profiles` folder there by hand.
 4. In the game, load the profile from the **Profile Manager**.
 
+## World Expansion (Rockport and Palmont)
+
+Optional. If you own **Need for Speed Most Wanted (2005)** or **Need for Speed
+Carbon** for PC, the Prep Tool can add their cities to the port.
+
+1. Under **Optional: World Expansion**, pick the **Most Wanted** and/or
+   **Carbon** folder (the one with `TRACKS` in it). Installed copies are
+   found by themselves. Leave a box empty to skip that city. The line under
+   the boxes shows each city's state: *not set*, *found -- press Convert*,
+   or *ready to send*.
+2. **Convert** does the Underground 2 tracks first, then checks the other
+   games' files and converts each city. **Check game files** checks them too.
+3. **Send to Vita** / **Copy to memory card** take the cities along while
+   **World Expansion too** is ticked. Untick it to send only Underground 2
+   (the cities are large and are always sent whole).
+4. On the Vita, open **Settings** (LiveArea, or hold L+R at start) and tick
+   **Rockport and Palmont** under **World Expansion**. Then pick
+   **Quick Race → Free Run** in the game.
+
 ## Command line
 
 ```
 NFSU2VitaPrep.exe --check GAME                   check the game files (exit code 0 = all match)
-NFSU2VitaPrep.exe --cli GAME OUT                 check + convert without the window (log in OUT\convert_log.txt)
+NFSU2VitaPrep.exe --cli GAME OUT [MW|- [CARBON|-]]
+                                                 check + convert without the window (log in OUT\convert_log.txt);
+                                                 MW / CARBON: the World Expansion's game folders ("-" = skip)
 NFSU2VitaPrep.exe --send IP OUT [GAME]           send OUT (and GAME's files) to the Vita at IP
+                                                 (converted World Expansion cities go too)
 NFSU2VitaPrep.exe --copy DEST OUT [GAME]         the same, into DEST (the memory card's drive, or a folder)
 NFSU2VitaPrep.exe --import-save SAVE GAME OUT    import a PC save into OUT\profiles
 ```

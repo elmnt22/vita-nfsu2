@@ -25,21 +25,23 @@ GAME_FLAGS=(-include "$ROOT/sim/include/sim_pre.h")
 # and the collision copy the tiles carry)
 SRC="src/world_tiles.c src/world_instance.c src/world.c src/resource.c src/world_mesh.c src/world_resident.c
      src/render.c src/physics.c src/wcoll.c src/shop.c src/feng.c converter/conv_extras.c
-     src/options.c src/perfparts.c src/vinyl.c src/pcsave.c src/garage_line.c src/beyond.c"
+     src/options.c src/perfparts.c src/vinyl.c src/pcsave.c src/garage_line.c src/beyond.c src/skyline.c"
 
 OBJS=(); pids=()
 for s in $SRC; do
     o="$OUT/obj/$(basename "${s%.c}").o"; OBJS+=("$o")
     if [ ! -f "$o" ] || [ "$ROOT/$s" -nt "$o" ] || [ -n "$(find "$ROOT/src" "$ROOT/sim/include" -name '*.h' -newer "$o" -print -quit)" ]; then
         echo "CC $s"
-        opt=(); case "$s" in src/world_instance.c) opt=(-O0);; esac   # see sim/README: clang -O2 trips its self-test
+        opt=(); case "$s" in src/world_instance.c) opt=(-O0);; src/skyline.c) opt=(-DSKYLINE_PREP);; esac   # see sim/README: clang -O2 trips its self-test
         "${CC[@]}" "${CFLAGS[@]}" "${opt[@]}" "${GAME_FLAGS[@]}" -c "$ROOT/$s" -o "$o" &
         pids+=($!)
     fi
 done
-for s in converter/conv_platform.c converter/conv_stubs.c sim/sim_gl.c converter/ug2conv.c; do
+# the World Expansion step (conv_xp.c: Most Wanted / Carbon -> Rockport / Palmont)
+for s in converter/conv_platform.c converter/conv_stubs.c sim/sim_gl.c src/xpconv.c src/xproads.c src/racepath.c \
+         converter/conv_xp.c converter/ug2conv.c; do
     o="$OUT/obj/$(basename "${s%.c}").o"; OBJS+=("$o")
-    extra=(); case "$s" in converter/ug2conv.c) extra=(-I"$ROOT/converter");; esac
+    extra=(); case "$s" in converter/ug2conv.c|converter/conv_xp.c) extra=(-I"$ROOT/converter");; esac
     echo "CC $s"
     "${CC[@]}" "${CFLAGS[@]}" "${extra[@]}" -c "$ROOT/$s" -o "$o" &
     pids+=($!)
