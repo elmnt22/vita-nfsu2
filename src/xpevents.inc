@@ -901,7 +901,7 @@ static int cand_cmp(const void *x, const void *y)
     return (a->j > b->j) - (a->j < b->j);
 }
 /* 1 ok, 0 out of memory, -1 the format can't hold it (too many nodes / waypoints) */
-static int paths_bin(const DPolys *S, int ev_id, int closed, Buf *part, uint8_t rec[0x110])
+static int paths_bin_full(const DPolys *S, int ev_id, int closed, Buf *part, uint8_t rec[0x110])
 {
     int nn = 0; for (int s = 0; s < S->n; s++) nn += S->v[s].n;
     if (nn >= 32768) return -1;
@@ -994,6 +994,39 @@ static int paths_bin(const DPolys *S, int ev_id, int closed, Buf *part, uint8_t 
     }
     free(nd); free(ge); free(cd); free(first);
     return !ok ? 0 : rc;
+}
+/* The game builds its AI / GPS / streaming road graph from these nodes. Retail spaces
+   them ~20-60 m (Bayview median 33 m); the lane polylines here are ~8 m, which made a
+   165k-node graph in Rockport (Bayview 15k) -- the road-ahead search, nearest-node scans
+   and player road tracking then missed frames on the Vita (hwxp4 11-19). Thin each
+   section to ~30 m, keeping its ends and every bend over ~10 degrees. */
+static int paths_bin(const DPolys *S, int ev_id, int closed, Buf *part, uint8_t rec[0x110])
+{
+    DPolys T = {0};
+    int ok = 1;
+    for (int s = 0; s < S->n && ok; s++) {
+        const DPoly *P = &S->v[s];
+        int t = dps_new(&T); if (t < 0) { ok = 0; break; }
+        if (P->n <= 0) continue;
+        ok = dp_add(&T.v[t], P->p[0]);
+        int last = 0;
+        for (int i = 1; i < P->n - 1 && ok; i++) {
+            const D3 *k = &P->p[last], *c = &P->p[i], *nx = &P->p[i + 1];
+            double run = hypot(c->x - k->x, c->y - k->y);
+            double ax = c->x - k->x, ay = c->y - k->y, bx = nx->x - c->x, by = nx->y - c->y;
+            double la = hypot(ax, ay), lb = hypot(bx, by);
+            int bend = la > 0.5 && lb > 0.5 && (ax * bx + ay * by) < cos(10.0 * 3.14159265358979 / 180.0) * la * lb;
+            if (run >= 30.0 || (bend && run >= 6.0)) { ok = dp_add(&T.v[t], *c); last = i; }
+        }
+        /* an interior node always: the waypoints sit on p[1] / p[n/2], and a section of just
+           its two ends put them on the junction node the next section shares, which the
+           route builder snapped to the wrong section (4 Rockport events refused) */
+        if (ok && T.v[t].n == 1 && P->n >= 3) ok = dp_add(&T.v[t], P->p[P->n / 2]);
+        if (ok && P->n > 1) ok = dp_add(&T.v[t], P->p[P->n - 1]);
+    }
+    int r = ok ? paths_bin_full(&T, ev_id, closed, part, rec) : 0;
+    dps_free(&T);
+    return r;
 }
 #define PT_ROUTE (0x800u | 0x1000u | 0x40000u | (0x3Fu << 19))
 #define EV_SEC_FLAGS 0x7FF141u
