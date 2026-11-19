@@ -77,4 +77,5 @@ void vita_step(const char *label) { (void)label; }   /* the hang recorder (sdl_v
 /* the expansion cities (xpcity.c) are game-only: the PC tools see Bayview alone */
 int g_xpcity_pick;
 int xpcity_is_city(const char *track) { (void)track; return 0; }
+const char *xpcity_map(const char *track) { (void)track; return NULL; }   /* world_tiles' sea mask: never reached (no city) */
 int xpcity_installed(int pick) { return pick == 0; }
