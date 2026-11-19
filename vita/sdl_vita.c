@@ -52,10 +52,10 @@
    over a long race was 85 MB (10-11, heap live minus big-size chunks).
    Big blocks belong in kernel blocks, which never fragment; the 35 MB moved
    to BIGBLK_POOL, so vitaGL's share is unchanged. */
-int _newlib_heap_size_user = 115 * 1024 * 1024;   /* + up to BIGBLK_POOL in kernel blocks */
+__attribute__((used, externally_visible)) int _newlib_heap_size_user = 115 * 1024 * 1024;   /* + up to BIGBLK_POOL in kernel blocks */
 static int g_gl_ready;
 static SceUID g_main_thid = -1;   /* render thread (vita_early_init) */   /* vitaGL initialised (its pools can be queried) */
-unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
+__attribute__((used, externally_visible)) unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 static SceUID g_boot_fd=-1;
 static SceKernelLwMutexWork g_boot_lock;
 static int g_boot_lock_ready;
@@ -531,34 +531,34 @@ int __real_fputs(const char *s, FILE *f);
 int __real_fputc(int c, FILE *f);
 size_t __real_fwrite(const void *p, size_t size, size_t count, FILE *f);
 
-int __wrap_vprintf(const char *fmt, va_list ap) { return vlog(fmt, ap); }
-int __wrap_printf(const char *fmt, ...) {
+__attribute__((used)) int __wrap_vprintf(const char *fmt, va_list ap) { return vlog(fmt, ap); }
+__attribute__((used)) int __wrap_printf(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); int n = vlog(fmt, ap); va_end(ap); return n;
 }
-int __wrap_vfprintf(FILE *f, const char *fmt, va_list ap) {
+__attribute__((used)) int __wrap_vfprintf(FILE *f, const char *fmt, va_list ap) {
     return is_std(f) ? vlog(fmt, ap) : __real_vfprintf(f, fmt, ap);
 }
-int __wrap_fprintf(FILE *f, const char *fmt, ...) {
+__attribute__((used)) int __wrap_fprintf(FILE *f, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int n = is_std(f) ? vlog(fmt, ap) : __real_vfprintf(f, fmt, ap);
     va_end(ap); return n;
 }
-int __wrap_puts(const char *s) {
+__attribute__((used)) int __wrap_puts(const char *s) {
     int n = (int)strlen(s);
     log_write(s, n); log_write("\n", 1);
     return n + 1;
 }
-int __wrap_fputs(const char *s, FILE *f) {
+__attribute__((used)) int __wrap_fputs(const char *s, FILE *f) {
     if (!is_std(f)) return __real_fputs(s, f);
     log_write(s, (int)strlen(s));
     return 0;
 }
-int __wrap_putchar(int c) { char ch = (char)c; log_write(&ch, 1); return c & 0xFF; }
-int __wrap_fputc(int c, FILE *f) {
+__attribute__((used)) int __wrap_putchar(int c) { char ch = (char)c; log_write(&ch, 1); return c & 0xFF; }
+__attribute__((used)) int __wrap_fputc(int c, FILE *f) {
     if (!is_std(f)) return __real_fputc(c, f);
     char ch = (char)c; log_write(&ch, 1); return c & 0xFF;
 }
-size_t __wrap_fwrite(const void *p, size_t size, size_t count, FILE *f) {
+__attribute__((used)) size_t __wrap_fwrite(const void *p, size_t size, size_t count, FILE *f) {
     if (!is_std(f)) return __real_fwrite(p, size, count, f);
     log_write((const char *)p, (int)(size * count));
     return count;
@@ -608,7 +608,7 @@ void vita_shader_failed(unsigned type, const char *src, const char *log) {
 }
 
 struct _reent;
-_ssize_t __wrap__write_r(struct _reent *r, int fd, const void *buf, size_t n) {
+__attribute__((used)) _ssize_t __wrap__write_r(struct _reent *r, int fd, const void *buf, size_t n) {
     if (g_log_ready && (fd == 1 || fd == 2)) return log_write((const char *)buf, (int)n);
     if (fd >= 0 && fd == g_ring_file.fd && async_put(&g_ring_file, (const char *)buf, (unsigned)n))
         return (_ssize_t)n;
@@ -996,7 +996,7 @@ void *__wrap_calloc(size_t c, size_t n) {
     else if (t >= BIG_ALLOC) vita_big("calloc", t, __builtin_return_address(0));
     return p;
 }
-void __wrap_free(void *p) {
+__attribute__((used)) void __wrap_free(void *p) {
     if (!p) return;
     HEAP_T0;
     if (!bigblk_free(p)) { spill_sub(p); __real_free(p); }
@@ -1471,7 +1471,7 @@ void vita_gx_row(FILE *f) {
     if (gx_on) gx_wait_us[slot] += sceKernelGetProcessTimeLow() - t0;
 
 int __real_sceGxmEndScene(SceGxmContext *, const SceGxmNotification *, const SceGxmNotification *);
-int __wrap_sceGxmEndScene(SceGxmContext *c, const SceGxmNotification *v, const SceGxmNotification *f) {
+__attribute__((used)) int __wrap_sceGxmEndScene(SceGxmContext *c, const SceGxmNotification *v, const SceGxmNotification *f) {
     GX_TIMED(GXW_END, __real_sceGxmEndScene(c, v, f))
     if (gx_on && f && f->address) {
         unsigned h = gx_head;
@@ -1486,24 +1486,24 @@ int __wrap_sceGxmEndScene(SceGxmContext *c, const SceGxmNotification *v, const S
 int __real_sceGxmBeginScene(SceGxmContext *, unsigned int, const SceGxmRenderTarget *,
                             const SceGxmValidRegion *, SceGxmSyncObject *, SceGxmSyncObject *,
                             const SceGxmColorSurface *, const SceGxmDepthStencilSurface *);
-int __wrap_sceGxmBeginScene(SceGxmContext *c, unsigned int fl, const SceGxmRenderTarget *rt,
+__attribute__((used)) int __wrap_sceGxmBeginScene(SceGxmContext *c, unsigned int fl, const SceGxmRenderTarget *rt,
                             const SceGxmValidRegion *vr, SceGxmSyncObject *vs, SceGxmSyncObject *fs,
                             const SceGxmColorSurface *cs, const SceGxmDepthStencilSurface *ds) {
     GX_TIMED(GXW_BEGIN, __real_sceGxmBeginScene(c, fl, rt, vr, vs, fs, cs, ds))
     return r;
 }
 int __real_sceGxmDisplayQueueAddEntry(SceGxmSyncObject *, SceGxmSyncObject *, const void *);
-int __wrap_sceGxmDisplayQueueAddEntry(SceGxmSyncObject *o, SceGxmSyncObject *n, const void *d) {
+__attribute__((used)) int __wrap_sceGxmDisplayQueueAddEntry(SceGxmSyncObject *o, SceGxmSyncObject *n, const void *d) {
     GX_TIMED(GXW_QUEUE, __real_sceGxmDisplayQueueAddEntry(o, n, d))
     return r;
 }
 int __real_sceGxmNotificationWait(const SceGxmNotification *);
-int __wrap_sceGxmNotificationWait(const SceGxmNotification *n) {
+__attribute__((used)) int __wrap_sceGxmNotificationWait(const SceGxmNotification *n) {
     GX_TIMED(GXW_NOTIFY, __real_sceGxmNotificationWait(n))
     return r;
 }
 int __real_sceGxmFinish(SceGxmContext *);
-int __wrap_sceGxmFinish(SceGxmContext *c) {
+__attribute__((used)) int __wrap_sceGxmFinish(SceGxmContext *c) {
     GX_TIMED(GXW_FINISH, __real_sceGxmFinish(c))
     return r;
 }

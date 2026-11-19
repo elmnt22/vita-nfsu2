@@ -36,10 +36,15 @@ CFLAGS=(-O2 -g -std=gnu99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-u
 # -fno-math-errno: sqrtf etc. become a bare vsqrt (no errno call path); results are identical,
 # so physics stays bit-exact. Draw-side files (no sim/AI state) also get -O3; physics, AI and
 # collision (n2sim, carcoll, airacer, main) keep -O2.
+# LTO=1: link-time optimisation (11-19, World Expansion runs: missed frames 5.4 -> 2.1%,
+# 2.7 -> 1.6%). The magic SDK symbols in sdl_vita.c are marked used/externally_visible,
+# or LTO drops sceUserMainThreadStackSize and main overflows the default stack at boot.
+LINKF=(); [ "${LTO:-0}" = 1 ] && CFLAGS+=(-flto)
 O3_FILES=" src/render.c src/world_instance.c src/world_tiles.c src/world_mesh.c src/acid.c src/aciddraw.c src/carfx.c src/nisdraw.c src/hud.c "
 # rebuild everything when the flags change
 FLAGSTAMP="$OUT/obj/.flags"
 FLAGSTR="${CFLAGS[*]} | O3:$O3_FILES"
+[ "${LTO:-0}" = 1 ] && LINKF=("${CFLAGS[@]}" "-flto=${VITA_JOBS:-2}")
 if [ ! -f "$FLAGSTAMP" ] || [ "$(cat "$FLAGSTAMP")" != "$FLAGSTR" ]; then
     echo "compiler flags changed: full rebuild"; rm -f "$OUT"/obj/*.o; printf '%s' "$FLAGSTR" > "$FLAGSTAMP"
 fi
@@ -82,7 +87,7 @@ LIBS="-lvitaGL -lvitashark -lSceShaccCgExt -ltaihen_stub -lSceShaccCg_stub -lmat
       -lSceLibKernel_stub -lSceKernelThreadMgr_stub -lstdc++ -lm -lc"
 
 echo "LD $TITLE.elf"
-"$CC" -Wl,-q -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,--wrap=_write_r,--wrap=printf,--wrap=vprintf,--wrap=fprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=putchar,--wrap=fputc,--wrap=fwrite,--wrap=sceGxmEndScene,--wrap=sceGxmBeginScene,--wrap=sceGxmDisplayQueueAddEntry,--wrap=sceGxmNotificationWait,--wrap=sceGxmFinish "${OBJS[@]}" "${VGL_DIR[@]}" $LIBS -o "$OUT/$TITLE.elf"
+"$CC" "${LINKF[@]}" -Wl,-q -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,--wrap=_write_r,--wrap=printf,--wrap=vprintf,--wrap=fprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=putchar,--wrap=fputc,--wrap=fwrite,--wrap=sceGxmEndScene,--wrap=sceGxmBeginScene,--wrap=sceGxmDisplayQueueAddEntry,--wrap=sceGxmNotificationWait,--wrap=sceGxmFinish "${OBJS[@]}" "${VGL_DIR[@]}" $LIBS -o "$OUT/$TITLE.elf"
 
 "$BIN/vita-elf-create" "$OUT/$TITLE.elf" "$OUT/$TITLE.velf" >/dev/null
 "$BIN/vita-make-fself" -c "$OUT/$TITLE.velf" "$OUT/eboot.bin"
