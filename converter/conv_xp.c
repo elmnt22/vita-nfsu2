@@ -189,7 +189,7 @@ int xpp_city_done(int c) {   /* translated + tiles + compact bundle + skyline */
     char p[MAX_PATH + 64], m[MAX_PATH + 64]; compact_path(p, sizeof p, c); stage_path(m, sizeof m, c, ".xp");
     char sk[256], skl[MAX_PATH + 300]; skyline_cache_file(k_city[c].bun, sk, sizeof sk);
     snprintf(skl, sizeof skl, "%s\\cache\\tiles\\%s", g_out, strrchr(sk, '/') ? strrchr(sk, '/') + 1 : sk);
-    return file_exists(m) && world_tiles_ready(k_city[c].bun) && file_exists(p) && file_exists(skl);
+    return translated(c, -1) && world_tiles_ready(k_city[c].bun) && file_exists(p) && file_exists(skl);   /* the marker at this XP_VERSION (11-19: an older one read as done) */
 }
 
 /* ---- the conversion ------------------------------------------------------ */
