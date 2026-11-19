@@ -27841,6 +27841,7 @@ int main(int argc, char **argv) {
         }
         WT_MARK(4);
         Uint64 cb0 = SDL_GetPerformanceCounter(), cb1 = cb0, cb2 = cb0, cb3 = cb0;
+        Uint64 cbw_res = 0, cbw_smk = 0, cbw_anim = 0; int cbw_up = 0;   /* worst-frame split (11-19) */
         if (ndefcut && VITA_PROBE(3)) {
             /* Nearest first. A discarding draw cannot be hidden-surface
                removed, but it is still depth tested: drawn front to back,
@@ -27965,13 +27966,17 @@ int main(int argc, char **argv) {
         if (g_dbg.show_track && (passmode == 0 || passmode == 1) && active_resident && !g_showroom) {
             /* the smokeable props: their meshes are out of the batches. None in the
                garage: it stands on the car's world spot, so nearby signs showed in it (GH #28) */
+            cbw_up = smk_upload_count();
+            Uint64 sr0 = SDL_GetPerformanceCounter();
             smk_resident(&active_resident->world.scene, active_resident->resources.mesh_textures,
                          active_resident->resources.mesh_modes, active_resident->generation);
+            cbw_res = SDL_GetPerformanceCounter() - sr0;
             #ifdef __vita__
             {   Uint64 p0 = SDL_GetPerformanceCounter();
                 smk_draw(&rp, MVP, cam, VIEW_DIST, (const float (*)[4])world_planes);
                 Uint64 p1 = SDL_GetPerformanceCounter();
                 wa_draw(&rp, MVP, (const float (*)[4])world_planes);   /* RenderWorldModels 0x61d4b0 */
+                cbw_smk = p1 - p0; cbw_anim = SDL_GetPerformanceCounter() - p1; cbw_up = smk_upload_count() - cbw_up;
                 g_wd_props[0] += p1 - p0; g_wd_props[1] += SDL_GetPerformanceCounter() - p1; }
             #else
             smk_draw(&rp, MVP, cam, VIEW_DIST, NULL);
@@ -28070,7 +28075,24 @@ int main(int argc, char **argv) {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);   /* restore the ordinary default */
         }
         {   Uint64 cb4 = SDL_GetPerformanceCounter();
-            g_wd_cb[0] += cb1 - cb0; g_wd_cb[1] += cb2 - cb1; g_wd_cb[2] += cb3 - cb2; g_wd_cb[3] += cb4 - cb3; }
+            g_wd_cb[0] += cb1 - cb0; g_wd_cb[1] += cb2 - cb1; g_wd_cb[2] += cb3 - cb2; g_wd_cb[3] += cb4 - cb3; 
+            /* the worst cut+blend frame of every 600, split; "new" = the frame a
+               new world build arrived (Palmont hwxp13: those frames missed) */
+            static Uint64 w_tot, w_p[7]; static int w_new, w_n, w_up; static unsigned long w_gen;
+            int isnew = active_resident && active_resident->generation != w_gen;
+            if (active_resident) w_gen = active_resident->generation;
+            if (cb4 - cb0 > w_tot) {
+                w_tot = cb4 - cb0; w_new = isnew; w_up = cbw_up;
+                w_p[0] = cb1 - cb0; w_p[1] = cb2 - cb1; w_p[2] = cb3 - cb2; w_p[3] = cb4 - cb3;
+                w_p[4] = cbw_res; w_p[5] = cbw_smk; w_p[6] = cbw_anim;
+            }
+            if (++w_n == 600) {
+                double k = 1000.0 / (double)SDL_GetPerformanceFrequency();
+                printf("cut+blend worst frame: %.2f ms%s (cutout %.2f fade %.2f props %.2f [resident %.2f smk %.2f anims %.2f, %d uploads] blend %.2f)\n",
+                       w_tot * k, w_new ? " (new build)" : "", w_p[0] * k, w_p[1] * k, w_p[2] * k, w_p[4] * k, w_p[5] * k, w_p[6] * k, w_up, w_p[3] * k);
+                w_tot = 0; w_n = 0;
+            }
+        }
         if (nrep) {   /* diagnostic overlay: where the restored geometry is */
             glUniform1f(uUseTex, 0.0f);
             glUniform1f(uUnlit, 1.0f);

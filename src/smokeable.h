@@ -91,6 +91,7 @@ void smk_rp_off(void);
 
 /* Per-run counters for the log line. */
 void smk_report(void);
+int  smk_upload_count(void);   /* meshes uploaded so far (worst-frame log) */
 
 #ifdef __cplusplus
 }

@@ -171,6 +171,8 @@ static unsigned char *read_file(const char *path, long *len)
     return d;
 }
 
+static long g_uploads_total;
+int smk_upload_count(void) { return (int)g_uploads_total; }
 static void gpu_free(int i)
 {
     if (!g_gpu || !g_gpu[i]) return;
@@ -867,7 +869,7 @@ static SmkGpu *gpu_make(int si)
         g->mode[g->n] = g_cur_mode ? g_cur_mode[S->mesh[k]] : N2_DRAW_OPAQUE;
         g->n++;
         free(gm);
-        g_st.uploads++;
+        g_st.uploads++; g_uploads_total++;
     }
     g->sig = S->sig;
     g_gpu[si] = g;
@@ -911,7 +913,9 @@ void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float vi
               const float (*planes)[4])
 {
     if (!g_nsp) return;
-    int budget = 16, drawn = 0, cur_blend = 0, cur_cut = 0;
+    /* uploads per frame, in meshes: each is 3-4 GPU buffers, and a new world
+       build brought 10-16 at once (Palmont hwxp13: ~10 ms on those frames, 11-19) */
+    int budget = 4, drawn = 0, cur_blend = 0, cur_cut = 0;
     GLuint lasttex = (GLuint)-1;
     /* the loaded spawners, then live props whose section has gone: the
        World Expansion has 12,692 spawners, ~600 loaded (a replay walks all) */
