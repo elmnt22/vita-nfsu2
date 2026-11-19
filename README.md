@@ -9,14 +9,20 @@ The goal is to play like the real game. Menus, HUD, sounds, handling, camera
 and controls are rebuilt 1:1 from the shipped game data and from reverse
 engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
 
+**New in v0.2.0: the World Expansion.** If you also own Need for Speed Most
+Wanted (2005) or Need for Speed Carbon for PC, you can take your Underground 2
+car to **Rockport** and **Palmont** at night, with traffic and about 300 race
+events between them. See [World Expansion](#world-expansion-rockport-and-palmont).
+
 > **Status: in development.** Builds are test builds and may crash or show
 > glitches. Many features are confirmed on hardware. The newest ones have so
 > far only been checked in the Windows simulator of the Vita build. Please
 > report problems with the log files (see [Reporting problems](#reporting-problems)).
 
 > **No game data is included.** This repository has no EA assets and no EA
-> code. You need your own legally owned copy of the PC game. This project is
-> not affiliated with, authorized or endorsed by Electronic Arts.
+> code. You need your own legally owned copy of the PC game (and, for the
+> World Expansion, of Most Wanted and/or Carbon). This project is not
+> affiliated with, authorized or endorsed by Electronic Arts.
 
 Disclosure: Whilst I know a bit of programming and coding, I used AI to help accelerate areas of this port that otherwise would have taken me forever. AI used was Claude Opus.
 
@@ -72,9 +78,10 @@ Disclosure: Whilst I know a bit of programming and coding, I used AI to help acc
   When it is on, choosing **No** on the World Map's GPS prompt puts you at
   that place. Off by default; turn it on in [Settings](#settings).
 - **World streaming.** The whole city streams in while you drive.
-- **World Expansion (optional).** Drive Rockport (from Need for Speed Most
-  Wanted, 2005) and Palmont (from Need for Speed Carbon) at night in Free Run,
-  with their races. Needs your own PC copy of those games. See
+- **World Expansion (optional).** Two more cities: Rockport (from Need for
+  Speed Most Wanted, 2005) and Palmont (from Need for Speed Carbon), at night,
+  with traffic, the minimap, world map, GPS, shops and about 300 race events.
+  Needs your own PC copy of those games. See
   [World Expansion](#world-expansion-rockport-and-palmont).
 - **Languages.** The game uses the Vita's system language when the original
   game has it. That covers English, French, German, Italian, Spanish, Dutch,
@@ -104,6 +111,9 @@ Disclosure: Whilst I know a bit of programming and coding, I used AI to help acc
   have it yet, extract it with **ShaRKBR33D**.
 - About **1.7 GB** free on the memory card for the game data, plus about
   **330 MB** for the converted world cache.
+- For the World Expansion only: about **2.7 GB** more, and your own PC copy
+  of **Need for Speed Most Wanted (2005)** and/or **Need for Speed Carbon**
+  (see [World Expansion](#world-expansion-rockport-and-palmont)).
 - For trophies only: the **[NoTrpDrm](https://github.com/Yoti/psv_notrpdrm)**
   plugin, listed under `*main` in `ur0:tai/config.txt`. Without it the game
   runs normally and simply reports no trophies.
@@ -165,7 +175,7 @@ ux0:data/NFSU2/
 On its first boot the game converts the world data into a format the Vita
 can stream quickly. This is the **"OPTIMIZING WORLD DATA"** screen, and on
 the console it takes **15–20+ minutes**. The **NFSU2 Vita Prep Tool** does
-the same job on your PC in about **1½ minutes** and puts the result on the
+the same job on your PC in about **2 minutes** and puts the result on the
 Vita with the game files. See [NFSU2 Vita Prep Tool](#nfsu2-vita-prep-tool-pc) below.
 
 You can skip this step. The Vita then converts the data itself on the first
@@ -190,8 +200,11 @@ gets your PC copy of the game ready for the Vita:
   identical to what the Vita would make. It also prebuilds the cars' parts
   lists and the shop screens.
 - **Puts it on the Vita** over Wi-Fi (FTP) or USB. Only the files the Vita
-  needs go over (no `Support`, `Uninstall` or other unused files), and game
-  files already there are skipped.
+  needs go over (no `Support`, `Uninstall` or other unused files). Files
+  already there are skipped: the tool remembers what it sent to each Vita or
+  memory card, so sending again later only sends what changed.
+- **Converts the World Expansion cities** from your Most Wanted and/or Carbon
+  install (see [below](#world-expansion-rockport-and-palmont)).
 - **Imports a PC save** (see [below](#bringing-over-a-pc-save)).
 
 Use the Prep Tool from the **same release** as your VPK. If the data format
@@ -200,20 +213,27 @@ data itself.
 
 **Quick start:**
 
-1. Run **NFSU2VitaPrep.exe**. It finds your NFSU2 install from the
-   registry. If it doesn't, click **Browse...** and pick the game folder
-   (the one with `TRACKS` in it).
-2. Click **Convert**. It checks your game files first, then converts all
-   six track sets (the City, both Drag Strips, Drift, Street X and URL).
-   The result is about 330 MB and goes to a folder called `NFSU2 Vita Prep`.
-3. Put it on the Vita. Leave **Game files too** ticked the first time
+Run **NFSU2VitaPrep.exe**. The window follows the steps from top to bottom:
+
+1. **Your Need for Speed Underground 2 Folder.** The tool finds your NFSU2
+   install from the registry. If it doesn't, click **Browse...** and pick
+   the game folder (the one with `TRACKS` in it). **Check Game Files** checks
+   it on its own; the line beside it tells you whether it's ready.
+2. **Optional: World Expansion.** Leave it empty if you only want Bayview.
+3. **Convert.** It checks your game files first, then converts all six
+   track sets (the City, both Drag Strips, Drift, Street X and URL). The
+   result is about 330 MB and goes to a folder called `NFSU2 Vita Prep`.
+   **Done!** shows beside the progress bar when it has finished.
+4. **Put It on Your Vita.** Leave **Game files too** ticked the first time
    (about 1.7 GB), then either:
    - **Over Wi-Fi:** start an FTP server on the Vita on port **1337** (in
      VitaShell press **SELECT**, or use vitacompanion), type the IP address
      the Vita shows and click **Send to Vita**.
    - **Over USB (faster):** in VitaShell press **START**, pick **USB**
-     and connect the Vita. Click **Copy to memory card...** and pick the
+     and connect the Vita. Click **Copy to Memory Card...** and pick the
      memory card's drive.
+
+   **Open Output Folder** shows the converted data and the logs.
 
 If it worked, the game goes straight to the title screen without the
 "OPTIMIZING WORLD DATA" screen.
@@ -226,7 +246,7 @@ The full guide, with the command line options and troubleshooting, is in
 ## Bringing over a PC save
 
 The Prep Tool can import a career save from the PC game with
-**Import PC save...**. The PC game keeps saves in
+**Import PC Save...**. The PC game keeps saves in
 `%LOCALAPPDATA%\NFS Underground 2\<name>\<name>`. The imported profile is
 sent or copied to `ux0:data/NFSU2/profiles` with the rest. Load it from the
 **Profile Manager** in the game. See
@@ -236,26 +256,65 @@ sent or copied to `ux0:data/NFSU2/profiles` with the rest. Load it from the
 
 ## World Expansion: Rockport and Palmont
 
-If you also own **Need for Speed Most Wanted (2005)** or **Need for Speed
-Carbon** for PC, you can drive their cities in the port, at night: Rockport
-and Palmont, with their traffic, minimap, world map, shops and race events.
-No data from those games is included; the Prep Tool converts your own copy.
+The World Expansion is an optional add-on that brings two more cities into
+the port, both at night:
+
+- **Rockport**, from **Need for Speed Most Wanted (2005)**
+- **Palmont**, from **Need for Speed Carbon**
+
+They play by Underground 2's rules, with your Underground 2 cars and
+handling. Each city has:
+
+- **Free roam** with traffic, the minimap, the world map and the GPS.
+- **Race events** spread around the map: about 156 in Rockport and 140 in
+  Palmont. Circuits, sprints and drift races, plus checkpoint, tollbooth,
+  speedtrap and lap knockout races, and Palmont's canyon duels, canyon
+  sprints and canyon drifts.
+- **Shops and the garage**, and smackable props along the roads.
+- **Your garage or a fresh start.** The first time you drive into a city,
+  the game asks whether to **share your garage** with it (your cars, parts
+  and cash) or **start fresh** there with its own career. You can switch
+  later.
+
+Not included: cops, heat and pursuits (Underground 2 has none), and
+Carbon's pursuit knockout events.
+
+### What you need
+
+- Your own PC copy of **Need for Speed Most Wanted (2005)** for Rockport
+  and/or **Need for Speed Carbon** for Palmont. One is enough: the other
+  city is simply left out. **No data from those games is included** in this
+  repository or the VPK; the Prep Tool converts your own copy on your PC.
+- About **2.7 GB** more on the memory card for both cities.
+- The **Prep Tool** from the same release as your VPK.
+
+### Setting it up
 
 1. In the Prep Tool, under **Optional: World Expansion**, pick your Most
-   Wanted and/or Carbon folder (the one with `TRACKS` in it). The tool finds
-   installed copies by itself. Leave a box empty to skip that city.
+   Wanted and/or Carbon folder (the one with `TRACKS` in it). Installed
+   copies are found by themselves. Leave a box empty to skip that city. The
+   labels under the boxes show each city's state (**Found**, **Ready to
+   send**, **Not set** or **Folder not right**).
 2. Click **Convert**. After the Underground 2 tracks it checks those games'
-   files and converts each city. This takes a while longer than the
-   Underground 2 tracks, and the cities need about 2.7 GB more on the memory
-   card.
-3. Send or copy as usual with **World Expansion too** ticked.
+   files and converts each city. This takes longer than the Underground 2
+   tracks alone.
+3. Send or copy as usual with **World Expansion too** ticked. If this tool
+   already sent the Underground 2 data, only the new cities go over.
 4. On the Vita, open [Settings](#settings) and tick **Rockport and Palmont**
-   under **World Expansion**.
+   under **World Expansion**. The right side shows which cities are on the
+   memory card.
 5. In the game, pick **Quick Race → Free Run**. It asks which city you want.
 
-The first time you drive into a city, the game asks whether to **share your
-garage** with it (your cars, parts and cash) or **start fresh** there with
-its own career. You can change this later.
+Turning the switch off hides the cities again. Your Underground 2 career is
+untouched either way.
+
+### Good to know
+
+- The World Expansion is **new and has had little hardware testing**. Some
+  busy spots can drop below 30 FPS. Logs from either city are very welcome
+  (see [Reporting problems](#reporting-problems)).
+- If the cities' data format changes in a later release, convert them again
+  with that release's Prep Tool.
 
 ---
 
@@ -384,6 +443,8 @@ port started from was released under the MIT License and stays available
 under it; the MIT text is kept in [LICENSE](LICENSE). Third-party code keeps
 its own license.
 
-Need for Speed and Need for Speed Underground 2 are trademarks of Electronic
-Arts. All game content belongs to its owners. This project ships none of
-it: the port loads the data from your own copy at runtime.
+Need for Speed, Need for Speed Underground 2, Need for Speed Most Wanted and
+Need for Speed Carbon are trademarks of Electronic Arts. All game content
+belongs to its owners. This project ships none of it: the port loads the
+data from your own copies at runtime, and the World Expansion's cities are
+converted on your own PC from your own installs.
