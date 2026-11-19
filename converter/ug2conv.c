@@ -702,6 +702,19 @@ static HWND mk(const char *cls, const char *text, DWORD style, int x, int y, int
     return c;
 }
 static void set_status(const char *s) { SetWindowTextA(g_status, s); }
+/* the result label beside the progress bar: 0 blank, 1 working, 2 done, 3 failed */
+static HWND g_done; static int g_done_state;
+static void set_done(int st) {
+    if (st == g_done_state) return;
+    g_done_state = st;
+    static const char *t[4] = { "", "Working...", "Done!", "Failed" };
+    SetWindowTextA(g_done, t[st]);
+    InvalidateRect(g_done, NULL, TRUE);
+    if (st >= 2 && GetForegroundWindow() != g_wnd) {   /* a long job ended: flash the taskbar button */
+        FLASHWINFO fw = { sizeof fw, g_wnd, FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0 };
+        FlashWindowEx(&fw);
+    }
+}
 static void ui_idle(void) {
     int busy = g_job.busy || g_send.busy || g_chk.busy;
     EnableWindow(g_convert, !busy); EnableWindow(g_browse, !busy); EnableWindow(g_game_ed, !busy);
@@ -940,6 +953,7 @@ static void on_import(void) {
 }
 static void on_timer(void) {
     char m[256];
+    if (g_chk.busy || g_job.busy || g_send.busy) set_done(1);
     if (g_chk.busy || (g_job.busy && g_job.checking)) {
         long long t = g_chk.total > 0 ? g_chk.total : 1;
         SendMessageA(g_bar, PBM_SETPOS, (WPARAM)(g_chk.bytes * 1000 / t), 0);
@@ -950,6 +964,7 @@ static void on_timer(void) {
         g_chk.done = 0;
         SendMessageA(g_bar, PBM_SETPOS, 1000, 0);
         set_status(g_chk.ok ? "Game files OK." : "Some game files are missing or changed.");
+        set_done(g_chk.ok ? 2 : 3);
         ui_idle();
         MessageBoxA(g_wnd, g_chk.msg, TOOL_NAME, g_chk.ok ? MB_ICONINFORMATION : MB_ICONWARNING);
     } else if (g_job.busy && g_job.in_xp) {   /* the World Expansion, after the tracks */
@@ -988,6 +1003,7 @@ static void on_timer(void) {
         g_job.done = 0;
         if (g_job.ok) SendMessageA(g_bar, PBM_SETPOS, 1000, 0);
         set_status(g_job.msg);
+        set_done(g_job.ok ? 2 : 3);
         ui_idle();
         xp_status_update();
         if (!g_job.ok) MessageBoxA(g_wnd, g_job.msg, TOOL_NAME, MB_ICONERROR);
@@ -1000,6 +1016,7 @@ static void on_timer(void) {
     } else if (g_send.done) {
         g_send.done = 0;
         set_status(g_send.msg);
+        set_done(g_send.ok ? 2 : 3);
         ui_idle();
         MessageBoxA(g_wnd, g_send.msg, TOOL_NAME, g_send.ok ? MB_ICONINFORMATION : MB_ICONERROR);
     }
@@ -1032,7 +1049,8 @@ static void build_ui(void) {
     g_convert = mk("BUTTON", "Convert", BS_DEFPUSHBUTTON, 20, y, 140, 30, ID_CONVERT, g_bold);
     mk("STATIC", "About 2 minutes (longer with the World Expansion). Your game files are only read, never "
        "changed.", 0, 172, y - 1, 348, 34, 0, g_font); y += 40;
-    g_bar = mk(PROGRESS_CLASSA, "", 0, 20, y, 500, 16, ID_PROGRESS, g_font);
+    g_bar = mk(PROGRESS_CLASSA, "", 0, 20, y, 400, 16, ID_PROGRESS, g_font);
+    g_done = mk("STATIC", "", SS_CENTER, 428, y - 3, 92, 22, 0, g_bold);
     SendMessageA(g_bar, PBM_SETRANGE32, 0, 1000); y += 22;
     g_status = mk("STATIC", "", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 20, y, 500, 18, ID_STATUS, g_font); y += 36;
 
@@ -1075,6 +1093,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER: on_timer(); return 0;
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp; SetBkMode(dc, TRANSPARENT);
+        if ((HWND)lp == g_done)
+            SetTextColor(dc, g_done_state == 2 ? RGB(0, 140, 40) : g_done_state == 3 ? RGB(200, 0, 0) : RGB(110, 110, 110));
         return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
     case WM_CLOSE:
