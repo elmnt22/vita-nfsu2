@@ -33,6 +33,7 @@
 #include <io.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <time.h>
 #include <direct.h>
 #include <process.h>
 #include <windows.h>
@@ -901,15 +902,38 @@ static int bs_font_raster_s(int face, int px, unsigned cp, unsigned char *buf, i
     return 1;
 }
 #define bs_font_raster(face, px, cp, buf, stride, cap, g) bs_font_raster_s(face, px, cp, buf, stride, cap, (void *)(g))
-static int bs_tap(int *x, int *y)   /* a mouse click stands in for a touch */
+static int bs_touch_now(int *x, int *y)   /* the left mouse button stands in for a touch */
 {
-    static int down;
-    int mx, my, was = down;
-    down = (SDL_GetMouseState(&mx, &my) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
-    if (!down || was) return 0;
+    int mx, my;
+    if (!(SDL_GetMouseState(&mx, &my) & SDL_BUTTON(SDL_BUTTON_LEFT))) return 0;
     int ww, wh; SDL_GetWindowSize(g_win, &ww, &wh);
     *x = ww > 0 ? mx * BS_W / ww : mx; *y = wh > 0 ? my * BS_H / wh : my;
     return 1;
+}
+#define bs_fopen sim_fopen
+static int bs_list(const char *dir, int dirs, char (*names)[64], int max)
+{
+    char b[1024], p[1200];
+    const char *real = sim_path(dir, b, sizeof b);
+    DIR *d = opendir(real);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "%s/%s", real, e->d_name);
+        struct stat st;
+        if (stat(p, &st) != 0 || ((st.st_mode & S_IFDIR) ? 1 : 0) != (dirs ? 1 : 0)) continue;
+        if (n < max) { snprintf(names[n], 64, "%s", e->d_name); n++; }
+    }
+    closedir(d);
+    return n;
+}
+static void bs_stamp(char *out, int cap)
+{
+    time_t t = time(NULL);
+    struct tm *lt = localtime(&t);
+    if (!lt || !strftime(out, (size_t)cap, "%Y-%m-%d_%H-%M-%S", lt)) snprintf(out, (size_t)cap, "0000-00-00_00-00-00");
 }
 #include "../vita/boot_settings.inc"
 

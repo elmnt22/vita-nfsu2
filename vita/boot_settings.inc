@@ -17,15 +17,23 @@
      Full detail fulldetail.txt  present = the original road reflection rate,
                              traffic count and particle rate; off by default
                              (the Vita's lighter mix for 30 fps downtown)
+     Save logs as ZIP        packs the last (or all kept) run folders of
+                             ux0:data/NFSU2/logs into ux0:data/NFSU2/
+                             NFSU2_logs_<time>.zip for bug reports; local only
      Reset caches            deletes ux0:data/NFSU2/cache (converted world
                              tiles, shaders, shop/parts lists); profiles,
                              options and the game data are kept
-   Leaving the screen restarts the app, so the game boots from a clean state.
+   Rows that do not fit scroll (d-pad, or drag on the touch screen) rather
+   than shrinking. Leaving the screen restarts the app, so the game boots
+   from a clean state.
 
    The includer provides:
      BS_W, BS_H             screen size
      bs_pad()               buttons held now, STG_* bits
-     bs_tap(&x, &y)         1 on a new front-touch press (screen pixels)
+     bs_touch_now(&x, &y)   1 while the front touch screen is held (screen pixels)
+     bs_fopen(p, mode)      stdio fopen of a ux0: path
+     bs_list(dir, dirs, names, max)  names in dir: folders (dirs 1) or files (0)
+     bs_stamp(out, cap)     local time as "YYYY-MM-DD_HH-MM-SS"
      bs_present()           show the frame and wait about 1/30 s
      bs_exists(p), bs_touch(p), bs_remove(p)
      bs_rmtree(p)           delete a folder tree, returns the files deleted
@@ -259,159 +267,529 @@ static void bs_face_button(float cx, float cy, float r, int cross)
     else bs_shape(cx - s, cy - s, 2 * s, 2 * s, 4.0f, 0, 1.8f * r / 9.0f, BSC(255, 255, 255, 1.0f), NULL);
 }
 
+/* ---- Save logs as ZIP (user 11-19) ----------------------------------------
+   Packs the kept run folders of ux0:data/NFSU2/logs (named by their start
+   time, see logs_rotate in sdl_vita.c) into one ZIP in ux0:data/NFSU2 that a
+   player can attach to a bug report. "latest" is this Settings run and is
+   left out: after a crash, the crashed run is the newest dated folder.
+   Nothing is uploaded. Deflate is our own (LZ77 + the fixed Huffman codes of
+   RFC 1951): the builds carry no zlib, and text logs still shrink ~5x. */
+#define BS_LOGS    "ux0:data/NFSU2/logs"
+#define BS_ZIPDIR  "ux0:data/NFSU2"
+#define BSZ_WB     15
+#define BSZ_W      (1 << BSZ_WB)
+#define BSZ_HB     15
+#define BSZ_CHAIN  24
+#define BSZ_MAXE   96
+
+typedef struct { unsigned char *p; size_t n, cap; unsigned bits; int nbits, err; } BszOut;
+static void bsz_byte(BszOut *o, unsigned b) { if (o->n < o->cap) o->p[o->n++] = (unsigned char)b; else o->err = 1; }
+static void bsz_bits(BszOut *o, unsigned v, int n)   /* LSB first, n <= 16 */
+{
+    o->bits |= v << o->nbits; o->nbits += n;
+    while (o->nbits >= 8) { bsz_byte(o, o->bits & 255u); o->bits >>= 8; o->nbits -= 8; }
+}
+static void bsz_code(BszOut *o, unsigned code, int n)   /* Huffman codes go MSB first */
+{
+    unsigned r = 0;
+    for (int i = 0; i < n; i++) { r = (r << 1) | (code & 1u); code >>= 1; }
+    bsz_bits(o, r, n);
+}
+static void bsz_lit(BszOut *o, unsigned v)   /* the fixed literal/length code */
+{
+    if (v < 144) bsz_code(o, 0x30 + v, 8);
+    else if (v < 256) bsz_code(o, 0x190 + v - 144, 9);
+    else if (v < 280) bsz_code(o, v - 256, 7);
+    else bsz_code(o, 0xc0 + v - 280, 8);
+}
+static const unsigned short k_bsz_lbase[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+                                                35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+static const unsigned char k_bsz_lext[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+                                              3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+static const unsigned short k_bsz_dbase[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385,
+                                                513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+static const unsigned char k_bsz_dext[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7,
+                                              8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+static void bsz_match(BszOut *o, int len, int dist)
+{
+    int c = 0, d = 0;
+    while (c < 28 && k_bsz_lbase[c + 1] <= len) c++;
+    while (d < 29 && k_bsz_dbase[d + 1] <= dist) d++;
+    bsz_lit(o, 257u + (unsigned)c);
+    if (k_bsz_lext[c]) bsz_bits(o, (unsigned)(len - k_bsz_lbase[c]), k_bsz_lext[c]);
+    bsz_code(o, (unsigned)d, 5);
+    if (k_bsz_dext[d]) bsz_bits(o, (unsigned)(dist - k_bsz_dbase[d]), k_bsz_dext[d]);
+}
+/* one fixed-Huffman block over src; prog(user, bytes done) != 0 cancels.
+   Returns the compressed size, 0 when it did not fit (caller stores raw),
+   -1 when cancelled or out of memory. */
+static long bsz_deflate(const unsigned char *src, size_t n, unsigned char *dst, size_t cap,
+                        int (*prog)(void *, size_t), void *user)
+{
+    int *head = (int *)malloc(sizeof(int) << BSZ_HB), *prev = (int *)malloc(sizeof(int) * BSZ_W);
+    if (!head || !prev) { free(head); free(prev); return -1; }
+    for (int i = 0; i < (1 << BSZ_HB); i++) head[i] = -1;
+    for (int i = 0; i < BSZ_W; i++) prev[i] = -1;
+    BszOut o = { dst, 0, cap, 0, 0, 0 };
+    bsz_bits(&o, 1, 1); bsz_bits(&o, 1, 2);   /* BFINAL, BTYPE 01 = fixed codes */
+    size_t pos = 0, tick = 1u << 20;
+    long result = 0;
+#define BSZ_HASH(q) ((((unsigned)(q)[0] | ((unsigned)(q)[1] << 8) | ((unsigned)(q)[2] << 16)) * 2654435761u) >> (32 - BSZ_HB))
+#define BSZ_INSERT(at) do { unsigned h_ = BSZ_HASH(src + (at)); prev[(at) & (BSZ_W - 1)] = head[h_]; head[h_] = (int)(at); } while (0)
+    while (pos < n) {
+        if (pos >= tick) {
+            tick += 1u << 20;
+            if (prog && prog(user, pos)) { result = -1; goto done; }
+        }
+        int best = 0, bdist = 0;
+        if (pos + 3 <= n) {
+            int maxlen = n - pos < 258 ? (int)(n - pos) : 258;
+            int cand = head[BSZ_HASH(src + pos)], chain = BSZ_CHAIN;
+            while (cand >= 0 && (int)pos - cand < BSZ_W && chain--) {
+                const unsigned char *a = src + cand, *b = src + pos;
+                if (a[best] == b[best]) {
+                    int l = 0;
+                    while (l < maxlen && a[l] == b[l]) l++;
+                    if (l > best) { best = l; bdist = (int)pos - cand; if (l == maxlen) break; }
+                }
+                int nx = prev[cand & (BSZ_W - 1)];
+                if (nx >= cand) break;   /* a slot reused by a newer position: the chain ends */
+                cand = nx;
+            }
+            BSZ_INSERT(pos);
+        }
+        if (best >= 3) {
+            bsz_match(&o, best, bdist);
+            for (int k = 1; k < best; k++)
+                if (pos + (size_t)k + 3 <= n) BSZ_INSERT(pos + (size_t)k);
+            pos += (size_t)best;
+        } else {
+            bsz_lit(&o, src[pos]);
+            pos++;
+        }
+        if (o.err) goto done;   /* bigger than the space given: stored instead */
+    }
+#undef BSZ_INSERT
+#undef BSZ_HASH
+    bsz_lit(&o, 256);
+    if (o.nbits) bsz_byte(&o, o.bits & 255u);
+    result = o.err ? 0 : (long)o.n;
+done:
+    free(head); free(prev);
+    return result;
+}
+static unsigned bsz_crc(unsigned crc, const unsigned char *p, size_t n)
+{
+    static unsigned t[256]; static int ready;
+    if (!ready) {
+        for (unsigned i = 0; i < 256; i++) {
+            unsigned c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
+            t[i] = c;
+        }
+        ready = 1;
+    }
+    crc = ~crc;
+    while (n--) crc = t[(crc ^ *p++) & 255u] ^ (crc >> 8);
+    return ~crc;
+}
+
+typedef struct { char name[96]; unsigned crc, csize, usize, off; unsigned short method, dtime, ddate; } BszEntry;
+typedef struct {
+    FILE *f; unsigned off; int err;
+    BszEntry e[BSZ_MAXE]; int ne;
+    unsigned short dtime, ddate;
+} BszZip;
+static void bsz_put(BszZip *z, const void *p, size_t n)
+{
+    if (!z->err && n && fwrite(p, 1, n, z->f) != n) z->err = 1;
+    z->off += (unsigned)n;
+}
+static void bsz_le(unsigned char *b, unsigned v, int n) { for (int i = 0; i < n; i++) b[i] = (unsigned char)(v >> (8 * i)); }
+/* DOS date/time from a run folder name "YYYY-MM-DD_HH-MM-SS..." */
+static void bsz_dostime(const char *stamp, unsigned short *dt, unsigned short *dd)
+{
+    int y = 1980, mo = 1, d = 1, h = 0, mi = 0, s = 0;
+    if (sscanf(stamp, "%4d-%2d-%2d_%2d-%2d-%2d", &y, &mo, &d, &h, &mi, &s) < 3 || y < 1980) { y = 1980; mo = d = 1; }
+    *dd = (unsigned short)(((y - 1980) << 9) | (mo << 5) | d);
+    *dt = (unsigned short)((h << 11) | (mi << 5) | (s / 2));
+}
+/* one member: deflated when that is smaller, else stored */
+static int bsz_add(BszZip *z, const char *name, const unsigned char *data, size_t n,
+                   int (*prog)(void *, size_t), void *user)
+{
+    if (z->ne >= BSZ_MAXE || z->err) return 0;
+    BszEntry *e = &z->e[z->ne];
+    memset(e, 0, sizeof *e);
+    snprintf(e->name, sizeof e->name, "%s", name);
+    e->crc = bsz_crc(0, data, n); e->usize = (unsigned)n; e->off = z->off;
+    e->dtime = z->dtime; e->ddate = z->ddate;
+    size_t cap = n + n / 8 + 64;
+    unsigned char *c = n ? (unsigned char *)malloc(cap) : NULL;
+    long cn = c ? bsz_deflate(data, n, c, cap, prog, user) : 0;
+    if (cn < 0) { free(c); return -1; }
+    const unsigned char *body = data;
+    e->method = 0; e->csize = (unsigned)n;
+    if (cn > 0 && (size_t)cn < n) { body = c; e->method = 8; e->csize = (unsigned)cn; }
+    unsigned char h[30];
+    bsz_le(h, 0x04034b50u, 4); bsz_le(h + 4, 20, 2); bsz_le(h + 6, 0, 2); bsz_le(h + 8, e->method, 2);
+    bsz_le(h + 10, e->dtime, 2); bsz_le(h + 12, e->ddate, 2); bsz_le(h + 14, e->crc, 4);
+    bsz_le(h + 18, e->csize, 4); bsz_le(h + 22, e->usize, 4);
+    bsz_le(h + 26, (unsigned)strlen(e->name), 2); bsz_le(h + 28, 0, 2);
+    bsz_put(z, h, sizeof h); bsz_put(z, e->name, strlen(e->name)); bsz_put(z, body, e->csize);
+    free(c);
+    z->ne++;
+    return z->err ? 0 : 1;
+}
+static void bsz_finish(BszZip *z)
+{
+    unsigned cd = z->off;
+    for (int i = 0; i < z->ne; i++) {
+        const BszEntry *e = &z->e[i];
+        unsigned char h[46];
+        memset(h, 0, sizeof h);
+        bsz_le(h, 0x02014b50u, 4); bsz_le(h + 4, 20, 2); bsz_le(h + 6, 20, 2); bsz_le(h + 10, e->method, 2);
+        bsz_le(h + 12, e->dtime, 2); bsz_le(h + 14, e->ddate, 2); bsz_le(h + 16, e->crc, 4);
+        bsz_le(h + 20, e->csize, 4); bsz_le(h + 24, e->usize, 4); bsz_le(h + 28, (unsigned)strlen(e->name), 2);
+        bsz_le(h + 42, e->off, 4);
+        bsz_put(z, h, sizeof h); bsz_put(z, e->name, strlen(e->name));
+    }
+    unsigned char t[22];
+    memset(t, 0, sizeof t);
+    bsz_le(t, 0x06054b50u, 4); bsz_le(t + 8, (unsigned)z->ne, 2); bsz_le(t + 10, (unsigned)z->ne, 2);
+    bsz_le(t + 12, z->off - cd, 4); bsz_le(t + 16, cd, 4);
+    bsz_put(z, t, sizeof t);
+}
+static unsigned char *bsz_read(const char *path, size_t *n)
+{
+    *n = 0;
+    FILE *f = bs_fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    unsigned char *p = len >= 0 ? (unsigned char *)malloc((size_t)len + 1) : NULL;
+    if (p && fread(p, 1, (size_t)len, f) != (size_t)len) { free(p); p = NULL; }
+    fclose(f);
+    if (p) *n = (size_t)len;
+    return p;
+}
+static long bsz_size(const char *path)
+{
+    FILE *f = bs_fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fclose(f);
+    return len;
+}
+static int bsz_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+
+/* ---- the screen ------------------------------------------------------------ */
+enum { I_LOGS, I_EXPORT, I_FPS, I_FTRAV, I_TROPHY, I_FULL, I_RESET, I_START, I_N };
+typedef struct {
+    int logs, unlocked, ftrav, trophies, full, export_all;
+    int sel, top, confirm, fonts;
+    char status[96];    /* Reset caches result */
+    char xstatus[128];  /* Save logs result */
+    const char *busy;   /* a long job's text, drawn in the description line */
+    float frac;         /* its progress, -1 = none */
+} BsUi;
+static BsFont g_bsf_title, g_bsf_label, g_bsf_small;
+static const char *const k_bs_names[I_N] = { "Enable logging", "Save logs as ZIP", "Limit frame rate", "Fast travel",
+                                             "Enable trophies", "Full detail", "Reset caches", "Start game" };
+static const char *const k_bs_help[I_N] = {
+    "Save logs for bug reports.",
+    "One ZIP in ux0:data/NFSU2 for bug reports. Left/Right: which sessions.",
+    "Limit to 30 FPS. Turn off to allow up to 60 FPS.",
+    "World Map: choose No on the GPS prompt to jump there.",
+    "Earn PS Vita trophies. Needs the NoTrpDrm plugin.",
+    "Original reflections, traffic and particles. Lower frame rate.",
+    "Clear converted data and shaders. Your saves are kept.",
+    "Start the game with these settings." };
+/* layout in 720x408 units: the title bar, the rows full width (scrolled when
+   they do not all fit), the description line, the button bar */
+#define BS_S   ((float)BS_H / 408.0f)
+#define BS_HB  (66 * BS_S)
+#define BS_RX  (30 * BS_S)
+#define BS_RY0 (BS_HB + 12 * BS_S)
+#define BS_RH  (38 * BS_S)
+#define BS_FB  (40 * BS_S)
+static int bs_visible_rows(void)
+{
+    int v = (int)(((float)BS_H - BS_FB - 24 * BS_S - BS_RY0 + 5 * BS_S) / BS_RH);
+    return v < 1 ? 1 : v > I_N ? I_N : v;
+}
+
+static void bs_draw(const BsUi *u)
+{
+    glViewport(0, 0, BS_W, BS_H);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (u->fonts) {
+        const float S = BS_S, W = (float)BS_W, H = (float)BS_H;
+        const float hb = BS_HB, rx = BS_RX, ry0 = BS_RY0, rh = BS_RH, fb = BS_FB;
+        const BsFont *ft = &g_bsf_title, *fl = &g_bsf_label, *fs = &g_bsf_small;
+        const float *white = BSC(255, 255, 255, 1.0f);
+        const int vis = bs_visible_rows();
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        /* Vita Settings green, with a soft light across the upper half. */
+        bs_fill(0, 0, W, H, 0, BSC(112, 173, 18, 1.0f), BSC(29, 91, 9, 1.0f));
+        bs_fill(0, 0, W, hb, 0, BSC(255, 255, 255, 0.08f), BSC(255, 255, 255, 0.0f));
+        bs_text(ft, "Settings", rx + 10 * S, hb * 0.5f, white);
+        const char *sub = "Need for Speed Underground 2";
+        bs_text(fs, sub, W - rx - bs_text_w(fs, sub), hb * 0.5f, BSC(255, 255, 255, 0.8f));
+        bs_fill(rx, hb, W - 2 * rx, 1 * S, 0, BSC(255, 255, 255, 0.45f), NULL);
+
+        for (int vi = 0; vi < vis && u->top + vi < I_N; vi++) {
+            int i = u->top + vi;
+            float y = ry0 + vi * rh, h = rh - 5 * S, yc = y + h * 0.5f;
+            int on = i == u->sel;
+            bs_fill(rx, y, W - 2 * rx, h, 6 * S,
+                    on ? BSC(38, 145, 225, 1.0f) : BSC(18, 72, 4, 0.18f),
+                    on ? BSC(8, 93, 184, 1.0f) : NULL);
+            if (on && u->busy && u->frac >= 0.0f)   /* a long job fills its row */
+                bs_fill(rx, y, (W - 2 * rx) * (u->frac > 1.0f ? 1.0f : u->frac), h, 6 * S,
+                        BSC(255, 255, 255, 0.22f), NULL);
+            bs_line(rx, y, W - 2 * rx, h, 6 * S, (on ? 2.0f : 1.0f) * S,
+                    BSC(255, 255, 255, on ? 1.0f : 0.55f));
+            bs_text(fl, k_bs_names[i], rx + 18 * S, yc, white);
+            float vr = W - rx - 18 * S;
+            if (i == I_LOGS || i == I_FPS || i == I_FTRAV || i == I_TROPHY || i == I_FULL) {
+                int checked = i == I_LOGS ? u->logs : i == I_FTRAV ? u->ftrav : i == I_TROPHY ? u->trophies :
+                              i == I_FULL ? u->full : !u->unlocked;
+                float b = 24 * S, bx = vr - b, by = yc - b * 0.5f;
+                bs_fill(bx, by, b, b, 2 * S, BSC(0, 0, 0, 0.12f), NULL);
+                bs_line(bx, by, b, b, 2 * S, 1.5f * S, white);
+                if (checked) bs_shape(bx + 3 * S, by + 3 * S, b - 6 * S, b - 6 * S,
+                                      5.0f, 0, 2.8f * S, white, NULL);
+                if (i == I_FPS) {
+                    const char *v = u->unlocked ? "Up to 60 FPS" : "30 FPS";
+                    bs_text(fs, v, bx - 16 * S - bs_text_w(fs, v), yc, white);
+                }
+            } else if (i == I_EXPORT) {
+                const char *v = u->export_all ? "<  All sessions  >" : "<  Last session  >";
+                bs_text(fs, v, vr - bs_text_w(fs, v), yc, white);
+            } else {
+                /* Small right-facing chevron, as in system setting rows. */
+                bs_text(fl, ">", vr - bs_text_w(fl, ">"), yc, white);
+            }
+        }
+        if (I_N > vis) {   /* scroll bar in the right margin */
+            float tx = W - rx + 11 * S, tw = 4 * S, ty = ry0, th = vis * rh - 5 * S;
+            float kh = th * (float)vis / (float)I_N, ky = ty + th * (float)u->top / (float)I_N;
+            bs_fill(tx, ty, tw, th, 2 * S, BSC(255, 255, 255, 0.22f), NULL);
+            bs_fill(tx, ky, tw, kh, 2 * S, BSC(255, 255, 255, 0.85f), NULL);
+        }
+        const char *d = u->busy ? u->busy
+                      : u->sel == I_RESET && u->status[0] ? u->status
+                      : u->sel == I_RESET && u->confirm ? "Select again to delete caches. Saves are kept."
+                      : u->sel == I_EXPORT && u->xstatus[0] ? u->xstatus
+                      : k_bs_help[u->sel];
+        float dy = ry0 + vis * rh + 12 * S;
+        bs_text(fs, d, (W - bs_text_w(fs, d)) * 0.5f, dy, white);
+        /* Quiet footer, using the same white symbols as system menus. */
+        float fy = H - fb * 0.5f;
+        bs_fill(0, H - fb, W, 1 * S, 0, BSC(255, 255, 255, 0.25f), NULL);
+        float br = 9 * S, x = W - rx;
+        const char *t2 = u->busy ? "Cancel" : "Start game", *t1 = "Enter";
+        x -= bs_text_w(fs, t2); bs_text(fs, t2, x, fy, white);
+        x -= 7 * S + br; bs_face_button(x, fy, br, 0); x -= br + 24 * S;
+        if (!u->busy) {
+            x -= bs_text_w(fs, t1); bs_text(fs, t1, x, fy, white);
+            x -= 7 * S + br; bs_face_button(x, fy, br, 1);
+        }
+        bsr_flush();
+        glDisable(GL_BLEND);
+        glUseProgram(0);
+    }
+    bs_present();
+}
+
+/* the export's progress: redraws about every MB, Circle cancels */
+typedef struct { BsUi *u; size_t base, total; char text[96]; } BsExportProg;
+static int bs_export_prog(void *p, size_t done)
+{
+    BsExportProg *x = (BsExportProg *)p;
+    float f = x->total ? (float)(x->base + done) / (float)x->total : 0.0f;
+    snprintf(x->text, sizeof x->text, "Saving logs... %d%%", (int)(f * 100.0f + 0.5f));
+    x->u->busy = x->text; x->u->frac = f;
+    bs_draw(x->u);
+    return (bs_pad() & STG_CIRCLE) != 0;
+}
+static void bs_export_logs(BsUi *u)
+{
+    static char runs[32][64];
+    int nr = bs_list(BS_LOGS, 1, runs, 32), k = 0;
+    for (int i = 0; i < nr; i++)   /* dated run folders only ("latest" is this run) */
+        if (runs[i][0] >= '0' && runs[i][0] <= '9') memmove(runs[k++], runs[i], sizeof runs[0]);
+    nr = k;
+    if (!nr) { snprintf(u->xstatus, sizeof u->xstatus, "No saved sessions yet. Play first, then come back."); return; }
+    qsort(runs, (size_t)nr, sizeof runs[0], bsz_cmp);
+    int first = u->export_all ? 0 : nr - 1;
+
+    char stamp[32], name[64], out[160], path[256];
+    bs_stamp(stamp, sizeof stamp);
+    snprintf(name, sizeof name, "NFSU2_logs_%s.zip", stamp);
+    snprintf(out, sizeof out, "%s/%s", BS_ZIPDIR, name);
+    static BszZip z;
+    memset(&z, 0, sizeof z);
+    z.f = bs_fopen(out, "wb");
+    if (!z.f) { snprintf(u->xstatus, sizeof u->xstatus, "Could not create the ZIP in ux0:data/NFSU2."); return; }
+
+    /* the members, and their total size for the progress */
+    static char files[BSZ_MAXE][64]; static int frun[BSZ_MAXE];
+    int nf = 0; size_t total = 0;
+    for (int r = first; r < nr; r++) {
+        static char fl[32][64];
+        snprintf(path, sizeof path, "%s/%s", BS_LOGS, runs[r]);
+        int n = bs_list(path, 0, fl, 32);
+        qsort(fl, (size_t)n, sizeof fl[0], bsz_cmp);
+        for (int i = 0; i < n && nf < BSZ_MAXE - 1; i++) {
+            snprintf(path, sizeof path, "%s/%s/%s", BS_LOGS, runs[r], fl[i]);
+            long sz = bsz_size(path);
+            if (sz < 0) continue;
+            memcpy(files[nf], fl[i], sizeof files[0]); frun[nf] = r; nf++;
+            total += (size_t)sz;
+        }
+    }
+    vita_mark("settings: saving logs, %d session(s), %d files, %u KB -> %s", nr - first, nf,
+              (unsigned)(total >> 10), out);
+    BsExportProg pr = { u, 0, total, "" };
+    int ok = 1, cancelled = 0;
+    for (int i = 0; i < nf && ok; i++) {
+        snprintf(path, sizeof path, "%s/%s/%s", BS_LOGS, runs[frun[i]], files[i]);
+        size_t n = 0;
+        unsigned char *data = bsz_read(path, &n);
+        if (!data) continue;   /* gone or too big for memory: skipped */
+        char member[96];
+        snprintf(member, sizeof member, "%s/%s", runs[frun[i]], files[i]);
+        bsz_dostime(runs[frun[i]], &z.dtime, &z.ddate);
+        int r = bsz_add(&z, member, data, n, bs_export_prog, &pr);
+        free(data);
+        if (r < 0) { ok = 0; cancelled = 1; } else if (!r) ok = 0;
+        pr.base += n;
+        if (ok && bs_export_prog(&pr, 0)) { ok = 0; cancelled = 1; }
+    }
+    if (ok) {   /* info.txt: what was saved and the Settings switches, nothing else */
+        char info[640];
+        int len = snprintf(info, sizeof info,
+            "OpenUG2 log export, saved %s (Vita local time)\r\n"
+            "Sessions (each folder is named by the time that session started):\r\n", stamp);
+        for (int r = first; r < nr && len < (int)sizeof info - 80; r++)
+            len += snprintf(info + len, sizeof info - (size_t)len, "  %s\r\n", runs[r]);
+        len += snprintf(info + len, sizeof info - (size_t)len,
+            "Settings now: logging %s, frame rate %s, fast travel %s, trophies %s, full detail %s\r\n",
+            u->logs ? "on" : "off", u->unlocked ? "up to 60" : "30", u->ftrav ? "on" : "off",
+            u->trophies ? "on" : "off", u->full ? "on" : "off");
+        if (len > (int)sizeof info) len = (int)sizeof info;
+        bsz_dostime(stamp, &z.dtime, &z.ddate);
+        if (bsz_add(&z, "info.txt", (const unsigned char *)info, (size_t)len, NULL, NULL) <= 0) ok = 0;
+    }
+    if (ok) bsz_finish(&z);
+    if (z.err) ok = 0;
+    if (fclose(z.f) != 0) ok = 0;
+    u->busy = NULL; u->frac = -1.0f;
+    if (!ok) {
+        bs_remove(out);
+        snprintf(u->xstatus, sizeof u->xstatus, cancelled ? "Cancelled. No ZIP was saved."
+                                                          : "Could not save the ZIP. Is the memory card full?");
+        vita_mark("settings: log ZIP %s", cancelled ? "cancelled" : "failed");
+        return;
+    }
+    unsigned kb = (z.off + 1023) >> 10;
+    if (kb >= 1024) snprintf(u->xstatus, sizeof u->xstatus, "Saved %s (%u.%u MB)", name, kb / 1024, (kb % 1024) * 10 / 1024);
+    else snprintf(u->xstatus, sizeof u->xstatus, "Saved %s (%u KB)", name, kb);
+    vita_mark("settings: log ZIP saved, %d members, %u KB from %u KB", z.ne, kb, (unsigned)(total >> 10));
+}
+
+/* flips a switch; its file exists while the switch is on (on_means_file) or off */
+static void bs_toggle(int *v, const char *file, int on_means_file)
+{
+    *v = !*v;
+    if ((*v != 0) == (on_means_file != 0)) bs_touch(file); else bs_remove(file);
+}
+
 static void boot_settings_run(void) {
-    enum { I_LOGS, I_FPS, I_FTRAV, I_TROPHY, I_FULL, I_RESET, I_START, I_N };
-    int logs = !bs_exists(BS_NOLOG), unlocked = bs_exists(BS_FPS60), ftrav = bs_exists(BS_FTRAV);
-    int trophies = bs_exists(BS_TRP), full = bs_exists(BS_FULL);
-    int sel = 0, confirm = 0, quit = 0;
-    char status[64] = "";
+    static BsUi u;
+    memset(&u, 0, sizeof u);
+    u.logs = !bs_exists(BS_NOLOG); u.unlocked = bs_exists(BS_FPS60); u.ftrav = bs_exists(BS_FTRAV);
+    u.trophies = bs_exists(BS_TRP); u.full = bs_exists(BS_FULL); u.frac = -1.0f;
+    int quit = 0;
     unsigned prev = bs_pad();   /* the L+R that opened the screen is not a press */
-    vita_mark("settings: opened (logs %s, frame rate %s, fast travel %s)", logs ? "on" : "off", unlocked ? "unlocked" : "30",
-              ftrav ? "on" : "off");
+    vita_mark("settings: opened (logs %s, frame rate %s, fast travel %s)", u.logs ? "on" : "off",
+              u.unlocked ? "unlocked" : "30", u.ftrav ? "on" : "off");
 
-    const float S = (float)BS_H / 408.0f;   /* layout in 720x408 units */
-    static BsFont f_title, f_label, f_small;
-    int fonts = bsr_init() &&
-                bsf_build(&f_title, 0, (int)(25 * S + 0.5f)) && bsf_build(&f_label, 0, (int)(21 * S + 0.5f)) &&
-                bsf_build(&f_small, 0, (int)(14.5f * S + 0.5f));
-    if (!fonts) printf("settings: drawing unavailable, keys still work\n");
-
-    static const char *names[I_N] = { "Enable logging", "Limit frame rate", "Fast travel", "Enable trophies",
-                                      "Full detail", "Reset caches", "Start game" };
-    static const char *help[I_N] = {
-        "Save logs for bug reports.",
-        "Limit to 30 FPS. Turn off to allow up to 60 FPS.",
-        "World Map: choose No on the GPS prompt to jump there.",
-        "Earn PS Vita trophies. Needs the NoTrpDrm plugin.",
-        "Original reflections, traffic and particles. Lower frame rate.",
-        "Clear converted data and shaders. Your saves are kept.",
-        "Start the game with these settings." };
-    /* the title bar, then the rows full width, then the button bar */
-    const float hb = 66 * S, rx = 30 * S, ry0 = hb + 12 * S, rh = 38 * S, fb = 40 * S;   /* 7 rows */
+    const float S = BS_S;
+    u.fonts = bsr_init() &&
+              bsf_build(&g_bsf_title, 0, (int)(25 * S + 0.5f)) && bsf_build(&g_bsf_label, 0, (int)(21 * S + 0.5f)) &&
+              bsf_build(&g_bsf_small, 0, (int)(14.5f * S + 0.5f));
+    if (!u.fonts) printf("settings: drawing unavailable, keys still work\n");
+    const int vis = bs_visible_rows();
+    /* touch: a tap (press and release without moving) picks a row and presses
+       it; dragging up/down scrolls the list */
+    int t_down = 0, t_moved = 0, t_x = 0, t_y = 0, t_top = 0;
 
     while (!quit) {
         unsigned now = bs_pad(), hit = now & ~prev;
         prev = now;
-        int tx, ty, act = 0;
-        if (bs_tap(&tx, &ty)) {   /* a tap on a row picks it and presses it */
-            for (int i = 0; i < I_N; i++) {
-                float y = ry0 + i * rh;
-                if (tx >= rx && tx < BS_W - rx && ty >= y && ty < y + rh - 5 * S) {
-                    if (sel != i) confirm = 0;
-                    sel = i; act = 1;
+        int tx, ty, act = 0, moved_sel = 0;
+        int held = bs_touch_now(&tx, &ty);
+        if (held && !t_down) { t_down = 1; t_moved = 0; t_x = tx; t_y = ty; t_top = u.top; }
+        else if (held) {
+            float dy = (float)(ty - t_y);
+            if (fabsf(dy) > 10 * S) t_moved = 1;
+            if (t_moved && I_N > vis) {
+                int nt = t_top - (int)floorf(dy / BS_RH + 0.5f);
+                u.top = nt < 0 ? 0 : nt > I_N - vis ? I_N - vis : nt;
+            }
+        } else if (t_down) {
+            t_down = 0;
+            for (int vi = 0; !t_moved && vi < vis && u.top + vi < I_N; vi++) {
+                float y = BS_RY0 + vi * BS_RH;
+                if (t_x >= BS_RX && t_x < BS_W - BS_RX && t_y >= y && t_y < y + BS_RH - 5 * S) {
+                    int i = u.top + vi;
+                    if (u.sel != i) u.confirm = 0;
+                    u.sel = i; act = 1;
                 }
             }
         }
-        if (hit & STG_UP)   { sel = (sel + I_N - 1) % I_N; confirm = 0; }
-        if (hit & STG_DOWN) { sel = (sel + 1) % I_N; confirm = 0; }
+        if (hit & STG_UP)   { u.sel = (u.sel + I_N - 1) % I_N; u.confirm = 0; moved_sel = 1; }
+        if (hit & STG_DOWN) { u.sel = (u.sel + 1) % I_N; u.confirm = 0; moved_sel = 1; }
+        if (moved_sel) {   /* keep the focus row on screen */
+            if (u.sel < u.top) u.top = u.sel;
+            if (u.sel >= u.top + vis) u.top = u.sel - vis + 1;
+        }
         if (hit & (STG_CIRCLE | STG_START)) quit = 1;
         if (act || (hit & (STG_CROSS | STG_LEFT | STG_RIGHT))) {
             int cross = act || (hit & STG_CROSS) != 0;
-            switch (sel) {
-            case I_LOGS:
-                logs = !logs;
-                if (logs) bs_remove(BS_NOLOG); else bs_touch(BS_NOLOG);
-                status[0] = 0;
-                break;
-            case I_FPS:
-                unlocked = !unlocked;
-                if (unlocked) bs_touch(BS_FPS60); else bs_remove(BS_FPS60);
-                status[0] = 0;
-                break;
-            case I_FTRAV:
-                ftrav = !ftrav;
-                if (ftrav) bs_touch(BS_FTRAV); else bs_remove(BS_FTRAV);
-                status[0] = 0;
-                break;
-            case I_TROPHY:
-                trophies = !trophies;
-                if (trophies) bs_touch(BS_TRP); else bs_remove(BS_TRP);
-                status[0] = 0;
-                break;
-            case I_FULL:
-                full = !full;
-                if (full) bs_touch(BS_FULL); else bs_remove(BS_FULL);
-                status[0] = 0;
+            switch (u.sel) {
+            case I_LOGS:   bs_toggle(&u.logs, BS_NOLOG, 0); u.status[0] = 0; break;
+            case I_FPS:    bs_toggle(&u.unlocked, BS_FPS60, 1); u.status[0] = 0; break;
+            case I_FTRAV:  bs_toggle(&u.ftrav, BS_FTRAV, 1); u.status[0] = 0; break;
+            case I_TROPHY: bs_toggle(&u.trophies, BS_TRP, 1); u.status[0] = 0; break;
+            case I_FULL:   bs_toggle(&u.full, BS_FULL, 1); u.status[0] = 0; break;
+            case I_EXPORT:
+                if (!cross) { u.export_all = !u.export_all; u.xstatus[0] = 0; break; }
+                u.xstatus[0] = 0; u.busy = "Saving logs..."; u.frac = 0.0f;
+                bs_draw(&u);
+                bs_export_logs(&u);
+                prev = bs_pad();   /* the Circle that cancelled is not a press */
                 break;
             case I_RESET:
                 if (!cross) break;
-                if (!confirm) { confirm = 1; status[0] = 0; break; }
+                if (!u.confirm) { u.confirm = 1; u.status[0] = 0; break; }
                 {   int n = bs_rmtree(BS_CACHE);
-                    snprintf(status, sizeof status, "Deleted %d files", n);
+                    snprintf(u.status, sizeof u.status, "Deleted %d files", n);
                     vita_mark("settings: cache reset, %d files deleted", n); }
-                confirm = 0;
+                u.confirm = 0;
                 break;
             case I_START:
                 if (cross) quit = 1;
                 break;
             }
         }
-
-        glViewport(0, 0, BS_W, BS_H);
-        glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        if (fonts) {
-            const float W = (float)BS_W, H = (float)BS_H;
-            const float *white = BSC(255, 255, 255, 1.0f);
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            /* Vita Settings green, with a soft light across the upper half. */
-            bs_fill(0, 0, W, H, 0, BSC(112, 173, 18, 1.0f), BSC(29, 91, 9, 1.0f));
-            bs_fill(0, 0, W, hb, 0, BSC(255, 255, 255, 0.08f), BSC(255, 255, 255, 0.0f));
-            bs_text(&f_title, "Settings", rx + 10 * S, hb * 0.5f, white);
-            const char *sub = "Need for Speed Underground 2";
-            bs_text(&f_small, sub, W - rx - bs_text_w(&f_small, sub), hb * 0.5f, BSC(255, 255, 255, 0.8f));
-            bs_fill(rx, hb, W - 2 * rx, 1 * S, 0, BSC(255, 255, 255, 0.45f), NULL);
-
-            for (int i = 0; i < I_N; i++) {
-                float y = ry0 + i * rh, h = rh - 5 * S, yc = y + h * 0.5f;
-                int on = i == sel;
-                bs_fill(rx, y, W - 2 * rx, h, 6 * S,
-                        on ? BSC(38, 145, 225, 1.0f) : BSC(18, 72, 4, 0.18f),
-                        on ? BSC(8, 93, 184, 1.0f) : NULL);
-                bs_line(rx, y, W - 2 * rx, h, 6 * S, (on ? 2.0f : 1.0f) * S,
-                        BSC(255, 255, 255, on ? 1.0f : 0.55f));
-                bs_text(&f_label, names[i], rx + 18 * S, yc, white);
-                float vr = W - rx - 18 * S;
-                if (i == I_LOGS || i == I_FPS || i == I_FTRAV || i == I_TROPHY || i == I_FULL) {
-                    int checked = i == I_LOGS ? logs : i == I_FTRAV ? ftrav : i == I_TROPHY ? trophies :
-                                  i == I_FULL ? full : !unlocked;
-                    float b = 24 * S, bx = vr - b, by = yc - b * 0.5f;
-                    bs_fill(bx, by, b, b, 2 * S, BSC(0, 0, 0, 0.12f), NULL);
-                    bs_line(bx, by, b, b, 2 * S, 1.5f * S, white);
-                    if (checked) bs_shape(bx + 3 * S, by + 3 * S, b - 6 * S, b - 6 * S,
-                                          5.0f, 0, 2.8f * S, white, NULL);
-                    if (i == I_FPS) {
-                        const char *v = unlocked ? "Up to 60 FPS" : "30 FPS";
-                        bs_text(&f_small, v, bx - 16 * S - bs_text_w(&f_small, v), yc, white);
-                    }
-                } else {
-                    /* Small right-facing chevron, as in system setting rows. */
-                    bs_text(&f_label, ">", vr - bs_text_w(&f_label, ">"), yc, white);
-                }
-            }
-            const char *d = sel == I_RESET && status[0] ? status
-                          : sel == I_RESET && confirm ? "Select again to delete caches. Saves are kept."
-                          : help[sel];
-            float dy = ry0 + I_N * rh + 12 * S;
-            bs_text(&f_small, d, (W - bs_text_w(&f_small, d)) * 0.5f, dy, white);
-            /* Quiet footer, using the same white symbols as system menus. */
-            float fy = H - fb * 0.5f;
-            bs_fill(0, H - fb, W, 1 * S, 0, BSC(255, 255, 255, 0.25f), NULL);
-            float br = 9 * S, x = W - rx;
-            const char *t2 = "Start game", *t1 = "Enter";
-            x -= bs_text_w(&f_small, t2); bs_text(&f_small, t2, x, fy, white);
-            x -= 7 * S + br; bs_face_button(x, fy, br, 0); x -= br + 24 * S;
-            x -= bs_text_w(&f_small, t1); bs_text(&f_small, t1, x, fy, white);
-            x -= 7 * S + br; bs_face_button(x, fy, br, 1);
-            bsr_flush();
-            glDisable(GL_BLEND);
-            glUseProgram(0);
-        }
-        bs_present();
+        bs_draw(&u);
     }
     vita_mark("settings: closed (logs %s, frame rate %s, fast travel %s, trophies %s, full detail %s), restarting",
-              logs ? "on" : "off", unlocked ? "unlocked" : "30", ftrav ? "on" : "off", trophies ? "on" : "off",
-              full ? "on" : "off");
+              u.logs ? "on" : "off", u.unlocked ? "unlocked" : "30", u.ftrav ? "on" : "off", u.trophies ? "on" : "off",
+              u.full ? "on" : "off");
 }

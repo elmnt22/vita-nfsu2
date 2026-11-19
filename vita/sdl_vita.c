@@ -2416,17 +2416,37 @@ static int bs_font_raster_v(int face, int px, unsigned cp, unsigned char *buf, i
     return 1;
 }
 #define bs_font_raster(face, px, cp, buf, stride, cap, g) bs_font_raster_v(face, px, cp, buf, stride, cap, (void *)(g))
-/* a new press on the front touch screen, in screen pixels */
-static int bs_tap(int *x, int *y)
+/* the front touch screen while held, in screen pixels */
+static int bs_touch_now(int *x, int *y)
 {
-    static int init, down;
+    static int init;
     if (!init) { init = 1; sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START); }
     SceTouchData td; memset(&td, 0, sizeof td);
-    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) < 0) return 0;
-    int was = down; down = td.reportNum > 0;
-    if (!down || was) return 0;
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) < 0 || td.reportNum <= 0) return 0;
     *x = td.report[0].x * BS_W / 1920; *y = td.report[0].y * BS_H / 1088;
     return 1;
+}
+#define bs_fopen fopen
+static int bs_list(const char *dir, int dirs, char (*names)[64], int max)
+{
+    int n = 0;
+    SceUID d = sceIoDopen(dir);
+    if (d < 0) return 0;
+    SceIoDirent e;
+    for (;;) {
+        memset(&e, 0, sizeof e);
+        if (sceIoDread(d, &e) <= 0) break;
+        if (e.d_name[0] == '.' || (SCE_S_ISDIR(e.d_stat.st_mode) ? 1 : 0) != (dirs ? 1 : 0)) continue;
+        if (n < max) { snprintf(names[n], 64, "%s", e.d_name); n++; }
+    }
+    sceIoDclose(d);
+    return n;
+}
+static void bs_stamp(char *out, int cap)
+{
+    SceDateTime now; memset(&now, 0, sizeof now);
+    sceRtcGetCurrentClockLocalTime(&now);
+    logs_stamp(&now, out, cap);
 }
 #include "boot_settings.inc"
 
