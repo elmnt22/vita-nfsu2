@@ -351,6 +351,22 @@ int smk_load(const char *root, const char *stem)
     smk_world_reset();
     printf("smokeables: %s: %d infos (%d hulls), %d spawners in %d packs (%d without an info)\n",
            stem, g_ninfo, nhull, g_nsp, npack, noinfo);
+    {   /* spawner box census (perf 11-19): the touch test converts on this box */
+        double sx = 0, sy = 0, sz = 0; float mxx = 0; int big = 0;
+        for (int i = 0; i < g_nsp; i++) {
+            float dx = g_sp[i].mx[0] - g_sp[i].mn[0], dy = g_sp[i].mx[1] - g_sp[i].mn[1], dz = g_sp[i].mx[2] - g_sp[i].mn[2];
+            sx += dx; sy += dy; sz += dz; if (dx > mxx) mxx = dx; if (dy > mxx) mxx = dy; big += dx > 6 || dy > 6;
+        }
+        if (g_nsp) printf("smokeables: spawner boxes avg %.2f x %.2f x %.2f m, max side %.1f, %d over 6 m\n",
+                          sx / g_nsp, sy / g_nsp, sz / g_nsp, mxx, big);
+        if (getenv("OPENUG2_SMK_CENSUS")) {
+            int *cnt = calloc((size_t)(g_ninfo ? g_ninfo : 1), sizeof *cnt);
+            for (int i = 0; cnt && i < g_nsp; i++) if (g_sp[i].info >= 0 && g_sp[i].info < g_ninfo) cnt[g_sp[i].info]++;
+            for (int k = 0; cnt && k < g_ninfo; k++) if (cnt[k] >= 40)
+                printf("smokeables census: %-24s %5d (%s)\n", g_info[k].name, cnt[k], CATEGORY[g_info[k].category % 19]);
+            free(cnt);
+        }
+    }
     return g_nsp;
 }
 

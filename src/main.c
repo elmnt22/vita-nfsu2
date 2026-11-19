@@ -5077,7 +5077,9 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
         }
     }
 #endif
+    hitch_mark("pt.begin");
     n2sim_step(g_n2, 1.0f / 60.0f);
+    hitch_mark("pt.step");
     if (n2_cc) {                                /* 0x5ffa50, after the cars moved */
         CarCollHit hit[8];
         /* the player and the smokeable props, each with its polygons; the
@@ -5087,14 +5089,18 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
         cs[0].c = g_cc; cs[0].s = g_n2; cs[0].wc = &g_wcc; cs[0].human = 1;
         {   N2Body pb; n2sim_body(g_n2, &pb);
             smk_touch(pb.pos, carcoll_radius(g_cc)); }
+    hitch_mark("pt.touch");
         int nc = 1 + smk_bodies(cs + 1, 32, 1);
+        {   static long ncs, nct, ncm; ncs += nc - 1; if (nc - 1 > ncm) ncm = nc - 1;   /* live props per tick (perf 11-19) */
+            if (++nct >= 600) { printf("smokeables: %.1f live bodies per tick (max %ld)\n", ncs / 600.0, ncm); ncs = nct = ncm = 0; } }
         CarCollHit hall[24];
         int nall = carcoll_run_all(cs, nc, g_wcoll, hall, 24, NULL, NULL), nh = 0;
         if (nall > 24) nall = 24;
         for (int i = 0; i < nall; i++)          /* the player's walls; the props' hits are theirs */
             if (hall[i].car == 0 && hall[i].other < 0 && nh < 8) hit[nh++] = hall[i];
         {   static const int ids0[1] = { 0 };   /* the player: sound id 0 */
-            smk_coll_sounds(2, cs, nc, hall, nall, ids0); }
+        hitch_mark("pt.runall");
+        smk_coll_sounds(2, cs, nc, hall, nall, ids0); }
         smk_hit_fx(cs, nc, hall, nall);
         g_n2_nwhit = 0;
         for (int i = 0; i < nh && i < 8; i++) {
@@ -5119,10 +5125,12 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
             if (pr[i][0] == 0 && pr[i][1] < 0) { pr[k][0] = pr[i][0]; pr[k][1] = pr[i][1]; pr[k][2] = pr[i][2]; k++; }
         sfx_coll_pairs(0, (const int (*)[3])pr, k);
     }
+    hitch_mark("pt.pairs");
     if (n2_cc) {                                /* CheckTimers, SmokeableThink */
         N2Body pb; n2sim_body(g_n2, &pb);
         smk_end(pb.pos);
     }
+    hitch_mark("pt.end");
 #ifdef OPENUG2_SIM_PRE_H
     {   /* sim test: OPENUG2_SIM_NANCAR=<tick> poisons the sim state once (the recovery below) */
         static int nan_at = -2, nan_tick;
@@ -12790,6 +12798,14 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         /* the player's car met the props in its own tick */
         if (cs[i].human) { cs[i].noprops = 1; continue; }
         N2Body cb; n2sim_body(cs[i].s, &cb);
+        /* World Expansion: its streets hold ~25x Bayview's props (12,692 in one city), and
+           traffic far off kept 15-20 bodies live -- ~2-3 ms a frame on the Vita (hwxp4).
+           Out there nobody sees a cone fly; near the player nothing changes */
+        if (g_bey_xp && g_n2) {
+            N2Body pb; n2sim_body(g_n2, &pb);
+            float dx = cb.pos[0] - pb.pos[0], dy = cb.pos[1] - pb.pos[1];
+            if (dx * dx + dy * dy > 90.0f * 90.0f) continue;
+        }
         smk_touch(cb.pos, carcoll_radius(cs[i].c));
     }
     int ncars = nc;
@@ -24084,6 +24100,7 @@ int main(int argc, char **argv) {
                    line -- standing, that is the blow-off (SPRAY SHOW) -- and 0x5f6088 adds
                    the second NOS_BLOWOFF while *0x890118 is 0..3 (acid frame nitrous 2) */
                 g_acid_prerace = race_state == 0;
+                hitch_mark("sim.p_pre");
                 if (n2_active())
                     dmag = n2_player_tick(&scene, carpos, vel, &heading, &speed,
                                           on_line ? (ks[SDL_SCANCODE_W] ? 1.0f : 0.0f) :
@@ -24098,6 +24115,7 @@ int main(int argc, char **argv) {
                                      &surf_now, &g_vehicle,g_ride_ready?&g_ride:NULL,
                                      &g_drift);
                 }
+                hitch_mark("sim.p_tick");
                 {   static int drift_ticks = 0; static float drift_peak = 0, drift_kmh = 0;
                     if (g_drift.entered) {
                         drift_ticks = 0; drift_peak = 0; drift_kmh = PHYS_KMH(speed);

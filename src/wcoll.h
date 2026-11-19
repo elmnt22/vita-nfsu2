@@ -104,4 +104,5 @@ float wcoll_bump(int surface, float x, float y);
 #ifdef __cplusplus
 }
 #endif
+void wcoll_prof_take(long *gn, double *gms, long *cn, double *cms, long *cpolys);
 #endif

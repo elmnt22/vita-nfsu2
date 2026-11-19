@@ -9,6 +9,7 @@
 
 #include "physics.h"
 #include "resource.h"   /* LOAD_PUMP */
+#include "wcoll.h"
 
 #if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
 #define HITCH_THREAD 1   /* the frame thread counters in hitch_report */
@@ -561,6 +562,13 @@ void hitch_report(double threshold_ms) {
                          s_pre / s_frames, s_pre_max, s_wait / s_frames, s_wait_max, s_heap / s_frames, s_heap_max, s_heap1);
 #endif
             printf("%s\n", line);
+            {   long gn, cn, cp; double gms, cms;
+                wcoll_prof_take(&gn, &gms, &cn, &cms, &cp);
+                if (gn || cn)
+                    printf("wcoll queries per frame: ground %.1f (%.3f ms), gather %.1f (%.3f ms, %.1f polys each)\n",
+                           (double)gn / s_frames, gms / s_frames, (double)cn / s_frames, cms / s_frames,
+                           cn ? (double)cp / cn : 0.0);
+            }
             s_pre = s_pre_max = s_wait = s_wait_max = s_heap = s_heap_max = s_heap1 = 0;
             for (int k = 0; k < s_n; k++) s_sum[k] = s_max[k] = 0;
             s_total = s_total_max = 0;

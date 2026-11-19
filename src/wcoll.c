@@ -783,7 +783,7 @@ static int pack_ground(WColl *w, int pk, const float *p, float limit, int nogrou
     return best;
 }
 
-float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
+static float wcoll_ground_impl(WColl *w, WCollCtx *c, const float p[3],
                    int *surface, float normal[3], int *found)
 {
     if (w && w->xp && w->gstart) {   /* (port) expansion city: every pack under the point */
@@ -897,7 +897,7 @@ float wcoll_ground(WColl *w, WCollCtx *c, const float p[3],
    groups switched on; ordered as the original creates its TrackPolygon
    bodies (by polygon). */
 static int gather_pack(WColl *w, WCollCtx *c, const float mn[2], const float mx[2], WCollPoly *out, int max);
-int wcoll_gather(WColl *w, WCollCtx *c, const float pos[3], const float mn[2], const float mx[2],
+static int wcoll_gather_impl(WColl *w, WCollCtx *c, const float pos[3], const float mn[2], const float mx[2],
                  WCollPoly *out, int max)
 {
     if (!w) return 0;
@@ -987,4 +987,28 @@ static int gather_pack(WColl *w, WCollCtx *c, const float mn[2], const float mx[
         m++;
     }
     return m;
+}
+
+/* query profile (11-19, World Expansion perf): calls / time / polygons returned,
+   read and reset by wcoll_prof_take (main thread and workers both count) */
+static volatile long g_wp_gn, g_wp_cn, g_wp_cpolys; static volatile uint64_t g_wp_gt, g_wp_ct;
+float wcoll_ground(WColl *w, WCollCtx *c, const float p[3], int *surface, float normal[3], int *found)
+{
+    uint64_t t0 = SDL_GetPerformanceCounter();
+    float r = wcoll_ground_impl(w, c, p, surface, normal, found);
+    g_wp_gt += SDL_GetPerformanceCounter() - t0; g_wp_gn++;
+    return r;
+}
+int wcoll_gather(WColl *w, WCollCtx *c, const float pos[3], const float mn[2], const float mx[2], WCollPoly *out, int max)
+{
+    uint64_t t0 = SDL_GetPerformanceCounter();
+    int r = wcoll_gather_impl(w, c, pos, mn, mx, out, max);
+    g_wp_ct += SDL_GetPerformanceCounter() - t0; g_wp_cn++; g_wp_cpolys += r;
+    return r;
+}
+void wcoll_prof_take(long *gn, double *gms, long *cn, double *cms, long *cpolys)
+{
+    double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
+    *gn = g_wp_gn; *gms = (double)g_wp_gt * f; *cn = g_wp_cn; *cms = (double)g_wp_ct * f; *cpolys = g_wp_cpolys;
+    g_wp_gn = g_wp_cn = g_wp_cpolys = 0; g_wp_gt = g_wp_ct = 0;
 }
