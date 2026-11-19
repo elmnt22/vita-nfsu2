@@ -99,7 +99,7 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
     if (!grp || !ngrp || ngrp > MAXG || !nvb) { st.bad++; return; }
     if (nvb > 1) st.streams_multi++;
     /* groups -> streams: a new stream at each change of EffectId (+0x30) */
-    int gs[MAXG]; uint32_t gv[MAXG], gt[MAXG], eff[MAXG];
+    int gs[MAXG]; uint32_t gv[MAXG], gt[MAXG], eff[MAXG], seff[MAXS];
     uint32_t svert[MAXS] = {0};
     int s = 0;
     for (size_t g = 0; g < ngrp; g++) {
@@ -107,6 +107,7 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
         eff[g] = rd32(r + 0x30);
         if (g > 0 && eff[g] != eff[g - 1]) s++;
         if (s >= nvb) { st.bad++; return; }
+        seff[s] = eff[g];
         gs[g] = s; gv[g] = rd32(r + g_gvo); gt[g] = rd32(r + g_gto);
         svert[s] += gv[g];
         if (eff[g] < 32) st.effects[eff[g]]++;
@@ -139,7 +140,20 @@ static void conv_mesh(Buf *o, const uint8_t *p, size_t n)
     {   size_t c = open_chunk(o, 0x134b01); align_fill(o, 0x80);
         for (int k = 0; k < nvb; k++)
             for (uint32_t i = 0; i < svert[k]; i++) {
-                uint8_t vx[36]; memcpy(vx, vb[k] + (size_t)i * stride[k], 36);
+                uint8_t vx[36]; const uint8_t *sv = vb[k] + (size_t)i * stride[k];
+                memcpy(vx, sv, 36);
+                /* Carbon has two other orders (11-19, checked on every Palmont
+                   stream: unit normal + opaque colour at the offsets below):
+                   effects 5/25 pos, uv, colour, normal; effect 26 pos, colour,
+                   uv, normal. Read as pos/normal/colour/uv they drew rainbow
+                   building fronts. Out: pos, normal, colour, uv. */
+                if (g_grec == 0x90 && (seff[k] == 5 || seff[k] == 25)) {
+                    memcpy(vx + 12, sv + 24, 12); memcpy(vx + 24, sv + 20, 4); memcpy(vx + 28, sv + 12, 8);
+                    st.relaid++;
+                } else if (g_grec == 0x90 && seff[k] == 26) {
+                    memcpy(vx + 12, sv + 24, 12); memcpy(vx + 24, sv + 12, 4); memcpy(vx + 28, sv + 16, 8);
+                    st.relaid++;
+                }
                 if (g_night)   /* Rockport is daytime: its prelight down to a night level (B, G, R, A) */
                     for (int ch = 0; ch < 3; ch++) vx[24 + ch] = (uint8_t)(vx[24 + ch] * k_night[ch] + 0.5f);
                 put(o, vx, 36);

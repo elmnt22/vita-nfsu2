@@ -4526,6 +4526,13 @@ static int dxt_chain_levels(const N2Tex *t, int w, int h, int offset) {
 }
 #endif
 
+static void render_texdump(const N2Tex *t, GLuint id) {   /* test aid: OPENUG2_TEXDUMP_ID=<GL id> */
+    const char *e = getenv("OPENUG2_TEXDUMP_ID");
+    if (!e || (GLuint)atoi(e) != id) return;
+    printf("TEXDUMP id %u: %dx%d dxtfmt %d dxtlen %d prehalved %d\n", id, t->w, t->h, t->dxtfmt, t->dxtlen, t->prehalved);
+    FILE *f = t->dxt ? fopen("texdump.bin", "wb") : NULL;
+    if (f) { fwrite(t->dxt, 1, (size_t)t->dxtlen, f); fclose(f); }
+}
 GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
 #ifdef __vita__
     int dw, dh, offset, bytes;
@@ -4533,7 +4540,7 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
         GLenum fmt = t->dxtfmt == 1 ? GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
                    : t->dxtfmt == 3 ? GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
                                    : GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
-        GLuint id = 0; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
+        GLuint id = 0; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id); render_texdump(t, id);
         int levels = tex_mips_enabled() ? dxt_chain_levels(t, dw, dh, offset) : 0;
         if (levels > 1) {
             /* Filter first: the chain upload sets the GXM mip count from it.
@@ -4623,6 +4630,17 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
                         complete ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         if (complete) { tex_apply_aniso(); tex_track(id); }   /* needs a mip chain */
+        {   /* test aid: OPENUG2_TEXDUMP_ID=<GL id from a sim probe> logs that texture's source */
+            const char *e = getenv("OPENUG2_TEXDUMP_ID");
+            if (e && (GLuint)atoi(e) == id) {
+                printf("TEXDUMP id %u: %dx%d dxtfmt %d dxtlen %d levels %d complete %d first bytes", id, t->w, t->h,
+                       t->dxtfmt, t->dxtlen, level, complete);
+                for (int q = 0; q < 32 && q < t->dxtlen; q++) printf(" %02x", t->dxt[q]);
+                printf("\n");
+                if (t->rgb) { void write_png(const char *, int, int, const unsigned char *);
+                              write_png("texdump.png", t->w, t->h, t->rgb); }
+            }
+        }
         return id;
     }
     return upload_tex(t);   /* portable fallback: CPU-decoded RGBA + mipmaps */
@@ -4653,6 +4671,14 @@ void render_prehalve_tex(N2Tex *t) {
 
 GLuint upload_tex(const N2Tex *t) {
     GLuint id = 0; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
+    {   /* test aid: OPENUG2_TEXDUMP_ID=<GL id from a sim probe> saves that texture's pixels */
+        const char *e = getenv("OPENUG2_TEXDUMP_ID");
+        if (e && (GLuint)atoi(e) == id && t->rgb) {
+            void write_png(const char *, int, int, const unsigned char *);
+            printf("TEXDUMP id %u: %dx%d afmt %d (rgb path)\n", id, t->w, t->h, t->afmt);
+            write_png("texdump.png", t->w, t->h, t->rgb);
+        }
+    }
     int w = t->w, h = t->h;
     const unsigned char *rgb = t->rgb, *alpha = t->alpha;
 #ifdef __vita__
