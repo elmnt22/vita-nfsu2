@@ -1264,15 +1264,11 @@ static void paint_all(HDC dc, int cw, int chh) {
         }
     }
     void *g = gp_begin(dc);
-    /* the header: soft light shapes on the right, the tile, the title */
+    /* the header: soft light shapes on the right, the title */
     gp_circle(g, 520, -10, 300, ARGB(70, 255, 255, 255));
     gp_circle(g, 600, 40, 220, ARGB(60, 214, 230, 252));
-    gp_box(g, 24, 18, 80, 80, 16, ARGB(255, 22, 36, 64), 0, 0);
-    gp_box(g, 24, 18, 80, 40, 16, ARGB(40, 120, 180, 255), 0, 0);
-    glyph_at(dc, g_glyph_l, RGB(120, 214, 255), 24, 22, 80, 56, 0xE804);   /* a car */
-    text_at(dc, g_small, RGB(170, 200, 235), 24, 74, 80, 16, L"VITA", DT_CENTER | DT_SINGLELINE);
-    text_at(dc, g_title, RGB(14, 28, 52), 124, 20, 450, 36, L"NFSU2 Vita Prep Tool", DT_SINGLELINE);
-    text_at(dc, g_sub, RGB(56, 70, 92), 124, 58, 450, 40,
+    text_at(dc, g_title, RGB(14, 28, 52), CX0 + 8, 20, 540, 36, L"NFSU2 Vita Prep Tool", DT_SINGLELINE);
+    text_at(dc, g_sub, RGB(56, 70, 92), CX0 + 8, 58, 540, 40,
             L"Gets your NFSU2 PC files ready for the Vita: checks them, does the Vita’s one-time "
             L"“Optimizing world data” step here, and puts everything on the Vita.", DT_WORDBREAK);
 
