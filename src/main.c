@@ -10498,6 +10498,44 @@ static void trig_update(int free_run)
                        bd.pos[0], bd.pos[1], bd.pos[2], acid_live_particles());
             }
 }
+/* The expansion's own-rule races (g_xr: checkpoint / tollbooth / speedtrap): the player's next
+   gate carries a trigger glow, as the free-roam event starts do (port: MW / Carbon draw their own
+   gate models / speed cameras, not translated). GUESS: the sprint glow for timed gates, the world
+   challenge glow for speedtraps. */
+static AcidTrigger g_xr_trig[2]; static int g_xr_trig_init;
+static void xr_gate_fx(int live)
+{
+    if (!g_acid_ok) return;
+    if (!g_xr_trig_init) {
+        acid_trigger_init(&g_xr_trig[0], "XEE_EVENT_SPRINT");
+        acid_trigger_init(&g_xr_trig[1], "XEE_WORLD_CHALLENGE");
+        g_xr_trig_init = 1;
+    }
+    int k = g_xr.mode == BX_MODE_SPEEDTRAP, g = g_xr.nextg[0];
+    if (!live || !g_xr.on || !g_xr.located || g_xr.done || g < 0 || g >= g_xr.ng || g_showroom) {
+        acid_trigger_off(&g_xr_trig[0]); acid_trigger_off(&g_xr_trig[1]);
+        return;
+    }
+    acid_trigger_off(&g_xr_trig[1 - k]);
+    float at[3] = { g_xr.gp[g][0], g_xr.gp[g][1], 0.0f }, gz;
+    g_trig_zref = g_xr.gp[g][2];
+    if (!trig_ground(at[0], at[1], &gz)) gz = g_xr.gp[g][2];   /* the ground under the gate, else its own height */
+    at[2] = gz != 0.0f ? gz : 0.01f;
+    int was = g_xr_trig[k].on;
+    if (!acid_trigger_place(&g_xr_trig[k], at, trig_ground)) acid_trigger_off(&g_xr_trig[k]);
+    else if (!was) printf("xr: gate %d / %d glow at (%.0f %.0f %.1f), %d emitters\n", g + 1, g_xr.ng,
+                          (double)at[0], (double)at[1], (double)at[2], g_xr_trig[k].nlive);
+    static int fl = -1, fn;
+    if (fl < 0) fl = getenv("OPENUG2_FXLOG") != NULL;
+    if (fl && g_xr_trig[k].on && ++fn % 60 == 0 && g_n2) {
+        N2Body bd; n2sim_body(g_n2, &bd);
+        for (int i = 0; i < g_xr_trig[k].nlive; i++) {
+            const AcidEmitter *e = g_xr_trig[k].live[i];
+            printf("xr fx: #%d at (%.0f %.0f %.1f) state %d vis %.0f, car %.0f m, %d particles live\n", i, e->m[12], e->m[13], e->m[14],
+                   e->state, e->def ? e->def->vis : -1.0f, hypotf(e->m[12] - bd.pos[0], e->m[13] - bd.pos[1]), acid_live_particles());
+        }
+    }
+}
 /* the minimap's track window, kept by the HUD fill (hud_set_trackmap) */
 static struct { int ev; float x0, y0, ext; } g_wm_trk = { 4000, -3425.43f, 3287.26f, 5633.16f };
 /* the minimap's opponents (HudMapCar rivals), kept by the HUD fill */
@@ -29948,6 +29986,7 @@ int main(int argc, char **argv) {
             }
             trig_update((live && g_career_mode && g_rt.active && g_rt.roam && n2_active()) ||
                         (live && g_bey_roam && n2_active()));   /* UpdateTriggerEffects */
+            xr_gate_fx(live && g_rt.active && !g_rt.roam && race_state == 1 && n2_active());   /* own-rule race gates */
             {   /* The showroom stands in room space at the car's world spot (DISC01 under the
                    car), so a shop zone's marker (and any other world particle there) would
                    be drawn inside it, round the camera. The front end draws no world
