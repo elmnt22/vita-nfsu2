@@ -1440,12 +1440,12 @@ GLuint hud_wide_loading_tex(void) {
     return tex;
 }
 float hud_wide_loading_pin(float asp) {
-    /* nx = p + (fx - 320 p) / (240 asp) = -0.25 (the logo's centre) at the
-       strip's centre fx -82 (its "LOADING" left edge ~-161, last circle's
-       right edge ~-2; Vita HW shot 11-13) */
+    /* nx = p + (fx - 320 p) / (240 asp) = the logo's centre at the strip's
+       centre fx -82 (its "LOADING" left edge ~-161, last circle's right
+       edge ~-2; Vita HW shot 11-13) */
     float k = 1.0f - 320.0f / (240.0f * asp);
     if (k < 0.02f) return -1.0f;   /* 4:3: the authored layout */
-    float p = (-0.25f + 82.0f / (240.0f * asp)) / k;
+    float p = (HUD_WIDE_LOGO_CX * 2.0f - 1.0f + 82.0f / (240.0f * asp)) / k;
     return p < -1.0f ? -1.0f : p > 0.0f ? 0.0f : p;
 }
 int hud_is_wide_loading_res(const char *name) {

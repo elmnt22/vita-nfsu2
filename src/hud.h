@@ -344,10 +344,16 @@ void hud_screen_wrap(Hud *h, int on);
    asset is missing. hud_is_wide_loading_res: a resource name is PC_load. */
 GLuint hud_wide_loading_tex(void);
 int hud_is_wide_loading_res(const char *name);
+/* Where the logo sits in that art, as fractions of the picture (it covers
+   the whole screen): its centre across and its bottom. The Ultimate Vita
+   Edition art (img/nfsu2-uve.png, 11-19): logo x 32..634 of 1024, bottom
+   162 of 576. */
+#define HUD_WIDE_LOGO_CX     0.325f
+#define HUD_WIDE_LOGO_BOTTOM 0.282f
 /* PC_Loading's "LOADING" + circles strip (authored on the left edge, centre
-   x -82 of 640) moved to sit centred under the widescreen art's logo (37.5%
-   of the width, where the title's "Press START button" sits): the edge pin
-   (-1 left .. 0 centre) that puts it there at aspect `asp`. */
+   x -82 of 640) moved to sit centred under the widescreen art's logo
+   (HUD_WIDE_LOGO_CX, where the title's "Press START button" sits): the edge
+   pin (-1 left .. 0 centre) that puts it there at aspect `asp`. */
 float hud_wide_loading_pin(float asp);
 int  hud_screen_break(Hud *h, const char *name, float width, const char *txt, char (*out)[160], int max);   /* CTextScroller lines */
 const char *hud_screen_string(const Hud *h, uint32_t label);      /* English.bin */

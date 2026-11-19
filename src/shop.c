@@ -1709,6 +1709,34 @@ static const ShopTex *tex_find(const Shop *s, uint32_t key) {
     return NULL;
 }
 
+/* Loading_Controller's logo UG_load_logo.tga (drawn 384x48) in the Ultimate
+   Vita Edition art: 512x64 straight-alpha RGBA (ug_load_logo.raw, made from
+   img/uga_load_logo.png by tools/ugl_png.py). ux0:data/NFSU2 first (art tests
+   without a reinstall), then the app's copy; 0 = the game's own logo. Loaded
+   once and kept (128 KB). */
+#define LS_CTL_LOGO_KEY 0x1c5dabaau
+#define LS_LOGO_W 512
+#define LS_LOGO_H 64
+static GLuint ls_logo_tex(void) {
+    static GLuint tex; static int tried;
+    if (tried) return tex;
+    tried = 1;
+    static const char *const k_path[2] = { "ux0:data/NFSU2/ug_load_logo.raw", "app0:assets/ug_load_logo.raw" };
+    const size_t n = (size_t)LS_LOGO_W * LS_LOGO_H * 4;
+    for (int k = 0; k < 2 && !tex; k++) {
+        FILE *f = fopen(k_path[k], "rb");
+        if (!f) continue;
+        unsigned char *px = (unsigned char *)malloc(n);
+        int ok = px && fread(px, 1, n, f) == n;
+        fclose(f);
+        if (ok) tex = upload_rgba(LS_LOGO_W, LS_LOGO_H, px);
+        else printf("shop: %s is not 512x64 RGBA, ignored\n", k_path[k]);
+        if (tex) printf("shop: loading logo %s\n", k_path[k]);
+        free(px);
+    }
+    return tex;
+}
+
 /* The PC packages park the console help bar (the "Help" prompt
    $JOY_EVENT_FENG_HELP$ and the screen's own prompts, with the bottom box
    they sit on) below the 480-high screen, y 285..305, for its mouse bar;
@@ -1970,6 +1998,8 @@ static void prepare_package(Shop *s, int p) {
     for (int r = 0; r < pk->nres; r++) {
         const ShopTex *t = pk->res[r].type == 1 ? tex_find(s, feng_tex_key(pk->res[r].name)) : NULL;
         s->res_tex[p][r] = t ? t->tex : 0;
+        if (p == PK_LOADING_CTL && pk->res[r].type == 1 && feng_tex_key(pk->res[r].name) == LS_CTL_LOGO_KEY && ls_logo_tex())
+            s->res_tex[p][r] = ls_logo_tex();
     }
     for (int i = 0; i < pk->nobj; i++) {
         const FengObj *o = &pk->obj[i];
@@ -2183,8 +2213,28 @@ static const struct { int act; uint32_t str; int career; } k_lsc_act[LSC_N] = { 
 };
 #define LSC_NOT_USED 0xf8b4303bu
 
-/* the controls, in picture pixels (body centre 128, 131) */
+/* the art came from loading_controller.raw (lsc_device_file), not lsc_device */
+static int g_lsc_art;
+/* the controls, in picture pixels: the drawn device (body centre 128, 131),
+   or the PS Vita art (img/loading_controller_new.png, 11-19: d-pad 33,113,
+   sticks 40 / 217,141, buttons round 222,112, screen 57..199 x 84..163,
+   back view's touch pad 98..158 x 200..234) */
 static void lsc_anchor(int vb, float *x, float *y) {
+    static const float art[VB_COUNT][2] = {
+        { 0, 0 },
+        { 222, 121 }, { 233, 112 }, { 212, 112 }, { 222, 102 },   /* cross circle square triangle */
+        { 42, 80 }, { 214, 80 },                                  /* L R: the shoulder edges */
+        { 33, 104 }, { 33, 121 }, { 24, 113 }, { 42, 113 },       /* d-pad up down left right */
+        { 226, 160 }, { 213, 160 },                               /* start select */
+        { 40, 141 }, { 40, 141 },                                 /* left stick left / right */
+        { 113, 209 }, { 143, 209 }, { 113, 225 }, { 143, 225 },   /* rear touch quarters */
+        { 40, 132 }, { 40, 150 },                                 /* left stick up / down */
+        { 217, 132 }, { 217, 150 },                               /* right stick up / down */
+        { 208, 141 }, { 226, 141 },                               /* right stick left / right */
+        { 93, 104 }, { 163, 104 },                                /* front touch quarters */
+        { 93, 143 }, { 163, 143 }
+    };
+    if (g_lsc_art) { *x = art[vb][0]; *y = art[vb][1]; return; }
     static const float a[VB_COUNT][2] = {
         { 0, 0 },
         { 216, 124 }, { 226, 114 }, { 206, 114 }, { 216, 104 },
@@ -2339,7 +2389,8 @@ static void lsc_build(unsigned char *rgba, const float *slot_y, const int *vb, i
     float *cv = (float *)calloc((size_t)LSC_W * LSC_W * 4, sizeof(float));
     for (int i = 0; i < LSC_N; i++) lab[i] = 0;
     if (!cv) { memset(rgba, 0, (size_t)LSC_W * LSC_W * 4); return; }
-    if (!lsc_device_file(cv)) lsc_device(cv);
+    g_lsc_art = lsc_device_file(cv);
+    if (!g_lsc_art) lsc_device(cv);
     if (getenv("OPENUG2_LSC_DUMP")) {   /* tools: the device layer + the label rows, for the art template */
         FILE *df = fopen(getenv("OPENUG2_LSC_DUMP"), "wb");
         if (df) {
@@ -11025,15 +11076,15 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
             float b[4] = { c[0], c[1], c[2], 0.55f + 0.45f * cosf(s->blink * 3.0f) };
             /* user 11-13: "Press START button" (not the PC's "Please press
                START to begin"), centred under the logo of the widescreen
-               art (hud_wide_loading_tex: the logo's centre at 37.5% of the
-               width, its bottom at 35% of the height) */
+               art (hud_wide_loading_tex: HUD_WIDE_LOGO_CX across, just
+               under HUD_WIDE_LOGO_BOTTOM) */
             static const char k_press[] = "Press START button";
             int fi = o->res >= 0 && o->res < pk->nres ? s->font_of[p][o->res] : -1;
             if (p == PK_SPLASH && hud_wide_loading_tex() && fi >= 0 && s->font[fi].ok) {
                 const FengFont *f = &s->font[fi].f;
                 float sc = o->size[0], tw = feng_text_width(f, k_press) * sc;
                 float lh = ((float)o->lead + (float)f->line) * sc;
-                float cx = (0.375f - 0.5f) * 480.0f * dc->asp, cy = (0.405f - 0.5f) * 480.0f;
+                float cx = (HUD_WIDE_LOGO_CX - 0.5f) * 480.0f * dc->asp, cy = (HUD_WIDE_LOGO_BOTTOM + 0.055f - 0.5f) * 480.0f;
                 float tx = cx - 0.5f * tw, ty = cy - 0.5f * lh;
                 if (o->just & FENG_JUST_HCENTER) tx += 0.5f * tw; else if (o->just & FENG_JUST_RIGHT) tx += tw;
                 if (o->just & FENG_JUST_VCENTER) ty += 0.5f * lh; else if (o->just & FENG_JUST_BOTTOM) ty += lh;
@@ -11084,6 +11135,7 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
         GLuint tex = s->res_tex[p][o->res];
         if (!tex) continue;
         const ShopTex *st = tex_find(s, feng_tex_key(pk->res[o->res].name));
+        if (st && st->tex != tex) st = NULL;   /* swapped art (ls_logo_tex): plain alpha */
         if (ov_img && ov_img->geom) {  /* a slider's handle / fill */
             blit(dc, tex, ov_img->w, ov_img->h, ov_img->x, ov_img->y, o->aangle, c, st && st->additive);
             continue;

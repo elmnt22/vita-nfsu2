@@ -103,8 +103,10 @@ PACK=(-s "$OUT/sce_sys/param.sfo" -b "$OUT/eboot.bin")
 while IFS= read -r f; do
     PACK+=(-a "$f=sce_sys/${f#"$ROOT/vita/sce_sys/"}")
 done < <(find "$ROOT/vita/sce_sys" -type f)
-# loading-screen controller art: img/loading_controller.png -> assets/loading_controller.raw
+# loading-screen controller art: img/loading_controller_new.png -> assets/loading_controller.raw
 python "$ROOT/tools/lsc_png.py" || echo "lsc_png failed: drawn controller used"
+# controls loading screen logo: img/uga_load_logo.png -> assets/ug_load_logo.raw
+python "$ROOT/tools/ugl_png.py" || echo "ugl_png failed: game logo used"
 # app assets (app0:assets/...): the tile conversion screen background
 while IFS= read -r f; do
     PACK+=(-a "$f=assets/${f#"$ROOT/vita/assets/"}")

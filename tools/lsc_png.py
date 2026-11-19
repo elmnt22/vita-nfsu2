@@ -1,13 +1,15 @@
-"""Loading-screen controller art: img/loading_controller.png (256x256, any
-PNG mode, transparent background) -> vita/assets/loading_controller.raw
-(256x256 straight-alpha RGBA, read by shop.c lsc_device_file) and the
-simulator's copy. Run by vita/build_vita.sh; does nothing without the PNG.
+"""Loading-screen controller art: img/loading_controller_new.png (the PS
+Vita art, 11-19; 256x256, any PNG mode, transparent background) ->
+vita/assets/loading_controller.raw (256x256 straight-alpha RGBA, read by
+shop.c lsc_device_file) and the simulator's copy. The leader lines end on
+shop.c lsc_anchor's art table, so a control that moves in the art moves
+there too. Run by vita/build_vita.sh; does nothing without the PNG.
   python tools/lsc_png.py [png] [out.raw ...]"""
 import os, sys
 from PIL import Image
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, '..', 'img', 'loading_controller.png')
+src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, '..', 'img', 'loading_controller_new.png')
 outs = sys.argv[2:] or [os.path.join(root, 'vita', 'assets', 'loading_controller.raw'),
                         os.path.join(root, '..', 'simroot', 'app0', 'assets', 'loading_controller.raw')]
 if not os.path.exists(src):
