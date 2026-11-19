@@ -1338,19 +1338,22 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
     }
     {   double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
         Uint64 c3 = SDL_GetPerformanceCounter();
-        tw += (double)g_bp_world * f; g_bp_world = 0;
+        double run_world = (double)g_bp_world * f;   /* this run's world gathers (the worst-run line) */
+        tw += run_world; g_bp_world = 0;
         tb += (double)(c1 - c0) * f; tn += (double)(c2 - c1) * f; tr += (double)(c3 - c2) * f;
         pairs_sum += W.npairs; iters_sum += iters;
         {   /* the worst run of the window and what its resolves were against */
-            static double wms; static int wit, ww, wp, wc, wn, wpairs, wpolys;
+            static double wms, wbp, wnr, wrs, wwg; static int wit, ww, wp, wc, wn, wpairs, wpolys;
             double ms = (double)(c3 - c0) * f;
             if (ms > wms) {
                 int polys = 0; for (int i = 0; i < n; i++) polys += np[i];
                 wms = ms; wit = iters; ww = it_world; wp = it_prop; wc = it_car; wn = n; wpairs = W.npairs; wpolys = polys;
+                wbp = (double)(c1 - c0) * f; wnr = (double)(c2 - c1) * f; wrs = (double)(c3 - c2) * f; wwg = run_world;
             }
             if (n > 1 && runs + 1 >= 1200 && wms > 0) {
-                printf("contacts worst run: %.2f ms, %d resolves (%d world, %d prop, %d car), %d pairs, %d bodies, %d world polys\n",
-                       wms, wit, ww, wp, wc, wpairs, wn, wpolys);
+                printf("contacts worst run: %.2f ms, %d resolves (%d world, %d prop, %d car), %d pairs, %d bodies, %d world polys"
+                       " | first broadphase %.2f narrow %.2f resolve loop %.2f, world gathers %.2f ms\n",
+                       wms, wit, ww, wp, wc, wpairs, wn, wpolys, wbp, wnr, wrs, wwg);
                 wms = 0;
             }
         }
