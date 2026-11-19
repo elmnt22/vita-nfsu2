@@ -2552,7 +2552,11 @@ static void hud_draw_map(Hud *h, const HudDC *dc, const HudState *s) {
         fan.nidx = MAP_FAN * 3;
         draw_gpumesh(&fan);
     }
-    if (tm) { hud_draw_map_icons(h, dc, s, cx, cy, mr, view, rot); return; }
+    /* a TRACKMAP has the race's route drawn in it (Bayview). The World
+       Expansion's city map is one picture for every race: its route is drawn
+       over it (the road-following race line), then the icons. */
+    const int tm_route = tm && h->tm_event == -2 && s->racing && s->route_line && s->route_line_n > 1;
+    if (tm && !tm_route) { hud_draw_map_icons(h, dc, s, cx, cy, mr, view, rot); return; }
     /* free-roam road network: dots, cheap and cullable (no street map only) */
     if (!h->map_tex && !s->racing && s->nav_xy && s->nav_n > 0) {
         int drawn = 0;
@@ -2610,9 +2614,10 @@ static void hud_draw_map(Hud *h, const HudDC *dc, const HudState *s) {
             float len = sqrtf(dx*dx + dy*dy);
             if (len < 1e-5f) continue;
             hud_blit(dc, 0, len, 0.020f * k, (ax+bx)*0.5f, (ay+by)*0.5f,
-                     atan2f(dy, dx), 0.30f, 0.80f, 1.0f, 0.95f);
+                     atan2f(dy, dx), tm_route ? 1.0f : 0.30f, tm_route ? 1.0f : 0.80f, 1.0f, 0.95f);   /* over a city map: white, as the TRACKMAPs draw it */
         }
     }
+    if (tm) { hud_draw_map_icons(h, dc, s, cx, cy, mr, view, rot); return; }
     /* the armed gate: the one checkpoint that actually counts next */
     if (s->route_xy && s->route_next >= 0 && s->route_next < s->route_n && h->o_gate >= 0) {
         float px, py; int in;

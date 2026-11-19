@@ -4,6 +4,7 @@
 #include "nfsu2.h"
 #include "smokeable.h"
 #include "beyond.h"
+#include "xpcity.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -2433,6 +2434,185 @@ static int wt_flip_artwork(N2Mesh *m) {
     return 1;
 }
 
+/* Palmont's sea (11-19). Carbon has two copies of its sea sheet: PAN_Ocean_Xenon
+   (instance flag 0x80000, high world detail) and PAN_Ocean_CG (0x40000, low);
+   NFSC.exe 0x79afa0 draws one or the other, never both. We draw the first.
+   The sheet lies at ~0 m over the whole west of the city, where a district of
+   streets is up to 11 m lower: drawn as it is, the sea covers them and the car
+   drives under it. The city's sea mask (<companion>.SEA, xpconv.c
+   sea_mask_write: dry land below the sea that a road reaches) cuts it open there. */
+typedef struct { int w, h; float x0, y0, cell; int *sat; } WtSea;   /* sat: summed-area table, (w+1)*(h+1) */
+static WtSea g_wt_sea; static char g_wt_sea_track[64]; static int g_wt_sea_tried;
+static long g_wt_sea_cut, g_wt_sea_tris;
+static const WtSea *wt_sea_mask(const char *track) {
+    if (strcmp(g_wt_sea_track, track)) {
+        free(g_wt_sea.sat); memset(&g_wt_sea, 0, sizeof g_wt_sea); g_wt_sea_tried = 0;
+        snprintf(g_wt_sea_track, sizeof g_wt_sea_track, "%s", track);
+    }
+    if (g_wt_sea_tried) return g_wt_sea.sat ? &g_wt_sea : NULL;
+    g_wt_sea_tried = 1;
+    const char *map = xpcity_map(track);
+    if (!map) return NULL;
+    char p[1100]; snprintf(p, sizeof p, "%s", map);
+    char *dot = strrchr(p, '.'); if (!dot) return NULL;
+    strcpy(dot, ".SEA");
+    FILE *f = fopen(p, "rb"); if (!f) { printf("world tiles: no sea mask %s (the sea is not cut)\n", p); return NULL; }
+    uint32_t hd[3]; float fl[3];
+    int ok = fread(hd, 4, 3, f) == 3 && fread(fl, 4, 3, f) == 3 && !memcmp(hd, "SEAM", 4) &&
+             hd[1] > 0 && hd[2] > 0 && hd[1] <= 4096 && hd[2] <= 4096 && fl[2] > 0;
+    int W = ok ? (int)hd[1] : 0, H = ok ? (int)hd[2] : 0;
+    size_t nb = ((size_t)W * H + 7) / 8;
+    uint8_t *bits = ok ? malloc(nb) : NULL;
+    int *sat = ok ? malloc((size_t)(W + 1) * (H + 1) * sizeof *sat) : NULL;
+    if (ok) ok = bits && sat && fread(bits, 1, nb, f) == nb;
+    fclose(f);
+    if (!ok) { free(bits); free(sat); printf("world tiles: bad sea mask %s\n", p); return NULL; }
+    for (int x = 0; x <= W; x++) sat[x] = 0;
+    for (int y = 0; y < H; y++) {
+        int row = 0; sat[(size_t)(y + 1) * (W + 1)] = 0;
+        for (int x = 0; x < W; x++) {
+            size_t b = (size_t)y * W + x;
+            row += (bits[b >> 3] >> (b & 7)) & 1;
+            sat[(size_t)(y + 1) * (W + 1) + x + 1] = sat[(size_t)y * (W + 1) + x + 1] + row;
+        }
+    }
+    free(bits);
+    g_wt_sea.w = W; g_wt_sea.h = H; g_wt_sea.x0 = fl[0]; g_wt_sea.y0 = fl[1]; g_wt_sea.cell = fl[2]; g_wt_sea.sat = sat;
+    printf("world tiles: sea mask %s %dx%d, %d cells cut\n", p, W, H, sat[(size_t)H * (W + 1) + W]);
+    return &g_wt_sea;
+}
+static int wt_sea_count(const WtSea *s, int x0, int y0, int x1, int y1) {   /* cells [x0,x1) x [y0,y1) */
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > s->w) x1 = s->w;
+    if (y1 > s->h) y1 = s->h;
+    if (x0 >= x1 || y0 >= y1) return 0;
+    const int *t = s->sat; int W = s->w + 1;
+    return t[(size_t)y1 * W + x1] - t[(size_t)y0 * W + x1] - t[(size_t)y1 * W + x0] + t[(size_t)y0 * W + x0];
+}
+typedef struct { float x, y, b[3]; } WtSeaP;   /* a clipped corner: xy + the triangle's barycentric weights */
+typedef struct { float *v, *nrm; unsigned char *vc; uint16_t *ix; int nv, ni, cv, ci, has_n, has_c; } WtSeaOut;
+static int wt_sea_vert(WtSeaOut *o, const N2Mesh *m, const int t[3], const float b[3]) {
+    if (o->nv >= 65535) return -1;
+    if (o->nv == o->cv) {
+        int c = o->cv ? o->cv * 2 : 1024;
+        float *v = realloc(o->v, (size_t)c * 5 * sizeof *v); if (!v) return -1; o->v = v;
+        if (o->has_n) { float *n = realloc(o->nrm, (size_t)c * 3 * sizeof *n); if (!n) return -1; o->nrm = n; }
+        if (o->has_c) { unsigned char *q = realloc(o->vc, (size_t)c * 4); if (!q) return -1; o->vc = q; }
+        o->cv = c;
+    }
+    int k = o->nv++;
+    for (int a = 0; a < 5; a++) o->v[k*5+a] = b[0]*m->verts[t[0]*5+a] + b[1]*m->verts[t[1]*5+a] + b[2]*m->verts[t[2]*5+a];
+    if (o->has_n) {
+        const float *N = m->verts + (size_t)m->nverts * 5;
+        for (int a = 0; a < 3; a++) o->nrm[k*3+a] = b[0]*N[t[0]*3+a] + b[1]*N[t[1]*3+a] + b[2]*N[t[2]*3+a];
+    }
+    if (o->has_c)
+        for (int a = 0; a < 4; a++) {
+            float c = b[0]*m->vcol[t[0]*4+a] + b[1]*m->vcol[t[1]*4+a] + b[2]*m->vcol[t[2]*4+a];
+            o->vc[k*4+a] = (unsigned char)(c < 0 ? 0 : c > 255 ? 255 : c + 0.5f);
+        }
+    return k;
+}
+static int wt_sea_idx(WtSeaOut *o, int a, int b, int c) {
+    if (o->ni + 3 > o->ci) {
+        int n = o->ci ? o->ci * 2 : 3072;
+        uint16_t *q = realloc(o->ix, (size_t)n * sizeof *q); if (!q) return 0;
+        o->ix = q; o->ci = n;
+    }
+    o->ix[o->ni++] = (uint16_t)a; o->ix[o->ni++] = (uint16_t)b; o->ix[o->ni++] = (uint16_t)c;
+    return 1;
+}
+/* the triangle's part inside the box [bx0,bx1] x [by0,by1] (Sutherland-Hodgman), as a fan */
+static int wt_sea_emit(WtSeaOut *o, const N2Mesh *m, const int t[3], float bx0, float by0, float bx1, float by1) {
+    WtSeaP P[16], Q[16]; int n = 3;
+    for (int k = 0; k < 3; k++) {
+        P[k].x = m->verts[t[k]*5]; P[k].y = m->verts[t[k]*5+1];
+        P[k].b[0] = P[k].b[1] = P[k].b[2] = 0; P[k].b[k] = 1;
+    }
+    for (int e = 0; e < 4 && n; e++) {
+        int q = 0;
+        for (int i = 0; i < n; i++) {
+            const WtSeaP *A = &P[i], *B = &P[(i + 1) % n];
+            float da, db;
+            switch (e) {
+            case 0: da = A->x - bx0; db = B->x - bx0; break;
+            case 1: da = bx1 - A->x; db = bx1 - B->x; break;
+            case 2: da = A->y - by0; db = B->y - by0; break;
+            default: da = by1 - A->y; db = by1 - B->y; break;
+            }
+            if (da >= 0 && q < 16) Q[q++] = *A;
+            if ((da >= 0) != (db >= 0) && q < 16) {
+                float s = da / (da - db); WtSeaP X;
+                X.x = A->x + s * (B->x - A->x); X.y = A->y + s * (B->y - A->y);
+                for (int a = 0; a < 3; a++) X.b[a] = A->b[a] + s * (B->b[a] - A->b[a]);
+                Q[q++] = X;
+            }
+        }
+        n = q; memcpy(P, Q, (size_t)n * sizeof *P);
+    }
+    if (n < 3) return 1;
+    int first = wt_sea_vert(o, m, t, P[0].b), prev = wt_sea_vert(o, m, t, P[1].b);
+    if (first < 0 || prev < 0) return 0;
+    for (int i = 2; i < n; i++) {
+        int cur = wt_sea_vert(o, m, t, P[i].b);
+        if (cur < 0 || !wt_sea_idx(o, first, prev, cur)) return 0;
+        prev = cur;
+    }
+    return 1;
+}
+static int wt_sea_quad(WtSeaOut *o, const N2Mesh *m, const int t[3], const WtSea *s, int cx, int cy, int size) {
+    int cnt = wt_sea_count(s, cx, cy, cx + size, cy + size);
+    if (cnt == size * size) return 1;                       /* all dry land: no sea here */
+    if (!cnt || size == 1) {
+        float bx0 = s->x0 + cx * s->cell, by0 = s->y0 + cy * s->cell;
+        return wt_sea_emit(o, m, t, bx0, by0, bx0 + size * s->cell, by0 + size * s->cell);
+    }
+    int h = size / 2;
+    return wt_sea_quad(o, m, t, s, cx, cy, h) && wt_sea_quad(o, m, t, s, cx + h, cy, h) &&
+           wt_sea_quad(o, m, t, s, cx, cy + h, h) && wt_sea_quad(o, m, t, s, cx + h, cy + h, h);
+}
+static int wt_sea_cut(N2Mesh *m, const WtSea *s) {
+    if (!m->verts || m->nverts <= 0 || !m->idx || m->nidx < 3) return 0;
+    WtSeaOut o; memset(&o, 0, sizeof o);
+    o.has_n = m->authored_normals != 0; o.has_c = m->vcol != NULL;
+    int ok = 1, cut = 0;
+    static const float one[3][3] = { {1,0,0}, {0,1,0}, {0,0,1} };
+    for (int i = 0; i + 2 < m->nidx && ok; i += 3) {
+        int t[3] = { m->idx[i], m->idx[i+1], m->idx[i+2] };
+        float mnx = 1e30f, mny = 1e30f, mxx = -1e30f, mxy = -1e30f;
+        for (int k = 0; k < 3; k++) {
+            float x = m->verts[t[k]*5], y = m->verts[t[k]*5+1];
+            if (x < mnx) mnx = x;
+            if (x > mxx) mxx = x;
+            if (y < mny) mny = y;
+            if (y > mxy) mxy = y;
+        }
+        int cx0 = (int)floorf((mnx - s->x0) / s->cell), cy0 = (int)floorf((mny - s->y0) / s->cell);
+        int cx1 = (int)floorf((mxx - s->x0) / s->cell) + 1, cy1 = (int)floorf((mxy - s->y0) / s->cell) + 1;
+        if (!wt_sea_count(s, cx0, cy0, cx1, cy1)) {         /* untouched: as it was */
+            int a = wt_sea_vert(&o, m, t, one[0]), b = wt_sea_vert(&o, m, t, one[1]), c = wt_sea_vert(&o, m, t, one[2]);
+            ok = a >= 0 && b >= 0 && c >= 0 && wt_sea_idx(&o, a, b, c);
+            continue;
+        }
+        cut++;
+        int size = 1; while (size < cx1 - cx0 || size < cy1 - cy0) size *= 2;
+        ok = wt_sea_quad(&o, m, t, s, cx0, cy0, size);
+    }
+    if (!ok || !o.ni) { free(o.v); free(o.nrm); free(o.vc); free(o.ix); return 0; }
+    N2SharedGeometry *g = calloc(1, sizeof *g);
+    float *v = malloc((size_t)o.nv * (o.has_n ? 8 : 5) * sizeof *v);
+    if (!g || !v) { free(g); free(v); free(o.v); free(o.nrm); free(o.vc); free(o.ix); return 0; }
+    memcpy(v, o.v, (size_t)o.nv * 5 * sizeof *v);
+    if (o.has_n) memcpy(v + (size_t)o.nv * 5, o.nrm, (size_t)o.nv * 3 * sizeof *v);
+    free(o.v); free(o.nrm);
+    n2_mesh_geometry_release(m);
+    g->refs = 1; g->verts = v; g->idx = o.ix; g->vcol = o.vc;
+    m->shared_geometry = g; m->verts = v; m->idx = o.ix; m->vcol = o.vc; m->nverts = o.nv; m->nidx = o.ni;
+    g_wt_sea_cut += cut; g_wt_sea_tris += o.ni / 3;
+    return 1;
+}
+
 /* Buildings arriving at the edge: which tiles gave objects to the last
    assembly, so this one can mark the ones that are new (N2Mesh.fade_in; main
    fades them in instead of popping). A first build, or one that is mostly new
@@ -2764,6 +2944,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                Palmont (11-19). Packs converted before then still hold them;
                nfsu2.h drops them from new conversions. Bayview has none. */
             if (strstr(m->sname, "REFLECTIONBARRI") && m->world_role != 1 && m->world_role != 4) continue;
+            if (!strcmp(m->sname, "PAN_OCEAN_CG") && xpcity_is_city(track)) continue;   /* Carbon's low-detail sea (wt_sea_mask) */
 #ifdef OPENUG2_SIM_PRE_H
             if (getenv("OPENUG2_SIM_NOSHEET") && !strncmp(m->sname, getenv("OPENUG2_SIM_NOSHEET"), strlen(getenv("OPENUG2_SIM_NOSHEET")))) continue;   /* test aid: hide meshes by name prefix */
 #endif
@@ -2784,6 +2965,10 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
             if (m->scen_has && sel.count && role != 1 && role != 4 &&
                 wg_selection_flipped(&sel, m->scen_region, m->scen_index))
                 wt_flip_artwork(&scene->meshes[scene->count - 1]);
+            if (!strcmp(m->sname, "PAN_OCEAN_XENON") && xpcity_is_city(track)) {
+                const WtSea *sea = wt_sea_mask(track);
+                if (sea) wt_sea_cut(&scene->meshes[scene->count - 1], sea);
+            }
 #ifdef OPENUG2_SIM_PRE_H
             if (getenv("OPENUG2_SIM_FLIPLOG") && strstr(m->sname, "TRACKBARRIER")) {   /* test aid: each barrier's arrow axis */
                 const N2Mesh *q = &scene->meshes[scene->count - 1];
@@ -2830,6 +3015,8 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         if (g_wt_flipped || g_wt_flip_fail)
             printf("world tiles: %ld race barrier meshes flipped (arrows the other way), %ld could not be\n", g_wt_flipped, g_wt_flip_fail);
         g_wt_flipped = g_wt_flip_fail = 0;
+        if (g_wt_sea_tris) printf("world tiles: sea cut open over dry land: %ld of its triangles cut, %ld after\n", g_wt_sea_cut, g_wt_sea_tris);
+        g_wt_sea_cut = g_wt_sea_tris = 0;
         stats->meshes_placed = scene->count;
     }
     g_wt_radius = radius;

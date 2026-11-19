@@ -286,6 +286,24 @@ int xpp_convert(XppJob *job, int ask_on_bad, HWND owner) {
                                     k_city[c].game == XP_GAME_CARBON ? 7601 : 7301, &es);
                 printf("xpprep: %s race events: %s (%ld races -> %ld events: %ld circuits, %ld sprints, %ld drags; %ld skipped, %ld dropped)\n",
                        k_city[c].name, erc == XP_OK ? "made" : "none", es.races, es.events, es.circuits, es.sprints, es.drags, es.skipped, es.dropped);
+                if (erc == XP_OK && k_city[c].game == XP_GAME_MW) {   /* each race's own map (the game's xpcity_race_map reads them) */
+                    char mdir[MAX_PATH + 64], src[MAX_PATH + 160], dst[MAX_PATH + 160], pat[MAX_PATH + 80];
+                    snprintf(mdir, sizeof mdir, "%s\\stage\\TRACKS\\RACEMAPS%s", g_out, k_city[c].companion);
+                    CreateDirectoryA(mdir, NULL);
+                    snprintf(pat, sizeof pat, "%s\\TRACKS\\%s\\MINI_MAP_*.BIN", g_dir[c], k_city[c].companion);
+                    int nmap = 0;
+                    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+                    if (h != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (!strcmp(fd.cFileName, "MINI_MAP.BIN")) continue;   /* the city map (made into the .MAP) */
+                            snprintf(src, sizeof src, "%s\\TRACKS\\%s\\%s", g_dir[c], k_city[c].companion, fd.cFileName);
+                            snprintf(dst, sizeof dst, "%s\\%s", mdir, fd.cFileName);
+                            nmap += copy_file(src, dst);
+                        } while (FindNextFileA(h, &fd));
+                        FindClose(h);
+                    }
+                    printf("xpprep: %s race maps: %d copied\n", k_city[c].name, nmap);
+                }
             }
             if (ok) {   /* the smackable props, as the Vita's xpcity makes them */
                 char pdst[MAX_PATH + 64]; XpPropStats ps;
@@ -374,7 +392,21 @@ static int send_events(XppSendFn add, void *ud, int n, int cap, int c) {
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    static const char *const k_txt[] = { "starts.txt", "barriers.txt", "shops.txt", "trackpoly.bin", "modes.txt", "gates.txt", "events.txt" };
+    static const char *const k_txt[] = { "starts.txt", "barriers.txt", "shops.txt", "trackpoly.bin", "modes.txt", "gates.txt", "names.txt", "mmroute.bin", "events.txt" };
+    /* MW: each race's own map (MINI_MAP_<race>.BIN, copied at Convert; xpcity_race_map) */
+    snprintf(pat, sizeof pat, "%s\\stage\\TRACKS\\RACEMAPS%s\\*.BIN", g_out, k_city[c].companion);
+    {
+        WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (n + 9 >= cap) break;
+                snprintf(l, sizeof l, "%s\\stage\\TRACKS\\RACEMAPS%s\\%s", g_out, k_city[c].companion, fd.cFileName);
+                snprintf(r, sizeof r, VITA_DATA "/TRACKS/RACEMAPS%s/%s", k_city[c].companion, fd.cFileName);
+                n += add(ud, l, r);
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+    }
     for (int i = 0; i < (int)(sizeof k_txt / sizeof k_txt[0]) && n < cap; i++) {   /* events.txt last */
         snprintf(l, sizeof l, "%s\\%s", dir, k_txt[i]);
         snprintf(r, sizeof r, VITA_DATA "/TRACKS/ROUTES%s/%s", k_city[c].companion, k_txt[i]);
@@ -426,6 +458,9 @@ int xpp_send_files(XppSendFn add, void *ud, int cap) {
         snprintf(l, sizeof l, "%s\\stage\\TRACKS\\%s.MAP", g_out, k_city[c].companion);
         if (GetFileAttributesA(l) != INVALID_FILE_ATTRIBUTES) {   /* the minimap (none: no radar) */
             snprintf(r, sizeof r, VITA_DATA "/TRACKS/%s.MAP", k_city[c].companion); n += add(ud, l, r); }
+        snprintf(l, sizeof l, "%s\\stage\\TRACKS\\%s.SEA", g_out, k_city[c].companion);
+        if (GetFileAttributesA(l) != INVALID_FILE_ATTRIBUTES) {   /* the sea mask (Carbon; none: the sea is not cut) */
+            snprintf(r, sizeof r, VITA_DATA "/TRACKS/%s.SEA", k_city[c].companion); n += add(ud, l, r); }
         snprintf(l, sizeof l, "%s\\stage\\TRACKS\\ROUTES%s\\RoutesFreeRoam.bin", g_out, k_city[c].companion);
         if (GetFileAttributesA(l) != INVALID_FILE_ATTRIBUTES) {   /* the road net (none: no traffic) */
             snprintf(r, sizeof r, VITA_DATA "/TRACKS/ROUTES%s/RoutesFreeRoam.bin", k_city[c].companion); n += add(ud, l, r); }

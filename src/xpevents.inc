@@ -1108,7 +1108,7 @@ static int routes_bin(const DPolys *S, int closed, FILE *f)
 }
 
 /* ---- the whole set ---- */
-typedef struct { int id, type, closed, mode, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; float tlim; char gates[1024]; } EvMeta;   /* pl: the route, x y every ~15 m */
+typedef struct { int id, type, closed, mode, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; float tlim; char gates[1024]; char name[64]; float *mr; int nmr; } EvMeta;   /* pl: the route, x y every ~15 m */
 static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t *recs, const unsigned char *keep, int reread)
 {
     int nk = 0; for (int i = 0; i < nm; i++) nk += keep[i];
@@ -1133,6 +1133,321 @@ static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t 
     }
     return 1;
 }
+/* ---- Carbon's minimap route (11-19) ----
+   Carbon keeps no route for its minimap: at race start (NFSC FUN_00642470) it
+   searches the road net once per leg -- start -> each checkpoint -> the finish,
+   a circuit adding finish -> checkpoint 1 -- with A* (g: the segments' stored
+   lengths x 0.015259, h: the straight line to the goal). A segment is closed to
+   it when the race's barriers cross it (flags 0x1000/0x2000: the 0x3414d
+   barrier lines of the race's BARRIER_SPLINE groups), when it is one-way (0x40)
+   and entered from its end, or when it is a shortcut (0x80, its road's +4 id)
+   already taken: each leg is searched again with every shortcut its path used
+   closed in turn, and every path found is marked (0x8000), plus ~100 m past
+   the finish. The HUD draws the marked segments (not 0x800) as their curves,
+   in white. Here: the same search, the curves sampled to x y points, runs
+   apart by a far point (the HUD skips a jump over 80 m). */
+#define MR_FAR 1.0e9f
+typedef struct { float x0, y0, x1, y1; uint32_t h; } MrBar;
+typedef struct {
+    const Rn *rn; const uint8_t *rd; int nrd;
+    int *head, *nxt;                 /* per node: its segments (two entries per segment) */
+    int *eseg;                       /* entry -> segment */
+    uint32_t **hit; int *nhit;       /* per segment: barrier group hashes crossing it */
+    double *g; int *from; int *heap, nheap, *hpos; unsigned *stamp, tag;
+    unsigned char *mark;
+} Mr;
+static uint8_t *read_nested(const char *path, uint32_t want, size_t *len)
+{
+    FILE *f = fopen(path, "rb"); if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long e = ftell(f), o = 0;
+    struct { long o, e; } st[32]; int sp = 0;
+    uint8_t *out = NULL; *len = 0;
+    for (;;) {
+        if (o + 8 > e) { if (!sp) break; sp--; o = st[sp].o; e = st[sp].e; continue; }
+        uint8_t h[8];
+        if (fseek(f, o, SEEK_SET) || fread(h, 1, 8, f) != 8) break;
+        uint32_t id = u32le(h), s = u32le(h + 4);
+        if ((long long)o + 8 + s > (long long)e) { if (!sp) break; sp--; o = st[sp].o; e = st[sp].e; continue; }
+        if (id == want) {
+            out = malloc(s ? s : 1);
+            if (out && fread(out, 1, s, f) != s) { free(out); out = NULL; }
+            if (out) *len = s;
+            break;
+        }
+        if ((id & 0x80000000u) && sp < 32) { st[sp].o = o + 8 + (long)s; st[sp].e = e; sp++; e = o + 8 + (long)s; o += 8; }
+        else o += 8 + (long)s;
+    }
+    fclose(f); return out;
+}
+static float mr_len(const Rn *r, int k) { return u16le(r->sg + (size_t)k * 22 + 4) * 0.0152590f; }
+static unsigned mr_flags(const Rn *r, int k) { return u16le(r->sg + (size_t)k * 22 + 10); }
+/* the segment's curve, as Carbon draws it (NFSC 0x5d23e0): a cubic Bezier, node 0, node 0 +
+   handle(+0x13..+0x15 s8 / 127 x u16 +0xe x 0.0076295), node 1 + handle(+0x10..+0x12, +0xc), node 1
+   (0x404d80 / 0x5d1ca0); the s8 axes as tri() turns them (physics x y z -> world z -x y) */
+static V3 mr_at(const Rn *r, int k, float t)
+{
+    const uint8_t *s = r->sg + (size_t)k * 22;
+    const int8_t *d1 = (const int8_t *)s + 0x13, *d0 = (const int8_t *)s + 0x10;
+    V3 a = node_pos(r, u16le(s)), b = node_pos(r, u16le(s + 2));
+    float k1 = u16le(s + 0xe) * 0.0076295f / 127.0f, k0 = u16le(s + 0xc) * 0.0076295f / 127.0f;   /* 0xa83d00 = 0.0076295 (set at 0x9b2990) */
+    V3 p1 = { a.x + d1[2] * k1, a.y - d1[0] * k1, a.z + d1[1] * k1 };
+    V3 p2 = { b.x + d0[2] * k0, b.y - d0[0] * k0, b.z + d0[1] * k0 };
+    float u = 1 - t, b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
+    V3 o = { b0 * a.x + b1 * p1.x + b2 * p2.x + b3 * b.x, b0 * a.y + b1 * p1.y + b2 * p2.y + b3 * b.y, b0 * a.z + b1 * p1.z + b2 * p2.z + b3 * b.z };
+    return o;
+}
+static int mr_cross(float ax, float ay, float bx, float by, float cx, float cy, float dx, float dy)
+{
+    float d1 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax), d2 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax);
+    float d3 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx), d4 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx);
+    return ((d1 > 0) != (d2 > 0)) && ((d3 > 0) != (d4 > 0));
+}
+static void mr_free(Mr *m)
+{
+    if (m->hit) for (int k = 0; k < m->rn->ns; k++) free(m->hit[k]);
+    free(m->hit); free(m->nhit); free(m->head); free(m->nxt); free(m->eseg);
+    free(m->g); free(m->from); free(m->heap); free(m->hpos); free(m->stamp); free(m->mark);
+    memset(m, 0, sizeof *m);
+}
+/* 0: no memory. The barrier lines are optional (none: nothing closed by them). */
+static int mr_init(Mr *m, const Rn *r, const char *companion, long *nbar_out)
+{
+    memset(m, 0, sizeof *m); m->rn = r;
+    m->rd = r->pf + (size_t)r->np * 64; m->nrd = (int)((r->sg - m->rd) / 8);
+    int nn = r->nn, ns = r->ns;
+    m->head = malloc((size_t)nn * sizeof *m->head); m->nxt = malloc((size_t)ns * 2 * sizeof *m->nxt);
+    m->eseg = malloc((size_t)ns * 2 * sizeof *m->eseg);
+    m->hit = calloc((size_t)ns, sizeof *m->hit); m->nhit = calloc((size_t)ns, sizeof *m->nhit);
+    m->g = malloc((size_t)nn * sizeof *m->g); m->from = malloc((size_t)nn * sizeof *m->from);
+    m->heap = malloc((size_t)nn * sizeof *m->heap); m->hpos = malloc((size_t)nn * sizeof *m->hpos);
+    m->stamp = calloc((size_t)nn, sizeof *m->stamp); m->mark = calloc((size_t)ns, 1);
+    if (!m->head || !m->nxt || !m->eseg || !m->hit || !m->nhit || !m->g || !m->from || !m->heap || !m->hpos || !m->stamp || !m->mark) return 0;
+    for (int i = 0; i < nn; i++) m->head[i] = -1;
+    for (int k = 0, e = 0; k < ns; k++) {
+        int n0 = u16le(r->sg + (size_t)k * 22), n1 = u16le(r->sg + (size_t)k * 22 + 2);
+        if (n0 >= nn || n1 >= nn) continue;
+        m->eseg[e] = k; m->nxt[e] = m->head[n0]; m->head[n0] = e; e++;
+        m->eseg[e] = k; m->nxt[e] = m->head[n1]; m->head[n1] = e; e++;
+    }
+    /* the barrier lines (0x3414d: x0 y0 x1 y1, u16 u16, the group's name hash) against every segment's curve */
+    size_t bn = 0; uint8_t *bd = read_nested(companion, 0x3414d, &bn);
+    long nb = 0;
+    if (bd) {
+        size_t p = 0; while (p < bn && bd[p] == 0x11) p++;
+        for (; p + 24 <= bn; p += 24) {
+            MrBar b = { f32le(bd + p), f32le(bd + p + 4), f32le(bd + p + 8), f32le(bd + p + 12), u32le(bd + p + 20) };
+            float bx0 = fminf(b.x0, b.x1), bx1 = fmaxf(b.x0, b.x1), by0 = fminf(b.y0, b.y1), by1 = fmaxf(b.y0, b.y1);
+            nb++;
+            for (int k = 0; k < ns; k++) {
+                const uint8_t *s = r->sg + (size_t)k * 22;
+                int n0 = u16le(s), n1 = u16le(s + 2);
+                if (n0 >= nn || n1 >= nn) continue;
+                V3 a = node_pos(r, n0), c = node_pos(r, n1);
+                float L = u16le(s + 4) / 64.0f, pad = L * 0.5f + 2;
+                if (fmaxf(a.x, c.x) + pad < bx0 || fminf(a.x, c.x) - pad > bx1 || fmaxf(a.y, c.y) + pad < by0 || fminf(a.y, c.y) - pad > by1) continue;
+                int crossed = 0; V3 q = a;
+                for (int i = 1; i <= 16 && !crossed; i++) {
+                    V3 w = mr_at(r, k, i / 16.0f);
+                    crossed = mr_cross(q.x, q.y, w.x, w.y, b.x0, b.y0, b.x1, b.y1); q = w;
+                }
+                if (!crossed) continue;
+                int dup = 0; for (int j = 0; j < m->nhit[k]; j++) dup |= m->hit[k][j] == b.h;
+                if (dup) continue;
+                uint32_t *nh = realloc(m->hit[k], (size_t)(m->nhit[k] + 1) * sizeof *nh);
+                if (!nh) { free(bd); return 0; }
+                m->hit[k] = nh; nh[m->nhit[k]++] = b.h;
+            }
+        }
+        free(bd);
+    }
+    if (nbar_out) *nbar_out = nb;
+    return 1;
+}
+/* the nearest segment to a point: its index and where along it (0..1) */
+static int mr_near(const Mr *m, D3 p, float *tt)
+{
+    const Rn *r = m->rn; int best = -1; float bd = 1e30f;
+    for (int k = 0; k < r->ns; k++) {
+        const uint8_t *s = r->sg + (size_t)k * 22;
+        int n0 = u16le(s), n1 = u16le(s + 2);
+        if (n0 >= r->nn || n1 >= r->nn) continue;
+        V3 a = node_pos(r, n0), c = node_pos(r, n1);
+        float L = u16le(s + 4) / 64.0f + 30;
+        if (fabsf(a.x - (float)p.x) > L || fabsf(a.y - (float)p.y) > L) { if (fabsf(c.x - (float)p.x) > L || fabsf(c.y - (float)p.y) > L) continue; }
+        for (int i = 0; i <= 16; i++) {
+            V3 w = mr_at(r, k, i / 16.0f);
+            float d = (w.x - (float)p.x) * (w.x - (float)p.x) + (w.y - (float)p.y) * (w.y - (float)p.y) + 0.25f * (w.z - (float)p.z) * (w.z - (float)p.z);
+            if (d < bd) { bd = d; best = k; *tt = i / 16.0f; }
+        }
+    }
+    return best;
+}
+static int mr_blocked(const Mr *m, int k, int from_node, const uint32_t *bars, int nbar, uint32_t scmask)
+{
+    const Rn *r = m->rn; unsigned fl = mr_flags(r, k);
+    if ((fl & 0x40) && from_node == u16le(r->sg + (size_t)k * 22 + 2)) return 1;   /* one-way, entered from its end */
+    if (fl & 0x80) {   /* a shortcut: its road's id */
+        int rd = (int16_t)u16le(r->sg + (size_t)k * 22 + 6);
+        if (rd >= 0 && rd < m->nrd) { unsigned id = m->rd[(size_t)rd * 8 + 4]; if (id < 32 && !(scmask >> id & 1)) return 1; }
+    }
+    for (int j = 0; j < m->nhit[k]; j++) for (int b = 0; b < nbar; b++) if (m->hit[k][j] == bars[b]) return 1;
+    return 0;
+}
+static int mr_shortcut(const Mr *m, int k)
+{
+    if (!(mr_flags(m->rn, k) & 0x80)) return -1;
+    int rd = (int16_t)u16le(m->rn->sg + (size_t)k * 22 + 6);
+    if (rd < 0 || rd >= m->nrd) return -1;
+    unsigned id = m->rd[(size_t)rd * 8 + 4];
+    return id < 32 ? (int)id : -1;
+}
+static double mr_h(const Rn *r, int n, D3 goal)
+{
+    V3 q = node_pos(r, n);
+    double dx = q.x - goal.x, dy = q.y - goal.y, dz = q.z - goal.z;
+    return sqrt(dx * dx + dy * dy + dz * dz);
+}
+static void mr_hup(Mr *m, int i)
+{
+    while (i > 0) { int p = (i - 1) / 2; if (m->g[m->heap[p]] <= m->g[m->heap[i]]) break;   /* g holds f while queued: see mr_leg */
+        int t = m->heap[p]; m->heap[p] = m->heap[i]; m->heap[i] = t; m->hpos[m->heap[p]] = p; m->hpos[m->heap[i]] = i; i = p; }
+}
+/* one leg: A* from the segment at a (ta) to the one at b (tb); marks the path, adds its shortcuts to *used.
+   Returns 1 found, 0 none, -1 no memory. *out_node, *out_seg: where it ends (for the tail). */
+static int mr_leg(Mr *m, int sa, float ta, int sb, float tb, D3 goal, const uint32_t *bars, int nbar, uint32_t scmask,
+                  int *first_sc, int *end_seg, int *end_from)
+{
+    const Rn *r = m->rn;
+    const uint8_t *A = r->sg + (size_t)sa * 22, *B = r->sg + (size_t)sb * 22;
+    int a0 = u16le(A), a1 = u16le(A + 2), b0 = u16le(B), b1 = u16le(B + 2);
+    unsigned fa = mr_flags(r, sa), fb = mr_flags(r, sb);
+    *first_sc = -1;
+    if (sa == sb && (tb >= ta || !(fa & 0x40))) {   /* on the one segment */
+        m->mark[sa] = 1; *end_seg = sa; *end_from = tb >= ta ? a0 : a1; return 1;
+    }
+    /* f = g + h kept in a second array would be cleaner; here g[] holds f for the heap, real g in gr[] */
+    static double *gr; static int grn;
+    if (grn < r->nn) { double *n2 = realloc(gr, (size_t)r->nn * sizeof *n2); if (!n2) return -1; gr = n2; grn = r->nn; }
+    m->tag++; if (!m->tag) { memset(m->stamp, 0, (size_t)r->nn * sizeof *m->stamp); m->tag = 1; }
+    m->nheap = 0;
+    float La = mr_len(r, sa), Lb = mr_len(r, sb);
+    #define MR_H(n) mr_h(r, (n), goal)
+    #define MR_PUSH(n, gv, fr) do { int _n = (n); double _g = (gv); \
+        if (m->stamp[_n] != m->tag) { m->stamp[_n] = m->tag; gr[_n] = 1e30; m->hpos[_n] = -2; } \
+        if (_g < gr[_n] && m->hpos[_n] != -3) { gr[_n] = _g; m->from[_n] = (fr); m->g[_n] = _g + MR_H(_n); \
+            if (m->hpos[_n] < 0) { m->hpos[_n] = m->nheap; m->heap[m->nheap++] = _n; } mr_hup(m, m->hpos[_n]); } } while (0)
+    /* the start segment, either way (one-way: forward only); -1 - seg: "came along the start segment" */
+    MR_PUSH(a1, floor((1 - ta) * La * 4 + 0.5) / 4, -1);
+    if (!(fa & 0x40)) MR_PUSH(a0, floor(ta * La * 4 + 0.5) / 4, -1);
+    double best = 1e30; int bnode = -1;
+    while (m->nheap) {
+        int u = m->heap[0]; m->hpos[u] = -3;
+        m->heap[0] = m->heap[--m->nheap];
+        if (m->nheap) { m->hpos[m->heap[0]] = 0; int i = 0;
+            for (;;) { int l = 2 * i + 1, rr = l + 1, s = i;
+                if (l < m->nheap && m->g[m->heap[l]] < m->g[m->heap[s]]) s = l;
+                if (rr < m->nheap && m->g[m->heap[rr]] < m->g[m->heap[s]]) s = rr;
+                if (s == i) break;
+                int t = m->heap[s]; m->heap[s] = m->heap[i]; m->heap[i] = t; m->hpos[m->heap[s]] = s; m->hpos[m->heap[i]] = i; i = s; } }
+        if (gr[u] >= best) break;
+        /* the goal segment from here */
+        if (u == b0) { double c = gr[u] + floor(tb * Lb * 4 + 0.5) / 4; if (c < best) { best = c; bnode = u; } }
+        if (u == b1 && !(fb & 0x40)) { double c = gr[u] + floor((1 - tb) * Lb * 4 + 0.5) / 4; if (c < best) { best = c; bnode = u; } }
+        for (int e = m->head[u]; e >= 0; e = m->nxt[e]) {
+            int k = m->eseg[e]; if (k == sa || k == sb) continue;
+            if (m->from[u] >= 0 && k == m->from[u]) continue;
+            if (mr_blocked(m, k, u, bars, nbar, scmask)) continue;
+            const uint8_t *s = r->sg + (size_t)k * 22;
+            int v = u16le(s) == u ? u16le(s + 2) : u16le(s);
+            MR_PUSH(v, gr[u] + floor(mr_len(r, k) * 4 + 0.5) / 4, k);
+        }
+    }
+    #undef MR_PUSH
+    #undef MR_H
+    if (bnode < 0) return 0;
+    /* the path, goal back to start */
+    m->mark[sa] = m->mark[sb] = 1;
+    *end_seg = sb; *end_from = bnode;
+    int sc = -1;
+    for (int n = bnode, guard = 0; m->from[n] >= 0 && guard < r->ns; guard++) {
+        int k = m->from[n]; m->mark[k] = 1;
+        int id = mr_shortcut(m, k); if (id >= 0 && (scmask >> id & 1)) sc = id;   /* ends on the first along the path */
+        const uint8_t *s = r->sg + (size_t)k * 22;
+        n = u16le(s) == n ? u16le(s + 2) : u16le(s);
+    }
+    { int id = mr_shortcut(m, sa); if (id >= 0 && (scmask >> id & 1)) sc = id; }
+    *first_sc = sc;
+    return 1;
+}
+/* ~100 m on past the finish: straight on at each node */
+static void mr_tail(Mr *m, int seg, int from)
+{
+    const Rn *r = m->rn; float left = 100;
+    for (int guard = 0; guard < 64 && seg >= 0; guard++) {
+        const uint8_t *s = r->sg + (size_t)seg * 22;
+        int to = u16le(s) == from ? u16le(s + 2) : u16le(s);
+        m->mark[seg] = 1; left -= mr_len(r, seg);
+        if (left <= 0) break;
+        V3 p = node_pos(r, to), q = mr_at(r, seg, to == u16le(s + 2) ? 0.9f : 0.1f);
+        float hx = p.x - q.x, hy = p.y - q.y, hl = hypotf(hx, hy); if (hl <= 0) hl = 1;
+        int best = -1; float bc = -2;
+        for (int e = m->head[to]; e >= 0; e = m->nxt[e]) {
+            int k = m->eseg[e]; if (k == seg) continue;
+            const uint8_t *t = r->sg + (size_t)k * 22;
+            if ((mr_flags(r, k) & 0x40) && u16le(t + 2) == to) continue;
+            V3 w = mr_at(r, k, u16le(t) == to ? 0.1f : 0.9f);
+            float dx = w.x - p.x, dy = w.y - p.y, dl = hypotf(dx, dy); if (dl <= 0) continue;
+            float c = (dx * hx + dy * hy) / (dl * hl);
+            if (c > bc) { bc = c; best = k; }
+        }
+        if (best < 0 || bc < 0.3f) break;
+        seg = best; from = to;
+    }
+}
+/* the whole route of one race -> x y points (runs apart by MR_FAR); 0 no memory */
+static int mr_race(Mr *m, const Race *rc, float **out, int *nout, long *nfail)
+{
+    const Rn *r = m->rn;
+    *out = NULL; *nout = 0;
+    memset(m->mark, 0, (size_t)r->ns);
+    uint32_t bars[64]; int nbar = 0;
+    for (int b = 0; b < rc->nbar && nbar < 64; b++) { const char *n = rc->bar[b]; if (*n == '*') n++; bars[nbar++] = bstr_hash(n); }
+    int npt = rc->nwp; if (npt < 2) return 1;
+    /* the legs: point i -> i+1; a circuit (no finish point: the start is its line) also last -> start, start -> 1 */
+    int legs[2 * 64 + 4][2], nl = 0;
+    for (int i = 0; i + 1 < npt && nl < 128; i++) { legs[nl][0] = i; legs[nl][1] = i + 1; nl++; }
+    if (rc->closed) { legs[nl][0] = npt - 1; legs[nl][1] = 0; nl++; }
+    int last_seg = -1, last_from = -1;
+    for (int L = 0; L < nl; L++) {
+        D3 a = rc->wp[legs[L][0]], b = rc->wp[legs[L][1]];
+        float ta = 0, tb = 0;
+        int sa = mr_near(m, a, &ta), sb = mr_near(m, b, &tb);
+        if (sa < 0 || sb < 0) { (*nfail)++; continue; }
+        uint32_t scmask = 0xffffffffu;
+        for (int it = 0; it < 33; it++) {
+            int sc = -1, es = -1, ef = -1;
+            int x = mr_leg(m, sa, ta, sb, tb, b, bars, nbar, scmask, &sc, &es, &ef);
+            if (x < 0) return 0;
+            if (!x) { if (!it) (*nfail)++; break; }
+            if (it == 0 && legs[L][1] == (rc->closed ? 0 : npt - 1)) { last_seg = es; last_from = ef; }
+            if (sc < 0) break;
+            scmask &= ~(1u << sc);
+        }
+    }
+    if (last_seg >= 0) mr_tail(m, last_seg, last_from);
+    /* the marked curves, a point every ~10 m */
+    size_t cap = 0; float *v = NULL; int n = 0;
+    for (int k = 0; k < r->ns; k++) {
+        if (!m->mark[k] || (mr_flags(r, k) & 0x800)) continue;
+        int ns = (int)(u16le(r->sg + (size_t)k * 22 + 4) / 64.0f / 10.0f) + 1; if (ns > 64) ns = 64;
+        if ((size_t)(n + ns + 2) * 2 > cap) { cap = cap * 2 + (size_t)(ns + 2) * 2 + 1024; float *nv = realloc(v, cap * sizeof *nv); if (!nv) { free(v); return 0; } v = nv; }
+        if (n) { v[2 * n] = MR_FAR; v[2 * n + 1] = MR_FAR; n++; }
+        for (int i = 0; i <= ns; i++) { V3 w = mr_at(r, k, (float)i / (float)ns); v[2 * n] = w.x; v[2 * n + 1] = w.y; n++; }
+    }
+    *out = v; *nout = n;
+    return 1;
+}
+
 int xp_events(const char *gameplay_bin, const char *raw_companion, const char *raw_stream,
               const char *out_dir, int game, const char *city, int first_id, XpEventStats *st)
 {
@@ -1151,6 +1466,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (!chunk) { free_races(R, nr); return rc; }
     Rn rn; G g; memset(&g, 0, sizeof g);
     Bars B; memset(&B, 0, sizeof B);
+    Mr mr; memset(&mr, 0, sizeof mr); long mr_bars = 0, mr_fail = 0;
     Grid grid = {0};
     ChainCtx C; memset(&C, 0, sizeof C);
     int *stamp = NULL, *seen = NULL, tag = 0, seentag = 0, nm = 0, nrecs = 0;
@@ -1163,6 +1479,8 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     rc = XP_ERR_OPEN_IN;
     if (!bar_names(raw_companion, &B) || !bar_walls(raw_stream, &B)) goto done;
     st->barrier_segs = B.ns;
+    rc = XP_ERR_MEMORY;
+    if (game == XP_GAME_CARBON && !mr_init(&mr, &rn, raw_companion, &mr_bars)) goto done;
     rc = XP_ERR_MEMORY;
     {
         int np = 0; for (int i = 0; i < g.n; i++) np += g.l[i].pts.n;
@@ -1221,7 +1539,9 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         f = okw ? fopen(p, "wb") : NULL;
         if (f) { okw = routes_bin(&S, closed, f); if (fclose(f)) okw = 0; } else okw = 0;
         if (!okw) { free(ch); rc = XP_ERR_WRITE; goto done; }
-        EvMeta *m = &meta[nm]; m->id = ev; m->type = r->type; m->closed = r->closed; m->mode = r->mode; m->tlim = r->tlim; memcpy(m->gates, r->gates, sizeof m->gates); m->len = (int)pyround(L); m->partlen = part.n;
+        EvMeta *m = &meta[nm];
+        if (game == XP_GAME_CARBON && !mr_race(&mr, r, &m->mr, &m->nmr, &mr_fail)) { free(ch); rc = XP_ERR_MEMORY; goto done; }
+        snprintf(m->name, sizeof m->name, "%s", r->name); m->id = ev; m->type = r->type; m->closed = r->closed; m->mode = r->mode; m->tlim = r->tlim; memcpy(m->gates, r->gates, sizeof m->gates); m->len = (int)pyround(L); m->partlen = part.n;
         /* a barrier the route still crosses (no way round it the format holds) stays off */
         size_t bl = 0; for (int b = 0; b < r->nbar; b++) bl += strlen(r->bar[b]) + 1;
         m->bars = malloc(bl + 1); if (!m->bars) { free(ch); goto done; }
@@ -1275,7 +1595,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (bad) {
         /* the records shrink to the events kept */
         int w = 0;
-        for (int i = 0; i < nm; i++) if (keep[i]) { if (w != i) { memmove(recs + 0x110 * (size_t)w, recs + 0x110 * (size_t)i, 0x110); free(meta[w].bars); free(meta[w].pl); meta[w] = meta[i]; meta[i].bars = NULL; meta[i].pl = NULL; } w++; }
+        for (int i = 0; i < nm; i++) if (keep[i]) { if (w != i) { memmove(recs + 0x110 * (size_t)w, recs + 0x110 * (size_t)i, 0x110); free(meta[w].bars); free(meta[w].pl); free(meta[w].mr); meta[w] = meta[i]; meta[i].bars = NULL; meta[i].pl = NULL; meta[i].mr = NULL; } w++; }
         nm = w; memset(keep, 1, (size_t)(nm ? nm : 1));
         if (!write_allrec(out_dir, meta, nm, recs, keep, 1)) goto done;
     }
@@ -1285,8 +1605,9 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         FILE *fs = fopen(p, "w"); snprintf(p, sizeof p, "%s/barriers.txt", out_dir);
         FILE *fb = fopen(p, "w"); snprintf(p, sizeof p, "%s/modes.txt", out_dir);
         FILE *fmo = fopen(p, "w"); snprintf(p, sizeof p, "%s/gates.txt", out_dir);
-        FILE *fg = fopen(p, "w");
-        int okw = fe && fs && fb && fmo && fg, cnt[6 * XM_NMODES] = {0};
+        FILE *fg = fopen(p, "w"); snprintf(p, sizeof p, "%s/names.txt", out_dir);
+        FILE *fn = fopen(p, "w");   /* the game's own race names (MW 1.2.3: its MINI_MAP_1_2_3.BIN race map) */
+        int okw = fe && fs && fb && fmo && fg && fn, cnt[6 * XM_NMODES] = {0};
         for (int i = 0; i < nm && okw; i++) {
             const char *label = meta[i].mode ? k_mode_label[meta[i].mode] :
                                 meta[i].type == RT_CIRCUIT ? "Circuit" : meta[i].type == RT_SPRINT ? "Sprint" :
@@ -1300,6 +1621,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
                 g = e + 1;
             }
             fputs(meta[i].start, fs);
+            fprintf(fn, "%d %s\n", meta[i].id, meta[i].name);
             if (meta[i].bars && meta[i].bars[0]) fprintf(fb, "%d %s\n", meta[i].id, meta[i].bars);
             st->events++;
             if (meta[i].type == RT_CIRCUIT) st->circuits++; else if (meta[i].type == RT_SPRINT) st->sprints++;
@@ -1317,16 +1639,36 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
             }
             if (fclose(ft)) okw = 0;
         }
+        if (okw) {   /* "XMMR" n, then per event: id, count, x y ... (Carbon's minimap route, mr_race; MW: none, its race maps hold theirs) */
+            snprintf(p, sizeof p, "%s/mmroute.bin", out_dir);
+            FILE *fr = fopen(p, "wb"); long tot = 0;
+            if (!fr) okw = 0;
+            else {
+                int nwr = 0; for (int i = 0; i < nm; i++) nwr += meta[i].nmr > 1;
+                uint32_t hd[2] = { 0x524d4d58u, (uint32_t)nwr };
+                if (fwrite(hd, 4, 2, fr) != 2) okw = 0;
+                for (int i = 0; i < nm && okw; i++) {
+                    if (meta[i].nmr <= 1) continue;
+                    int32_t eh[2] = { meta[i].id, meta[i].nmr };
+                    if (fwrite(eh, 4, 2, fr) != 2 || fwrite(meta[i].mr, 8, (size_t)eh[1], fr) != (size_t)eh[1]) okw = 0;
+                    tot += eh[1];
+                }
+                if (fclose(fr)) okw = 0;
+            }
+            if (game == XP_GAME_CARBON) printf("xp_events: minimap routes: %ld points, %ld barrier lines, %ld legs not found\n", tot, mr_bars, mr_fail);
+        }
         if (fe && fclose(fe)) okw = 0;
         if (fs && fclose(fs)) okw = 0;
         if (fb && fclose(fb)) okw = 0;
         if (fmo && fclose(fmo)) okw = 0;
         if (fg && fclose(fg)) okw = 0;
+        if (fn && fclose(fn)) okw = 0;
         rc = okw ? XP_OK : XP_ERR_WRITE;
     }
 done:
     (void)nrecs;
-    if (meta) for (int i = 0; i < nr; i++) { free(meta[i].bars); free(meta[i].pl); }
+    if (meta) for (int i = 0; i < nr; i++) { free(meta[i].bars); free(meta[i].pl); free(meta[i].mr); }
+    if (mr.rn) mr_free(&mr);
     free(meta); free(recs); free(keep); free(mark); free(stamp); free(seen);
     free(C.dist); free(C.prev); free(C.touched); free(C.W); free(C.heap.v); free(C.nl.v);
     dps_free(&g2); dps_free(&S); free(part.b);

@@ -14007,6 +14007,10 @@ static int race_line_update(const World *w) {
         g_race_line_s[q] = s;
     }
     g_race_line_n = n_out; g_race_line_ev = ev;
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_FLIPLOG"))   /* test aid: the line, for the barrier arrow check */
+        for (int q = 0; q < n_out; q++) printf("raceline: %.1f %.1f\n", g_race_line[q*2], g_race_line[q*2+1]);
+#endif
     g_race_line_loop = loop; g_race_line_seg = 0; g_race_line_t = 0.0f;
     printf("race route line: %d points over %d legs, %.0f m\n", n_out, legs, s);
     return n_out > 1;
@@ -23085,6 +23089,13 @@ int main(int argc, char **argv) {
             prepared = NULL;
             prepared_status = 0;
         }
+#ifdef __vita__
+        /* a race waiting to be placed needs this area built for its scenery:
+           a cell that failed before (free roam) gets its retry now */
+        if (race_place_pending && race_state == 0 && resident_retry_at &&
+            !isnan(failed_resident_cell[0]) && job_scenery_event != resident_args.scenery_event)
+            resident_retry_at = SDL_GetTicks();
+#endif
         if (resident_retry_at && (Sint32)(SDL_GetTicks() - resident_retry_at) >= 0) {
             resident_retry_at = 0;
             failed_resident_cell[0] = failed_resident_cell[1] = NAN;
@@ -23179,6 +23190,13 @@ int main(int argc, char **argv) {
                         g_fin_prev_us = (unsigned)((SDL_GetPerformanceCounter() - fin_t0) * 1000000u / SDL_GetPerformanceFrequency());
 #endif
                         build_timing = candidate_timing;
+#ifdef OPENUG2_SIM_PRE_H
+                        {   /* test aid (simulator): OPENUG2_SIM_RESFAIL=N fails the first N area builds (as for room on the Vita) */
+                            static int resfail = -1;
+                            if (resfail < 0) resfail = getenv("OPENUG2_SIM_RESFAIL") ? atoi(getenv("OPENUG2_SIM_RESFAIL")) : 0;
+                            if (build_status > 0 && resfail > 0) { resfail--; build_status = -1; printf("sim: area build failed on purpose (%d more)\n", resfail); }
+                        }
+#endif
                         hitch_mark("finish_step");
                         unsigned elapsed = SDL_GetTicks() - build_begin;
                         finish_frames++; finish_total_ms += elapsed;
@@ -23215,12 +23233,13 @@ int main(int argc, char **argv) {
                        game in a race -- an exit to LiveArea, which a player reads as
                        a crash. A build fails for room (the placement cache is flushed
                        above): give the tiles' read-ahead back too and let the same
-                       cell try again in 2 s, the current area staying meanwhile. */
-                    if (race_state == 0) {
-                        world_tiles_trim(0);
-                        resident_retry_at = SDL_GetTicks() + 2000u;
-                        if (!resident_retry_at) resident_retry_at = 1;
-                    }
+                       cell try again in 2 s, the current area staying meanwhile.
+                       11-19 (HW, Rockport): in free roam too -- a cell that failed
+                       there was never tried again, and a race asked at that spot
+                       waited for it forever behind its loading screen. */
+                    world_tiles_trim(0);
+                    resident_retry_at = SDL_GetTicks() + 2000u;
+                    if (!resident_retry_at) resident_retry_at = 1;
 #else
                     if(race_state==0) { running=0; final_status=1; }
 #endif
@@ -30831,6 +30850,10 @@ int main(int argc, char **argv) {
                 int mev = g_rt.active ? g_rt.ev
                         : strstr(trackname, "L4RB") ? 4200 : strstr(trackname, "L4RC") ? 4300 : 4000;
                 const char *xmap = xpcity_is_city(trackname) ? xpcity_map(trackname) : NULL;   /* MW / Carbon: their own map */
+                if (xmap && RT_RACE) {   /* MW: the race's own map, its route drawn in (xpcity_race_map) */
+                    const char *rmap = xpcity_race_map(trackname, g_rt.ev);
+                    if (rmap) xmap = rmap;
+                }
                 const int map_beyond = beyond_is_track(trackname) || xpcity_is_city(trackname);   /* its own map, no TRACKMAP */
                 if (xmap) hud_set_trackmap_file(hud, xmap);
                 else if (map_beyond && !xpcity_is_city(trackname)) hud_set_trackmap_file(hud, "ux0:data/NFSU2/beyond/minimap.bin");
@@ -30951,6 +30974,10 @@ int main(int argc, char **argv) {
                     hs.route_loop = hs.circuit;
 #ifdef __vita__
                     /* WRONG WAY: see below, once the route line exists */
+                    if (RT_RACE && xpcity_is_city(trackname)) {   /* Carbon: its own minimap route (xpcity_race_route), white over the city map */
+                        int mrn = 0; const float *mrv = xpcity_race_route(trackname, g_rt.ev, &mrn);
+                        if (mrv) { hs.route_line = mrv; hs.route_line_n = mrn; hs.route_loop = 0; }
+                    }
 #endif
 #ifdef __vita__
                     {   /* draw the event's own racing line (its Paths<id> nav

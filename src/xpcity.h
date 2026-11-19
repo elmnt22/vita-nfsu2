@@ -17,6 +17,10 @@ int xpcity_prepare(const char *troot, const char *track);
 int xpcity_window_made(void);
 /* the city's minimap file (BMAP) once xpcity_prepare found or made it, else NULL */
 const char *xpcity_map(const char *track);
+/* MW: that race's own map (its route drawn in), made once from MINI_MAP_<race>.BIN; else NULL */
+const char *xpcity_race_map(const char *track, int event_id);
+/* Carbon: the race's minimap route (its own search, the converter's mmroute.bin): x y pairs; else NULL */
+const float *xpcity_race_route(const char *track, int event_id, int *n_out);
 /* the Free Run world picker: 0 Bayview, 1 Rockport, 2 Palmont */
 extern int g_xpcity_pick;
 int xpcity_installed(int pick);          /* translated or raw files there (Bayview: 1) */

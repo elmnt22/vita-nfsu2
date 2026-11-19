@@ -93,7 +93,8 @@ static void make_map(int c, const char *troot)
 {
     char raw[256];
     snprintf(g_map, sizeof g_map, "%s/%s.MAP", troot, k_city[c].companion);
-    if (xp_file_size(g_map) > 0) return;
+    char sea[1100]; snprintf(sea, sizeof sea, "%s/%s.SEA", troot, k_city[c].companion);
+    if (xp_file_size(g_map) > 0 && (k_city[c].game != XP_GAME_CARBON || xp_file_size(sea) > 0)) return;   /* Carbon: + its sea mask (11-19) */
     snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s/MINI_MAP.BIN", k_city[c].dir, k_city[c].companion);
     if (k_city[c].game == XP_GAME_CARBON)   /* no map art for the city: drawn from its road collision */
         snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
@@ -123,6 +124,10 @@ static void make_events(int c, const char *troot)
     snprintf(ev, sizeof ev, "%s/shops.txt", dir);                    /* a set from before the shops / track maps: made again */
     int have_shops = xp_file_size(ev) > 0;
     snprintf(ev, sizeof ev, "%s/trackpoly.bin", dir);
+    have_shops = have_shops && xp_file_size(ev) > 0;
+    snprintf(ev, sizeof ev, "%s/names.txt", dir);                    /* + the race names (11-19: MW's race maps) */
+    have_shops = have_shops && xp_file_size(ev) > 0;
+    snprintf(ev, sizeof ev, "%s/mmroute.bin", dir);                  /* + Carbon's minimap routes (11-19) */
     have_shops = have_shops && xp_file_size(ev) > 0;
     snprintf(ev, sizeof ev, "%s/events.txt", dir);
     if (have_shops && xp_file_size(ev) > 0) return;
@@ -173,6 +178,108 @@ const char *xpcity_map(const char *track)
 {
     int c = city_of(track);
     return c >= 0 && g_map[0] && strstr(g_map, k_city[c].companion) ? g_map : NULL;
+}
+
+/* MW's race map (11-19): Most Wanted shows a race on a map of its own,
+   TRACKS/L2RA/MINI_MAP_<race>.BIN (its race 1.2.3: MINI_MAP_1_2_3.BIN): the city map
+   with that race's route drawn in white and its start in green (64 tiles, as
+   MINI_MAP.BIN). The race names are in ROUTES<companion>/names.txt (xpevents.inc).
+   The file comes from the PC tool (TRACKS/RACEMAPS<companion>/) or the raw install;
+   it is made into <companion>_RACE<id>.MAP once, the one before it removed.
+   Carbon has no such maps (its route is drawn from its road net). */
+/* Carbon's minimap route for a race (xpevents.inc mr_race: its own search, made by the
+   converter into ROUTES<companion>/mmroute.bin): x y pairs, runs apart by a far point.
+   NULL for MW (its race maps carry theirs) or none. The buffer stays until the next race. */
+const float *xpcity_race_route(const char *track, int event_id, int *n_out)
+{
+    static float *buf; static int bn, bev = -1, bc = -1;
+    *n_out = 0;
+    int c = city_of(track);
+    if (c < 0 || k_city[c].game != XP_GAME_CARBON || !g_map[0]) return NULL;
+    if (event_id == bev && c == bc) { *n_out = bn; return bn > 1 ? buf : NULL; }
+    free(buf); buf = NULL; bn = 0; bev = event_id; bc = c;
+    char troot[1024]; snprintf(troot, sizeof troot, "%s", g_map);
+    char *sl = strrchr(troot, '/'); if (!sl) return NULL;
+    *sl = 0;
+    char p[1100]; snprintf(p, sizeof p, "%s/ROUTES%s/mmroute.bin", troot, k_city[c].companion);
+    FILE *f = fopen(p, "rb");
+    if (!f) { vita_mark("xpcity: no minimap routes (%s)", p); return NULL; }
+    uint32_t hd[2];
+    if (fread(hd, 4, 2, f) == 2 && hd[0] == 0x524d4d58u) {
+        for (uint32_t i = 0; i < hd[1]; i++) {
+            int32_t eh[2];
+            if (fread(eh, 4, 2, f) != 2 || eh[1] < 0 || eh[1] > 1000000) break;
+            if (eh[0] != event_id) { if (fseek(f, (long)eh[1] * 8, SEEK_CUR)) break; continue; }
+            buf = malloc((size_t)eh[1] * 8);
+            if (buf && fread(buf, 8, (size_t)eh[1], f) == (size_t)eh[1]) bn = eh[1];
+            else { free(buf); buf = NULL; }
+            break;
+        }
+    }
+    fclose(f);
+    vita_mark("xpcity: minimap route for %d: %d points", event_id, bn);
+    *n_out = bn;
+    return bn > 1 ? buf : NULL;
+}
+
+const char *xpcity_race_map(const char *track, int event_id)
+{
+    static char out[1100]; static int out_ev = -1;
+    static int bad_ev = -1;
+    int c = city_of(track);
+    if (c < 0 || k_city[c].game != XP_GAME_MW || !g_map[0] || !strstr(g_map, k_city[c].companion)) return NULL;
+    if (event_id == out_ev && out[0]) return out;
+    if (event_id == bad_ev) return NULL;
+    char troot[1024]; snprintf(troot, sizeof troot, "%s", g_map);
+    char *sl = strrchr(troot, '/'); if (!sl) return NULL;
+    *sl = 0;
+    char p[1100], name[64] = "";
+    snprintf(p, sizeof p, "%s/ROUTES%s/names.txt", troot, k_city[c].companion);
+    FILE *f = fopen(p, "r");
+    if (f) {
+        int id; char nm[64];
+        while (fscanf(f, "%d %63s", &id, nm) == 2) if (id == event_id) { snprintf(name, sizeof name, "%s", nm); break; }
+        fclose(f);
+    }
+    bad_ev = event_id;
+    if (!name[0]) { vita_mark("xpcity: race %d has no name (%s): no race map", event_id, p); return NULL; }
+    {   /* "7_2_2_r_sprint" -> "7_2_2_R": the leading numbers, _R for the reverse ('r') */
+        char b[64] = ""; size_t bl = 0; int rev = 0, nums = 1;
+        for (char *tok = strtok(name, "._"); tok; tok = strtok(NULL, "._")) {
+            int num = tok[0] >= '0' && tok[0] <= '9';
+            if (num && nums && bl + strlen(tok) + 2 < sizeof b) bl += (size_t)snprintf(b + bl, sizeof b - bl, "%s%s", bl ? "_" : "", tok);
+            else { nums = 0; if (!strcmp(tok, "r") || !strcmp(tok, "R")) rev = 1; }
+        }
+        snprintf(name, sizeof name, "%s%s", b, rev ? "_R" : "");
+    }
+    char dst[1100]; snprintf(dst, sizeof dst, "%s/%s_RACE%d.MAP", troot, k_city[c].companion, event_id);
+    if (xp_file_size(dst) <= 0) {
+        char src[1100];
+        snprintf(src, sizeof src, "%s/RACEMAPS%s/MINI_MAP_%s.BIN", troot, k_city[c].companion, name);
+        if (xp_file_size(src) <= 0) snprintf(src, sizeof src, XP_RAW_ROOT "/%s/TRACKS/%s/MINI_MAP_%s.BIN", k_city[c].dir, k_city[c].companion, name);
+        size_t nl = strlen(name);
+        if (xp_file_size(src) <= 0 && nl > 2 && !strcmp(name + nl - 2, "_R")) {   /* no reverse map: the race's own */
+            name[nl - 2] = 0;
+            snprintf(src, sizeof src, "%s/RACEMAPS%s/MINI_MAP_%s.BIN", troot, k_city[c].companion, name);
+            if (xp_file_size(src) <= 0) snprintf(src, sizeof src, XP_RAW_ROOT "/%s/TRACKS/%s/MINI_MAP_%s.BIN", k_city[c].dir, k_city[c].companion, name);
+        }
+        if (xp_file_size(src) <= 0) { vita_mark("xpcity: no race map for %d (MINI_MAP_%s.BIN)", event_id, name); return NULL; }
+        Uint32 t0 = SDL_GetTicks();
+        int rc = xp_minimap(src, dst, k_city[c].game);
+        vita_mark("xpcity: race map %s from %s: %s in %u ms", dst, src, rc == XP_OK ? "made" : "FAILED", (unsigned)(SDL_GetTicks() - t0));
+        if (rc != XP_OK) return NULL;
+    }
+    {   /* one at a time (4 MB each): <companion>_RACE.txt holds the id of the one on the card */
+        char side[1100]; snprintf(side, sizeof side, "%s/%s_RACE.txt", troot, k_city[c].companion);
+        FILE *sf = fopen(side, "r"); int old = -1;
+        if (sf) { if (fscanf(sf, "%d", &old) != 1) old = -1; fclose(sf); }
+        if (old >= 0 && old != event_id) {
+            char op[1100]; snprintf(op, sizeof op, "%s/%s_RACE%d.MAP", troot, k_city[c].companion, old); remove(op);
+        }
+        if (old != event_id && (sf = fopen(side, "w"))) { fprintf(sf, "%d\n", event_id); fclose(sf); }
+    }
+    snprintf(out, sizeof out, "%s", dst); out_ev = event_id; bad_ev = -1;
+    return out;
 }
 
 int xpcity_prepare(const char *troot, const char *track) {

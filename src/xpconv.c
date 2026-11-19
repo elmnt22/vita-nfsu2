@@ -330,9 +330,9 @@ static int16_t q16(float v) { long k = lroundf(v); return (int16_t)(k < -32768 ?
 
 /* the minimap collector (Carbon has no map art for its city): every ground triangle's
    xy + its surface key, instead of the collision pack */
-typedef struct { float xy[6]; uint32_t key; } MmTri;
+typedef struct { float xy[6]; uint32_t key; float ztop; } MmTri;   /* ztop: its highest corner */
 static MmTri *g_mm; static size_t g_mmn, g_mmcap; static int g_mm_on;
-static void mm_add(const float *a, const float *b, const float *c, uint32_t key)
+static void mm_add(const float *a, const float *b, const float *c, uint32_t key, float ztop)
 {
     if (g_mmn == g_mmcap) {
         size_t n = g_mmcap ? g_mmcap * 2 : 65536;
@@ -341,7 +341,7 @@ static void mm_add(const float *a, const float *b, const float *c, uint32_t key)
     }
     MmTri *t = &g_mm[g_mmn++];
     t->xy[0] = a[0]; t->xy[1] = a[1]; t->xy[2] = b[0]; t->xy[3] = b[1]; t->xy[4] = c[0]; t->xy[5] = c[1];
-    t->key = key;
+    t->key = key; t->ztop = ztop;
 }
 static void bake_article(const uint8_t *a, size_t an, const float *ip, int grp)
 {
@@ -377,7 +377,7 @@ static void bake_article(const uint8_t *a, size_t an, const float *ip, int grp)
             memcpy(t.v[3], t.v[2], 12);
             t.nv = 3;
             int si = v[8 * (i + 2) + 6];
-            if (g_mm_on) { if (nz / l >= 0.25f) mm_add(t.v[0], t.v[1], t.v[2], si < nsf ? rd32(sf + 4 * si) : 0); continue; }
+            if (g_mm_on) { if (nz / l >= 0.25f) mm_add(t.v[0], t.v[1], t.v[2], si < nsf ? rd32(sf + 4 * si) : 0, fmaxf(t.v[0][2], fmaxf(t.v[1][2], t.v[2][2]))); continue; }
             t.surf = mw_surface(si < nsf ? rd32(sf + 4 * si) : 0, 0);
             t.flags = nz / l < 0.25f ? 0x08 : 0x01;          /* steep: UG2's 0x8 wall triangles; ground: layered */
             t.grp = grp;
@@ -859,6 +859,92 @@ static void mm_fill(uint8_t *img, int W, const float *xy, float x0, float y0, fl
     }
 }
 static void conv_carp(Buf *o, const uint8_t *d, size_t sz, const uint8_t *raw);
+/* The sea mask (<companion>.SEA, 11-19): Palmont's sea is one flat sheet at ~0 m
+   (PAN_Ocean_Xenon) laid over the whole west of the city, where a district of
+   streets lies up to 11 m below it (South City / Campus): drawn as it is, the sea
+   covers the streets and the car drives under it. These are the cells of dry land
+   below the sea: ground under -0.3 m that a sunken road reaches (so canal and sea
+   beds, with no road, keep their water), plus one cell round. The game cuts the
+   sheet open there (world_tiles.c). 8 m cells over the map's square, 1 bit each. */
+#define SEA_CELL 8.0f
+static int sea_mask_write(const char *map_path)
+{
+    /* over the sunken ground (not the map's square: that is the largest road cluster) */
+    float x0 = 1e30f, ymin = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (size_t i = 0; i < g_mmn; i++) {
+        if (!(g_mm[i].ztop < -0.3f)) continue;
+        for (int k = 0; k < 3; k++) {
+            x0 = fminf(x0, g_mm[i].xy[2*k]); x1 = fmaxf(x1, g_mm[i].xy[2*k]);
+            ymin = fminf(ymin, g_mm[i].xy[2*k+1]); y1 = fmaxf(y1, g_mm[i].xy[2*k+1]);
+        }
+    }
+    if (x0 > x1) { x0 = ymin = 0; x1 = y1 = SEA_CELL; }
+    x0 -= 2 * SEA_CELL; ymin -= 2 * SEA_CELL; x1 += 2 * SEA_CELL; y1 += 2 * SEA_CELL;
+    int W = (int)ceilf((x1 - x0) / SEA_CELL), H = (int)ceilf((y1 - ymin) / SEA_CELL);
+    if (W > 4096 || H > 4096) { printf("xp_minimap carbon: sea mask %dx%d too big, none\n", W, H); return XP_OK; }
+    uint8_t *S = calloc((size_t)W * H, 1);
+    int *stk = malloc((size_t)W * H * sizeof *stk);
+    if (!S || !stk) { free(S); free(stk); return XP_ERR_MEMORY; }
+    /* 1 = sunken ground, 2 = sunken road (a seed), 3 = reached */
+    for (int pass = 0; pass < 2; pass++)
+        for (size_t i = 0; i < g_mmn; i++) {
+            const MmTri *t = &g_mm[i];
+            if (!(t->ztop < -0.3f)) continue;
+            int road = is_road_key(t->key);
+            if (pass != road) continue;
+            float X[3], Y[3];
+            for (int k = 0; k < 3; k++) { X[k] = (t->xy[2*k] - x0) / SEA_CELL; Y[k] = (t->xy[2*k+1] - ymin) / SEA_CELL; }
+            int ix0 = (int)floorf(fminf(X[0], fminf(X[1], X[2]))), ix1 = (int)floorf(fmaxf(X[0], fmaxf(X[1], X[2])));
+            int iy0 = (int)floorf(fminf(Y[0], fminf(Y[1], Y[2]))), iy1 = (int)floorf(fmaxf(Y[0], fmaxf(Y[1], Y[2])));
+            if (ix1 < 0 || iy1 < 0 || ix0 >= W || iy0 >= H) continue;
+            if (ix0 < 0) ix0 = 0;
+            if (iy0 < 0) iy0 = 0;
+            if (ix1 >= W) ix1 = W - 1;
+            if (iy1 >= H) iy1 = H - 1;
+            /* every cell the triangle's box touches: generous, the edge cells are dry land anyway */
+            for (int y = iy0; y <= iy1; y++) for (int x = ix0; x <= ix1; x++) {
+                uint8_t *c = &S[(size_t)y * W + x];
+                if (*c < 1 + road) *c = (uint8_t)(1 + road);
+            }
+        }
+    int sp = 0; long ncut = 0;
+    for (int c = 0; c < W * H; c++) if (S[c] == 2) { S[c] = 3; stk[sp++] = c; }
+    while (sp) {
+        int e = stk[--sp], ex = e % W, ey = e / W;
+        for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+            int nx = ex + dx, ny = ey + dy;
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            uint8_t *c = &S[(size_t)ny * W + nx];
+            if (*c == 1 || *c == 2) { *c = 3; stk[sp++] = ny * W + nx; }
+        }
+    }
+    size_t nb = ((size_t)W * H + 7) / 8;
+    uint8_t *bits = calloc(nb, 1);
+    if (!bits) { free(S); free(stk); return XP_ERR_MEMORY; }
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        int on = 0;
+        for (int dy = -1; dy <= 1 && !on; dy++) for (int dx = -1; dx <= 1 && !on; dx++) {
+            int nx = x + dx, ny = y + dy;
+            on = nx >= 0 && ny >= 0 && nx < W && ny < H && S[(size_t)ny * W + nx] == 3;
+        }
+        if (on) { size_t b = (size_t)y * W + x; bits[b >> 3] |= (uint8_t)(1u << (b & 7)); ncut++; }
+    }
+    free(S); free(stk);
+    char path[1100]; snprintf(path, sizeof path, "%s", map_path);
+    char *dot = strrchr(path, '.'); if (dot && !strchr(dot, '/')) strcpy(dot, ".SEA"); else strcat(path, ".SEA");
+    int rc = XP_OK;
+    FILE *o = fopen(path, "wb");
+    if (!o) rc = XP_ERR_OPEN_OUT;
+    else {
+        uint32_t hd[3] = { 0, (uint32_t)W, (uint32_t)H }; memcpy(hd, "SEAM", 4);
+        float fl[3] = { x0, ymin, SEA_CELL };
+        int ok = fwrite(hd, 4, 3, o) == 3 && fwrite(fl, 4, 3, o) == 3 && fwrite(bits, 1, nb, o) == nb;
+        if (fclose(o) != 0 || !ok) { rc = XP_ERR_WRITE; remove(path); }
+    }
+    free(bits);
+    printf("xp_minimap carbon: sea mask %dx%d, %ld cells of dry land below the sea\n", W, H, ncut);
+    return rc;
+}
 static int minimap_carbon(const char *in_path, const char *out_path)
 {
     FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
@@ -941,6 +1027,7 @@ static int minimap_carbon(const char *in_path, const char *out_path)
             int ok = fwrite(hd, 4, 3, o) == 3 && fwrite(fl, 4, 4, o) == 4 && fwrite(img, 4, (size_t)W * W, o) == (size_t)W * W;
             if (fclose(o) != 0 || !ok) { rc = XP_ERR_WRITE; remove(out_path); }
         }
+        if (rc == XP_OK) rc = sea_mask_write(out_path);
     } else {
         printf("xp_minimap carbon: %zu ground triangles, %zu road -- keys:", g_mmn, nr);
         for (size_t i = 0; i < g_mmn && i < 200000; i += 20000) printf(" %08x", g_mm[i].key);
@@ -971,8 +1058,11 @@ int xp_minimap(const char *in_path, const char *out_path, int game)
         int un = id == 0x3a100 ? jdlz(d + q + 8, (int)sz, u, 1 << 16) : 0;
         const uint8_t *t4 = un ? find_id(u, (size_t)un, 0x33310004) : NULL;
         const uint8_t *px = un ? find_id(u, (size_t)un, 0x33320002) : NULL;
-        if (t4 && px && !memcmp(t4 + 8 + 12, "MINI_MAP_CHOP", 13)) {
-            int k = atoi((const char *)t4 + 8 + 25);
+        /* MINI_MAP_CHOP<n>, or a race's map MINI_MAP_<race>_CHOP<n> (xpcity_race_map) */
+        const char *tn = t4 ? (const char *)t4 + 8 + 12 : NULL, *ch = NULL;
+        if (tn && !memcmp(tn, "MINI_MAP_", 9) && memchr(tn, 0, 40)) ch = strstr(tn, "CHOP");
+        if (t4 && px && ch) {
+            int k = atoi(ch + 4);
             uint32_t pn = rd32(px + 4); const uint8_t *b = px + 8;
             while (pn && *b == 0x11) { b++; pn--; }
             if (k >= 0 && k < 64 && pn >= 128 * 128 && px + 8 + rd32(px + 4) <= u + un) {

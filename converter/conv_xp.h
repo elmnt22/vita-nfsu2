@@ -6,7 +6,7 @@
 #include "world_tiles.h"
 
 #define XPP_NCITY 2                 /* 0 = Rockport (Most Wanted), 1 = Palmont (Carbon) */
-#define XPP_FILES_PER_CITY (12 + 400)
+#define XPP_FILES_PER_CITY (12 + 400 + 300)   /* + MW race maps (266) */
 
 typedef struct {
     volatile int checking;
