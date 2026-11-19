@@ -281,12 +281,14 @@ const char *xpcity_track(int pick) { return pick >= 1 && pick <= NCITY ? k_city[
 
 /* ---- race barriers (MW BARRIER_SPLINE_<n> groups; xpconv xp_companion) ----
    TRACKS/ROUTES<region>/barriers.txt (mkevents): "<event> NAME NAME ...", a leading
-   '*' (MW: the barrier the other way round) dropped. */
+   '*' = the barrier the other way round (MW flips its artwork: its arrows point
+   the other way; 11-19 HW: without it every arrow pointed right). */
 #include "wcoll.h"
 #include "world_scenery.h"
 typedef struct { int ev, first, n; } XpBarEv;
 static XpBarEv *g_bar_ev; static int g_bar_nev;
 static char (*g_bar_nm)[24]; static int g_bar_nnm;
+static unsigned char *g_bar_flip;   /* per name: '*' */
 static char g_bar_region[16] = "";
 static const XpBarEv *bar_find(int event)
 {
@@ -298,7 +300,7 @@ static int xpbar_on(const char *name, int event)
     const XpBarEv *e = bar_find(event);
     if (!e) return -1;
     if (!name) return 1;
-    for (int i = 0; i < e->n; i++) if (!strcmp(g_bar_nm[e->first + i], name)) return 1;
+    for (int i = 0; i < e->n; i++) if (!strcmp(g_bar_nm[e->first + i], name)) return g_bar_flip[e->first + i] ? 2 : 1;
     return 0;
 }
 void xpcity_barriers_select(const char *troot, const char *track)
@@ -308,7 +310,7 @@ void xpcity_barriers_select(const char *troot, const char *track)
     g_wg_xp_barrier_on = xpbar_on;
     if (!strcmp(reg, g_bar_region)) return;
     snprintf(g_bar_region, sizeof g_bar_region, "%s", reg);
-    free(g_bar_ev); free(g_bar_nm); g_bar_ev = NULL; g_bar_nm = NULL; g_bar_nev = g_bar_nnm = 0;
+    free(g_bar_ev); free(g_bar_nm); free(g_bar_flip); g_bar_ev = NULL; g_bar_nm = NULL; g_bar_flip = NULL; g_bar_nev = g_bar_nnm = 0;
     char p[1024]; snprintf(p, sizeof p, "%s/ROUTES%s/barriers.txt", troot, reg);
     FILE *f = fopen(p, "r");
     if (!f) { printf("xpcity: no race barriers (%s)\n", p); return; }
@@ -318,7 +320,8 @@ void xpcity_barriers_select(const char *troot, const char *track)
     char line[4096];
     while (fgets(line, sizeof line, f)) cev++;
     g_bar_ev = calloc((size_t)cev + 1, sizeof *g_bar_ev); g_bar_nm = calloc((size_t)cnm + 1, sizeof *g_bar_nm);
-    if (!g_bar_ev || !g_bar_nm) { fclose(f); free(g_bar_ev); free(g_bar_nm); g_bar_ev = NULL; g_bar_nm = NULL; return; }
+    g_bar_flip = calloc((size_t)cnm + 1, 1);
+    if (!g_bar_ev || !g_bar_nm || !g_bar_flip) { fclose(f); free(g_bar_ev); free(g_bar_nm); free(g_bar_flip); g_bar_ev = NULL; g_bar_nm = NULL; g_bar_flip = NULL; return; }
     rewind(f);
     while (fgets(line, sizeof line, f)) {
         char *s = strtok(line, " \t\r\n");
@@ -326,7 +329,9 @@ void xpcity_barriers_select(const char *troot, const char *track)
         XpBarEv *e = &g_bar_ev[g_bar_nev++];
         e->ev = atoi(s); e->first = g_bar_nnm; e->n = 0;
         while ((s = strtok(NULL, " \t\r\n")) && g_bar_nnm < cnm) {
-            if (*s == '*') s++;
+            int flip = *s == '*';
+            if (flip) s++;
+            g_bar_flip[g_bar_nnm] = (unsigned char)flip;
             snprintf(g_bar_nm[g_bar_nnm++], 24, "%s", s); e->n++;
         }
     }

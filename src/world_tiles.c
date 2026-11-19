@@ -2397,6 +2397,42 @@ static int wt_push(N2Scene *s, const N2Mesh *src, int role, int drop_vcol) {
     return 1;
 }
 
+/* An MW race barrier the race runs the other way round (xpcity.c '*'): MW flips
+   its artwork, so the arrows point the other way. The pushed mesh gets its own
+   copy of the geometry with U mirrored over the mesh's own U range (stays inside
+   it, whatever the texture's wrap); the tile's shared copy is untouched.
+   Returns 0 only when the copy cannot be made (the mesh stays as it was). */
+static long g_wt_flipped, g_wt_flip_fail;
+static int wt_flip_artwork(N2Mesh *m) {
+    if (!m->verts || m->nverts <= 0 || !m->idx || m->nidx <= 0) { g_wt_flip_fail++; return 0; }
+    size_t nf = (size_t)m->nverts * (m->authored_normals ? 8 : 5);
+    N2SharedGeometry *g = calloc(1, sizeof *g);
+    float *v = malloc(nf * sizeof *v);
+    uint16_t *ix = malloc((size_t)m->nidx * sizeof *ix);
+    unsigned char *vc = m->vcol ? malloc((size_t)m->nverts * 4) : NULL;
+    if (!g || !v || !ix || (m->vcol && !vc)) { free(g); free(v); free(ix); free(vc); g_wt_flip_fail++; return 0; }
+    memcpy(v, m->verts, nf * sizeof *v);
+    memcpy(ix, m->idx, (size_t)m->nidx * sizeof *ix);
+    if (vc) memcpy(vc, m->vcol, (size_t)m->nverts * 4);
+    float lo = 1e30f, hi = -1e30f;
+    for (int i = 0; i < m->nverts; i++) { float u = v[i*5+3]; if (u < lo) lo = u; if (u > hi) hi = u; }
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_FLIPLOG")) {   /* test aid: which way the artwork runs */
+        float vlo = 1e30f, vhi = -1e30f;
+        for (int i = 0; i < m->nverts; i++) { float t = v[i*5+4]; if (t < vlo) vlo = t; if (t > vhi) vhi = t; }
+        printf("fliplog: %s tex %08x n %d u %.2f..%.2f v %.2f..%.2f bb %.0f %.0f %.0f - %.0f %.0f %.0f grp %u/%u\n", m->sname, m->texkey, m->nverts,
+               lo, hi, vlo, vhi, m->world_bounds[0], m->world_bounds[1], m->world_bounds[2], m->world_bounds[3], m->world_bounds[4], m->world_bounds[5], m->scen_region, m->scen_index);
+        for (int i = 0; i < m->nverts && i < 6; i++) printf("fliplog:   v%d %.1f %.1f %.1f uv %.2f %.2f\n", i, v[i*5], v[i*5+1], v[i*5+2], v[i*5+3], v[i*5+4]);
+    }
+#endif
+    for (int i = 0; i < m->nverts; i++) v[i*5+3] = lo + hi - v[i*5+3];
+    n2_mesh_geometry_release(m);
+    g->refs = 1; g->verts = v; g->idx = ix; g->vcol = vc;
+    m->shared_geometry = g; m->verts = v; m->idx = ix; m->vcol = vc;
+    g_wt_flipped++;
+    return 1;
+}
+
 /* Buildings arriving at the edge: which tiles gave objects to the last
    assembly, so this one can mark the ones that are new (N2Mesh.fade_in; main
    fades them in instead of popping). A first build, or one that is mostly new
@@ -2728,6 +2764,9 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                Palmont (11-19). Packs converted before then still hold them;
                nfsu2.h drops them from new conversions. Bayview has none. */
             if (strstr(m->sname, "REFLECTIONBARRI") && m->world_role != 1 && m->world_role != 4) continue;
+#ifdef OPENUG2_SIM_PRE_H
+            if (getenv("OPENUG2_SIM_NOSHEET") && !strncmp(m->sname, getenv("OPENUG2_SIM_NOSHEET"), strlen(getenv("OPENUG2_SIM_NOSHEET")))) continue;   /* test aid: hide meshes by name prefix */
+#endif
             int role = m->world_role, drop_vcol = 0;
             if (role == 1 || role == 2) {   /* a LOD pair: full model (1) + stand-in (2) */
                 if (near && role == 2) {
@@ -2742,6 +2781,18 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                drawn by smokeable.c, not batched */
             if (role != 1 && role != 4 && m->scen_has && smk_is_prop(m->scen_region, m->scen_index)) role = 3;
             if (!wt_push(scene, m, role, drop_vcol)) return 0;
+            if (m->scen_has && sel.count && role != 1 && role != 4 &&
+                wg_selection_flipped(&sel, m->scen_region, m->scen_index))
+                wt_flip_artwork(&scene->meshes[scene->count - 1]);
+#ifdef OPENUG2_SIM_PRE_H
+            if (getenv("OPENUG2_SIM_FLIPLOG") && strstr(m->sname, "TRACKBARRIER")) {   /* test aid: each barrier's arrow axis */
+                const N2Mesh *q = &scene->meshes[scene->count - 1];
+                int a0 = -1, a1 = -1;
+                for (int v = 0; v < q->nverts; v++) { if (a0 < 0 || q->verts[v*5+3] < q->verts[a0*5+3]) a0 = v; if (a1 < 0 || q->verts[v*5+3] > q->verts[a1*5+3]) a1 = v; }
+                if (a0 >= 0) printf("barrierdir: %u/%u tex %08x flip %d from %.1f %.1f to %.1f %.1f\n", q->scen_region, q->scen_index, q->texkey,
+                                    wg_selection_flipped(&sel, m->scen_region, m->scen_index), q->verts[a0*5], q->verts[a0*5+1], q->verts[a1*5], q->verts[a1*5+1]);
+            }
+#endif
             if (fresh && !ground && role != 3) { scene->meshes[scene->count - 1].fade_in = 1; faded++; }
         }
     }
@@ -2776,6 +2827,9 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         snprintf(stats->bundle, sizeof stats->bundle, "%s", track);
         stats->scenery_effective = sel_effective;
         stats->scenery_hidden = hidden;
+        if (g_wt_flipped || g_wt_flip_fail)
+            printf("world tiles: %ld race barrier meshes flipped (arrows the other way), %ld could not be\n", g_wt_flipped, g_wt_flip_fail);
+        g_wt_flipped = g_wt_flip_fail = 0;
         stats->meshes_placed = scene->count;
     }
     g_wt_radius = radius;

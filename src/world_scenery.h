@@ -11,7 +11,7 @@ typedef struct {
     unsigned char membership, checked;
 } WGSelected;
 typedef struct { WGSelected *items; size_t count; } WGSelection;
-enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4, WG_LOCK=8 };
+enum { WG_EVENT=1, WG_OTHER=2, WG_ACTIVE=4, WG_LOCK=8, WG_FLIP=16 };   /* WG_FLIP: an active MW barrier the other way round */
 
 /* Career scenery groups (GC TrackLoader::InitTopologyAndSceneryGroups
  * 80196cb8). The retail loader enables, only when not racing (race params
@@ -119,7 +119,8 @@ static int wg_selection_open(const WGTable *table,int event,WGSelection *out) {
         if(id>0&&id==event){bits|=WG_ACTIVE;found=1;}
         if(g_wg_xp_barrier_on&&wg_xp_barrier((const char *)g+8)) {
             bits=WG_EVENT;
-            if(event>0&&g_wg_xp_barrier_on((const char *)g+8,event)==1){bits|=WG_ACTIVE;found=1;}
+            int on=event>0?g_wg_xp_barrier_on((const char *)g+8,event):0;
+            if(on>=1){bits|=WG_ACTIVE|(on==2?WG_FLIP:0);found=1;}
         }
         uint32_t refs=wg_u32(g+48);
         for(uint32_t j=0;j<refs;j++)items[wg_u16(g+52+2*(size_t)j)].membership|=(unsigned char)bits;
@@ -135,6 +136,11 @@ static const WGSelected *wg_selection_find(const WGSelection *s,unsigned section
     if(!s||!s->count||section>65535||row>65535)return NULL;
     WGSelected key={0};key.section=(uint16_t)section;key.row=(uint16_t)row;
     return bsearch(&key,s->items,s->count,sizeof *s->items,wg_selected_cmp);
+}
+/* an MW race barrier the race uses the other way round: its artwork mirrored */
+static int wg_selection_flipped(const WGSelection *s,unsigned section,unsigned row) {
+    const WGSelected *i=wg_selection_find(s,section,row);
+    return i&&(i->membership&WG_FLIP)&&(i->membership&WG_ACTIVE);
 }
 static int wg_selection_visible(const WGSelection *s,unsigned section,unsigned row) {
     const WGSelected *i=wg_selection_find(s,section,row);
