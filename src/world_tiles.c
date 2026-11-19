@@ -1254,6 +1254,17 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
         m->scen_has = h.scen_has; m->scen_region = h.scen_region; m->scen_index = h.scen_index;
         m->terrain_biased = h.terrain_biased; m->vrepair = h.vrepair; m->draw_mode = h.draw_mode;
         m->reflect = (h.flags & WTM_REFLECT) != 0;
+        {   /* test aid: OPENUG2_MESHDUMP_KEY=<hex texkey> logs the tile meshes that use it */
+            const char *e = getenv("OPENUG2_MESHDUMP_KEY");
+            if (e && strtoul(e, NULL, 16) == h.texkey) {
+                printf("MESHDUMP %.31s / %.27s nv %d vcol %d at %.0f %.0f %.0f:", h.sname, h.aname, nv, h.has_vcol,
+                       v[0], v[1], v[2]);
+                for (int i = 0; col && i < nv && i < 8; i++) printf(" %02x%02x%02x%02x", col[i*4], col[i*4+1], col[i*4+2], col[i*4+3]);
+                printf(" uv");
+                for (int i = 0; i < nv && i < 4; i++) printf(" %.2f,%.2f", v[i*5+3], v[i*5+4]);
+                printf("\n");
+            }
+        }
         {   /* bounds of the decoded (1 mm grid) positions, so no vertex
                lies outside its own box */
             float *wb = m->world_bounds;
