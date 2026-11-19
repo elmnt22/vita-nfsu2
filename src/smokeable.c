@@ -899,7 +899,15 @@ void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float vi
     if (!g_nsp) return;
     int budget = 16, drawn = 0, cur_blend = 0, cur_cut = 0;
     GLuint lasttex = (GLuint)-1;
-    for (int i = 0; i < g_nsp; i++) {
+    /* the loaded spawners, then live props whose section has gone: the
+       World Expansion has 12,692 spawners, ~600 loaded (a replay walks all) */
+    int nlist = g_rp_on ? g_nsp : g_npres;
+    int extra[SMK_LIVE_MAX], nextra = 0;
+    if (!g_rp_on)
+        for (int k = 0; k < SMK_LIVE_MAX; k++)
+            if (g_live[k].used && !g_sp[g_live[k].spawner].present) extra[nextra++] = g_live[k].spawner;
+    for (int j = 0; j < nlist + nextra; j++) {
+        int i = g_rp_on ? j : j < nlist ? g_pres[j] : extra[j - nlist];
         SmkSpawner *S = &g_sp[i];
         const SmkLive *L = S->live >= 0 ? &g_live[(int)S->live] : NULL;
         const float *RM = NULL;              /* replay: the recorded model matrix */
