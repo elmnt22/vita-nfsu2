@@ -48,6 +48,15 @@ int xpcity_default_focus(const char *track, float xy[2], float *heading_deg) {
     if (heading_deg) *heading_deg = -30.0f;
     return 1;
 }
+/* start point when no focus cache exists: the authored focus the sim derived
+   (Rockport 204.6,-143.3; Palmont 706.7,339.7 -- Palmont's free roam then
+   moves to xpcity_default_focus) */
+int xpcity_fixed_focus(const char *track, float xy[2]) {
+    int c = city_of(track);
+    if (c == 0) { xy[0] = 204.65f; xy[1] = -143.31f; return 1; }
+    if (c == 1) { xy[0] = 706.73f; xy[1] = 339.70f; return 1; }
+    return 0;
+}
 const char *xpcity_region(const char *track) { int c = city_of(track); return c >= 0 ? k_city[c].bun + 6 : NULL; }
 
 static int g_window;

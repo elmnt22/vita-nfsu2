@@ -13892,7 +13892,18 @@ static int track_focus_cached(const char *troot, const char *track, float xy[2])
                   got[0] == key[0] && got[1] == key[1] && isfinite(f[0]) && isfinite(f[1]);
         fclose(c);
         if (hit) { xy[0] = f[0]; xy[1] = f[1]; return 1; }
+        /* an expansion city never reads its stream whole here (Palmont's is
+           1 GB: hwxp2 died on a 490 MB malloc after a stale key) -- a cached
+           point from an older conversion is still a good start */
+        if (xpcity_is_city(track) && isfinite(f[0]) && isfinite(f[1]) && fabsf(f[0]) < 1e5f && fabsf(f[1]) < 1e5f) {
+            xy[0] = f[0]; xy[1] = f[1];
+            if (key[0] > 0 && key[1] > 0 && (c = fopen(fp, "wb"))) {
+                fwrite(key, sizeof key, 1, c); fwrite(xy, sizeof(float) * 2, 1, c); fclose(c);
+            }
+            return 1;
+        }
     }
+    if (xpcity_is_city(track)) return xpcity_fixed_focus(track, xy);
     long clen = 0, slen = 0;
     unsigned char *comp = n2_read_file(cp, &clen);
     unsigned char *strm = res_bundle(sp, &slen);   /* pinned */

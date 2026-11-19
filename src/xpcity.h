@@ -7,6 +7,7 @@ int xpcity_is_city(const char *track);
    its free-roam start, written to xy (and its heading in degrees, forward = cos/sin, when
    heading_deg is not NULL); 0 = keep the authored focus */
 int xpcity_default_focus(const char *track, float xy[2], float *heading_deg);
+int xpcity_fixed_focus(const char *track, float xy[2]);
 const char *xpcity_region(const char *track);   /* its routes region (L2RA ...): TRACKS/ROUTES<region> */
 /* Makes sure the city's translated stream is in troot (from the PC tool, or
    translated here from ux0:data/NFSU2/expansion/<game>/TRACKS behind a progress
