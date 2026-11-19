@@ -1130,6 +1130,7 @@ static int wt_decode_ready(unsigned char *data, long len, const uint32_t *hdr, i
         memcpy(m->world_bounds, h.world_bounds, sizeof m->world_bounds);
         m->world_bounds_valid = 1;
         memcpy(m->sname, h.sname, sizeof m->sname); m->sname[sizeof m->sname - 1] = 0;
+        if (strstr(m->sname, "REFBLOCKER")) m->world_role = 4;   /* Carbon reflection blockers: reflection pass only, never drawn (port) */
         memcpy(m->aname, h.aname, sizeof m->aname); m->aname[sizeof m->aname - 1] = 0;
         out->n++;
         sp += ds; dp += ds;
@@ -1252,6 +1253,7 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
         }
         m->world_bounds_valid = 1;
         memcpy(m->sname, h.sname, sizeof m->sname); m->sname[sizeof m->sname - 1] = 0;
+        if (strstr(m->sname, "REFBLOCKER")) m->world_role = 4;   /* Carbon reflection blockers: reflection pass only, never drawn (port) */
         memcpy(m->aname, h.aname, sizeof m->aname); m->aname[sizeof m->aname - 1] = 0;
         out->n++;
     }
