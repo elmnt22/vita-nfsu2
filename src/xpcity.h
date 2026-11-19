@@ -19,6 +19,7 @@ const char *xpcity_map(const char *track);
 /* the Free Run world picker: 0 Bayview, 1 Rockport, 2 Palmont */
 extern int g_xpcity_pick;
 int xpcity_installed(int pick);          /* translated or raw files there (Bayview: 1) */
+int xpcity_enabled(void);              /* ux0:data/NFSU2/expansion/enable.txt (the switch; the cities need it and their files) */
 const char *xpcity_track(int pick);      /* its stream name (STREAML2RA ...), Bayview NULL */
 /* race barriers (MW BARRIER_SPLINE groups): the city's per-event lists
    (TRACKS/ROUTES<region>/barriers.txt) for the scenery selection (world_scenery.h hook,

@@ -24,6 +24,7 @@ void vita_progress_screen(const char *title, const char *line1, const char *line
 void vita_progress_screen_done(void);
 
 #define XP_RAW_ROOT "ux0:data/NFSU2/expansion"
+#define XP_SWITCH   XP_RAW_ROOT "/enable.txt"   /* the switch: the cities need it AND their files */
 #define XP_CACHE    "ux0:data/NFSU2/cache"
 
 static const struct { const char *bun, *companion, *dir, *name; int game; } k_city[] = {
@@ -168,6 +169,7 @@ const char *xpcity_map(const char *track)
 int xpcity_prepare(const char *troot, const char *track) {
     int c = city_of(track);
     if (c < 0) return 1;
+    if (!xpcity_enabled()) { vita_mark("xpcity: %s asked for without " XP_SWITCH, k_city[c].name); return 0; }
     char raw[256], rawc[256], out[1024], outc[1024], mark[1024];
     snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
     snprintf(rawc, sizeof rawc, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
@@ -235,8 +237,20 @@ int xpcity_prepare(const char *troot, const char *track) {
 
 /* the Free Run world picker (shop.c): 0 Bayview, 1 Rockport, 2 Palmont */
 int g_xpcity_pick;
+/* the switch (as the World Expansion's beyond/enable.txt): the cities need it AND their files */
+int xpcity_enabled(void)
+{
+    static int known, on;
+    if (!known) {
+        on = xp_file_size(XP_SWITCH) >= 0;
+        known = 1;
+        printf("xpcity: %s\n", on ? "enable.txt found -- Rockport / Palmont on where installed" : "off (no " XP_SWITCH ")");
+    }
+    return on;
+}
 static int city_ok(int c)
 {
+    if (!xpcity_enabled()) return 0;
     char a[256], b[256], m[256];
     snprintf(a, sizeof a, "ux0:data/NFSU2/TRACKS/%s.BUN", k_city[c].bun);
     snprintf(b, sizeof b, "ux0:data/NFSU2/TRACKS/%s.BUN", k_city[c].companion);
