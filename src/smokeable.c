@@ -211,6 +211,14 @@ void smk_free(void)
     memset(&g_st, 0, sizeof g_st);
 }
 
+/* World Expansion cities: a prop draws to SMK_XP_FAR_K x its radius (at least
+   SMK_XP_FAR_MIN m), not the whole view distance -- Palmont's dense blocks drew
+   ~1.3-2.3 ms of props a frame on the Vita (hwxp11). A 1.7 m-radius bin ends
+   at 170 m, ~6 px tall. Bayview keeps the retail reach (0 = off). */
+#define SMK_XP_FAR_K   100.0f
+#define SMK_XP_FAR_MIN 150.0f
+static float g_far_k;
+static long g_drawn_sum, g_drawn_frames;
 int smk_load(const char *root, const char *stem)
 {
     smk_free();
@@ -224,7 +232,8 @@ int smk_load(const char *root, const char *stem)
        infos + hulls + placements + spawners) that stands in for both files */
     snprintf(path, sizeof path, "%s/XPSMK%s.BUN", root, stem);
     FILE *xp = fopen(path, "rb");
-    if (xp) { fclose(xp); snprintf(spath, sizeof spath, "%s", path); }
+    g_far_k = 0.0f;
+    if (xp) { fclose(xp); snprintf(spath, sizeof spath, "%s", path); g_far_k = getenv("OPENUG2_SMK_FARK") ? (float)atof(getenv("OPENUG2_SMK_FARK")) : SMK_XP_FAR_K; }   /* env: A/B (0 = off) */
     else {
         snprintf(path, sizeof path, "%s/%s.BUN", root, stem);
         snprintf(spath, sizeof spath, "%s/STREAM%s.BUN", root, stem);
@@ -929,7 +938,13 @@ void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float vi
         } else { memcpy(lo, S->mn, sizeof lo); memcpy(hi, S->mx, sizeof hi); }
         float dx = cam[0] < lo[0] ? lo[0] - cam[0] : cam[0] > hi[0] ? cam[0] - hi[0] : 0;
         float dy = cam[1] < lo[1] ? lo[1] - cam[1] : cam[1] > hi[1] ? cam[1] - hi[1] : 0;
-        if (dx * dx + dy * dy > view_dist * view_dist) continue;
+        float reach = view_dist;
+        if (g_far_k > 0.0f) {
+            float rr = g_far_k * spawner_radius(S);
+            if (rr < SMK_XP_FAR_MIN) rr = SMK_XP_FAR_MIN;
+            if (rr < reach) reach = rr;
+        }
+        if (dx * dx + dy * dy > reach * reach) continue;
         if (!box_in_view(planes, lo, hi)) continue;
         SmkGpu *g = g_gpu[i];
         if (!g) {
@@ -973,4 +988,9 @@ void smk_draw(const RProg *rp, const float MVP[16], const float cam[3], float vi
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
     g_st.drawn = drawn;
+    g_drawn_sum += drawn;
+    if (++g_drawn_frames >= 600) {
+        printf("smokeables: %.1f props drawn/frame%s\n", (double)g_drawn_sum / g_drawn_frames, g_far_k > 0.0f ? " (size reach)" : "");
+        g_drawn_sum = g_drawn_frames = 0;
+    }
 }

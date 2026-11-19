@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <sys/stat.h>
 
 #define SKYLINE_MIN_H   30.0f    /* tilestat 11-14: >= 30 m = 7.8 MB, 372 textures, city-wide */
 #define SKYLINE_CELL_M  128.0f   /* the inner-edge test unit (= the tile size) */
@@ -231,6 +232,16 @@ void skyline_forget(const char *track) {
 }
 static int cache_read(void) {
     char path[256]; cache_path(path, sizeof path);
+    {   /* tiles newer than the skyline (a Prep Tool rebuild copied over): build again --
+           the Vita kept a skyline from older city tiles (11-19, 43 blocks vs 340) */
+        char pak[256]; struct stat sp, sc;
+        snprintf(pak, sizeof pak, "%s/%.63s_v%d.pak", WTILE_DIR, S.track,
+                 sky_beyond() ? WTILE_BEYOND_VERSION : WTILE_VERSION);
+        if (stat(path, &sc) == 0 && stat(pak, &sp) == 0 && sp.st_mtime > sc.st_mtime) {
+            printf("skyline: %s is older than the tiles, building again\n", path);
+            return 0;
+        }
+    }
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     uint32_t h[6];
