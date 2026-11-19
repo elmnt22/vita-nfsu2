@@ -841,7 +841,7 @@ static void bs_present(void) {
     script_step();
 }
 static int bs_exists(const char *p) { char b[1024]; FILE *f = fopen(sim_path(p, b, sizeof b), "rb"); if (f) fclose(f); return f != NULL; }
-static void bs_touch(const char *p) { char b[1024]; FILE *f = fopen(sim_path(p, b, sizeof b), "wb"); if (f) fclose(f); }
+static void bs_touch(const char *p) { char b[1024]; sim_path(p, b, sizeof b); { char d[1024]; snprintf(d, sizeof d, "%s", b); char *sl = strrchr(d, '/'); if (sl) { *sl = 0; _mkdir(d); } } FILE *f = fopen(b, "wb"); if (f) fclose(f); }
 static void bs_remove(const char *p) { char b[1024]; remove(sim_path(p, b, sizeof b)); }
 static int rmtree_real(const char *dir) {
     int n = 0;

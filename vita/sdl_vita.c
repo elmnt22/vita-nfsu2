@@ -2273,6 +2273,11 @@ static int bs_exists(const char *p) {
     sceIoClose(fd); return 1;
 }
 static void bs_touch(const char *p) {
+    {   /* its folder may not exist yet (expansion/enable.txt before the Prep Tool ran) */
+        char d[256]; snprintf(d, sizeof d, "%s", p);
+        char *sl = strrchr(d, '/');
+        if (sl) { *sl = 0; sceIoMkdir(d, 0777); }
+    }
     SceUID fd = sceIoOpen(p, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd >= 0) sceIoClose(fd);
 }

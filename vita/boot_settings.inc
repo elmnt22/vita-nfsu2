@@ -17,6 +17,9 @@
      Full detail fulldetail.txt  present = the original road reflection rate,
                              traffic count and particle rate; off by default
                              (the Vita's lighter mix for 30 fps downtown)
+     World Expansion  expansion/enable.txt  present = Rockport (from NFS Most
+                             Wanted) and Palmont (from NFS Carbon) in Free Run,
+                             where the Prep Tool installed them; off by default
      Save logs as ZIP        packs the last (or all kept) run folders of
                              ux0:data/NFSU2/logs into ux0:data/NFSU2/
                              NFSU2_logs_<time>.zip for bug reports; local only
@@ -54,6 +57,7 @@ enum { STG_UP = 1, STG_DOWN = 2, STG_LEFT = 4, STG_RIGHT = 8, STG_CROSS = 16, ST
 #define BS_TRP    "ux0:data/NFSU2/trophies.txt"     /* = trophy.h TROPHY_ON_FILE */
 #define BS_FULL   "ux0:data/NFSU2/fulldetail.txt"   /* = main.c full_detail() */
 #define BS_CACHE  "ux0:data/NFSU2/cache"
+#define BS_XP     "ux0:data/NFSU2/expansion/enable.txt"   /* = xpcity.c XP_SWITCH */
 
 /* one rasterised glyph: w x h coverage, left = pen to bitmap's left edge,
    top = baseline to bitmap's top edge (up positive), adv = pen advance */
@@ -482,9 +486,11 @@ static long bsz_size(const char *path)
 static int bsz_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
 
 /* ---- the screen ------------------------------------------------------------ */
-enum { I_LOGS, I_EXPORT, I_FPS, I_FTRAV, I_TROPHY, I_FULL, I_RESET, I_START, I_N };
+enum { I_LOGS, I_EXPORT, I_FPS, I_FTRAV, I_TROPHY, I_FULL, I_XPHDR, I_XP, I_RESET, I_START, I_N };
+#define BS_HEADER(i) ((i) == I_XPHDR)   /* section titles: drawn, never selected */
 typedef struct {
-    int logs, unlocked, ftrav, trophies, full, export_all;
+    int logs, unlocked, ftrav, trophies, full, export_all, xp;
+    int xp_city[2];     /* Rockport, Palmont installed by the Prep Tool */
     int sel, top, confirm, fonts;
     char status[96];    /* Reset caches result */
     char xstatus[128];  /* Save logs result */
@@ -493,7 +499,8 @@ typedef struct {
 } BsUi;
 static BsFont g_bsf_title, g_bsf_label, g_bsf_small;
 static const char *const k_bs_names[I_N] = { "Enable logging", "Save logs as ZIP", "Limit frame rate", "Fast travel",
-                                             "Enable trophies", "Full detail", "Reset caches", "Start game" };
+                                             "Enable trophies", "Full detail", "World Expansion", "Rockport and Palmont",
+                                             "Reset caches", "Start game" };
 static const char *const k_bs_help[I_N] = {
     "Save logs for bug reports.",
     "One ZIP in ux0:data/NFSU2 for bug reports. Left/Right: which sessions.",
@@ -501,6 +508,8 @@ static const char *const k_bs_help[I_N] = {
     "World Map: choose No on the GPS prompt to jump there.",
     "Earn PS Vita trophies. Needs the NoTrpDrm plugin.",
     "Original reflections, traffic and particles. Lower frame rate.",
+    "",
+    "Drive Rockport and Palmont in Free Run. Needs the Prep Tool.",
     "Clear converted data and shaders. Your saves are kept.",
     "Start the game with these settings." };
 /* layout in 720x408 units: the title bar, the rows full width (scrolled when
@@ -542,6 +551,11 @@ static void bs_draw(const BsUi *u)
         for (int vi = 0; vi < vis && u->top + vi < I_N; vi++) {
             int i = u->top + vi;
             float y = ry0 + vi * rh, h = rh - 5 * S, yc = y + h * 0.5f;
+            if (BS_HEADER(i)) {   /* section title: text on the green, a thin rule under it */
+                bs_text(fl, k_bs_names[i], rx + 6 * S, yc + 4 * S, white);
+                bs_fill(rx, y + h, W - 2 * rx, 1 * S, 0, BSC(255, 255, 255, 0.45f), NULL);
+                continue;
+            }
             int on = i == u->sel;
             bs_fill(rx, y, W - 2 * rx, h, 6 * S,
                     on ? BSC(38, 145, 225, 1.0f) : BSC(18, 72, 4, 0.18f),
@@ -553,9 +567,9 @@ static void bs_draw(const BsUi *u)
                     BSC(255, 255, 255, on ? 1.0f : 0.55f));
             bs_text(fl, k_bs_names[i], rx + 18 * S, yc, white);
             float vr = W - rx - 18 * S;
-            if (i == I_LOGS || i == I_FPS || i == I_FTRAV || i == I_TROPHY || i == I_FULL) {
+            if (i == I_LOGS || i == I_FPS || i == I_FTRAV || i == I_TROPHY || i == I_FULL || i == I_XP) {
                 int checked = i == I_LOGS ? u->logs : i == I_FTRAV ? u->ftrav : i == I_TROPHY ? u->trophies :
-                              i == I_FULL ? u->full : !u->unlocked;
+                              i == I_FULL ? u->full : i == I_XP ? u->xp : !u->unlocked;
                 float b = 24 * S, bx = vr - b, by = yc - b * 0.5f;
                 bs_fill(bx, by, b, b, 2 * S, BSC(0, 0, 0, 0.12f), NULL);
                 bs_line(bx, by, b, b, 2 * S, 1.5f * S, white);
@@ -563,6 +577,12 @@ static void bs_draw(const BsUi *u)
                                       5.0f, 0, 2.8f * S, white, NULL);
                 if (i == I_FPS) {
                     const char *v = u->unlocked ? "Up to 60 FPS" : "30 FPS";
+                    bs_text(fs, v, bx - 16 * S - bs_text_w(fs, v), yc, white);
+                }
+                if (i == I_XP) {   /* which cities the Prep Tool installed */
+                    const char *v = u->xp_city[0] && u->xp_city[1] ? "Both installed"
+                                  : u->xp_city[0] ? "Rockport installed" : u->xp_city[1] ? "Palmont installed"
+                                  : "Not installed";
                     bs_text(fs, v, bx - 16 * S - bs_text_w(fs, v), yc, white);
                 }
             } else if (i == I_EXPORT) {
@@ -583,6 +603,11 @@ static void bs_draw(const BsUi *u)
                       : u->sel == I_RESET && u->status[0] ? u->status
                       : u->sel == I_RESET && u->confirm ? "Select again to delete caches. Saves are kept."
                       : u->sel == I_EXPORT && u->xstatus[0] ? u->xstatus
+                      : u->sel == I_XP && !u->xp_city[0] && !u->xp_city[1]
+                        ? "Not installed: add NFS Most Wanted / Carbon with the PC Prep Tool."
+                      : u->sel == I_XP && u->xp && !(u->xp_city[0] && u->xp_city[1])
+                        ? (u->xp_city[0] ? "Rockport is ready. Add NFS Carbon in the Prep Tool for Palmont."
+                                         : "Palmont is ready. Add NFS Most Wanted in the Prep Tool for Rockport.")
                       : k_bs_help[u->sel];
         float dy = ry0 + vis * rh + 12 * S;
         bs_text(fs, d, (W - bs_text_w(fs, d)) * 0.5f, dy, white);
@@ -713,6 +738,13 @@ static void boot_settings_run(void) {
     memset(&u, 0, sizeof u);
     u.logs = !bs_exists(BS_NOLOG); u.unlocked = bs_exists(BS_FPS60); u.ftrav = bs_exists(BS_FTRAV);
     u.trophies = bs_exists(BS_TRP); u.full = bs_exists(BS_FULL); u.frac = -1.0f;
+    u.xp = bs_exists(BS_XP);
+    /* installed = translated by the Prep Tool (.xp marker beside the world), or
+       the raw files the Vita translates itself on the first drive (xpcity.c city_ok) */
+    u.xp_city[0] = bs_exists("ux0:data/NFSU2/TRACKS/STREAML2RA.xp") ||
+                   bs_exists("ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN");
+    u.xp_city[1] = bs_exists("ux0:data/NFSU2/TRACKS/STREAML5RA.xp") ||
+                   bs_exists("ux0:data/NFSU2/expansion/carbon/TRACKS/STREAML5RA.BUN");
     int quit = 0;
     unsigned prev = bs_pad();   /* the L+R that opened the screen is not a press */
     vita_mark("settings: opened (logs %s, frame rate %s, fast travel %s)", u.logs ? "on" : "off",
@@ -747,13 +779,14 @@ static void boot_settings_run(void) {
                 float y = BS_RY0 + vi * BS_RH;
                 if (t_x >= BS_RX && t_x < BS_W - BS_RX && t_y >= y && t_y < y + BS_RH - 5 * S) {
                     int i = u.top + vi;
+                    if (BS_HEADER(i)) continue;
                     if (u.sel != i) u.confirm = 0;
                     u.sel = i; act = 1;
                 }
             }
         }
-        if (hit & STG_UP)   { u.sel = (u.sel + I_N - 1) % I_N; u.confirm = 0; moved_sel = 1; }
-        if (hit & STG_DOWN) { u.sel = (u.sel + 1) % I_N; u.confirm = 0; moved_sel = 1; }
+        if (hit & STG_UP)   { do u.sel = (u.sel + I_N - 1) % I_N; while (BS_HEADER(u.sel)); u.confirm = 0; moved_sel = 1; }
+        if (hit & STG_DOWN) { do u.sel = (u.sel + 1) % I_N; while (BS_HEADER(u.sel)); u.confirm = 0; moved_sel = 1; }
         if (moved_sel) {   /* keep the focus row on screen */
             if (u.sel < u.top) u.top = u.sel;
             if (u.sel >= u.top + vis) u.top = u.sel - vis + 1;
@@ -767,6 +800,7 @@ static void boot_settings_run(void) {
             case I_FTRAV:  bs_toggle(&u.ftrav, BS_FTRAV, 1); u.status[0] = 0; break;
             case I_TROPHY: bs_toggle(&u.trophies, BS_TRP, 1); u.status[0] = 0; break;
             case I_FULL:   bs_toggle(&u.full, BS_FULL, 1); u.status[0] = 0; break;
+            case I_XP:     bs_toggle(&u.xp, BS_XP, 1); u.status[0] = 0; break;
             case I_EXPORT:
                 if (!cross) { u.export_all = !u.export_all; u.xstatus[0] = 0; break; }
                 u.xstatus[0] = 0; u.busy = "Saving logs..."; u.frac = 0.0f;
@@ -789,7 +823,7 @@ static void boot_settings_run(void) {
         }
         bs_draw(&u);
     }
-    vita_mark("settings: closed (logs %s, frame rate %s, fast travel %s, trophies %s, full detail %s), restarting",
+    vita_mark("settings: closed (logs %s, frame rate %s, fast travel %s, trophies %s, full detail %s, World Expansion %s), restarting",
               u.logs ? "on" : "off", u.unlocked ? "unlocked" : "30", u.ftrav ? "on" : "off", u.trophies ? "on" : "off",
-              u.full ? "on" : "off");
+              u.full ? "on" : "off", u.xp ? "on" : "off");
 }
