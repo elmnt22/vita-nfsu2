@@ -59,6 +59,7 @@ static int vu_sel[VS_N];
 static int vu_dofw = -1;                   /* uDofW's name index (depth of field) */
 static void vu_dof_sync(void);
 static unsigned vu_switches;               /* cumulative variant binds */
+static unsigned vu_n_calls, vu_n_pass, vu_n_sync;   /* census: uniform writes, ones that reach GL, variant re-syncs */
 #define VU_HASH 128
 static struct { GLint loc; int idx; } vu_hash[VU_HASH];
 
@@ -81,6 +82,7 @@ static void vu_sync(int v) {
         GLint l = x->to[i];
         VuSlot *s = vu_slot(vu_main, vu_from[i], 0);
         if (l == -1 || !s) continue;
+        vu_n_sync++;
         switch (s->n) {
         case 1:  glUniform1f(l, s->v[0]); break;
         case 3:  glUniform3fv(l, 1, s->v); break;
@@ -211,6 +213,8 @@ void vita_use_lite(int on) {
 }
 
 unsigned vita_variant_switch_total(void) { return vu_switches; }
+/* census: [0] uniform writes, [1] the ones that reached GL (main program), [2] variant re-sync writes, [3] variant binds */
+void vita_uniform_counts(unsigned out[4]) { out[0] = vu_n_calls; out[1] = vu_n_pass; out[2] = vu_n_sync; out[3] = vu_switches; }
 unsigned vita_variant_switches(void) {
     static unsigned previous;
     unsigned n = vu_switches - previous;
@@ -236,6 +240,7 @@ static int vu_is_variant(GLuint prog) {
 }
 GLint vu_Uniform(GLint loc, int n, int count, const GLfloat *v) {
     if (loc == -1 || !vu_prog || !v || count < 1 || n < 1 || n > 16) return loc;
+    vu_n_calls++;
     VuSlot *s = vu_slot(vu_prog, loc, 1);
     int same = !vu_skip_off && s && s->known && count == 1 && s->n == n && !memcmp(s->v, v, (size_t)n * sizeof *v);
     if (s) { s->n = n; memcpy(s->v, v, (size_t)n * sizeof *v); }
@@ -249,6 +254,7 @@ GLint vu_Uniform(GLint loc, int n, int count, const GLfloat *v) {
     /* the bound variant has every value up to vu_ver (vu_bind syncs) */
     if (same && vu_var[vu_bound].synced[i] == vu_ver[i]) return -1;
     if (s) s->known = 1;
+    vu_n_pass++;
     vu_first[i] = v[0];
     vu_var[vu_bound].synced[i] = ++vu_ver[i];
     return vu_var[vu_bound].to[i];

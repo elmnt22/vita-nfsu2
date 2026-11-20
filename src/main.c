@@ -3176,6 +3176,7 @@ static void (*pf_GetQueryObjectui64v)(GLuint,GLenum,unsigned long long*);
 extern volatile int vita_wd_armed, vita_wd_sec, vita_wd_load;
 extern volatile unsigned vita_wd_beat;
 unsigned vita_variant_switch_total(void);
+void vita_uniform_counts(unsigned out[4]);
 #endif
 /* test aid: autodrive.txt "race quit" exits 20 s after the results screen
    opens, so an unattended Vita run can launch the next one */
@@ -28990,9 +28991,74 @@ int main(int argc, char **argv) {
             const short *plead = pm_gpu && !g_shop ? pm_lead : NULL;
             Uint64 pf_mesh_start = pf_live_body ? SDL_GetPerformanceCounter() : 0;
             Uint64 pf_submit_ticks = 0;
+            /* census (PERF_PLAN_1120 item 2): uniform traffic of the player body loop */
+            unsigned pc_u0[4]; vita_uniform_counts(pc_u0);
+            unsigned pc_draws0 = g_dbg.drawn;
             /* per-mesh: each part wears its own bound texture (body/wheel/...);
                parts with no in-TPK texture get a sensible flat colour by class. */
-            for (int i = 0; !follow_roam_ai && !g_cc_hide_car && i < ncar; i++) {
+            /* PERF_PLAN_1120 item 2: the opaque body parts in material order.
+               HW hwlog77: 85 draws, cpu_player_mesh_state 1.23 ms; the sim census
+               found ~10 uniform writes per draw reaching vitaGL (each one makes
+               it copy the uniform buffer again at the draw), because neighbouring
+               parts alternate category / trim / material / texture. Sorted by
+               what the loop's state is a function of (the part's category, trim,
+               material, texture, vertex colours, part slot, carbon slot), equal
+               parts run together and the uniform cache drops the repeats. Parts
+               drawn with alpha (car_alpha_part: the cabin's driver card) keep
+               their order and go after the opaque ones. Opaque order has no
+               visible effect except coplanar ties. nocarsort.txt = mesh order. */
+            static short *pord; static int pord_cap, pord_n = -1; static unsigned pord_sig;
+            static int pord_off = -1;
+            if (pord_off < 0) {
+                FILE *f = fopen("ux0:data/NFSU2/nocarsort.txt", "r");
+                pord_off = f != NULL; if (f) fclose(f);
+#ifdef OPENUG2_SIM_PRE_H
+                if (getenv("OPENUG2_SIM_NOCARSORT")) pord_off = 1;
+#endif
+                printf("car draw: player parts %s\n", pord_off ? "in mesh order (nocarsort.txt)" : "sorted by material");
+            }
+            const short *pdo = NULL;
+            if (!pord_off && ncar > 0 && ncar < 32000) {
+                unsigned sig = (unsigned)(uintptr_t)cgm * 2654435761u ^ (unsigned)(uintptr_t)plead ^ (unsigned)ncar * 40503u
+                             ^ (unsigned)(uintptr_t)car.meshes;
+                for (int i = 0; i < ncar; i++) sig = sig * 31u + cgm[i].texkey + cgm[i].car_material * 7u + (unsigned)cgm[i].cat;
+                for (int j = 0; j < nmap; j++) sig = sig * 31u + mapkey[j] + (unsigned)mapmode[j];
+                if (ncar > pord_cap) {
+                    short *np = (short *)realloc(pord, (size_t)ncar * sizeof *pord);
+                    if (np) { pord = np; pord_cap = ncar; }
+                }
+                if (pord && pord_cap >= ncar && (sig != pord_sig || pord_n != ncar)) {
+                    pord_sig = sig; pord_n = ncar;
+                    static uint64_t *pkey; static int pkey_cap;
+                    if (ncar > pkey_cap) {
+                        uint64_t *nk = (uint64_t *)realloc(pkey, (size_t)ncar * sizeof *pkey);
+                        if (nk) { pkey = nk; pkey_cap = ncar; }
+                    }
+                    if (pkey && pkey_cap >= ncar) {
+                        for (int i = 0; i < ncar; i++) {
+                            int tm = N2_DRAW_OPAQUE; GLuint tx = 0;
+                            for (int j = 0; j < nmap; j++) if (mapkey[j] == cgm[i].texkey) { tx = maptex[j]; tm = mapmode[j]; break; }
+                            int alpha = car_alpha_part(tx, tm, cgm[i].cat);
+                            /* the key: alpha class, category, trim, material, texture, vcol, slot */
+                            uint32_t h = cgm[i].car_material * 2654435761u ^ cgm[i].texkey * 40503u
+                                       ^ (uint32_t)car.meshes[i].car_part * 97u ^ (uint32_t)car.meshes[i].car_cf * 389u;
+                            pkey[i] = (uint64_t)(alpha ? 1 : 0) << 63 | (uint64_t)(cgm[i].cat & 0xff) << 54
+                                    | (uint64_t)(cgm[i].trim ? 1 : 0) << 53 | (uint64_t)(car.meshes[i].vcol ? 1 : 0) << 52
+                                    | (uint64_t)h << 16;
+                            if (alpha) pkey[i] = (uint64_t)1 << 63 | (uint64_t)i;   /* alpha parts: their own order */
+                            pord[i] = (short)i;
+                        }
+                        for (int a = 1; a < ncar; a++) {           /* stable insertion sort */
+                            short v = pord[a]; int b = a - 1;
+                            while (b >= 0 && pkey[pord[b]] > pkey[v]) { pord[b + 1] = pord[b]; b--; }
+                            pord[b + 1] = v;
+                        }
+                    } else pord_n = -1;
+                }
+                if (pord && pord_n == ncar) pdo = pord;
+            }
+            for (int oi = 0; !follow_roam_ai && !g_cc_hide_car && oi < ncar; oi++) {
+                int i = pdo ? pdo[oi] : oi;
                 if (plead && plead[i] == -1) continue;   /* drawn with its group */
                 int c = cgm[i].cat;
                 int mount = car.meshes[i].car_mount;
@@ -29258,6 +29324,18 @@ int main(int argc, char **argv) {
                 if (insp_on && g_dbg.insp_flipn) glUniform1f(rp.uFlipN, 0.0f);
                 if (insp_on && g_dbg.insp_cull) { if (g_dbg.car_cull) glCullFace(GL_BACK); else glDisable(GL_CULL_FACE); }
 #endif
+            }
+            {   /* census: per 600 frames, per player body draw */
+                static unsigned long pc_acc[5], pc_fr;
+                unsigned pc_u1[4]; vita_uniform_counts(pc_u1);
+                for (int q = 0; q < 4; q++) pc_acc[q] += pc_u1[q] - pc_u0[q];
+                pc_acc[4] += g_dbg.drawn - pc_draws0;
+                if (++pc_fr >= 600) {
+                    double d = pc_acc[4] ? (double)pc_acc[4] : 1.0;
+                    printf("player body census over %lu frames: %.1f draws/frame; per draw %.1f uniform writes, %.1f reach GL, %.2f variant binds, %.1f re-sync writes\n",
+                           pc_fr, pc_acc[4] / (double)pc_fr, pc_acc[0] / d, pc_acc[1] / d, pc_acc[3] / d, pc_acc[2] / d);
+                    memset(pc_acc, 0, sizeof pc_acc); pc_fr = 0;
+                }
             }
             if (pf_mesh_start) {
                 Uint64 elapsed = pf_elapsed(pf_mesh_start);
