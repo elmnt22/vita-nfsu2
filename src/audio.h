@@ -46,17 +46,17 @@ typedef struct {
     int n_rpm;
     uint32_t *grain;        /* n_grain+1 ascending cycle-aligned loop points */
     int n_grain;
+    float cyc_k;            /* grain length x its recorded rpm (the sweep's mean): a grain
+                               is one engine cycle, so it plays at length x rpm / cyc_k */
 } GinsuSweep;
 
 typedef struct {
     GinsuSweep accel_sweep, decel_sweep;
-    float play_cursor[2];   /* per-sweep looping cursor (accel, decel) */
-    int   grain_idx[2];     /* per-sweep current grain window */
-    float grain_rpm[2];     /* recorded rpm at the current grain (cached) */
-    /* sub-grain crossfade: a secondary cursor sprouts at the rpm-target
-       grain and fades in over ~12ms, then becomes the primary */
-    int   xf_on[2], xf_grain[2];
-    float xf_cursor[2], xf_rpm[2], xf_t[2];
+    double play_cursor[2];  /* per-sweep cursor (accel, decel); double: a float's step at 131072+
+                               samples is 1/64, a 2 % staircase on a 0.72 increment (GitHub #16) */
+    int   grain_idx[2];     /* per-sweep grain (engine cycle) being played */
+    float slot_lo, slot_hi; /* the engine slot's recorded min / max rpm (0x7f0de0 +0x20 / +0x1c);
+                               0 = the sweep's own range */
     int   decel_is_alias;   /* decel_sweep shares accel's buffers (no _DCL file) */
     int   has_gin_data;
 } Ginsu20State;
@@ -73,7 +73,13 @@ typedef struct {
     Ginsu20State gin;               /* native Gnsu20 sweeps (preferred) */
     int sample_mode;                /* 1 = .abk loops loaded, 0 = synth fallback */
     volatile float master_volume;   /* main thread writes */
+    volatile float rpm_lo, rpm_hi;  /* main thread writes: target_rpm's idle and limiter (engine record
+                                       +0x1f0 / +0x1f8, SFXCTL_Physics +0x78 / +0x7c); 0 = 1000..8000 */
 } EngineSynthState;
+
+/* an engine rpm on the sound's 1000..10000 scale (the pre-race scene's rev
+   patterns) as an rpm of the player's engine (0x46f7d0's inverse) */
+float eng_eax_to_rpm(float eax);
 
 extern EngineSynthState g_engine;
 extern volatile float g_road_vol;   /* tyre/wind noise, scales with speed */

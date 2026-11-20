@@ -106,6 +106,8 @@ typedef struct {
 
 /* Parse the four mixmaps (MAPOUTPUT, DFT, DRG, URL). Returns maps read. */
 int  carsfx_init(const char *dataroot);
+/* an engine slot's recorded rpm (0x7f0de0 +0x1c max / +0x20 min); 0 outside 0..42 */
+float carsfx_slot_rpm(int slot, int max);
 /* the player's car changed (audio row): its SWTN_CAR_xx_MB.abk -- the
    CAR_Sputter patch and its samples -- by the engine slot at the level
    audio_set_player_engine_level gave, and its skid bank (0x465b90: the

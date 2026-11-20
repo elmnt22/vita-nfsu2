@@ -2,6 +2,7 @@
 #include "audio.h"
 #include "music.h"
 #include "reverb.h"
+#include "carsfx.h"
 #include <assert.h>
 #include <math.h>
 #include <ctype.h>
@@ -77,6 +78,13 @@ void eng_gearbox_step(float speed_frac, float throttle, float dt,
 }
 
 void eng_shift_event(int dir) { g_shift_event = dir; }
+
+float eng_eax_to_rpm(float eax)   /* 0x46f7d0: (limiter - idle) x (eax - 1000) / 9000 + idle */
+{
+    float lo = g_engine.rpm_lo, hi = g_engine.rpm_hi;
+    if (!(hi > lo + 1.0f)) { lo = ENG_IDLE_RPM; hi = ENG_REDLINE_RPM; }
+    return (hi - lo) * (eax - 1000.0f) * (1.0f / 9000.0f) + lo;
+}
 
 float eng_gear_rpm(float speed_frac, int gear) {
     if (gear < 1) gear = 1;
@@ -450,6 +458,7 @@ int audio_load_ginsu_sweeps(const char *dataroot, const char *carname) {
                 ok = gin_load(path, &g->decel_sweep);
             }
             if (!ok) { g->decel_sweep = g->accel_sweep; g->decel_is_alias = 1; }
+            g->slot_lo = carsfx_slot_rpm(slot, 0); g->slot_hi = carsfx_slot_rpm(slot, 1);
             printf("engine sounds: slot %d (row %d, engine sound level %d) %s + %s\n", slot, car_audio_row(carname),
                    g_peng_want, k_engine_slot[slot].gin, ok ? k_engine_slot[slot].dcl : "(no decel)");
             goto loaded;
@@ -486,10 +495,17 @@ int audio_load_ginsu_sweeps(const char *dataroot, const char *carname) {
 loaded:
     for (int a = 0; a < 2; a++) {   /* same indexing as the callback: 1=accel */
         GinsuSweep *sw = a ? &g->accel_sweep : &g->decel_sweep;
-        g->play_cursor[a] = (float)sw->grain[0];
-        g->grain_rpm[a] = gin_rpm_at(sw,
-            0.5f*((float)sw->grain[0] + (float)sw->grain[1]));
-        if (g->grain_rpm[a] < 1.0f) g->grain_rpm[a] = sw->rpm_min;
+        g->play_cursor[a] = (double)sw->grain[0];
+        g->grain_idx[a] = 0;
+        /* each grain is one engine cycle: its length x its recorded rpm is
+           the sweep's constant (32 kHz: 120 s x 32000 = 3.84e6) */
+        double k = 0.0; int nk = 0;
+        for (int j = 0; j < sw->n_grain; j++) {
+            float r = gin_rpm_at(sw, 0.5f * ((float)sw->grain[j] + (float)sw->grain[j+1]));
+            float len = (float)(sw->grain[j+1] - sw->grain[j]);
+            if (r > 1.0f && len > 0.0f) { k += (double)r * len; nk++; }
+        }
+        sw->cyc_k = nk ? (float)(k / nk) : 120.0f * (float)sw->sample_rate;
     }
     g->has_gin_data = 1;
     return g->decel_is_alias ? 1 : 2;
@@ -1721,23 +1737,31 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
         float w[3]; eng_band_weights(e->current_rpm, w);
         float eng = 0.0f;
         if (e->gin.has_gin_data) {
-            /* native Gnsu20 path: loop the cycle-aligned grain matching the
-               current rpm, pitch-corrected by the grain's recorded rpm.
-               When rpm moves >6% off the playing grain, a secondary cursor
-               sprouts at the target grain and crossfades in over ~12ms
-               (dual-grain interpolation — no staircase on fast sweeps).
+            /* native Gnsu20 path (GitHub #16). Each grain of a sweep is one
+               engine cycle of the recording, so the voice plays whole cycles:
+               at every cycle end it continues with the cycle recorded at the
+               current rpm (GinsuSynthesis works in cycle space too,
+               HandlePacketRelease GC 800b0908), each read at length x rpm /
+               cyc_k so the pitch follows the rpm exactly whichever cycle
+               plays. The old way held a grain until the rpm was 6 % off,
+               then crossfaded to a grain started out of phase: a 1 % pitch
+               jump and a dip at every switch, a staircase on a pull.
                Accel/decel sweeps crossfade by load. */
             Ginsu20State *g = &e->gin;
-            /* The gearbox runs idle..redline (1000-8000); each car's accel
-               recording covers its own engine's range (the Hummer 1267-4783).
-               Map by fraction onto that range, so a truck never plays its
-               sweep at 1.7x speed; that is the engine rpm both sweeps use.
-               Several decel recordings only cover high revs (Bronco_DCL
-               4629-5748): below its range the coast sound hands over to the
-               accel sweep instead of playing a high-rev note at idle. */
-            float rf = (e->current_rpm - ENG_IDLE_RPM) / (ENG_REDLINE_RPM - ENG_IDLE_RPM);
+            /* the rpm the sweeps play (0x47c3f8 -> ctl +0xf8): the engine
+               rpm on the sound's 1000..10000 scale (SFXCTL_Physics 0x484c50:
+               (tach - idle) / (limiter - idle) x 9000 + 1000) onto the engine
+               slot's recorded min..max. Several decel recordings only cover
+               high revs (Bronco_DCL 4629-5748): below its range the coast
+               sound hands over to the accel sweep instead of playing a
+               high-rev note at idle. */
+            float lo = e->rpm_lo, hi = e->rpm_hi;
+            if (!(hi > lo + 1.0f)) { lo = ENG_IDLE_RPM; hi = ENG_REDLINE_RPM; }
+            float rf = (e->current_rpm - lo) / (hi - lo);
             if (rf < 0.0f) rf = 0.0f; if (rf > 1.0f) rf = 1.0f;
-            float erpm = g->accel_sweep.rpm_min + rf * (g->accel_sweep.rpm_max - g->accel_sweep.rpm_min);
+            float s_lo = g->slot_lo, s_hi = g->slot_hi;
+            if (!(s_hi > s_lo)) { s_lo = g->accel_sweep.rpm_min; s_hi = g->accel_sweep.rpm_max; }
+            float erpm = s_lo + rf * (s_hi - s_lo);
             float dmin = g->decel_sweep.rpm_min;
             float wdec = (erpm - 0.85f * dmin) / (0.15f * dmin);
             if (wdec < 0.0f) wdec = 0.0f; if (wdec > 1.0f) wdec = 1.0f;
@@ -1745,53 +1769,42 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
             float wd = (1.0f - e->current_load) * wdec;
             for (int a = 0; a < 2; a++) {
                 GinsuSweep *sw = a ? &g->accel_sweep : &g->decel_sweep;
+                if (!a && wd < 1e-4f) continue;   /* decel silent: skip its work */
                 float rate = (float)sw->sample_rate / 44100.0f;
                 float srpm = erpm < sw->rpm_min ? sw->rpm_min : erpm > sw->rpm_max ? sw->rpm_max : erpm;
-                if (!a && wd < 1e-4f) continue;   /* decel silent: skip its work */
+                /* below the sweep the lowest cycle plays lower (0x473e60:
+                   frequency = the data's minimum, pitch x rpm / minimum) */
+                float prpm = erpm < sw->rpm_min ? erpm : srpm;
                 int j = g->grain_idx[a];
-                if (g->play_cursor[a] >= (float)sw->grain[j+1])   /* loop own grain */
-                    g->play_cursor[a] -= (float)(sw->grain[j+1] - sw->grain[j]);
-                if (g->play_cursor[a] < (float)sw->grain[j])
-                    g->play_cursor[a] = (float)sw->grain[j];
-                if (!g->xf_on[a] &&
-                    fabsf(srpm - g->grain_rpm[a]) > 0.06f * g->grain_rpm[a]) {
-                    float pos = gin_pos_at(sw, srpm);
-                    int lo = 0, hi = sw->n_grain - 1;
-                    while (lo < hi) {
-                        int mid = (lo + hi) / 2;
-                        if (pos >= (float)sw->grain[mid+1]) lo = mid + 1; else hi = mid;
-                    }
-                    if (lo != j) {
-                        g->xf_on[a] = 1; g->xf_grain[a] = lo; g->xf_t[a] = 0.0f;
-                        g->xf_cursor[a] = (float)sw->grain[lo];
-                        g->xf_rpm[a] = gin_rpm_at(sw,
-                            0.5f*((float)sw->grain[lo] + (float)sw->grain[lo+1]));
-                        if (g->xf_rpm[a] < 1.0f) g->xf_rpm[a] = sw->rpm_min;
-                    }
-                }
+                if (j < 0 || j >= sw->n_grain) { j = 0; g->play_cursor[a] = (double)sw->grain[0]; }
+                if (g->play_cursor[a] < (double)sw->grain[j]) g->play_cursor[a] = (double)sw->grain[j];
                 uint32_t i0 = (uint32_t)g->play_cursor[a];
-                float fr = g->play_cursor[a] - (float)i0;
+                float fr = (float)(g->play_cursor[a] - (double)i0);
                 float s = (sw->samples[i0]*(1.0f-fr) + sw->samples[i0+1]*fr) / 32768.0f;
-                g->play_cursor[a] += (srpm / g->grain_rpm[a]) * rate;
-                if (g->xf_on[a]) {
-                    int k = g->xf_grain[a];
-                    if (g->xf_cursor[a] >= (float)sw->grain[k+1])
-                        g->xf_cursor[a] -= (float)(sw->grain[k+1] - sw->grain[k]);
-                    uint32_t i1 = (uint32_t)g->xf_cursor[a];
-                    float f1 = g->xf_cursor[a] - (float)i1;
-                    float s2 = (sw->samples[i1]*(1.0f-f1) + sw->samples[i1+1]*f1) / 32768.0f;
-                    float t = g->xf_t[a];
-                    s = s*(1.0f-t) + s2*t;
-                    g->xf_cursor[a] += (srpm / g->xf_rpm[a]) * rate;
-                    g->xf_t[a] += 1.0f / (0.012f * 44100.0f);
-                    if (g->xf_t[a] >= 1.0f) {   /* promote secondary to primary */
-                        g->grain_idx[a] = k; g->play_cursor[a] = g->xf_cursor[a];
-                        g->grain_rpm[a] = g->xf_rpm[a]; g->xf_on[a] = 0;
+                float len = (float)(sw->grain[j+1] - sw->grain[j]);
+                g->play_cursor[a] += (double)(rate * prpm * len / sw->cyc_k);
+                if (g->play_cursor[a] >= (double)sw->grain[j+1]) {   /* the cycle's end: the next one */
+                    float over = (float)(g->play_cursor[a] - (double)sw->grain[j+1]) / len;
+                    float pos = gin_pos_at(sw, srpm);
+                    int lo_g = 0, hi_g = sw->n_grain - 1;
+                    while (lo_g < hi_g) {
+                        int mid = (lo_g + hi_g) / 2;
+                        if (pos >= (double)sw->grain[mid+1]) lo_g = mid + 1; else hi_g = mid;
                     }
+                    float nlen = (float)(sw->grain[lo_g+1] - sw->grain[lo_g]);
+                    if (over > 0.999f) over = 0.999f;
+                    g->play_cursor[a] = (double)sw->grain[lo_g] + (double)(over * nlen);
+                    g->grain_idx[a] = lo_g;
                 }
                 eng += s * (a ? wa : wd) * master;
             }
             eng *= 0.55f;   /* sweeps are recorded near full scale */
+#ifdef OPENUG2_SIM_PRE_H
+            {   static FILE *ew; static int ewi = -1;   /* test aid: the engine voice alone, f32 mono 44.1k */
+                if (ewi < 0) { ewi = getenv("OPENUG2_SIM_ENGRAW") != NULL; if (ewi) ew = fopen(getenv("OPENUG2_SIM_ENGRAW"), "wb"); }
+                if (ew) { float r2[2] = { eng, e->current_rpm }; fwrite(r2, 4, 2, ew); }
+            }
+#endif
         } else if (e->sample_mode) {
             /* Ginsu path: idle loop below ~2200rpm, crossfading into the 3
                RPM-band loop pairs; accel vs decel crossfaded by load */
@@ -1987,6 +2000,15 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
             out[i * 2 + c] = (int16_t)v;
         }
     }
+#ifdef OPENUG2_SIM_PRE_H
+    {   static int el = -1;   /* test aid: the engine voice per mix buffer */
+        if (el < 0) el = getenv("OPENUG2_SIM_ENGLOG") != NULL;
+        if (el && e->gin.has_gin_data)
+            printf("englog: target %.0f cur %.0f lo %.0f hi %.0f load %.2f grain %d/%d\n", (double)target,
+                   (double)e->current_rpm, (double)e->rpm_lo, (double)e->rpm_hi, (double)e->current_load,
+                   e->gin.grain_idx[1], e->gin.grain_idx[0]);
+    }
+#endif
 #if OPENUG2_REVERB
     rvw0 = rvw1;
     if (rv_on) {

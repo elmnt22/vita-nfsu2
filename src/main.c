@@ -23592,7 +23592,7 @@ int main(int argc, char **argv) {
         }
         if (g_tt_rev) {   /* the DynoEnter revs (one step a tick, as the race NIS's) */
             nis_rev_step(&g_tt_revs, 1);
-            g_engine.target_rpm = g_tt_revs.rpm;
+            g_engine.target_rpm = eng_eax_to_rpm(g_tt_revs.rpm);   /* 1000..10000 scale (GitHub #16) */
             g_engine.load = g_tt_revs.thr * 0.01f;
             if (g_tt_revs.state != 3 || !tun_active() || !tun_on_dyno() || tun_dyno_live()) g_tt_rev = 0;
         }
@@ -24254,8 +24254,15 @@ int main(int argc, char **argv) {
           g_rt.rev_on = nis_rev_step(&g_rt.rev, g_rt.active && g_rt.nis && race_state == 0 && g_rt.nis_on);
           for (int k = 0; k < g_rt.n; k++)
               nis_rev_step(&g_rt.arev[k], g_rt.active && g_rt.nis && race_state == 0);
-          if (g_rt.rev_on) {
-              g_engine.target_rpm = g_rt.rev.rpm;
+          /* GitHub #16: the engine sound plays the tach between the car's idle and
+             limiter (SFXCTL_Physics InitCTL 0x45d370: engine record +0x1f0 / +0x1f8);
+             the virtual gearbox's own revs keep its 1000..8000 */
+          if (g_n2 && g_n2rec_ok && (g_n2_ticked || rp_up() || g_rt.rev_on || g_tt_rev)) {
+              g_engine.rpm_lo = n2sim_param(g_n2, 0x1f0);
+              g_engine.rpm_hi = n2sim_param(g_n2, 0x1f8);
+          } else g_engine.rpm_lo = g_engine.rpm_hi = 0.0f;
+          if (g_rt.rev_on) {   /* the scene's revs are on the sound's 1000..10000 scale */
+              g_engine.target_rpm = eng_eax_to_rpm(g_rt.rev.rpm);
               g_engine.load = g_rt.rev.thr * 0.01f;     /* throttle 0..100 */
           }
 #ifdef OPENUG2_SIM_PRE_H

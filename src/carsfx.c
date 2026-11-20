@@ -808,6 +808,10 @@ static const float k_slot_rpm[43][2] = {
     {6773, 1000}, {5653, 1350}, {6548, 1250}, {6566, 1150}, {6840, 1250}, {6786, 1200}, {7301, 1250},
     {7421, 1250}, {6508, 1250}, {6958, 1000}, {4782, 1000}, {7052, 1000}, {8326, 1250},
     {5200, 750}, {6509, 750} };   /* 41, 42: CAR_14's / CAR_12's files, their own records */
+float carsfx_slot_rpm(int slot, int max)
+{
+    return slot >= 0 && slot < 43 ? k_slot_rpm[slot][max ? 0 : 1] : 0.0f;
+}
 
 typedef struct {
     int on, slot, bank, detune;
