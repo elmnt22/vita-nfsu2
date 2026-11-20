@@ -20093,7 +20093,6 @@ int main(int argc, char **argv) {
     float post_hold_pos[4];      /* the marker spot + heading */
     int cc_cycle = 0;            /* D-pad Up while driving: next camera view */
 #endif
-    float nitro_fx = 0.0f;                 /* eased visual/boost state, 0..1 */
     float turbo_boost = -0.70f;            /* HUD turbo dial, -1 vacuum .. +1 */
 #ifdef __vita__
     /* Nitrous bottle, 0..1: about 8 s of boost. Full at every race start;
@@ -23918,8 +23917,6 @@ int main(int argc, char **argv) {
             g_turbo_boost = p < 0.0f ? 0.0f : p > 1.0f ? 1.0f : p;
         }
 #endif
-        float nitro_target = nitro_active ? 1.0f : 0.0f;
-        nitro_fx += (nitro_target - nitro_fx) * 0.18f;
         steer_filtered=phys_steer_response(steer_filtered,steer);
         /* Surface-aware handling (M114): query the selected centre contact layer,
            then EASE the active profile toward that surface's
@@ -30020,31 +30017,6 @@ int main(int argc, char **argv) {
         if (g_rt_crumbs > 0) { vita_crumb("frame: end"); g_rt_crumbs--; }
         vita_lap(0);
         #endif
-        /* Nitro screen stress: a few soft corner layers keep the centre clear
-           while suggesting speed without adding a post-process dependency. */
-        if (nitro_fx > 0.01f) {
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glDepthMask(GL_FALSE); glDisable(GL_DEPTH_TEST);
-            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-            glUniform3f(uColor,0.58f,0.72f,0.92f);
-            for (int corner=0; corner<4; corner++) {
-                float x = (corner&1) ? 1.0f : -1.0f;
-                float y = (corner&2) ? 1.0f : -1.0f;
-                for (int layer=0; layer<2; layer++) {
-                    float sz = 0.28f + layer*0.18f;
-                    float px = x > 0 ? 1.0f-sz : -1.0f;
-                    float py = y > 0 ? 1.0f-sz : -1.0f;
-                    float M[16]={sz,0,0,0, 0,sz,0,0, 0,0,1,0, px,py,0,1};
-                    glUniformMatrix4fv(uMVP,1,GL_FALSE,M);
-                    glUniform1f(uAlpha, nitro_fx * (0.055f - layer*0.018f));
-                    draw_gpumesh(&quad); g_dbg.drawn++;
-                }
-            }
-            glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f);
-            glUniform1f(uUnlit,0.0f); glUniformMatrix4fv(uMVP,1,GL_FALSE,MVP);
-            glDepthMask(GL_TRUE); glEnable(GL_DEPTH_TEST); glDisable(GL_BLEND);
-        }
-
         {   /* the opponents' and traffic's engine sounds (carsfx.c) */
 #ifdef __vita__
             float sfx_dt = (float)vita_ticks / 60.0f;
