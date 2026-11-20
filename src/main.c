@@ -10610,6 +10610,21 @@ static int fast_travel_on(void)
     return on;
 }
 static struct { int go; float p[3]; } g_ft;
+/* Right stick look (LiveArea Settings, rstickcam.txt; GitHub #30, a port
+   addition): the chase camera turns to the right stick's direction instead
+   of the rate orbit, and the bumper / hood views look back with the stick's
+   lower half (chasecam.h orbit_mode). Off by default. */
+static int rstick_look_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        FILE *f = fopen("ux0:data/NFSU2/rstickcam.txt", "rb");
+        on = f != NULL;
+        if (f) fclose(f);
+        printf("right stick look: %s\n", on ?"on (rstickcam.txt)" : "off");
+    }
+    return on;
+}
 static void wm_free(void)
 {
     hud_free(&g_wm.dlg); hud_free(&g_wm.h);
@@ -26366,8 +26381,9 @@ int main(int argc, char **argv) {
             if (g_cc_snap) { chasecam_snap(&g_ccam); g_cc_snap = 0; }
             {   /* 0x602bd0 event 0x7e: Look Back while the binding is held */
                 int lb = SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B] != 0 && !rp_up();   /* replay: the pad is UI_ReplayControl's */
-                if (lb != g_ccam.lookback) printf("camera: look back %s\n", lb ? "on" : "off");
-                g_ccam.lookback = lb;
+                static int lb_was;   /* the button's (GitHub #30: chasecam_orbit adds the stick's lower half below) */
+                if (lb != lb_was) printf("camera: look back %s\n", lb ? "on" : "off");
+                g_ccam.lookback = lb_was = lb;
             }
 #ifdef __vita__
             float cc_dt = (float)vita_ticks / 60.0f * n2sim_time_scale();   /* the world step (0x865154) */
@@ -26441,8 +26457,9 @@ int main(int argc, char **argv) {
                     for (int a = 0; a < OPT_ACT_COUNT; a++)
                         for (int k = 0; k < 2; k++)
                             if (g_opt.ctl[a][k] >= VB_RS_UP && g_opt.ctl[a][k] <= VB_RS_RIGHT) rs_bound = 1;
+                    g_ccam.orbit_mode = rstick_look_on();   /* GitHub #30: follow the stick's angle */
                     if (!rs_bound && g_hyd_level <= 0 && !g_pause.on && !post_up() && !tun_active() &&
-                        !(g_rt.active && (g_rt.pfinished || g_rt.postrace))) {
+                        !(g_rt.active && (g_rt.pfinished || g_rt.postrace)) && !(g_ccam.orbit_mode && rp_up())) {
                         ox = -vita_rstick_x; oy = vita_rstick_y;   /* right: the view turns right */
                     }
                     chasecam_orbit(&g_ccam, ox, oy, cc_dt);
@@ -26454,6 +26471,16 @@ int main(int argc, char **argv) {
                     g_cc_cubic = !jumpcam_camera(&jc, cc_dt, &cc_out);   /* 0xf / 0x10 fall back to Cubic */
                 }
                 g_nis_znear = cc_out.znear;   /* camera +0xbc: 0.5 */
+#ifdef OPENUG2_SIM_PRE_H
+                if (getenv("OPENUG2_SIM_CAMLOG")) {   /* sim aid (GitHub #30): the drive camera every frame */
+                    static int camlog_n;
+                    printf("camlog %d view %d yaw %.4f lb %d dist %.3f od %.3f eye %.9g %.9g %.9g fwd %.9g %.9g %.9g\n", camlog_n++,
+                           g_ccam.view, g_ccam.orbit_yaw, g_ccam.lookback,
+                           sqrtf((cc_out.eye[0]-cc.pos[0])*(cc_out.eye[0]-cc.pos[0]) + (cc_out.eye[1]-cc.pos[1])*(cc_out.eye[1]-cc.pos[1])),
+                           g_ccam.orbit_dist, cc_out.eye[0], cc_out.eye[1], cc_out.eye[2],
+                           cc_out.fwd[0], cc_out.fwd[1], cc_out.fwd[2]);
+                }
+#endif
                 /* Player::DetermineHudFeatures 0x600090: HUD feature 0x1000 (the
                    rear-view mirror; FEngHud::SetHudFeatures 0x4ca090 creates /
                    deletes RearViewMirrorCameraMover on its change) with the

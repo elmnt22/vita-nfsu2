@@ -12,6 +12,10 @@
      Frame rate  fps60.txt   present = unlocked (vsync, up to 60), else locked 30
      Fast travel fasttravel.txt  present = the World Map's GPS dialog "No"
                              moves the car to the entry (NFSU2FastTravel mod)
+     Right stick look rstickcam.txt  present = the chase camera turns to the
+                             right stick's direction (cut back when released
+                             behind), bumper / hood look back with the stick's
+                             lower half; off = the right stick's turning orbit
      Trophies    trophies.txt  present = trophies reported to the system; off
                              by default (progress is still kept in the profile)
      Full detail fulldetail.txt  present = the original road reflection rate,
@@ -54,6 +58,7 @@ enum { STG_UP = 1, STG_DOWN = 2, STG_LEFT = 4, STG_RIGHT = 8, STG_CROSS = 16, ST
 #define BS_NOLOG  "ux0:data/NFSU2/nolog.txt"
 #define BS_FPS60  "ux0:data/NFSU2/fps60.txt"
 #define BS_FTRAV  "ux0:data/NFSU2/fasttravel.txt"
+#define BS_RSCAM  "ux0:data/NFSU2/rstickcam.txt"    /* = main.c rstick_look_on() */
 #define BS_TRP    "ux0:data/NFSU2/trophies.txt"     /* = trophy.h TROPHY_ON_FILE */
 #define BS_FULL   "ux0:data/NFSU2/fulldetail.txt"   /* = main.c full_detail() */
 #define BS_CACHE  "ux0:data/NFSU2/cache"
@@ -486,10 +491,10 @@ static long bsz_size(const char *path)
 static int bsz_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
 
 /* ---- the screen ------------------------------------------------------------ */
-enum { I_LOGS, I_EXPORT, I_FPS, I_FTRAV, I_TROPHY, I_FULL, I_XPHDR, I_XP, I_RESET, I_START, I_N };
+enum { I_LOGS, I_EXPORT, I_FPS, I_FTRAV, I_RSCAM, I_TROPHY, I_FULL, I_XPHDR, I_XP, I_RESET, I_START, I_N };
 #define BS_HEADER(i) ((i) == I_XPHDR)   /* section titles: drawn, never selected */
 typedef struct {
-    int logs, unlocked, ftrav, trophies, full, export_all, xp;
+    int logs, unlocked, ftrav, rscam, trophies, full, export_all, xp;
     int xp_city[2];     /* Rockport, Palmont installed by the Prep Tool */
     int sel, top, confirm, fonts;
     char status[96];    /* Reset caches result */
@@ -498,7 +503,7 @@ typedef struct {
     float frac;         /* its progress, -1 = none */
 } BsUi;
 static BsFont g_bsf_title, g_bsf_label, g_bsf_small;
-static const char *const k_bs_names[I_N] = { "Enable logging", "Save logs as ZIP", "Limit frame rate", "Fast travel",
+static const char *const k_bs_names[I_N] = { "Enable logging", "Save logs as ZIP", "Limit frame rate", "Fast travel", "Right stick look",
                                              "Enable trophies", "Full detail", "World Expansion", "Rockport and Palmont",
                                              "Reset caches", "Start game" };
 static const char *const k_bs_help[I_N] = {
@@ -506,6 +511,7 @@ static const char *const k_bs_help[I_N] = {
     "One ZIP in ux0:data/NFSU2 for bug reports. Left/Right: which sessions.",
     "Limit to 30 FPS. Turn off to allow up to 60 FPS.",
     "World Map: choose No on the GPS prompt to jump there.",
+    "Aim the chase camera with the right stick. Down: look back.",
     "Earn PS Vita trophies. Needs the NoTrpDrm plugin.",
     "Original reflections, traffic and particles. Lower frame rate.",
     "",
@@ -567,8 +573,8 @@ static void bs_draw(const BsUi *u)
                     BSC(255, 255, 255, on ? 1.0f : 0.55f));
             bs_text(fl, k_bs_names[i], rx + 18 * S, yc, white);
             float vr = W - rx - 18 * S;
-            if (i == I_LOGS || i == I_FPS || i == I_FTRAV || i == I_TROPHY || i == I_FULL || i == I_XP) {
-                int checked = i == I_LOGS ? u->logs : i == I_FTRAV ? u->ftrav : i == I_TROPHY ? u->trophies :
+            if (i == I_LOGS || i == I_FPS || i == I_FTRAV || i == I_RSCAM || i == I_TROPHY || i == I_FULL || i == I_XP) {
+                int checked = i == I_LOGS ? u->logs : i == I_FTRAV ? u->ftrav : i == I_RSCAM ? u->rscam : i == I_TROPHY ? u->trophies :
                               i == I_FULL ? u->full : i == I_XP ? u->xp : !u->unlocked;
                 float b = 24 * S, bx = vr - b, by = yc - b * 0.5f;
                 bs_fill(bx, by, b, b, 2 * S, BSC(0, 0, 0, 0.12f), NULL);
@@ -702,8 +708,8 @@ static void bs_export_logs(BsUi *u)
         for (int r = first; r < nr && len < (int)sizeof info - 80; r++)
             len += snprintf(info + len, sizeof info - (size_t)len, "  %s\r\n", runs[r]);
         len += snprintf(info + len, sizeof info - (size_t)len,
-            "Settings now: logging %s, frame rate %s, fast travel %s, trophies %s, full detail %s\r\n",
-            u->logs ? "on" : "off", u->unlocked ? "up to 60" : "30", u->ftrav ? "on" : "off",
+            "Settings now: logging %s, frame rate %s, fast travel %s, right stick look %s, trophies %s, full detail %s\r\n",
+            u->logs ? "on" : "off", u->unlocked ? "up to 60" : "30", u->ftrav ? "on" : "off", u->rscam ? "on" : "off",
             u->trophies ? "on" : "off", u->full ? "on" : "off");
         if (len > (int)sizeof info) len = (int)sizeof info;
         bsz_dostime(stamp, &z.dtime, &z.ddate);
@@ -737,6 +743,7 @@ static void boot_settings_run(void) {
     static BsUi u;
     memset(&u, 0, sizeof u);
     u.logs = !bs_exists(BS_NOLOG); u.unlocked = bs_exists(BS_FPS60); u.ftrav = bs_exists(BS_FTRAV);
+    u.rscam = bs_exists(BS_RSCAM);
     u.trophies = bs_exists(BS_TRP); u.full = bs_exists(BS_FULL); u.frac = -1.0f;
     u.xp = bs_exists(BS_XP);
     /* installed = translated by the Prep Tool (.xp marker beside the world), or
@@ -798,6 +805,7 @@ static void boot_settings_run(void) {
             case I_LOGS:   bs_toggle(&u.logs, BS_NOLOG, 0); u.status[0] = 0; break;
             case I_FPS:    bs_toggle(&u.unlocked, BS_FPS60, 1); u.status[0] = 0; break;
             case I_FTRAV:  bs_toggle(&u.ftrav, BS_FTRAV, 1); u.status[0] = 0; break;
+            case I_RSCAM:  bs_toggle(&u.rscam, BS_RSCAM, 1); u.status[0] = 0; break;
             case I_TROPHY: bs_toggle(&u.trophies, BS_TRP, 1); u.status[0] = 0; break;
             case I_FULL:   bs_toggle(&u.full, BS_FULL, 1); u.status[0] = 0; break;
             case I_XP:     bs_toggle(&u.xp, BS_XP, 1); u.status[0] = 0; break;

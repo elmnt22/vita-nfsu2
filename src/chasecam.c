@@ -306,6 +306,38 @@ void chasecam_orbit(ChaseCam *c, float sx, float sy, float dt)
 {
     const float PI = 3.14159265f;
     if (dt <= 0.0f || dt > 0.25f) dt = 1.0f / 30.0f;
+    if (c->orbit_mode) {   /* GitHub #30: the camera follows the stick's angle */
+        float m = sqrtf(sx * sx + sy * sy);
+        int out = m > 0.3f;
+        c->orbit_pitch = 0.0f;
+        if (!is_chase(c->view)) {   /* bumper / hood: no orbit; the lower half looks back */
+            c->orbit_yaw = 0.0f; c->orbit_held = 0;
+            c->stick_lb = out && sy > 0.0f;
+            if (c->stick_lb) c->lookback = 1;
+            return;
+        }
+        c->stick_lb = 0;
+        if (out) {
+            /* sx = stick left (+), sy = stick down (+): up 0, right -90 deg
+               (the eye on the car's left, looking right), down 180 deg */
+            c->orbit_tgt = atan2f(sx, -sy);
+            float d = c->orbit_tgt - c->orbit_yaw;
+            while (d > PI) d -= 2.0f * PI;
+            while (d < -PI) d += 2.0f * PI;
+            c->orbit_yaw += d * (1.0f - expf(-14.0f * dt));
+            while (c->orbit_yaw > PI) c->orbit_yaw -= 2.0f * PI;
+            while (c->orbit_yaw < -PI) c->orbit_yaw += 2.0f * PI;
+            c->orbit_held = 1;
+        } else {
+            if (c->orbit_held && fabsf(c->orbit_tgt) >= 120.0f * (PI / 180.0f))
+                c->orbit_yaw = 0.0f;                          /* released behind: cut back */
+            c->orbit_held = 0;
+            float k = 1.0f - expf(-6.0f * dt);                /* released to a side: ease back */
+            c->orbit_yaw -= c->orbit_yaw * k;
+            if (fabsf(c->orbit_yaw) < 1e-3f) c->orbit_yaw = 0.0f;
+        }
+        return;
+    }
     if (sx != 0.0f || sy != 0.0f) {
         c->orbit_yaw += sx * 3.0f * dt;                 /* rad/s at full tilt */
         c->orbit_pitch = clampf(c->orbit_pitch - sy * 1.5f * dt, -0.15f, 1.1f);
@@ -711,6 +743,22 @@ void chasecam_update(ChaseCam *c, const CcCar *car, float dt,
 
     /* 0x444530 / 0x444190: keep the eye out of the world (chase views) */
     if (chase && w) keep_out_of_world(c->V, w, &c->wctx, start, R);
+    if (c->orbit_mode && chase && sg > 0.0f && c->orbit_yaw != 0.0f) {
+        /* GitHub #30: turned, a pull-in is instant (the pass above) but the way
+           back out is eased, so passing a wall's end does not jump the camera */
+        float e[3]; ea_eye(c->V, e);
+        float dv[3] = { e[0]-start[0], e[1]-start[1], e[2]-start[2] };
+        float d = sqrtf(dot3(dv, dv));
+        if (c->orbit_dist <= 0.0f || d <= c->orbit_dist) c->orbit_dist = d;
+        else {
+            c->orbit_dist += (d - c->orbit_dist) * (1.0f - expf(-4.0f * dt));
+            if (d > 1e-4f && c->orbit_dist < d - 1e-3f) {
+                float s = c->orbit_dist / d;
+                for (int i = 0; i < 3; i++) e[i] = start[i] + dv[i] * s;
+                rebuild_keep(c->V, e, start);
+            }
+        }
+    } else c->orbit_dist = -1.0f;
 
     /* 0x44b040 / 0x44ac10 (MinGapCars, traffic only): rise over cars beside
        the eye */
