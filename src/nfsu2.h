@@ -380,7 +380,11 @@ static int n2_lang(void) {
 #endif
     /* Korean / Chinese / Japanese (8-10): their FNTF fonts and strings are past
        Latin-1, which the port's text path stops at (feng_load_font c < 256) --
-       English until that is done (GAPS "Language select") */
+       English until that is done (GAPS "Language select"). Chinese = Traditional
+       Chinese (PC installer "Chinese (Traditional)", Taiwan); an English install's
+       Chinese.bin has its fonts (1,399 Traditional glyphs, atlases in
+       LanguageTextures.bin) but all 3,925 strings empty -- the text is only in a
+       Taiwan install's Chinese.bin (GitHub #20) */
     if (l < 0 || l > 7) l = 0;
     lang = l;
     return lang;
