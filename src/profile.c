@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -197,7 +198,13 @@ static int apply(const unsigned char *p, long n) {
     uint32_t sz = 0;
     if (opt && optn >= 4) memcpy(&sz, opt, 4);
     if (opt && sz == sizeof g_opt && optn == (long)(4 + sz)) memcpy(&g_opt, opt + 4, sizeof g_opt);
-    else printf("profile: options from another build, kept\n");
+    else if (opt && optn == (long)(4 + sz) && sz >= offsetof(N2Options, shuffle)) {
+        /* (GitHub #3 S6) another build's block: its head (audio, gameplay, the save
+           settings -- the same layout in every build) is still this profile's; only
+           the rest stays as it is, not the last profile's autosave / save prompts */
+        memcpy(&g_opt, opt + 4, offsetof(N2Options, shuffle));
+        printf("profile: options from another build, audio / gameplay / save settings taken\n");
+    } else printf("profile: options from another build, kept\n");
     options_save();
     if (gar && garn > 0) {
         /* the garage not written: the last profile's cars would be saved into this one */
