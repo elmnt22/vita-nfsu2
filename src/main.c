@@ -26577,7 +26577,7 @@ int main(int argc, char **argv) {
             if (refl_wanted && !(catchup && refl_valid) && ((refl_tick++ & 1) == 0 || refl_every || rlite)) {
                 float fc[3] = { g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b };
                 if (rscreen && render_prev_valid() && render_refl_begin(240, 136, fc)) {
-                    int rdraws = render_refl_screen(&quad, MVP, 1.0f);
+                    int rdraws = render_refl_screen(&quad, MVP, 1.0f, fc);
                     if (g_acid_ok) {   /* the reflection view's flares, as below */
                         rdraws += aciddraw_reflect_flares(V, MVP, 0.5f * (float)H / tanf(0.5f * cam_fovy),
                                                           rain_wetness(), refl_flare_ground);
