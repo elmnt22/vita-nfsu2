@@ -953,6 +953,8 @@ int world_resident_resources_build(WorldResidentResources *resources,
 
 static int resident_validate_meshes(const WorldResident *resident);
 
+int world_resident_validate_relaxed;
+
 int world_resident_validate_cpu(const WorldResident *resident,
                                 float player_x, float player_y, float player_z) {
     if (!resident || !isfinite(player_x) || !isfinite(player_y) ||
@@ -961,6 +963,10 @@ int world_resident_validate_cpu(const WorldResident *resident,
     WGroundHit hit;
     if (world_ground_hit_grid(&resident->world.grid, &resident->world.scene,
                               player_x, player_y, player_z, &hit) != WSURF_NONE) return 1;
+    if (world_resident_validate_relaxed) {
+        printf("resident validate: no road / terrain under the held car at (%.0f %.0f %.1f), accepted\n", player_x, player_y, player_z);
+        return 1;
+    }
     {
         WGroundHit any; int c2 = world_ground_hit_grid(&resident->world.grid, &resident->world.scene,
                                                       player_x, player_y, N2_GROUND_HIGHEST, &any);
@@ -1108,7 +1114,7 @@ int world_resident_finish_step(WorldResident *candidate, float x, float y, float
         WGroundHit hit;
         if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
             world_ground_hit_grid(&candidate->world.grid, &candidate->world.scene,
-                                  x, y, z, &hit) == WSURF_NONE) {
+                                  x, y, z, &hit) == WSURF_NONE && !world_resident_validate_relaxed) {
             printf("resident finish failed: no ground under the car (%.1f %.1f %.1f) in the area at %.0f %.0f\n",
                    x, y, z, candidate->center[0], candidate->center[1]);
             return -1;

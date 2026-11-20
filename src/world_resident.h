@@ -105,6 +105,9 @@ typedef struct {
     int omit_vista;
 } WResidentBuildArgs;
 
+/* set: a missing ground under (x, y) passes (a car held in place for the area: it is put
+   down on the collision once the area is in) */
+extern int world_resident_validate_relaxed;
 int world_resident_validate_cpu(const WorldResident *resident,
                                 float player_x, float player_y, float player_z);
 int world_resident_build(WorldResident *candidate,

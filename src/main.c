@@ -3836,6 +3836,7 @@ static int g_devui = 0;
 static int g_reset_req;          /* the Reset binding pressed (keypad 1 event), taken by the next tick */
 static float g_reset_blink;      /* car +0x974 / +0x978: seconds of the 2 s reset blink left (0x5fbd60 / 0x5ebf70) */
 static int g_pose_ring_clear;    /* a new Player (ctor 0x5f1670 sets +0xbc = 0): the saved poses start over */
+static int g_fall_good_clear;    /* the fell-through check's last poses start over (a fast travel) */
 /* M130: the player's authoritative vertical pose. carpos[0..1] stay owned by
    the XY arcade model; carpos[2], the chassis tilt and every wheel's own height
    now come from here. There is exactly one body-pose filter, not two. */
@@ -23264,6 +23265,13 @@ int main(int argc, char **argv) {
                         fin_heavy_run = 0;
                         Uint64 fin_t0 = SDL_GetPerformanceCounter();
 #endif
+#ifdef __vita__
+                        /* GH #7: a car held for an area (fast travel, post-race marker,
+                           replay exit) need not stand on road / terrain: a fast travel to
+                           the Garage zone (on a parking deck, building meshes only) failed
+                           every build there and held the car for good */
+                        world_resident_validate_relaxed = post_hold;
+#endif
                         build_status = prepared_status < 0 ? -1 :
                             world_resident_finish_step(candidate_resident,
                                 carpos[0], carpos[1], carpos[2], fin_budget,
@@ -25064,6 +25072,24 @@ int main(int argc, char **argv) {
             }
         }
 #endif
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_FT="x,y,z_x,y,z..." -- in free roam, a fast travel to
+               each spot in turn, 15 s apart (GH #7 repro; z as a zone record's +0x14) */
+            static Uint32 ft_t; static const char *ft_l;
+            if (getenv("OPENUG2_SIM_FT") && race_state == 1 && g_rt.roam && g_ride_ready && !post_hold) {
+                if (!ft_l) { ft_l = getenv("OPENUG2_SIM_FT"); ft_t = SDL_GetTicks(); }
+                float p[3];
+                if (*ft_l && SDL_GetTicks() - ft_t > 15000) {
+                    ft_t = SDL_GetTicks();
+                    if (sscanf(ft_l, "%f,%f,%f", &p[0], &p[1], &p[2]) == 3) {
+                        memcpy(g_ft.p, p, sizeof p); g_ft.go = 1;
+                        printf("sim: OPENUG2_SIM_FT to (%.0f %.0f %.1f) from (%.0f %.0f %.1f)\n", p[0], p[1], p[2], carpos[0], carpos[1], carpos[2]);
+                    }
+                    ft_l = strchr(ft_l, '_'); ft_l = ft_l ? ft_l + 1 : "";
+                }
+            }
+        }
+#endif
         if (g_ft.go) {   /* fast travel (the World Map): held on the zone like a post-race marker */
             g_ft.go = 0;
             if (race_state == 1 && (g_rt.roam || beyond_is_track(trackname))) {   /* (Beyond: free roam without the city's AI world) */
@@ -25089,6 +25115,22 @@ int main(int argc, char **argv) {
                     int found = 0;
                     float gz = wcoll_ground(g_wcoll, &gc, q, NULL, NULL, &found);
                     if (found) z = gz;
+                    /* GH #7: a fast travel to a zone with no collision under its spot
+                       (a record at height 99999, off the drivable world) dropped the
+                       car into the void. Put on the nearest road instead. */
+                    float rp[3];
+                    if (!found && ft_hold && g_rt.net && ainet_nearest_point(g_rt.net, post_hold_pos[0], post_hold_pos[1],
+                                                                             post_hold_pos[2] < 5000.0f ? post_hold_pos[2] : 0.0f, 400.0f, rp)) {
+                        float q2[3] = { rp[0], rp[1], rp[2] + 1.0f };
+                        WCollCtx gc2; wcoll_ctx_init(&gc2);
+                        gz = wcoll_ground(g_wcoll, &gc2, q2, NULL, NULL, &found);
+                        printf("fast travel: no ground at (%.0f %.0f %.1f), the nearest road (%.0f %.0f %.1f) %s\n",
+                               post_hold_pos[0], post_hold_pos[1], post_hold_pos[2], rp[0], rp[1], rp[2], found ? "has it" : "has none either");
+                        post_hold_pos[0] = rp[0]; post_hold_pos[1] = rp[1]; z = found ? gz : rp[2];
+                    }
+                }
+                if (ft_hold) {   /* GH #7: what was saved before the trip (Reset's poses, the fall check's) is not where the car is now */
+                    g_pose_ring_clear = 1; g_fall_good_clear = 1;
                 }
                 carpos[0] = post_hold_pos[0]; carpos[1] = post_hold_pos[1]; carpos[2] = z;
                 heading = post_hold_pos[3]; vel[0] = vel[1] = 0; speed = 0;
@@ -25272,6 +25314,7 @@ int main(int argc, char **argv) {
            put the car back on an earlier all-wheels-down pose. */
         if (race_state == 1 && g_ride_ready && active_resident && !post_hold) {
             static float good[2][4]; static int have_good, ground_run, air_run;
+            if (g_fall_good_clear) { g_fall_good_clear = 0; have_good = ground_run = air_run = 0; }
             static float lost[3];
             if (g_ride.contact_mask == 0xf) {
                 air_run = 0;
