@@ -222,6 +222,11 @@ float shop_rate_car(Shop *s, const char *car, const N2CarConfig *c, const char *
 /* After the Car Shop (0x55bdf0): the save question when the profile
  * changed since profile_snapshot() and save prompts are on, over the screen. */
 void  shop_save_check(Shop *s);
+/* (GitHub #3 S4) ExitToRoamHelper 8015dd24: the career shop's way out when IsDirty --
+   EnterMemcard(0x41) over the shop (asks to save unless autosave). shop_mc_busy is 1
+   while those screens are up; free roam starts once it is 0 (MemcardExitShopCallback) */
+int   shop_exit_memcard(Shop *s);
+int   shop_mc_busy(const Shop *s);
 /* Shows PC_Loading (the game's loading screen); shop_front_end ends it. */
 void  shop_loading(Shop *s);
 /* The screens' cache (first shop use builds it): its path, and building it

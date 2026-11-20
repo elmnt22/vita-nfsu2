@@ -7635,6 +7635,12 @@ void shop_save_check(Shop *s) {
     profile_drop_snapshot();
     if (g_opt.save_on && dirty) mc_enter(s, 0x2042, s->screen);
 }
+int shop_exit_memcard(Shop *s) {
+    if (!s || s->mc_view != MCV_OFF) return 0;
+    mc_enter(s, 0x41, s->screen);   /* 0x41: the save check (mc_flow 4: autosave saves, else asks) */
+    return 1;
+}
+int shop_mc_busy(const Shop *s) { return s && s->mc_view != MCV_OFF; }
 
 /* HandleButtonPressed 0x4f3780 (Yes = button 0), and realmc's answers */
 static void mc_answer(Shop *s, int yes) {
@@ -8759,6 +8765,10 @@ int shop_career_customize(Shop *s, int entry, const unsigned char *shop) {
     if (!s) return 0;
     int type = shop ? (signed char)shop[0x50] : 0;
     s->cust_entry = entry;
+    /* AllocBackupDB(0) 8013278c (the shop screens' entry 80171a3c ..., BeginCarCustomize):
+       IsDirty's reference on the way out, unless one is already up (the crib's, or the
+       one taken before the perf shop's Test Track); none for an unnamed profile (GitHub #3 S4) */
+    if (!profile_has_snapshot() && profile_named()) profile_snapshot();
     /* 8016104c: no Test Track for entry 0 / 1, no paint for entry 1 (the crib) */
     if (entry == 1) scroller_set(&s->top, k_car_shop_crib, (int)NELEM(k_car_shop_crib));
     else scroller_set(&s->top, k_car_shop, CAT_COUNT);

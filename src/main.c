@@ -217,6 +217,7 @@ static int g_shop_career, g_crib_parts_pending, g_crib_from_main;
 static int g_career_from_wmap;   /* 0x85ba67: the race was started from the crib World Map (StartCareerEventFromWorldMap) */
 static const unsigned char *g_cshop_pending;
 static int g_cshop_dirty;   /* a career Car Shop changed the car since the last save */
+static int g_cshop_saving;   /* the career shop's way-out save check is up (GitHub #3 S4) */
 static int g_car_reload;   /* a profile load / delete: the car again from the stock files + its garage line */
 static int g_cust_pending;   /* Customize Car Select accepted: the Car Shop once its car is in */
 static ShopQuickRace g_qr; static int g_qr_pending;   /* the quick race to start */
@@ -22741,6 +22742,19 @@ int main(int argc, char **argv) {
                             printf("garage: %s left stock -- no tuned slot (MaybeCommitChangesToCarStable)\n", carname);
                         else garage_save_car(carname, &sa.cfg, sa.rim_folder, sa.rim_style);
                     }
+                    /* (GitHub #3 S4) ExitToRoamHelper 8015dd24: IsDirty (the whole profile against
+                       the shop's AllocBackupDB -- cash, bought parts, the car) -> EnterMemcard 0x41
+                       over the shop (asks unless autosave), StartCareerFreeRoam after it */
+                    if (cs == 2 && (!tt || g_xp_trip_shop) && g_bey_shop_type < 0) {
+                        int dirty = (profile_dirty() || g_cshop_dirty) && profile_named();
+                        g_cshop_dirty = 0;
+                        if (dirty && shop_exit_memcard(g_shop)) {
+                            g_cshop_saving = 1;
+                            printf("career shop: the profile changed -- the save check first%c", 10);
+                            break;
+                        }
+                        profile_drop_snapshot();   /* UnTakeControl: DeallocBackupDB */
+                    }
                     shop_close(&g_shop);
                     world_tiles_trim(0);
                     kit_globalb_release();
@@ -22763,9 +22777,6 @@ int main(int argc, char **argv) {
                         break;
                     }
                     if (cs == 2 && g_xp_trip_shop) {   /* port: a shared trip's shop left -- the city again */
-                        if (g_cshop_dirty && profile_named())
-                            printf("career shop: saved on the way out (%s)\n", profile_save() ? "ok" : "FAILED");
-                        g_cshop_dirty = 0;
                         g_xp_trip_shop = 0; g_career_mode = 0;
                         race_state = 1; g_ride_ready = 0;
                         vel[0] = vel[1] = 0; speed = 0;
@@ -22776,10 +22787,7 @@ int main(int argc, char **argv) {
                         g_tt_entry = 1; g_tt_shop = g_cshop_cur; g_tt_begin = 1;
                         break;
                     }
-                    if (cs == 2) {   /* ExitToRoamHelper 8015dd24: IsDirty -> EnterMemcard 0x41, then StartCareerFreeRoam */
-                        if (g_cshop_dirty && profile_named())
-                            printf("career shop: saved on the way out (%s)\n", profile_save() ? "ok" : "FAILED");
-                        g_cshop_dirty = 0;
+                    if (cs == 2) {   /* ExitToRoamHelper 8015dd24: nothing to save -- StartCareerFreeRoam */
                         g_career_go = 1;
                         printf("career shop: back to Explore Mode\n");
                         break;
@@ -22805,7 +22813,26 @@ int main(int argc, char **argv) {
                     break;
                 }
             }
+            /* (GitHub #3 S4) MemcardExitShopCallback 8015dcf0: the save check over, saved or
+               not -- DeallocBackupDB, StartCareerFreeRoam (a trip's shop: its city again) */
+            if (g_cshop_saving && g_shop && !shop_mc_busy(g_shop)) {
+                g_cshop_saving = 0;
+                profile_drop_snapshot();
+                shop_close(&g_shop);
+                world_tiles_trim(0);
+                kit_globalb_release();
+                if (g_xp_trip_shop) {
+                    g_xp_trip_shop = 0; g_career_mode = 0;
+                    race_state = 1; g_ride_ready = 0;
+                    vel[0] = vel[1] = 0; speed = 0;
+                    printf("xp trip: shop left -- back to free roam (after the save check)\n");
+                } else {
+                    g_career_go = 1;
+                    printf("career shop: back to Explore Mode (after the save check)\n");
+                }
+            }
         }
+        if (!g_shop) g_cshop_saving = 0;
         if (g_shop_rim_pending) {   /* Car Shop rims: brand file + STYLEnn */
             g_shop_rim_pending = 0;
             int brand = -1;
