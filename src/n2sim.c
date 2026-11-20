@@ -438,6 +438,7 @@ struct N2Sim {
        (0), set by the scene's event track (CAR_BRAKE_LOCK 0x598ed0,
        CAR_BURNOUT_ADDITIVE 0x598ee0, CAR_ENGINE_TORQUE 0x5a4080) */
     float nis_tgt[3], nis_prev[3], nis_head;
+    float nis_pathv[3];                /* (port) the scene path's own motion over the last tick */
     int   nis_count, nis_moving;
     float nis_fspin, nis_spinadd, nis_tq[2];
     float tm_s540;                     /* car +0x540, 0x5f50a0's smoothed speed */
@@ -2242,6 +2243,7 @@ static void nis_enter(N2Sim *s)                                          /* 0x5b
     b->top_speed = PF(0x290);                                /* body +0x204, always */
     memset(s->nis_tgt, 0, sizeof s->nis_tgt); memset(s->nis_prev, 0, sizeof s->nis_prev);
     s->nis_head = 0; s->nis_count = 0; s->nis_moving = 0;
+    memset(s->nis_pathv, 0, sizeof s->nis_pathv);
     s->nis_fspin = 1.0f; s->nis_spinadd = 0; s->nis_tq[0] = s->nis_tq[1] = 0;
     body_from_state(s);
     s->h = 0;
@@ -2805,6 +2807,24 @@ void n2sim_set_mover(N2Sim *s, int mover)                               /* 0x5f4
     if (mover != N2_MOVER_MELLO && mover != N2_MOVER_TRAFFIC && mover != N2_MOVER_NIS && mover != N2_MOVER_FAR) mover = N2_MOVER_PHYSICS;
     if (mover == s->mover) return;
     float dg_w0 = len3(s->b.w); int dg_m0 = s->mover;   /* 11-15 diag */
+    if (dg_m0 == N2_MOVER_NIS) {
+        /* (port) leaving the scene's path: the mover's velocity is the catch-up
+           toward its target, (target - pos) / dt -- up to 66 m/s for the 1.1 m
+           the put-down allows. A car held off its spot (a wall, another car)
+           sat there pulled at that speed and kept it at the hand-off: launched
+           into the car ahead or over it (GitHub #31; player logs: f +63 m/s at
+           the countdown on 4602, +33 on 4401). On its path the car moves with
+           the path, so it leaves at the path's own speed, at most */
+        Body *b = &s->b;
+        float pv = sqrtf(s->nis_pathv[0] * s->nis_pathv[0] + s->nis_pathv[1] * s->nis_pathv[1]) + 1.0f;
+        float hv = sqrtf(b->v[0] * b->v[0] + b->v[1] * b->v[1]);
+        if (hv > pv) {
+            float k = pv / hv, v[3] = { b->v[0] * k, b->v[1] * k, b->v[2] > 1.0f ? 1.0f : b->v[2] };
+            printf("n2sim: scene hand-off at %.1f m/s, path %.1f m/s -- kept to the path's%c", hv, pv - 1.0f, 10);
+            float w[3] = { b->w[0], b->w[1], b->w[2] };
+            body_set_velocity(b, v, w);
+        }
+    }
     s->mover = mover;
     if (mover == N2_MOVER_MELLO) mello_enter(s);
     else if (mover == N2_MOVER_NIS) nis_enter(s);
@@ -3648,6 +3668,7 @@ void n2sim_nis_target(N2Sim *s, float x, float y, unsigned short heading, int co
         if (s->mover == N2_MOVER_NIS) {
             s->nis_fspin = fs; s->nis_spinadd = sa; s->nis_tq[0] = tq0; s->nis_tq[1] = tq1;
             s->nis_head = hdeg;
+            memset(s->nis_pathv, 0, sizeof s->nis_pathv);   /* put down standing */
             memcpy(s->nis_tgt, p, sizeof p); memcpy(s->nis_prev, p, sizeof p);
             s->nis_count = count;
         }
@@ -3655,9 +3676,12 @@ void n2sim_nis_target(N2Sim *s, float x, float y, unsigned short heading, int co
     }
     int same = fabsf(s->nis_tgt[0] - p[0]) <= 0.001f && fabsf(s->nis_tgt[1] - p[1]) <= 0.001f &&
                fabsf(s->nis_tgt[2] - p[2]) <= 0.001f;            /* 0x43d190 */
-    if (same && s->nis_head == hdeg) return;
+    if (same && s->nis_head == hdeg) { memset(s->nis_pathv, 0, sizeof s->nis_pathv); return; }
     s->nis_moving = 1;
     s->nis_head = hdeg;
+    int fresh = s->nis_prev[0] == 0.0f && s->nis_prev[1] == 0.0f;   /* the mover just entered */
+    for (int i = 0; i < 2; i++) s->nis_pathv[i] = fresh ? 0.0f : (p[i] - s->nis_prev[i]) / (dt > 0.0f ? dt : 1.0f / 60.0f);
+    s->nis_pathv[2] = 0.0f;
     if (count < 4) memcpy(s->nis_tgt, p, sizeof p);
     else for (int i = 0; i < 3; i++) s->nis_tgt[i] = s->nis_prev[i] * 0.25f + p[i] * 0.75f;   /* 0x7a19e0 */
     memcpy(s->nis_prev, p, sizeof p);

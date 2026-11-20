@@ -5086,7 +5086,9 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
            virgins the car's box touches go live first (0x5b23b0) */
         static CarCollCar cs[1 + 32];
         memset(cs, 0, sizeof cs);
-        cs[0].c = g_cc; cs[0].s = g_n2; cs[0].wc = &g_wcc; cs[0].human = 1;
+        /* on the scene's path the walls are off, as for the opponents' cars (rt
+           contacts): they held the car off its spot (GitHub #31) */
+        cs[0].c = g_cc; cs[0].s = g_n2; cs[0].wc = g_n2_nis ? NULL : &g_wcc; cs[0].human = 1;
         {   N2Body pb; n2sim_body(g_n2, &pb);
             smk_touch(pb.pos, carcoll_radius(g_cc)); }
     hitch_mark("pt.touch");
@@ -7693,6 +7695,18 @@ static void rt_nis_handoff(void)
         if (c->r) { airacer_set_racer(c->r, 100 + k, 1); airacer_placed(c->r); }
         n2sim_set_mover(c->s, c->r ? airacer_mover(c->r) : N2_MOVER_PHYSICS);
     }
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_SIM_NISKICK=<m/s> gives the player's car that forward
+           speed on its scene path just before the hand-off (a car held off its spot, GitHub #31) */
+        const char *e = getenv("OPENUG2_SIM_NISKICK");
+        if (e && g_n2_nis && g_n2) {
+            N2State st; n2sim_state(g_n2, &st);
+            float kv = (float)atof(e), v3[3] = { cosf(st.heading) * kv, sinf(st.heading) * kv, 0.0f };
+            n2sim_set_velocity(g_n2, v3);
+            printf("sim: scene hand-off kick %.1f m/s%c", kv, 10);
+        }
+    }
+#endif
     if (g_n2_nis && g_n2) n2sim_set_mover(g_n2, N2_MOVER_PHYSICS);
     g_n2_nis = 0;
     airacer_free(g_rt.human);           /* made again on the next tick (0x42caa0) */
