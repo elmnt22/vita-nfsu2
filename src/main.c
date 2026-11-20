@@ -21644,6 +21644,13 @@ int main(int argc, char **argv) {
                 if (cev && career_respawn(rsp, &rh) && (rsp[0] != 0.0f || rsp[1] != 0.0f)) {
                     if (g_prmv) g_prmv_go = 1; else g_career_go = 1;
                     printf("career: Explore -- free roam from the event's entry spot (%.0f %.0f)\n", rsp[0], rsp[1]);
+                } else if (!strncmp(trackname, "STREAML4R", 9) && strcmp(trackname, "STREAML4RA")) {
+                    /* (GitHub #3 S8) no entry spot (an event started from the World Map on a
+                       profile that never had one) on a venue track (drag / drift / Street X /
+                       URL): free roam is the city, not this track -- LoadTrack STREAML4RA,
+                       where the career's start (event 4000's start line) stands in for the spot */
+                    if (g_prmv) g_prmv_go = 1; else g_career_go = 1;
+                    printf("career: Explore -- no entry spot, back to the city from %s\n", trackname);
                 } else
                 printf("career: Explore -- free roam from the finish (%.0f %.0f)\n", carpos[0], carpos[1]);
             } else if (act == PR_NEXTRACE && g_career.engaged_event && tour_has_next()) {
