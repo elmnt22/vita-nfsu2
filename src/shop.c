@@ -569,7 +569,7 @@ static const char *group_name(int g) {   /* as in the part hash "<CAR>_KITnn_<NA
 
 /* ------------------------------------------------------------------ data */
 
-typedef struct { uint32_t key; GLuint tex; int w, h; unsigned char additive; } ShopTex;
+typedef struct { uint32_t key; GLuint tex; int w, h; unsigned char additive; long off; } ShopTex;   /* off: its pixels in the cache, not read yet */
 typedef struct { GLuint tex; int aw, ah, ok; FengFont f; } ShopFont;
 
 typedef struct {
@@ -613,7 +613,9 @@ struct Shop {
     float rgba[PK_COUNT][FENG_MAX_OBJ][4];   /* colour through the parent chain */
     signed char font_of[PK_COUNT][FENG_MAX_RES];
     GLuint res_tex[PK_COUNT][FENG_MAX_RES];
+    short res_ti[PK_COUNT][FENG_MAX_RES];    /* res_tex's ShopTex while not read yet, else -1 */
     ShopTex *tex; int ntex;
+    FILE *texf; int tex_read; long tex_read_kb;   /* the cache, open for textures read on first use */
     ShopFont font[4]; int nfont;
     GLuint qb_vbo, qb_nbo, qb_ibo;
     GLuint prog; GLint u_color, u_usetex, u_tex;   /* the shop's own 2D program */
@@ -1704,9 +1706,38 @@ static GLuint upload_rgba(int w, int h, const unsigned char *px) {
     return id;
 }
 
+/* a cache texture's pixels, read and uploaded on its first use (load_cache);
+   the GL binding is left as it was (this runs between a screen's draws) */
+static GLuint tex_load(Shop *s, ShopTex *t) {
+    if (t->tex || !t->off) return t->tex;
+    long off = t->off;
+    t->off = 0;                                   /* once, as the read at the open was */
+    if (!s->texf) s->texf = fopen(SHOP_CACHE, "rb");
+    size_t n = (size_t)t->w * t->h * 4;
+    unsigned char *px = s->texf ? (unsigned char *)malloc(n ? n : 1) : NULL;
+    if (px && !fseek(s->texf, off, SEEK_SET) && fread(px, 1, n, s->texf) == n) {
+        GLint bound = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+        t->tex = upload_rgba(t->w, t->h, px);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+        s->tex_read++; s->tex_read_kb += (long)(n >> 10);
+    }
+    free(px);
+    return t->tex;
+}
+
 static const ShopTex *tex_find(const Shop *s, uint32_t key) {
-    for (int i = 0; i < s->ntex; i++) if (s->tex[i].key == key) return &s->tex[i];
+    for (int i = 0; i < s->ntex; i++)
+        if (s->tex[i].key == key) { tex_load((Shop *)s, &((Shop *)s)->tex[i]); return &s->tex[i]; }
     return NULL;
+}
+/* a package resource's texture (prepare_package), read on first use */
+static GLuint res_tex(const Shop *s, int p, int r) {
+    GLuint t = s->res_tex[p][r];
+    int i = s->res_ti[p][r];
+    if (t || i < 0 || i >= s->ntex) return t;
+    Shop *w = (Shop *)s;
+    w->res_ti[p][r] = -1;
+    return w->res_tex[p][r] = tex_load(w, &w->tex[i]);
 }
 
 /* Loading_Controller's logo UG_load_logo.tga (drawn 384x48) in the Ultimate
@@ -1787,35 +1818,31 @@ static int load_cache(Shop *s) {
         LOAD_PUMP();
     }
     free(bun);
-    Uint64 lq1 = SDL_GetPerformanceCounter(), lq_up = 0;
+    Uint64 lq1 = SDL_GetPerformanceCounter();
+    /* GitHub #31: the textures only listed here, each read and uploaded the first
+       time a screen draws it (tex_load). Every open read and uploaded all 348,
+       18.8 MB, for the few screens one shop visit shows: a large part of the
+       ~7.5 s a shop or crib entry took on the Vita. Same pixels, same file. */
     unsigned char c[12];
-    uint32_t nt = fread(c, 1, 4, f) == 4 ? n2_u32(c) : 0;
+    long flen = -1, at = 12 + bunlen + 4;
+    if (!fseek(f, 0, SEEK_END)) flen = ftell(f);
+    uint32_t nt = !fseek(f, 12 + bunlen, SEEK_SET) && fread(c, 1, 4, f) == 4 ? n2_u32(c) : 0;
     s->tex = (ShopTex *)calloc(nt ? nt : 1, sizeof *s->tex);
-    unsigned char *px = NULL; size_t cap = 0;
-    for (uint32_t i = 0; s->tex && i < nt && fread(c, 1, 12, f) == 12; i++) {
+    for (uint32_t i = 0; s->tex && i < nt && !fseek(f, at, SEEK_SET) && fread(c, 1, 12, f) == 12; i++) {
         uint32_t key = n2_u32(c), wh = n2_u32(c + 4), bl = n2_u32(c + 8);
         int w = (int)(wh & 0xffff), h = (int)(wh >> 16);
-        size_t n = (size_t)w * h * 4;
-        if (n > cap) {
-            unsigned char *np = (unsigned char *)realloc(px, n);
-            if (!np) break;
-            px = np; cap = n;
-        }
-        if (fread(px, 1, n, f) != n) break;
+        long n = (long)w * h * 4;
+        if (at + 12 + n > flen) break;   /* cut short: as a failed read before */
         ShopTex *t = &s->tex[s->ntex++];
         t->key = key; t->w = w; t->h = h; t->additive = bl == 6;
-        Uint64 u0 = SDL_GetPerformanceCounter();
-        t->tex = upload_rgba(w, h, px);
-        lq_up += SDL_GetPerformanceCounter() - u0;
-        LOAD_PUMP();   /* 348 of them through stdio: 11 s behind the boot screen on the Vita (play1116b) */
+        t->off = at + 12;
+        at += 12 + n;
     }
-    free(px);
-    long tbytes = ftell(f);
     fclose(f);
     {   double fq = 1000.0 / (double)SDL_GetPerformanceFrequency();
-        printf("shop: cache ms: packages %.1f (%ld KB) textures %.1f (upload %.1f; %ld KB read)\n",
+        printf("shop: cache ms: packages %.1f (%ld KB) texture list %.1f (%d textures, %ld KB, read on first use)\n",
                (double)(lq1 - lq0) * fq, bunlen >> 10, (double)(SDL_GetPerformanceCounter() - lq1) * fq,
-               (double)lq_up * fq, tbytes >> 10);
+               s->ntex, (at - 12 - bunlen) >> 10);
     }
     return s->pk[PK_CATEGORY] && s->pk[PK_PARTS];
 }
@@ -2006,10 +2033,15 @@ static void prepare_package(Shop *s, int p) {
     s->ndraw[p] = 0;
     if (!pk) return;
     for (int r = 0; r < pk->nres; r++) {
-        const ShopTex *t = pk->res[r].type == 1 ? tex_find(s, feng_tex_key(pk->res[r].name)) : NULL;
-        s->res_tex[p][r] = t ? t->tex : 0;
+        int ti = -1;   /* the texture by key, as tex_find, but not read yet */
+        if (pk->res[r].type == 1) {
+            uint32_t key = feng_tex_key(pk->res[r].name);
+            for (int i = 0; i < s->ntex && ti < 0; i++) if (s->tex[i].key == key) ti = i;
+        }
+        s->res_tex[p][r] = ti >= 0 ? s->tex[ti].tex : 0;
+        s->res_ti[p][r] = (short)(ti >= 0 && !s->tex[ti].tex ? ti : -1);
         if (p == PK_LOADING_CTL && pk->res[r].type == 1 && feng_tex_key(pk->res[r].name) == LS_CTL_LOGO_KEY && ls_logo_tex())
-            s->res_tex[p][r] = ls_logo_tex();
+            { s->res_tex[p][r] = ls_logo_tex(); s->res_ti[p][r] = -1; }
     }
     for (int i = 0; i < pk->nobj; i++) {
         const FengObj *o = &pk->obj[i];
@@ -2626,6 +2658,8 @@ void shop_close(Shop **sp) {
                        movie_stop(*sp); }
     if (!sp || !*sp) return;
     Shop *s = *sp;
+    if (s->ntex) printf("shop: %d of %d textures read on use (%ld KB)\n", s->tex_read, s->ntex, s->tex_read_kb);
+    if (s->texf) fclose(s->texf);
     for (int i = 0; i < s->ntex; i++) if (s->tex[i].tex) glDeleteTextures(1, &s->tex[i].tex);
     glDeleteTextures(4, s->mag_tex);
     if (s->ls_pic) glDeleteTextures(1, &s->ls_pic);
@@ -10968,7 +11002,7 @@ static void draw_part_list(Shop *s, const DC *dc, int p) {
     if (tab >= 0 && n > 1) {
         const FengObj *o = &pk->obj[tab];
         float f = (float)cur / (float)(n - 1);
-        GLuint tx = s->res_tex[p][o->res];
+        GLuint tx = res_tex(s, p, o->res);
         if (tx) blit(dc, tx, fabsf(o->size[0]), fabsf(o->size[1]), o->ax,
                      top + 11.0f + f * (bot - top - 22.0f), 0.0f, s->rgba[p][tab], 0);
     }
@@ -11084,7 +11118,7 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
                 float ph = fmodf(s->blink * 4.0f, 7.0f) - (float)(o->hash - c0);
                 float a = 1.0f - fabsf(ph) / 1.5f; if (a < 0.15f) a = 0.15f;
                 float b[4] = { c[0], c[1], c[2], a };
-                GLuint tx = o->res > 0 && o->res < pk->nres ? s->res_tex[p][o->res] : 0;
+                GLuint tx = o->res > 0 && o->res < pk->nres ? res_tex(s, p, o->res) : 0;
                 /* a longer first line pushes the circles along after it */
                 float shift = loading_text_shift(s, pk, p);
                 if (tx) blit(dc, tx, fabsf(o->size[0]), fabsf(o->size[1]), o->ax + shift, o->ay, o->aangle, b, 0);
@@ -11167,7 +11201,7 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
         }
         /* untextured = code slots; Loading_Controller's res 0 is its U2_Menu_Box panel */
         if (o->res < (p == PK_LOADING_CTL ? 0 : 1) || o->res >= pk->nres) continue;
-        GLuint tex = s->res_tex[p][o->res];
+        GLuint tex = res_tex(s, p, o->res);
         if (!tex) continue;
         const ShopTex *st = tex_find(s, feng_tex_key(pk->res[o->res].name));
         if (st && st->tex != tex) st = NULL;   /* swapped art (ls_logo_tex): plain alpha */
@@ -11262,7 +11296,7 @@ static void cwm_draw(Shop *s, const DC *dc, Texts *t) {
     int m = feng_find(pk, O_CWM_MASTER);
     if (m < 0 || dlg_open(s)) return;
     const FengObj *mo = &pk->obj[m];
-    GLuint tex = mo->res > 0 && mo->res < pk->nres ? s->res_tex[PK_CRIB_WMAP][mo->res] : 0;
+    GLuint tex = mo->res > 0 && mo->res < pk->nres ? res_tex(s, PK_CRIB_WMAP, mo->res) : 0;
     if (!tex) return;
     DC idc = *dc; idc.cover = 0; idc.fade = 0.0f; idc.pin = obj_pin(pk, m, 1);
     float w = fabsf(mo->size[0]), h = fabsf(mo->size[1]);
@@ -11319,7 +11353,7 @@ static void draw_anim_package(Shop *s, const DC *dc0, int p, const FengAnim *a, 
         if (tex) ;
         else if (s->qr_rowobj[i] == 2) { if (arrow) tex = arrow->tex; }   /* 0x54ef30: U2_Menu_Arrow */
         else if (o->res > 0 && o->res < pk->nres) {
-            tex = s->res_tex[p][o->res];
+            tex = res_tex(s, p, o->res);
             const ShopTex *st = tex_find(s, feng_tex_key(pk->res[o->res].name));
             add = st && st->additive;
         }
