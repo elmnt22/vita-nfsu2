@@ -22630,6 +22630,18 @@ int main(int argc, char **argv) {
                 sim_cs_n--; sim_cs_at = SDL_GetTicks() + 1000;
             }
         }
+        {   /* test aid (simulator): OPENUG2_SIM_SHOPOPEN=N opens + closes the whole front end N times
+               once driving stands (a shop / crib entry's load time, GitHub #31) */
+            static int sim_so_n = -1; static Uint32 sim_so_at;
+            if (sim_so_n < 0) sim_so_n = getenv("OPENUG2_SIM_SHOPOPEN") ? atoi(getenv("OPENUG2_SIM_SHOPOPEN")) : 0;
+            if (sim_so_n > 0 && race_state == 1 && g_ride_ready && !g_fe && !g_shop && SDL_GetTicks() > sim_so_at) {
+                Uint32 t0 = SDL_GetTicks();
+                Shop *so = shop_open(dataroot, carname, &carcfg, modification, wheel_brands[wheel_brand], wheel_style);
+                printf("sim: front end open %s in %u ms\n", so ? "ok" : "FAILED", SDL_GetTicks() - t0);
+                if (so) shop_close(&so);
+                sim_so_n--; sim_so_at = SDL_GetTicks() + 1000;
+            }
+        }
         {   /* test aid (simulator): OPENUG2_SIM_CSHOP=<type> walks into that city shop once free roam stands
                ("goal": the running world challenge's goal shop, as its zone would) */
             static int sim_cshop_done;

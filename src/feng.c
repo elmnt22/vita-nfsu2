@@ -323,6 +323,27 @@ static int parse_feng(const unsigned char *d, long len, FengPackage *p) {
     return p->nobj > 0;
 }
 
+/* 1 when the name parse_feng would give the package (its last PkHd's, walked
+   the same way) is `name` */
+static int parse_feng_name_is(const unsigned char *d, long len, const char *name) {
+    if (len < 16 || memcmp(d, "FEn\xe7", 4)) return 0;
+    long end = 8 + (long)n2_u32(d + 4);
+    if (end > len) end = len;
+    char nm[40]; nm[0] = 0;
+    for (long o = 8; o + 8 <= end; ) {
+        uint32_t sz = n2_u32(d + o + 4);
+        if ((unsigned long)sz > (unsigned long)(end - o - 8)) break;
+        long body = o + 8, bend = body + (long)sz;
+        if (!memcmp(d + o, "PkHd", 4) && sz > 0x18) {
+            int n = 0;
+            while (n < 39 && body + 0x18 + n < bend && d[body + 0x18 + n]) { nm[n] = (char)d[body + 0x18 + n]; n++; }
+            nm[n] = 0;
+        }
+        o = bend;
+    }
+    return same_name(nm, name);
+}
+
 void feng_free_package(FengPackage *p) {
     if (!p) return;
     free(p->scr); free(p->trk); free(p->keyw);
@@ -389,7 +410,9 @@ int feng_load_package(const unsigned char *bun, long len, const char *name,
             for (long j = 0; pk && j + 4 <= pklen && j < 64; j++)
                 if (!memcmp(pk + j, "FEn\xe7", 4)) { f = j; break; }
             int ok = 0;
-            if (f >= 0) {
+            /* another package: passed over on its header's name alone, not cleared and parsed
+               whole first (GitHub #31: the front end's 49 packages, ~1,200 parses an open) */
+            if (f >= 0 && parse_feng_name_is(pk + f, pklen - f, name)) {
                 memset(out, 0, sizeof *out);
                 out->scr = t_scr; out->trk = t_trk; out->keyw = t_keyw;
                 out->ev = t_ev; out->tg = t_tg; out->rsp = t_rsp;

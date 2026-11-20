@@ -1777,6 +1777,7 @@ static int load_cache(Shop *s) {
     if (!bun || fseek(f, 12, SEEK_SET) || fread(bun, 1, (size_t)bunlen, f) != (size_t)bunlen) {
         free(bun); fclose(f); return 0;
     }
+    Uint64 lq0 = SDL_GetPerformanceCounter();
     for (int i = 0; i < PK_COUNT; i++) {
         s->pk[i] = (FengPackage *)malloc(sizeof *s->pk[i]);
         if (s->pk[i] && !feng_load_package(bun, bunlen, k_pk_name[i], s->pk[i])) {
@@ -1786,6 +1787,7 @@ static int load_cache(Shop *s) {
         LOAD_PUMP();
     }
     free(bun);
+    Uint64 lq1 = SDL_GetPerformanceCounter(), lq_up = 0;
     unsigned char c[12];
     uint32_t nt = fread(c, 1, 4, f) == 4 ? n2_u32(c) : 0;
     s->tex = (ShopTex *)calloc(nt ? nt : 1, sizeof *s->tex);
@@ -1802,11 +1804,19 @@ static int load_cache(Shop *s) {
         if (fread(px, 1, n, f) != n) break;
         ShopTex *t = &s->tex[s->ntex++];
         t->key = key; t->w = w; t->h = h; t->additive = bl == 6;
+        Uint64 u0 = SDL_GetPerformanceCounter();
         t->tex = upload_rgba(w, h, px);
+        lq_up += SDL_GetPerformanceCounter() - u0;
         LOAD_PUMP();   /* 348 of them through stdio: 11 s behind the boot screen on the Vita (play1116b) */
     }
     free(px);
+    long tbytes = ftell(f);
     fclose(f);
+    {   double fq = 1000.0 / (double)SDL_GetPerformanceFrequency();
+        printf("shop: cache ms: packages %.1f (%ld KB) textures %.1f (upload %.1f; %ld KB read)\n",
+               (double)(lq1 - lq0) * fq, bunlen >> 10, (double)(SDL_GetPerformanceCounter() - lq1) * fq,
+               (double)lq_up * fq, tbytes >> 10);
+    }
     return s->pk[PK_CATEGORY] && s->pk[PK_PARTS];
 }
 
@@ -2058,6 +2068,8 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
     if (!s) return NULL;
     s->dlg_pk = -1; s->vmode = -1;
     snprintf(s->dataroot, sizeof s->dataroot, "%s", dataroot ? dataroot : ".");
+    /* where an open's time goes (GitHub #31: ~7.5 s a shop entry on the Vita) */
+    Uint64 tq[7]; tq[0] = SDL_GetPerformanceCounter();
     if (!load_cache(s)) {
         for (int i = 0; i < PK_COUNT; i++) { feng_free_package(s->pk[i]); free(s->pk[i]); s->pk[i] = NULL; }
         printf("shop: building %s (first use)\n", SHOP_CACHE);
@@ -2068,15 +2080,20 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
         }
     }
     LOAD_PUMP();
+    tq[1] = SDL_GetPerformanceCounter();
     load_strings(s);
     LOAD_PUMP();
+    tq[2] = SDL_GetPerformanceCounter();
     load_fonts(s);
     LOAD_PUMP();
+    tq[3] = SDL_GetPerformanceCounter();
     for (int p = 0; p < PK_COUNT; p++) feng_apply_labels(s->pk[p], s->str_hash, s->str_txt, s->nstr, 0);   /* FEString labels */
     for (int p = 0; p < PK_COUNT; p++) { prepare_package(s, p); LOAD_PUMP(); }
+    tq[4] = SDL_GetPerformanceCounter();
     load_db(s);
     LOAD_PUMP();
     if (s->db) vinyl_db_load(s->db, s->dblen);
+    tq[5] = SDL_GetPerformanceCounter();
     /* glyph / sprite quad batch */
     {
         enum { QMAX = 64 };
@@ -2103,6 +2120,13 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
     memcpy(s->prev_folder, s->rim_folder, sizeof s->prev_folder); s->prev_style = s->rim_style;
     shop_set_car(s, car, installed, menus);
     s->screen = SC_CAR_SHOP;
+    tq[6] = SDL_GetPerformanceCounter();
+    {   double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
+        printf("shop: open ms: cache %.1f strings %.1f fonts %.1f prepare %.1f db %.1f rest %.1f = %.1f\n",
+               (double)(tq[1] - tq[0]) * f, (double)(tq[2] - tq[1]) * f, (double)(tq[3] - tq[2]) * f,
+               (double)(tq[4] - tq[3]) * f, (double)(tq[5] - tq[4]) * f, (double)(tq[6] - tq[5]) * f,
+               (double)(tq[6] - tq[0]) * f);
+    }
     printf("shop: open (%d textures, %d fonts, %d strings)\n", s->ntex, s->nfont, s->nstr);
     return s;
 }
