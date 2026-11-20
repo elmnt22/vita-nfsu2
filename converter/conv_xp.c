@@ -189,7 +189,23 @@ int xpp_city_done(int c) {   /* translated + tiles + compact bundle + skyline */
     char p[MAX_PATH + 64], m[MAX_PATH + 64]; compact_path(p, sizeof p, c); stage_path(m, sizeof m, c, ".xp");
     char sk[256], skl[MAX_PATH + 300]; skyline_cache_file(k_city[c].bun, sk, sizeof sk);
     snprintf(skl, sizeof skl, "%s\\cache\\tiles\\%s", g_out, strrchr(sk, '/') ? strrchr(sk, '/') + 1 : sk);
-    return translated(c, -1) && world_tiles_ready(k_city[c].bun) && file_exists(p) && file_exists(skl);   /* the marker at this XP_VERSION (11-19: an older one read as done) */
+    if (!(translated(c, -1) && world_tiles_ready(k_city[c].bun) && file_exists(p) && file_exists(skl))) return 0;   /* the marker at this XP_VERSION (11-19: an older one read as done) */
+    /* 11-19: the race files added after a city was first converted (race names, the route
+       file, race maps, sea mask, area maps): missing ones make the run fill them in */
+    char f[MAX_PATH + 96];
+    snprintf(f, sizeof f, "%s\\stage\\TRACKS\\ROUTES%s\\names.txt", g_out, k_city[c].companion);
+    if (!file_exists(f)) return 0;
+    if (k_city[c].game == XP_GAME_CARBON) {
+        snprintf(f, sizeof f, "%s\\stage\\TRACKS\\ROUTES%s\\mmroute.bin", g_out, k_city[c].companion); if (!file_exists(f)) return 0;
+        snprintf(f, sizeof f, "%s\\stage\\TRACKS\\%s.SEA", g_out, k_city[c].companion); if (!file_exists(f)) return 0;
+        snprintf(f, sizeof f, "%s\\stage\\TRACKS\\%s_A0.MAP", g_out, k_city[c].companion); if (!file_exists(f)) return 0;
+    } else {
+        WIN32_FIND_DATAA fd; HANDLE h;
+        snprintf(f, sizeof f, "%s\\stage\\TRACKS\\RACEMAPS%s\\MINI_MAP_*.BIN", g_out, k_city[c].companion);
+        if ((h = FindFirstFileA(f, &fd)) == INVALID_HANDLE_VALUE) return 0;
+        FindClose(h);
+    }
+    return 1;
 }
 
 /* ---- the conversion ------------------------------------------------------ */
@@ -315,10 +331,43 @@ int xpp_convert(XppJob *job, int ask_on_bad, HWND owner) {
             if (ok) ok = xp_marker_write(mark, k_city[c].game, src_size);
             if (!ok) { printf("xpprep: %s: translation failed\n", k_city[c].name); break; }
         }
+        if (ok) {   /* translated before the race names / routes / race maps (11-19): those again */
+            char rdir[MAX_PATH + 64], np[MAX_PATH + 96], mp[MAX_PATH + 96], mdir[MAX_PATH + 64], pat[MAX_PATH + 80];
+            snprintf(rdir, sizeof rdir, "%s\\stage\\TRACKS\\ROUTES%s", g_out, k_city[c].companion);
+            snprintf(np, sizeof np, "%s\\names.txt", rdir);
+            snprintf(mp, sizeof mp, "%s\\mmroute.bin", rdir);
+            if (!file_exists(np) || (k_city[c].game == XP_GAME_CARBON && !file_exists(mp))) {
+                char csrc[MAX_PATH + 64], gp[MAX_PATH + 64]; XpEventStats es;
+                snprintf(csrc, sizeof csrc, "%s\\TRACKS\\%s.BUN", g_dir[c], k_city[c].companion);
+                snprintf(gp, sizeof gp, "%s\\GLOBAL\\gameplay.bin", g_dir[c]);
+                int erc = xp_events(gp, csrc, src, rdir, k_city[c].game, k_city[c].name,
+                                    k_city[c].game == XP_GAME_CARBON ? 7601 : 7301, &es);
+                printf("xpprep: %s race events again (names/routes): %s\n", k_city[c].name, erc == XP_OK ? "made" : "none");
+            }
+            snprintf(mdir, sizeof mdir, "%s\\stage\\TRACKS\\RACEMAPS%s", g_out, k_city[c].companion);
+            snprintf(pat, sizeof pat, "%s\\MINI_MAP_*.BIN", mdir);
+            WIN32_FIND_DATAA fd; HANDLE h;
+            if (k_city[c].game == XP_GAME_MW && (h = FindFirstFileA(pat, &fd)) == INVALID_HANDLE_VALUE) {
+                char s2[MAX_PATH + 160], d2[MAX_PATH + 160]; int nmap = 0;
+                CreateDirectoryA(mdir, NULL);
+                snprintf(pat, sizeof pat, "%s\\TRACKS\\%s\\MINI_MAP_*.BIN", g_dir[c], k_city[c].companion);
+                if ((h = FindFirstFileA(pat, &fd)) != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!strcmp(fd.cFileName, "MINI_MAP.BIN")) continue;
+                        snprintf(s2, sizeof s2, "%s\\TRACKS\\%s\\%s", g_dir[c], k_city[c].companion, fd.cFileName);
+                        snprintf(d2, sizeof d2, "%s\\%s", mdir, fd.cFileName);
+                        nmap += copy_file(s2, d2);
+                    } while (FindNextFileA(h, &fd));
+                    FindClose(h);
+                }
+                printf("xpprep: %s race maps again: %d copied\n", k_city[c].name, nmap);
+            } else if (k_city[c].game == XP_GAME_MW) FindClose(h);
+        }
         if (k_city[c].game == XP_GAME_CARBON) {   /* translated before the areas' maps (11-19): the map again */
             char a0[MAX_PATH + 64], mdst[MAX_PATH + 64];
             snprintf(a0, sizeof a0, "%s\\stage\\TRACKS\\%s_A0.MAP", g_out, k_city[c].companion);
-            if (!file_exists(a0)) {
+            char sea[MAX_PATH + 64]; snprintf(sea, sizeof sea, "%s\\stage\\TRACKS\\%s.SEA", g_out, k_city[c].companion);
+            if (!file_exists(a0) || !file_exists(sea)) {
                 snprintf(mdst, sizeof mdst, "%s\\stage\\TRACKS\\%s.MAP", g_out, k_city[c].companion);
                 int mrc = xp_minimap(src, mdst, k_city[c].game);
                 printf("xpprep: %s minimap + area maps: %s\n", k_city[c].name, mrc == XP_OK ? "made" : "none");
