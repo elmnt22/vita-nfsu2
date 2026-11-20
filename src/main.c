@@ -22826,11 +22826,14 @@ int main(int argc, char **argv) {
                                                 g_dbg.body_drop), rb;
                     if(g_n2rec_ok && rec_ride(g_n2rec,&rb,NULL)) ride=rb;
                     float z0=pos[2]+ride+kit.bb[2], z1=pos[2]+ride+kit.bb[5];
-                    if(collide_body_walls(pos,v,heading,kit.bb,obst,obstz,nobst,z0,z1,
+                    /* the Car Shop is a front end over a turntable: the car's spot in the street is not where the
+                       parts are seen, so no street clearance test there (GitHub #31: a shop door under a roof or
+                       by a wall refused every body part) -- only a part changed while roaming needs room */
+                    if(!shopreq && (collide_body_walls(pos,v,heading,kit.bb,obst,obstz,nobst,z0,z1,
                                           &scene,obstsrc,NULL,0)>0 ||
                        world_body_wall_push(&scene,pos,v,heading,kit.bb,z0,z1,NULL) ||
                        ss_ceiling_above(&scene,(const float (*)[4])world.neighborhood.mbb,
-                                        carpos[0],carpos[1],carpos[2])<z1)
+                                        carpos[0],carpos[1],carpos[2])<z1))
                         error="Not enough clearance here. Current parts kept.";
                 }
                 if(!error) {
