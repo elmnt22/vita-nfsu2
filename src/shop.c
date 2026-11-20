@@ -11976,6 +11976,10 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
     case SC_PERF_PKG: {
         const FengPackage *pk = s->pk[PK_PERF_PKG];
         if (!pk || !s->perf_anim) break;
+        if (s->brand_on) {   /* 0x55bd60 is FEngSwitchPackages: the brand screen replaces the package screen */
+            brand_draw(s, &dc);
+            break;
+        }
         static const char *otxt[FENG_MAX_OBJ];
         memset(otxt, 0, sizeof otxt);
         for (int n = 0; n < s->perf_nrow; n++) {
@@ -12021,7 +12025,6 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
             draw_anim_package(s, &dc, PK_PERF_BUY, s->buy_anim, &bt, otxt);
             memset(s->qr_rowobj, 0, sizeof s->qr_rowobj);
         }
-        if (s->brand_on) brand_draw(s, &dc);   /* pushed over the package screen (0x55bd60) */
         break;
     }
     case SC_CREDITS: {
