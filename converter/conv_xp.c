@@ -315,6 +315,15 @@ int xpp_convert(XppJob *job, int ask_on_bad, HWND owner) {
             if (ok) ok = xp_marker_write(mark, k_city[c].game, src_size);
             if (!ok) { printf("xpprep: %s: translation failed\n", k_city[c].name); break; }
         }
+        if (k_city[c].game == XP_GAME_CARBON) {   /* translated before the areas' maps (11-19): the map again */
+            char a0[MAX_PATH + 64], mdst[MAX_PATH + 64];
+            snprintf(a0, sizeof a0, "%s\\stage\\TRACKS\\%s_A0.MAP", g_out, k_city[c].companion);
+            if (!file_exists(a0)) {
+                snprintf(mdst, sizeof mdst, "%s\\stage\\TRACKS\\%s.MAP", g_out, k_city[c].companion);
+                int mrc = xp_minimap(src, mdst, k_city[c].game);
+                printf("xpprep: %s minimap + area maps: %s\n", k_city[c].name, mrc == XP_OK ? "made" : "none");
+            }
+        }
         /* 2. the game's world conversion on the staged city, as the Vita's boot does */
         g_job->phase = 2;
         char stage[MAX_PATH + 16]; snprintf(stage, sizeof stage, "%s\\stage", g_out);
