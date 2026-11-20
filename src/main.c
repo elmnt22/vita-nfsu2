@@ -185,38 +185,6 @@ static void ls_pump(void) {
     }
 #endif
 }
-/* A big file read on a worker while this thread keeps the loading screen
-   moving (PERF_PLAN_1120 item 4, 11-20). n2_read_file alone stops every
-   512 KB for a loading frame, so each frame's draw and swap was added to the
-   read: HW base1120 car.read 0.8-1.5 s per opponent (GEOMETRY.BIN ~7.4 MB).
-   Here the frames run beside the read. Same bytes, same buffer, no extra
-   memory. Off the loading screen (or nothreadread.txt): n2_read_file. */
-typedef struct { const char *path; long len; unsigned char *data; volatile int done; } LsRead;
-static int ls_read_thread(void *a) {
-    LsRead *r = (LsRead *)a;
-    r->data = n2_read_file(r->path, &r->len);   /* its own pump calls return at once off the frame thread */
-    r->done = 1;
-    return 0;
-}
-static unsigned char *ls_read_file(const char *path, long *len) {
-    static int on = -1;
-    if (on < 0) {
-        FILE *f = fopen("ux0:data/NFSU2/nothreadread.txt", "r");
-        on = !f;
-        if (f) fclose(f);
-        printf("loading: big reads %s\n", on ? "on a worker beside the loading frames"
-                                             : "between loading frames (nothreadread.txt)");
-    }
-    Shop *fe = g_boot_fe ? g_boot_fe : g_ls_fe;
-    if (!on || !fe || !g_ls_drawn || SDL_ThreadID() != g_ls_tid) return n2_read_file(path, len);
-    LsRead r = { path, 0, NULL, 0 };
-    SDL_Thread *t = SDL_CreateThread(ls_read_thread, "ls-read", &r);
-    if (!t) return n2_read_file(path, len);
-    while (!r.done) { ls_pump(); SDL_Delay(3); }
-    SDL_WaitThread(t, NULL);
-    if (len) *len = r.len;
-    return r.data;
-}
 /* the boot world load, off the main thread so the loading screen animates */
 static struct { World *w; const char *root, *track; const WLoadOptions *opt; int world2, nm; volatile int done; } g_wl;
 static int world_load_thread(void *a) {
@@ -2523,7 +2491,7 @@ static void body_kit_release(BodyKitCandidate *kit) {
 static unsigned char *load_global_car_data(const char *root, long *len) {
     char path[1024]; *len=0;
     snprintf(path,sizeof path,"%s/GLOBAL/GLOBALB.BUN",root);
-    unsigned char *data=ls_read_file(path,len);
+    unsigned char *data=n2_read_file(path,len);
     if(data)return data;
     snprintf(path,sizeof path,"%s/GLOBAL/GlobalB.lzc",root);
     long bytes=0;unsigned char *packed=n2_read_file(path,&bytes);
@@ -2938,9 +2906,9 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
     for (int n = 0; n < 16 && glGetError() != GL_NO_ERROR; n++) {}
     char path[1024];
     snprintf(path, sizeof path, "%s/CARS/%s/GEOMETRY.BIN", dataroot, name);
-    candidate->data = ls_read_file(path, &candidate->len);
+    candidate->data = n2_read_file(path, &candidate->len);
     snprintf(path, sizeof path, "%s/CARS/%s/TEXTURES.BIN", dataroot, name);
-    candidate->texdata = ls_read_file(path, &candidate->texlen);
+    candidate->texdata = n2_read_file(path, &candidate->texlen);
     candidate->nkeys = candidate->texdata
         ? n2_car_tex_keys(candidate->texdata, candidate->texlen,
                           candidate->keys, 512) : 0;
