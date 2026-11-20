@@ -284,14 +284,26 @@ int profile_list(char names[][PROFILE_NAME_MAX + 1], int cap) {
 static void put32(unsigned char *p, uint32_t v) { memcpy(p, &v, 4); }
 static uint32_t get32(const unsigned char *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
+/* (GitHub #3 S5) "Unable to save %1." then autosave off, as the memcard screens' answer to
+   a failed save does (RM_SAVE_FAIL: g_opt.autosave = 0) -- the direct autosaves too, so a
+   card that cannot take the save stops being written to behind the player's back */
+static int save_failed(void) {
+    savenote_failed();
+    if (g_opt.autosave) {
+        g_opt.autosave = 0;
+        options_save();
+        printf("profile: the save failed -- autosave off\n");
+    }
+    return 0;
+}
 int profile_save(void) {
     if (!g_named) return 0;
     if (g_xf_city) profile_xf_save();   /* the city's own career beside it */
     long pn; unsigned char *pay = serialize(&pn);
-    if (!pay) { savenote_failed(); return 0; }   /* said, not silent (audit 11-17) */
+    if (!pay) return save_failed();   /* said, not silent (audit 11-17) */
     long total = RMC_HDR + pn;
     unsigned char *f = (unsigned char *)malloc((size_t)total);
-    if (!f) { free(pay); return 0; }
+    if (!f) { free(pay); printf("profile: out of memory for the save file\n"); return save_failed(); }
     memset(f, 0, RMC_HDR);
     put32(f + 0x1c, PROFILE_VERSION); put32(f + 0x20, (uint32_t)pn);
     memcpy(f + RMC_HDR, pay, (size_t)pn);
@@ -308,7 +320,7 @@ int profile_save(void) {
     free(f); free(pay);
     printf("profile: %s %s (%ld bytes)\n", ok ? "saved" : "cannot save", g_name, total);
     if (ok) savenote_saved();   /* the corner note (port addition, savenote.c) */
-    else savenote_failed();
+    else save_failed();
     return ok;
 }
 
