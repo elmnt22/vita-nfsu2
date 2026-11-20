@@ -87,3 +87,7 @@ tools/pcload_wide.py
 # --- Local backups ---
 *.pre_*
 vita/lib/libvitaGL_1008_backup.a
+
+# --- Local release staging + extra build folders (release files, converted data: never commit) ---
+/work/
+/vita/build_*/
