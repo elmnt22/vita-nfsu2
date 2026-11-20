@@ -21691,8 +21691,13 @@ int main(int argc, char **argv) {
                     if (act == PR_WORLDMAP) career_mark_event_complete();
                     else {
                         /* NotifyEnterCribFromPauseMenu 801269a4: the car's spot and heading as the
-                           spawn (+0x7e3c = 1), WorldChallengeState::NotifyExitingToFrontend */
-                        career_enter_fe_magazine(carpos, (uint16_t)((int)lrintf(heading * 10430.3779f) - 0x4000));
+                           spawn (+0x7e3c = 1), WorldChallengeState::NotifyExitingToFrontend.
+                           (GitHub #3 S3) only on the city's own track: a venue's (URL / drag /
+                           drift track, an expansion city) spot is no place in Bayview -- the
+                           spot the event was entered from (NotifyEnterEvent) stays the spawn */
+                        if (!strcmp(trackname, "STREAML4RA"))
+                            career_enter_fe_magazine(carpos, (uint16_t)((int)lrintf(heading * 10430.3779f) - 0x4000));
+                        else { g_career.has_spawn = 1; printf("career: Return to World Map on %s -- the event's entry spot stays the spawn%c", trackname, 10); }
                         career_wc_exit_to_frontend();
                     }
                     g_eng.commit = 0;
