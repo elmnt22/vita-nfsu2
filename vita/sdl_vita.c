@@ -1535,9 +1535,13 @@ void SDL_GL_SwapWindow(SDL_Window *w) {
             printf("vita: frame %u (%.1f fps avg), heap break %u MB, vram free %u KB\n", frames,
                    secs > 0 ? frames / secs : 0.0, vita_heap_top_mb(),
                    (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10));
-        else
-            printf("vita: frame %u (%.1f fps avg), heap break %u MB\n", frames,
-                   secs > 0 ? frames / secs : 0.0, vita_heap_top_mb());
+        else {   /* GPU memory every 20 s too (freeze hunt 11-19: none logged after boot); timed, as it can be slow */
+            Uint64 m0 = sceKernelGetProcessTimeWide();
+            unsigned vr = (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10), rm = (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10);
+            printf("vita: frame %u (%.1f fps avg), heap break %u MB, gpu free vram %u ram %u KB (%.2f ms)\n", frames,
+                   secs > 0 ? frames / secs : 0.0, vita_heap_top_mb(), vr, rm,
+                   (double)(sceKernelGetProcessTimeWide() - m0) / 1000.0);
+        }
         vita_log_flush();
     }
 }
