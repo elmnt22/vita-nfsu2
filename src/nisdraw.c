@@ -263,7 +263,12 @@ static void m4mul(const float *a, const float *b, float *o)
 static void bind_stream(NisDraw *d, const float *v, int n)
 {
     glBindBuffer(GL_ARRAY_BUFFER, d->vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * 8 * sizeof(float)), v, GL_DYNAMIC_DRAW);
+    /* STATIC, not DYNAMIC (issue 31, 11-19): vitaGL puts DYNAMIC data in its circular pool,
+       whose slice for a frame is written again 2-3 frames on without waiting for the GPU; when
+       the GPU lags (a pre-race scene), a later pose landed under one still being drawn and the
+       flag girl tore (Vita only, never the sim). STATIC data gets its own memory each upload,
+       the old freed by vitaGL's garbage collector once the GPU is done with it. */
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * 8 * sizeof(float)), v, GL_STATIC_DRAW);
 }
 /* the attributes at vertex `first` of the bound stream */
 static void stream_at(int first)
