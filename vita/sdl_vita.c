@@ -1919,11 +1919,13 @@ static SDL_AudioSpec g_aspec;
 static int g_aport = -1;
 static SceUID g_athread = -1;
 static volatile int g_apaused = 1, g_arun;
+static Uint8 *g_abuf[2];   /* allocated (and checked) before the thread starts (Codex CR5) */
 
 static int audio_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
     int bytes = g_aspec.samples * g_aspec.channels * 2;
-    Uint8 *buf[2] = { calloc(1, (size_t)bytes), calloc(1, (size_t)bytes) };
+    Uint8 *buf[2] = { g_abuf[0], g_abuf[1] };
+    g_abuf[0] = g_abuf[1] = NULL;
     int cur = 0;
     while (g_arun) {
         if (g_apaused) memset(buf[cur], 0, (size_t)bytes);
@@ -1944,14 +1946,28 @@ SDL_AudioDeviceID SDL_OpenAudioDevice(const char *device, int iscapture,
                                   g_aspec.channels == 1 ? SCE_AUDIO_OUT_MODE_MONO : SCE_AUDIO_OUT_MODE_STEREO);
     if (g_aport < 0) { printf("audio: open port failed 0x%08X\n", g_aport); return 0; }
     if (obtained) *obtained = g_aspec;
+    {   size_t bytes = (size_t)g_aspec.samples * (size_t)g_aspec.channels * 2;
+        g_abuf[0] = calloc(1, bytes); g_abuf[1] = calloc(1, bytes);
+        if (!g_abuf[0] || !g_abuf[1]) {
+            printf("audio: no memory for the output buffers\n");
+            free(g_abuf[0]); free(g_abuf[1]); g_abuf[0] = g_abuf[1] = NULL;
+            sceAudioOutReleasePort(g_aport); g_aport = -1; return 0;
+        }
+    }
     g_arun = 1;
     /* Above the streaming/read-ahead threads and off the render thread's
        core: with the render thread busy, sharing its core made the mix
        choppy (10-09). The mixer itself is ~7-11% of one core. */
     g_athread = sceKernelCreateThread("audio", audio_thread, 64, 0x10000, 0,
                                       SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);
-    if (g_athread < 0) { printf("audio: thread could not start: 0x%08X\n", (unsigned)g_athread); sceAudioOutReleasePort(g_aport); g_aport = -1; return 0; }
-    sceKernelStartThread(g_athread, 0, NULL);
+    int sr = g_athread < 0 ? g_athread : sceKernelStartThread(g_athread, 0, NULL);
+    if (sr < 0) {
+        printf("audio: thread could not start: 0x%08X\n", (unsigned)sr);
+        if (g_athread >= 0) sceKernelDeleteThread(g_athread);
+        g_athread = -1; g_arun = 0;
+        free(g_abuf[0]); free(g_abuf[1]); g_abuf[0] = g_abuf[1] = NULL;
+        sceAudioOutReleasePort(g_aport); g_aport = -1; return 0;
+    }
     return 1;
 }
 void SDL_PauseAudioDevice(SDL_AudioDeviceID dev, int pause_on) { (void)dev; g_apaused = pause_on; }
@@ -1985,7 +2001,13 @@ SDL_Thread *SDL_CreateThread(SDL_ThreadFunction fn, const char *name, void *data
                                    (big_stack ? 8 : 2) * 1024 * 1024, 0,
                                    SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);
     if (t->uid < 0) { printf("thread \"%s\" could not start: 0x%08X (out of kernel memory?)\n", name ? name : "worker", (unsigned)t->uid); free(t); return NULL; }
-    sceKernelStartThread(t->uid, sizeof t, &t);
+    /* (Codex CR7) a thread that was created but never started used to come back as
+       a live SDL_Thread: its caller then waited forever for work nobody did */
+    int sr = sceKernelStartThread(t->uid, sizeof t, &t);
+    if (sr < 0) {
+        printf("thread \"%s\" created but could not start: 0x%08X\n", name ? name : "worker", (unsigned)sr);
+        sceKernelDeleteThread(t->uid); free(t); return NULL;
+    }
     return t;
 }
 
@@ -2049,6 +2071,9 @@ void vita_copy_push(void *dst, const void *src, unsigned n) {
     if (vcopy_sleeping) { vcopy_sleeping = 0; sceKernelSignalSema(vcopy_sem, 1); }
 }
 int vita_copy_idle(void) { __sync_synchronize(); return vcopy_tail == vcopy_head; }
+/* (CR12) every copy queued before the mark has finished (the frame thread is the one producer) */
+unsigned vita_copy_mark(void) { __sync_synchronize(); return vcopy_head; }
+int vita_copy_passed(unsigned mark) { __sync_synchronize(); return (int)(vcopy_tail - mark) >= 0; }
 void vita_copy_wait(void) { while (!vita_copy_idle()) sceKernelDelayThread(100); }
 void vita_copy_stats(unsigned long long *us, unsigned long long *bytes) {
     *us = vcopy_us; *bytes = vcopy_bytes; vcopy_us = vcopy_bytes = 0;

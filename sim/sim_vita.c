@@ -323,6 +323,8 @@ void vita_parallel_join(void) {}
 /* GPU-buffer copies: inline here (the Vita runs them on a worker) */
 void vita_copy_push(void *dst, const void *src, unsigned n) { memcpy(dst, src, n); }
 int vita_copy_idle(void) { return 1; }
+unsigned vita_copy_mark(void) { return 0; }
+int vita_copy_passed(unsigned mark) { (void)mark; return 1; }
 void vita_copy_wait(void) {}
 void vita_copy_stats(unsigned long long *us, unsigned long long *bytes) { *us = 0; *bytes = 0; }
 

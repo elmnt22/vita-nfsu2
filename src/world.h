@@ -92,6 +92,8 @@ typedef struct {
     WGroundGrid grid;
     WInstStats inst_stats;
     float center[2], radius;
+    int load_failed;                /* (Codex CR10) a 0-mesh load was a failure (read / memory / abort), not open water */
+    int *cat_idx; int cat_nsky, cat_nglow, cat_count;   /* (CR13) scene meshes: sky ones, then glow ones (worker-made; cat_count = scene.count then) */
 } WorldNeighborhood;
 
 typedef struct {

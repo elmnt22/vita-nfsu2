@@ -303,7 +303,18 @@ static int plan(void) {
     S.run = (SkyRun *)malloc((size_t)(S.nmesh + 1) * sizeof *S.run);
     if (!S.voff || !S.ioff || !S.order || !S.run) return 0;
     long vo = 0, io = 0;
-    for (int i = 0; i < S.nmesh; i++) { S.voff[i] = vo; S.ioff[i] = io; vo += S.mesh[i].nv; io += S.mesh[i].ni; S.order[i] = i; }
+    for (int i = 0; i < S.nmesh; i++) {
+        /* (Codex CR6) the collector's own limits, per mesh: a cached mesh over
+           SKYLINE_MAXV fits no run, and the loop below would add empty runs past S.run */
+        const SkyMesh *m = &S.mesh[i];
+        if (m->nv == 0 || m->ni == 0 || m->nv > SKYLINE_MAXV ||
+            (long)m->nv > S.nv - vo || (long)m->ni > S.ni - io) {
+            printf("skyline: mesh %d of %d does not fit (%u verts, %u indices): cache rejected\n",
+                   i, S.nmesh, (unsigned)m->nv, (unsigned)m->ni);
+            return 0;
+        }
+        S.voff[i] = vo; S.ioff[i] = io; vo += m->nv; io += m->ni; S.order[i] = i;
+    }
     if (vo != S.nv || io != S.ni) return 0;
     qsort(S.order, (size_t)S.nmesh, sizeof *S.order, order_cmp);
     S.nrun = 0;
@@ -329,13 +340,19 @@ static int plan(void) {
             }
         }
         while (sub_next <= SKYLINE_BLOCK*SKYLINE_BLOCK) r->sub_i[sub_next++] = r->ni;
+        if (i == i0) return 0;   /* a run that takes no mesh would repeat forever */
         r->m1 = i; i0 = i;
     }
     return 1;
 }
+static void free_cpu(void);
 static int loader(void *arg) {
     (void)arg;
-    int ok = cache_read();
+    int ok = cache_read(), planned = 0;
+    if (ok && !SDL_AtomicGet(&S.abort)) {   /* (Codex CR6) a cache the planner rejects is rebuilt from the tiles */
+        planned = plan();
+        if (!planned) { printf("skyline: the cache for %s is damaged, building it again\n", S.track); free_cpu(); ok = 0; }
+    }
     if (!ok && !SDL_AtomicGet(&S.abort)) {
         int tiles = world_tiles_each_standin(S.track, sky_min_h(), collect, NULL, &S.abort);
         ok = tiles > 0 && S.nmesh > 0 && !SDL_AtomicGet(&S.abort);
@@ -344,7 +361,7 @@ static int loader(void *arg) {
                (double)sky_min_h(), S.nv, (S.nv * (long)sizeof(SkyV) + S.ni * 2) >> 10);
         if (ok) { cache_write(); S.built = 1; }
     }
-    if (ok && !SDL_AtomicGet(&S.abort)) ok = plan();
+    if (ok && !planned && !SDL_AtomicGet(&S.abort)) ok = plan();
     SDL_AtomicSet(&S.state, ok && !SDL_AtomicGet(&S.abort) ? 2 : -1);
     return 0;
 }
@@ -432,10 +449,18 @@ void skyline_pump(void) {
     /* a few cells a frame: one cell is at most 65535 x 28 B */
     BatchedVertex *bv = NULL; uint16_t *bi = NULL;
     for (int budget = 0; S.next_run < S.nrun && budget < 6; budget++) {
-        const SkyRun *r = &S.run[S.next_run++];
-        bv = (BatchedVertex *)realloc(bv, (size_t)r->nv * sizeof *bv);
-        bi = (uint16_t *)realloc(bi, (size_t)r->ni * 2);
-        if (!bv || !bi) break;
+        /* (Codex CR3) the run is only taken once its scratch exists: a failed grow
+           used to skip it, after which every later batch drew with the skipped
+           run's cell ranges (past its own index buffer). Low memory now just
+           tries the same run again next frame. */
+        const SkyRun *r = &S.run[S.next_run];
+        BatchedVertex *nbv = (BatchedVertex *)realloc(bv, (size_t)(r->nv ? r->nv : 1) * sizeof *bv);
+        if (!nbv) break;
+        bv = nbv;
+        uint16_t *nbi = (uint16_t *)realloc(bi, (size_t)(r->ni ? r->ni : 1) * 2);
+        if (!nbi) break;
+        bi = nbi;
+        S.next_run++;
         int vo = 0, io = 0;
         for (int k = r->m0; k < r->m1; k++) {
             int mi = S.order[k]; const SkyMesh *m = &S.mesh[mi];
@@ -464,6 +489,7 @@ void skyline_pump(void) {
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)((size_t)io * 2), bi, GL_STATIC_DRAW);
         b->index_count = io; b->nmesh = r->m1 - r->m0; b->tall = 1; b->drawmode = N2_DRAW_OPAQUE;
         for (int c = 0; c < 3; c++) { b->bbox_min[c] = r->bb[c]; b->bbox_max[c] = r->bb[c+3]; }
+        S.bsub[S.nbatch] = *r;   /* its cell ranges beside it, whatever the run index */
         S.nbatch++;
     }
     free(bv); free(bi);

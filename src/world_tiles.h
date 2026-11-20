@@ -51,6 +51,10 @@ void world_tiles_aim(float x, float y);
 /* 1: free the read-ahead tiles and decode scratch and pause the read-ahead
    (before a front end over the world); 0: resume. */
 void world_tiles_trim(int pause);
+/* (Codex CR15) an area assembled with generation gen (WInstStats.tile_vis_gen)
+   was thrown away unseen: the fade / LOD history goes back to the area that is
+   on screen. A no-op for any other generation or once another assembly began. */
+void world_tiles_visibility_undo(unsigned gen);
 /* A track switch in the running game: drop everything kept for the old
    track (index, loaded and read-ahead tiles, global tile, scenery
    selection) so the next build reads the new one's. The read-ahead thread

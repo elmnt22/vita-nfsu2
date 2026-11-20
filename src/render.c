@@ -2048,7 +2048,36 @@ struct WorldBatchUpload {
     struct PreparedBatch *prepared;
     int prepared_count;
     void *arena;   /* the prepared batches' assembled arrays (render_world_plan_fill): a chain of PlanSlab */
+    unsigned copy_mark; int copy_mark_set;   /* upload_world_batches_retire: the copies queued before it */
 };
+
+/* (Codex CR12, 11-20) upload_world_batches_cancel spread over frames, for an area
+   retired with a partial upload in it: hwlog new1120_R spent 21-22 ms in one frame
+   on vita_copy_wait + releasing every emitted batch + the arena. Here: the copies
+   queued before the retire are waited out without blocking (0 = come back next
+   frame), the batches go *budget at a time, and the arena's slabs are handed to
+   `later` (the area-release worker) when given. 1 once the job is gone. */
+static void plan_slabs_free_cb(void *head);
+int upload_world_batches_retire(WorldBatchUpload **slot, int *budget,
+                                int (*later)(void (*fn)(void *), void *p)) {
+    if (!slot || !*slot) return 1;
+    WorldBatchUpload *j = *slot;
+#ifdef __vita__
+    if (!j->copy_mark_set) { j->copy_mark = vita_copy_mark(); j->copy_mark_set = 1; }
+    if (!vita_copy_passed(j->copy_mark)) return 0;   /* copies into its buffers (from its arena) still running */
+#endif
+    while (j->batches && j->count > 0) {
+        if (*budget <= 0) return 0;
+        render_batch_release(&j->batches[--j->count]);
+        (*budget)--;
+    }
+    void *arena = j->arena; j->arena = NULL;
+    if (arena && !(later && later(plan_slabs_free_cb, arena))) plan_slabs_free(arena);
+    free(j->batches); free(j->prepared); free(j->ent); free(j->run0); free(j->run1); free(j);
+    *slot = NULL;
+    return 1;
+}
+static void plan_slabs_free_cb(void *head) { plan_slabs_free(head); }
 
 void upload_world_batches_cancel(WorldBatchUpload **slot) {
     if (!slot || !*slot) return;
@@ -3755,13 +3784,40 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
  * (no spatial grid — a city has a handful of skybox/neon meshes, not tens of
  * thousands, so there's nothing for a cell split to buy here). */
 int g_glow_cells;   /* Beyond (port): glow batched per world cell, so a rebuild finds them by hash */
+#ifdef __vita__
+/* batch_fingerprint with the packed meshes indexed by sorted position (pk[k] = ent[k]) */
+static void batch_fingerprint_k(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
+                                const PackedMesh *pk, uint64_t hash[2]) {
+    hash[0]=UINT64_C(14695981039346656037); hash[1]=UINT64_C(0x6a09e667f3bcc909);
+    for (int k=i0; k<i1; k++) {
+        const N2Mesh *m=&s->meshes[ent[k].idx];
+        batch_payload_hash(&m->nverts,sizeof m->nverts,hash);
+        batch_payload_hash(&m->nidx,sizeof m->nidx,hash);
+        batch_payload_hash(pk[k].hash,sizeof pk[k].hash,hash);
+    }
+}
+#endif
 int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
                        const unsigned char *mtexmode) {
+    return upload_cat_batches_list(s, cat, NULL, 0, mtex, out, mtexmode);
+}
+/* (Codex CR13, 11-20) list: the scene's meshes of this category, found by the
+   worker (world_resident_prepare), so the frame thread no longer walks every
+   mesh of the area (18k downtown) for a handful of sky / glow ones; a list that
+   does not match the scene is ignored (full walk) */
+int upload_cat_batches_list(const N2Scene *s, int cat, const int *list, int nlist,
+                            const GLuint *mtex, N2Batch **out, const unsigned char *mtexmode) {
     int n = s->count;
-    BSortEnt *ent = (BSortEnt *)malloc((size_t)(n ? n : 1) * sizeof *ent);
+    if (list) {
+        for (int k = 0; k < nlist; k++)
+            if (list[k] < 0 || list[k] >= n || s->meshes[list[k]].cat != cat) { list = NULL; break; }
+    }
+    int nscan = list ? nlist : n;
+    BSortEnt *ent = (BSortEnt *)malloc((size_t)(nscan ? nscan : 1) * sizeof *ent);
     if (!ent) return -1;
     int m = 0;
-    for (int i = 0; i < n; i++)
+    for (int q = 0; q < nscan; q++) {
+        int i = list ? list[q] : q;
         if (s->meshes[i].cat == cat) {
             ent[m].key = mtex[i]; ent[m].idx = i;
             ent[m].cell_x = ent[m].cell_y = 0;
@@ -3778,6 +3834,7 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
                 &s->meshes[i], mode);
             m++;
         }
+    }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
     int cap = 8, nb = 0;
     N2Batch *bat = (N2Batch *)malloc((size_t)cap * sizeof *bat);
@@ -3792,13 +3849,13 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
     PackedMesh *pk = NULL;
     int reuse_was = g_batch_reuse, found = 0;
     g_batch_reuse = 1;   /* only the world upload had it on: register these too */
-    if (m > 0) {
-        pk = (PackedMesh *)calloc((size_t)n, sizeof *pk);
+    if (m > 0) {   /* (CR13) one entry per sorted mesh, not a zeroed array for the whole area */
+        pk = (PackedMesh *)calloc((size_t)m, sizeof *pk);
         for (int k = 0; pk && k < m; k++) {
             int idx = ent[k].idx;
-            if (!s->meshes[idx].shared_geometry || !render_pack_mesh(&s->meshes[idx], &pk[idx]) ||
-                !pk[idx].hash_valid) { free(pk); pk = NULL; }
-            else pk[idx].v = NULL;   /* only the hash and box are wanted here */
+            if (!s->meshes[idx].shared_geometry || !render_pack_mesh(&s->meshes[idx], &pk[k]) ||
+                !pk[k].hash_valid) { free(pk); pk = NULL; }
+            else pk[k].v = NULL;   /* only the hash and box are wanted here */
         }
     }
 #endif
@@ -3822,7 +3879,7 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
                 int nv = 0, ni = 0;
                 for (int k = i0; k < i; k++) { nv += s->meshes[ent[k].idx].nverts; ni += s->meshes[ent[k].idx].nidx; }
                 uint64_t h[2];
-                batch_fingerprint(s, ent, i0, i, pk, NULL, h);
+                batch_fingerprint_k(s, ent, i0, i, pk, h);
                 SharedBatchBuffers *p = batch_buffers_find(h, nv, ni);
                 if (p) {
                     N2Batch *b = &bat[nb]; const N2Mesh *m0 = &s->meshes[ent[i0].idx];
@@ -3835,7 +3892,7 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
                     for (int c = 0; c < 3; c++) { b->bbox_min[c] = 1e30f; b->bbox_max[c] = -1e30f; }
                     int named = 0;
                     for (int k = i0; k < i; k++) {
-                        const PackedMesh *q = &pk[ent[k].idx]; const N2Mesh *mk = &s->meshes[ent[k].idx];
+                        const PackedMesh *q = &pk[k]; const N2Mesh *mk = &s->meshes[ent[k].idx];
                         for (int c = 0; c < 3; c++) {
                             if (q->bb[c] < b->bbox_min[c]) b->bbox_min[c] = q->bb[c];
                             if (q->bb[c+3] > b->bbox_max[c]) b->bbox_max[c] = q->bb[c+3];

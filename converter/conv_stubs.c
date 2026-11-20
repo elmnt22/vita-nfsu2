@@ -31,7 +31,7 @@ STUB(music_set_playlist) STUB(music_title)
 STUB(profile_default) STUB(profile_delete) STUB(profile_dirty) 
 STUB(profile_drop_snapshot) STUB(profile_exists) STUB(profile_file) STUB(profile_list) STUB(profile_load) 
 STUB(profile_name) STUB(profile_named) STUB(profile_restore) STUB(profile_save) STUB(profile_set_name) 
-STUB(profile_snapshot) STUB(smk_is_prop) STUB(profile_xf_city) STUB(profile_xf_enter) STUB(profile_xf_leave) STUB(profile_xf_save) STUB(profile_xf_forget) STUB(profile_xf_exists)
+STUB(profile_snapshot) STUB(smk_is_prop) STUB(profile_xf_city) STUB(profile_xf_enter) STUB(profile_xf_leave) STUB(profile_xf_save) STUB(profile_xf_forget) STUB(profile_xf_exists) STUB(profile_has_snapshot)
 STUB(airace_ntypes) STUB(career_any_owned) STUB(career_completed_career) STUB(career_decal_brand_unlocked)
 STUB(career_sim_find_shops) STUB(career_speech_fe) STUB(career_speech_sponsor) STUB(career_speech_sponsor_done)
 STUB(career_speech_uniques) STUB(garage_tt_request)
@@ -70,6 +70,8 @@ void savenote_cancel(void) {}
 void skyline_texavg_note(uint32_t key, const struct N2Tex *t) { (void)key; (void)t; }
 void vita_copy_push(void *dst, const void *src, unsigned n) { memcpy(dst, src, n); }
 int vita_copy_idle(void) { return 1; }
+unsigned vita_copy_mark(void) { return 0; }
+int vita_copy_passed(unsigned mark) { (void)mark; return 1; }
 void vita_copy_wait(void) {}
 void vita_copy_stats(unsigned long long *us, unsigned long long *bytes) { *us = 0; *bytes = 0; }
 void vita_step(const char *label) { (void)label; }   /* the hang recorder (sdl_vita.c) */

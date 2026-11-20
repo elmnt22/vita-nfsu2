@@ -46,6 +46,7 @@ typedef struct {
     int regions_selected;
     int home_region;
     char bundle[64];
+    unsigned tile_vis_gen;   /* (CR15) the tile assembly that made this scene (world_tiles_visibility_undo) */
 } WInstStats;
 
 int  winst_parse_regions(const unsigned char *data, long len,

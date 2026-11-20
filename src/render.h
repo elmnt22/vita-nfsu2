@@ -287,6 +287,9 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
 int upload_world_batches_step(WorldBatchUpload **job, int max_batches,
                           N2Batch **out, int *count, int *meshbatch);
 void upload_world_batches_cancel(WorldBatchUpload **job);
+/* cancel over several frames (retire step): 0 = not done, call again next frame */
+int upload_world_batches_retire(WorldBatchUpload **job, int *budget,
+                                int (*later)(void (*fn)(void *), void *p));
 /* Optional per-mesh normals (scene order) computed ahead of time, e.g. on a
    worker thread; NULL entries fall back to computing them during upload. */
 void upload_world_batches_set_normals(WorldBatchUpload *job, float *const *normals);
@@ -358,6 +361,8 @@ int upload_world_batches_bind_checked(WorldBatchUpload *job, const GLuint *textu
  * glow, vista and diagnostic-marker batches keep their own dedicated render
  * treatment, so their callers pass mtexmode = NULL (-> N2_DRAW_OPAQUE). */
 extern int g_glow_cells;   /* Beyond: glow batches per world cell (render.c) */
+int  upload_cat_batches_list(const N2Scene *s, int cat, const int *list, int nlist,
+                             const GLuint *mtex, N2Batch **out, const unsigned char *mtexmode);
 int  upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out,
                         const unsigned char *mtexmode);
 void render_batch_array_free(N2Batch **batches, int *count);

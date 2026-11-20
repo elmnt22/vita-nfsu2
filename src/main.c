@@ -15734,6 +15734,7 @@ static void resident_discard(WorldResident *r, WorldResident **retired, WorldRes
                              unsigned *frames, unsigned *peak, unsigned *total)
 {
     if (!r) return;
+    world_tiles_visibility_undo(r->world.inst_stats.tile_vis_gen);   /* never shown (CR15) */
     world_resident_release_meshes_async(r);
     if (!*retired) { *retired = r; *frames = *peak = *total = 0; return; }
     if (!*waiting) { *waiting = r; return; }
@@ -20236,6 +20237,7 @@ int main(int argc, char **argv) {
     };
     float failed_resident_cell[2] = {NAN, NAN};
     Uint32 resident_retry_at = 0;   /* (Vita) a race's failed cell may try again from then */
+    Uint32 resident_ra_held = 0;    /* (Codex CR11) the read-ahead is held off for a failed build's retry, since then */
     /* Scenery set (free roam -1, or a race event's own barriers) the active
        area was built with, and the one the current/last build uses. When
        resident_args.scenery_event changes (race start/quit) the area is
@@ -23333,6 +23335,11 @@ int main(int argc, char **argv) {
             !isnan(failed_resident_cell[0]) && job_scenery_event != resident_args.scenery_event)
             resident_retry_at = SDL_GetTicks();
 #endif
+        if (resident_ra_held && SDL_GetTicks() - resident_ra_held > 20000u) {   /* CR11: never off for good */
+            resident_ra_held = 0;
+            world_tiles_trim(0);
+            printf("resident build: read-ahead back on after 20 s%c", 10);
+        }
         if (resident_retry_at && (Sint32)(SDL_GetTicks() - resident_retry_at) >= 0) {
             resident_retry_at = 0;
             failed_resident_cell[0] = failed_resident_cell[1] = NAN;
@@ -23481,7 +23488,12 @@ int main(int argc, char **argv) {
                        11-19 (HW, Rockport): in free roam too -- a cell that failed
                        there was never tried again, and a race asked at that spot
                        waited for it forever behind its loading screen. */
-                    world_tiles_trim(0);
+                    /* (Codex CR11, 11-20) this used to be world_tiles_trim(0), which only
+                       unpauses: nothing was given back, and the retry met the same full
+                       read-ahead. Now the read-ahead's tiles + decode scratch are handed
+                       back and it stays off until an area build succeeds (or 20 s). */
+                    world_tiles_trim(1);
+                    if (!resident_ra_held) resident_ra_held = SDL_GetTicks() | 1u;
                     resident_retry_at = SDL_GetTicks() + 2000u;
                     if (!resident_retry_at) resident_retry_at = 1;
 #else
@@ -23489,6 +23501,13 @@ int main(int argc, char **argv) {
 #endif
                 } else if (build_status > 0) {
                     uint32_t activate_begin = SDL_GetTicks();
+#ifdef __vita__
+                    if (resident_ra_held) {   /* the retry built: the read-ahead comes back (CR11) */
+                        resident_ra_held = 0;
+                        world_tiles_trim(0);
+                        printf("resident build: retry built, read-ahead back on%c", 10);
+                    }
+#endif
                     hitch_mark("act.pre");
                     world_resident_activate(&active_resident,
                                             &candidate_resident);

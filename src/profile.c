@@ -4,6 +4,7 @@
 #include "options.h"
 #include "career.h"
 #include "trophy.h"
+#include "beyond.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -245,6 +246,7 @@ static int apply(const unsigned char *p, long n) {
 void profile_init(void) {
     mkdir(PROFILE_DIR, 0777);
     scores_load();
+    beyond_progress_path_fn(profile_xp_progress_path);   /* per-profile expansion progress (CR8) */
     if (!g_named) g_opt.autosave = 0;   /* unnamed at boot: autosave needs a name (0x49b170) */
 }
 int profile_named(void) { return g_named; }
@@ -310,9 +312,12 @@ static int save_failed(void) {
     }
     return 0;
 }
+static int xf_flush_unsaved(void);
 int profile_save(void) {
     if (!g_named) return 0;
-    if (g_xf_city) profile_xf_save();   /* the city's own career beside it */
+    int xok = 1;
+    if (g_xf_city) xok = profile_xf_save();   /* the city's own career beside it */
+    if (!xf_flush_unsaved()) xok = 0;          /* a city career kept after a failed write (CR9) */
     long pn; unsigned char *pay = serialize(&pn);
     if (!pay) return save_failed();   /* said, not silent (audit 11-17) */
     long total = RMC_HDR + pn;
@@ -332,6 +337,7 @@ int profile_save(void) {
     profile_path(g_name, path, sizeof path);
     int ok = write_file(path, f, total);
     free(f); free(pay);
+    if (ok && !xok) { ok = 0; printf("profile: the city career file was not written\n"); }   /* (CR9) not "saved" */
     printf("profile: %s %s (%ld bytes)\n", ok ? "saved" : "cannot save", g_name, total);
     if (ok) savenote_saved();   /* the corner note (port addition, savenote.c) */
     else save_failed();
@@ -358,44 +364,104 @@ void profile_xf_win(void) {
     int st = g_xf_wins / 10; if (st > 4) st = 4;
     if (st > g_career.stage) { g_career.stage = st; printf("xp fresh: city stage %d (%d wins)\n", st, g_xf_wins); }
 }
+/* (Codex CR9, 11-20) a city career whose file could not be written when the trip
+   ended stays here for the session: the next trip there takes it up and the next
+   profile save writes it, instead of it being lost (or a default saved over it) */
+static unsigned char *g_xf_unsaved; static long g_xf_unsavedn; static int g_xf_unsaved_city;
+static char g_xf_unsaved_name[sizeof g_name];   /* whose it is: never written into another profile */
+static void xf_unsaved_drop(void) { free(g_xf_unsaved); g_xf_unsaved = NULL; g_xf_unsavedn = 0; g_xf_unsaved_city = 0; }
+static unsigned char *xf_build(long *n) {   /* the XPCITY<n> file of the city career now in */
+    unsigned char *car, *cc; long carn, ccn;
+    if (!xf_blobs(&car, &carn, &cc, &ccn)) return NULL;
+    *n = 16 + carn + ccn;
+    unsigned char *b = (unsigned char *)malloc((size_t)*n);
+    if (b) {
+        memcpy(b, "XPF1", 4); put32(b + 4, (uint32_t)g_xf_wins); put32(b + 8, (uint32_t)carn); put32(b + 12, (uint32_t)ccn);
+        memcpy(b + 16, car, (size_t)carn); memcpy(b + 16 + carn, cc, (size_t)ccn);
+    }
+    free(car); free(cc);
+    return b;
+}
+static int xf_valid(const unsigned char *b, long n) {
+    return b && n >= 16 && !memcmp(b, "XPF1", 4) && 16 + (long)get32(b + 8) + (long)get32(b + 12) == n;
+}
+static int xf_flush_unsaved(void) {
+    if (!g_xf_unsaved) return 1;
+    char p[320];
+    snprintf(p, sizeof p, "%s/%s/XPCITY%d", PROFILE_DIR, g_xf_unsaved_name, g_xf_unsaved_city);
+    if (!write_file(p, g_xf_unsaved, g_xf_unsavedn)) return strcmp(g_xf_unsaved_name, g_name) != 0;   /* another profile's: not this save's failure */
+    printf("xp fresh: city %d career of %s (kept from a failed save) saved\n", g_xf_unsaved_city, g_xf_unsaved_name);
+    xf_unsaved_drop();
+    return 1;
+}
 int profile_xf_save(void) {
     if (!g_xf_city) return 0;
     char f[16], p[320];
     snprintf(f, sizeof f, "XPCITY%d", g_xf_city);
     if (!profile_file(f, p, sizeof p)) return 0;   /* unnamed: the city's career lasts the trip */
-    unsigned char *car, *cc; long carn, ccn;
-    if (!xf_blobs(&car, &carn, &cc, &ccn)) return 0;
-    long n = 16 + carn + ccn;
-    unsigned char *b = (unsigned char *)malloc((size_t)n);
-    int ok = 0;
-    if (b) {
-        memcpy(b, "XPF1", 4); put32(b + 4, (uint32_t)g_xf_wins); put32(b + 8, (uint32_t)carn); put32(b + 12, (uint32_t)ccn);
-        memcpy(b + 16, car, (size_t)carn); memcpy(b + 16 + carn, cc, (size_t)ccn);
-        ok = write_file(p, b, n);
-    }
-    free(b); free(car); free(cc);
+    long n = 0; unsigned char *b = xf_build(&n);
+    int ok = b && write_file(p, b, n);
+    free(b);
+    if (ok && g_xf_unsaved_city == g_xf_city && !strcmp(g_xf_unsaved_name, g_name)) xf_unsaved_drop();
     printf("xp fresh: city %d career %s ($%d, %d wins)\n", g_xf_city, ok ? "saved" : "NOT saved", g_career.cash, g_xf_wins);
     return ok;
 }
+/* 0: not entered (the Bayview career stays in): an XPCITY file that exists but
+   cannot be read or parsed is never treated as a first visit (CR9), and no memory
+   for the Bayview snapshot refuses the trip (GAPS XF6) */
 int profile_xf_enter(int city) {
     if (g_xf_city == city) return 1;
     profile_xf_leave();
-    if (!xf_blobs(&g_xf_car, &g_xf_carn, &g_xf_cc, &g_xf_ccn)) return 0;
-    g_xf_city = city; g_xf_wins = 0;
     char f[16], p[320]; long n = 0; unsigned char *b = NULL;
+    int exists = 0, from_mem = 0;
     snprintf(f, sizeof f, "XPCITY%d", city);
-    if (profile_file(f, p, sizeof p)) b = read_file(p, &n);
-    int ok = b && n >= 16 && !memcmp(b, "XPF1", 4) && 16 + (long)get32(b + 8) + (long)get32(b + 12) == n &&
-             career_load(b + 16, (long)get32(b + 8)) && career_cars_load(b + 16 + get32(b + 8), (long)get32(b + 12));
-    if (ok) g_xf_wins = (int)get32(b + 4);
-    else career_default();   /* a new city career: UG2's start (no cash, the first slot, the car lot) */
+    if (g_xf_unsaved && g_xf_unsaved_city == city && g_named && !strcmp(g_xf_unsaved_name, g_name)) { b = g_xf_unsaved; n = g_xf_unsavedn; exists = from_mem = 1; }
+    else if (profile_file(f, p, sizeof p)) {
+        b = read_file(p, &n);   /* (puts a .savebak back first) */
+        struct stat st;
+        exists = b != NULL || stat(p, &st) == 0;
+    }
+    if (exists && !xf_valid(b, n)) {
+        printf("xp fresh: city %d career file %s -- the trip is refused, the file kept\n", city, b ? "is damaged" : "cannot be read");
+        if (!from_mem) free(b);
+        return 0;
+    }
+    if (!xf_blobs(&g_xf_car, &g_xf_carn, &g_xf_cc, &g_xf_ccn)) {
+        printf("xp fresh: no memory for the Bayview career's copy -- the trip is refused\n");
+        if (!from_mem) free(b);
+        return 0;
+    }
+    g_xf_city = city; g_xf_wins = 0;
+    int ok = 0;
+    if (exists) {
+        ok = career_load(b + 16, (long)get32(b + 8)) && career_cars_load(b + 16 + get32(b + 8), (long)get32(b + 12));
+        if (!ok) {   /* parsed but refused: the Bayview career back in, the file untouched */
+            career_load(g_xf_car, g_xf_carn); career_cars_load(g_xf_cc, g_xf_ccn);
+            free(g_xf_car); free(g_xf_cc); g_xf_car = g_xf_cc = NULL; g_xf_carn = g_xf_ccn = 0;
+            g_xf_city = 0;
+            printf("xp fresh: city %d career could not be loaded -- the trip is refused, the file kept\n", city);
+            if (!from_mem) free(b);
+            return 0;
+        }
+        g_xf_wins = (int)get32(b + 4);
+    } else career_default();   /* a new city career: UG2's start (no cash, the first slot, the car lot) */
+    if (from_mem) { g_xf_unsaved = NULL; g_xf_unsavedn = 0; g_xf_unsaved_city = 0; }   /* it is live again */
     free(b);
-    printf("xp fresh: city %d career %s ($%d, %d wins)\n", city, ok ? "loaded" : "new", g_career.cash, g_xf_wins);
+    printf("xp fresh: city %d career %s ($%d, %d wins)\n", city, exists ? (from_mem ? "taken up from memory" : "loaded") : "new",
+           g_career.cash, g_xf_wins);
     return 1;
 }
 void profile_xf_leave(void) {
     if (!g_xf_city) return;
-    profile_xf_save();
+    if (!profile_xf_save() && g_named) {   /* (CR9) not written: keep it for a later save, not lost */
+        long n = 0; unsigned char *b = xf_build(&n);
+        if (b) {
+            free(g_xf_unsaved); g_xf_unsaved = b; g_xf_unsavedn = n; g_xf_unsaved_city = g_xf_city;
+            snprintf(g_xf_unsaved_name, sizeof g_xf_unsaved_name, "%s", g_name);
+            printf("xp fresh: city %d career kept in memory until a save goes through\n", g_xf_city);
+        }
+        savenote_failed();
+    }
     int ok = career_load(g_xf_car, g_xf_carn);
     if (!ok) career_default();
     career_cars_load(g_xf_cc, g_xf_ccn);
@@ -415,6 +481,26 @@ void profile_xf_forget(int city) {
     char f[16], p[320];
     snprintf(f, sizeof f, "XPCITY%d", city);
     if (profile_file(f, p, sizeof p) && remove(p) == 0) printf("xp fresh: city %d career cleared\n", city);
+    if (g_xf_unsaved && g_xf_unsaved_city == city && !strcmp(g_xf_unsaved_name, g_name)) xf_unsaved_drop();
+    snprintf(f, sizeof f, "XPPROG_F%d", city);   /* its wins too: a fresh start pays full purses again (CR8) */
+    if (profile_file(f, p, sizeof p) && remove(p) == 0) printf("xp fresh: city %d progress cleared\n", city);
+}
+
+int profile_xp_progress_path(char *out, int cap) {
+    if (!g_named) return 0;
+    char f[24];
+    if (g_xf_city) snprintf(f, sizeof f, "XPPROG_F%d", g_xf_city);
+    else snprintf(f, sizeof f, "XPPROG");
+    if (!profile_file(f, out, cap)) return 0;
+    if (!g_xf_city) {   /* the one-time move: the old shared file goes to the first profile that races there */
+        struct stat st;
+        const char *old = beyond_progress_legacy_path();
+        if (stat(out, &st) != 0 && stat(old, &st) == 0) {
+            if (rename(old, out) == 0) printf("xp progress: %s moved to profile %s\n", old, g_name);
+            else printf("xp progress: could not move %s to profile %s\n", old, g_name);
+        }
+    }
+    return 1;
 }
 
 int profile_load(const char *name) {

@@ -158,6 +158,10 @@ static int decoder_thread(void *ud) {
     FILE *f = fopen(g_viv, "rb");
     if (!f) { g_thread_up = 0; return 0; }
     Eal3 *d = eal3_new();
+    if (!d) {   /* (Codex CR5) no decoder: no songs, the rest of the mixer and speech's own reads go on */
+        printf("music: no memory for the decoder, music off\n");
+        fclose(f); g_thread_up = 0; return 0;
+    }
     static unsigned char blk[0x10000];
     static int16_t pcm[2 * 8192];
     int gen = g_req_gen, song = -1;

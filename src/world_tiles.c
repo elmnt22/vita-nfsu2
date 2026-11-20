@@ -572,6 +572,12 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
         memset(&nb, 0, sizeof nb);
         WLoadOptions opt = { 1, fx, fy, radius, 0 };
         int nm = world_neighborhood_load(&nb, troot, trackname, &opt);
+        if (nm <= 0 && nb.load_failed) {   /* (Codex CR10) a failure, not water: the set must not be published */
+            printf("tiles: cell (%d %d) failed to load (read / memory) -- conversion stopped, nothing published\n", cx, cy);
+            world_neighborhood_free(&nb);
+            ok = 0;
+            break;
+        }
         if (nm <= 0) {   /* open water / outside every district */
             world_neighborhood_free(&nb);
             p->cells_failed++; p->cells_done++; p->now_ms = wt_ms();
@@ -651,8 +657,11 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
     if (!wt_pw_finish(&pw, trackname, ok)) ok = 0;
     if (ok) wt_pack_probe(trackname, 1);
     if (ok) {   /* the index goes last: its presence means the set is complete */
-        char path[256]; wt_index_path(path, sizeof path, trackname);
-        FILE *f = fopen(path, "wb");
+        /* (Codex CR10) written beside it and renamed in: a conversion cut off during
+           this write leaves no half index that world_tiles_ready would accept */
+        char path[256], tpath[264]; wt_index_path(path, sizeof path, trackname);
+        snprintf(tpath, sizeof tpath, "%s.tmp", path);
+        FILE *f = fopen(tpath, "wb");
         uint32_t hdr[3] = { 0x49324755u /* "UG2I" */, (uint32_t)wt_ver(trackname), 0 };
         float size = WTILE_SIZE;
         hdr[2] = (uint32_t)icount;
@@ -660,6 +669,8 @@ int world_tiles_convert(const char *troot, const char *trackname, WTileProgress 
              fwrite(&hdr[2], 4, 1, f) == 1 && fwrite(bb, sizeof bb, 1, f) == 1 &&
              fwrite(index, sizeof *index, (size_t)icount, f) == (size_t)icount;
         if (f && fclose(f) != 0) ok = 0;
+        if (ok) { remove(path); ok = rename(tpath, path) == 0; }
+        if (!ok) remove(tpath);
     }
     free(index);
     p->now_ms = wt_ms();
@@ -1458,11 +1469,13 @@ static unsigned char *volatile *g_wt_raw;
 static long *g_wt_rawlen;
 static volatile long long g_wt_raw_bytes, g_wt_raw_hits;
 #define WT_RAW_CAP (8LL << 20)
-static void wt_raw_drop(int i) {   /* any thread; CAS 4 -> 1 -> 0 */
-    if (!g_wt_raw || g_wt_state[i] != 4 || !__sync_bool_compare_and_swap(&g_wt_state[i], 4, 1)) return;
+static long long wt_raw_drop(int i) {   /* any thread; CAS 4 -> 1 -> 0; the bytes it freed */
+    if (!g_wt_raw || g_wt_state[i] != 4 || !__sync_bool_compare_and_swap(&g_wt_state[i], 4, 1)) return 0;
     unsigned char *p = g_wt_raw[i]; g_wt_raw[i] = NULL;
-    if (p) { __sync_fetch_and_sub(&g_wt_raw_bytes, (long long)g_wt_rawlen[i]); free(p); }
+    long long b = 0;
+    if (p) { b = (long long)g_wt_rawlen[i]; __sync_fetch_and_sub(&g_wt_raw_bytes, b); free(p); }
     __sync_synchronize(); g_wt_state[i] = 0;
+    return b;
 }
 #define WT_PREFETCH_CAP (24LL << 20)
 #define WT_PREFETCH_ROOM_MB 4u    /* a tile (<= ~3 MB decoded) must fit in kernel blocks; 12 MB cut read-ahead hits 83% -> 33% (10-11) */
@@ -1478,14 +1491,19 @@ static int wt_objects_at(const WtIndexEntry *e, float fx, float fy, float radius
 }
 
 /* hand back a prepared upgrade (any thread, CAS on its state) */
-static void wt_up_drop(int i) {
-    if (!g_wt_upst || g_wt_upst[i] != 2 || !__sync_bool_compare_and_swap(&g_wt_upst[i], 2, 1)) return;
+/* returns the bytes it handed back (0 when another thread claimed the slot first:
+   the loser never looks at the payload -- Codex review CR2) */
+static long long wt_up_drop(int i) {
+    if (!g_wt_upst || g_wt_upst[i] != 2 || !__sync_bool_compare_and_swap(&g_wt_upst[i], 2, 1)) return 0;
     WtLoaded *t = g_wt_up[i]; g_wt_up[i] = NULL;
-    if (t) { __sync_fetch_and_sub(&g_wt_ready_bytes, (long long)t->bytes); wt_release(t); free(t); }
+    long long b = 0;
+    if (t) { b = (long long)t->bytes; __sync_fetch_and_sub(&g_wt_ready_bytes, b); wt_release(t); free(t); }
     __sync_synchronize(); g_wt_upst[i] = 0;
+    return b;
 }
 
-static long g_wt_miss_in, g_wt_miss_out, g_wt_miss_full, g_wt_miss_busy;   /* read-ahead census (wt_take) */
+static long g_wt_miss_in, g_wt_miss_out, g_wt_miss_full, g_wt_miss_busy;
+static int g_wt_regrade_ready, g_wt_regrade_now;   /* (CR14) far-ring ground: read-ahead's / read in the build */   /* read-ahead census (wt_take) */
 /* the read-ahead loop's turns by outcome: [0] off/paused, [1] a build's texture
    fetch, [2] the 24 MB cap, [3] short room (stored bytes path), [4] nothing in
    reach, [5] prepared a tile */
@@ -1794,11 +1812,18 @@ static int wt_prefetch_thread(void *arg) {
            ground-only one whose buildings the aim needs, or stored bytes in
            hand that room now lets it decode */
         int best = -1, up = 0; float bd = reach * reach;
+        float ground_reach = g_wt_radius + 60.0f + ra_extra;   /* the grade rule below */
         for (int i = 0; i < g_wt_nindex; i++) {
             const WtIndexEntry *e = &g_wt_index[i];
             if (e->x == -32768) continue;
             int st = g_wt_state[i];
             int want_up = st == 3 && g_wt_owned_ground[i] && g_wt_upst[i] == 0 && wt_objects_at(e, ax, ay, object_radius);
+            /* (Codex CR14, 11-20) an owned far-ring tile (stand-ins only) the aim's
+               ground reach now covers: its ground prepared too, so the build's
+               wt_regrade takes it instead of reading the card on its thread */
+            if (!want_up && st == 3 && g_wt_owned_ground[i] == WT_FAR_ONLY && g_wt_upst[i] == 0 &&
+                wt_tile_d2(e, ax, ay) <= ground_reach * ground_reach)
+                want_up = WT_GROUND_ONLY + 1;   /* 2: ground grade (1: full) */
             if (st != 0 && st != 4 && !want_up) continue;
             float d = wt_tile_d2(e, ax, ay);
             if (d < bd) { bd = d; best = i; up = want_up; }
@@ -1810,7 +1835,7 @@ static int wt_prefetch_thread(void *arg) {
         if (up) {
             if (!__sync_bool_compare_and_swap(&g_wt_upst[best], 0, 1)) continue;
             WtLoaded *t = (WtLoaded *)calloc(1, sizeof *t);
-            int ok = t && wt_read_decode_t(g_wt_track, e->x, e->y, t, 0, 0);
+            int ok = t && wt_read_decode_t(g_wt_track, e->x, e->y, t, 0, up == WT_GROUND_ONLY + 1 ? WT_GROUND_ONLY : 0);
             if (ok) { g_wt_up[best] = t; __sync_fetch_and_add(&g_wt_ready_bytes, (long long)t->bytes); }
             else free(t);
             __sync_synchronize();
@@ -1870,8 +1895,8 @@ static void wt_trim(int pause, int keep_preload) {
     if (!pause) return;
     long long freed = 0;
     for (int i = 0; g_wt_state && i < g_wt_nindex; i++) {
-        if (g_wt_upst[i] == 2) { freed += g_wt_up[i] ? (long long)g_wt_up[i]->bytes : 0; wt_up_drop(i); }
-        if (g_wt_state[i] == 4) { freed += g_wt_rawlen[i]; wt_raw_drop(i); continue; }
+        if (g_wt_upst[i] == 2) freed += wt_up_drop(i);
+        if (g_wt_state[i] == 4) { freed += wt_raw_drop(i); continue; }
         if (g_wt_state[i] != 2 || !__sync_bool_compare_and_swap(&g_wt_state[i], 2, 1)) continue;
         WtLoaded *t = g_wt_ready[i]; g_wt_ready[i] = NULL;
         if (t) { freed += (long long)t->bytes; __sync_fetch_and_sub(&g_wt_ready_bytes, (long long)t->bytes); wt_release(t); free(t); }
@@ -2284,6 +2309,11 @@ static int wt_upgrade(const char *track, int idx, WtLoaded *t) {
         if (st == 2 && __sync_bool_compare_and_swap(&g_wt_upst[idx], 2, 1)) {
             WtLoaded *u = g_wt_up[idx]; g_wt_up[idx] = NULL;
             __sync_fetch_and_sub(&g_wt_ready_bytes, (long long)u->bytes);
+            if (u->ground) {   /* a ground-grade one (CR14): not what this wants; read the full tile */
+                wt_release(u); free(u);
+                __sync_synchronize(); g_wt_upst[idx] = 0;
+                continue;
+            }
             full = *u; free(u);
             __sync_synchronize(); g_wt_upst[idx] = 0;
             g_wt_up_ready++;
@@ -2309,9 +2339,33 @@ static int wt_upgrade(const char *track, int idx, WtLoaded *t) {
 
 /* A far-ring tile (stand-ins only) that came within the ground reach: its
    ground too, read now (a few per build, ~100-300 KB each). */
-static int wt_regrade(const char *track, WtLoaded *t) {
+static int wt_regrade(const char *track, int idx, WtLoaded *t) {
     WtLoaded r;
-    if (!wt_read_decode(track, t->tx, t->ty, &r, WT_GROUND_ONLY)) return 0;
+    int got = 0, upwait = 0; (void)upwait;
+    /* (CR14) the read-ahead's decode when prepared (any grade with ground: full
+       or ground-only), waiting while it is being prepared */
+    while (idx >= 0 && g_wt_upst && !got) {
+        int st = g_wt_upst[idx];
+        if (st == 0) break;
+        if (st == 2 && __sync_bool_compare_and_swap(&g_wt_upst[idx], 2, 1)) {
+            WtLoaded *u = g_wt_up[idx]; g_wt_up[idx] = NULL;
+            if (u) { __sync_fetch_and_sub(&g_wt_ready_bytes, (long long)u->bytes); r = *u; free(u); got = 1; }
+            __sync_synchronize(); g_wt_upst[idx] = 0;
+            if (got) { g_wt_regrade_ready++; if (g_wt_owned_ground) g_wt_owned_ground[idx] = (char)r.ground; }
+            break;
+        }
+#ifdef __vita__
+        SDL_Delay(2);
+        if (++upwait == 1500) { printf("wt_regrade: tile %d still being prepared after 3 s\n", idx); break; }
+#else
+        break;
+#endif
+    }
+    if (!got) {
+        if (!wt_read_decode(track, t->tx, t->ty, &r, WT_GROUND_ONLY)) return 0;
+        g_wt_regrade_now++;
+        if (idx >= 0 && g_wt_owned_ground) g_wt_owned_ground[idx] = WT_GROUND_ONLY;
+    }
     wt_release(t);            /* meshes a resident still uses live on in it */
     *t = r;
     return 1;
@@ -2619,6 +2673,28 @@ static int wt_sea_cut(N2Mesh *m, const WtSea *s) {
    (a teleport, a switch), marks nothing. */
 static unsigned char *g_wt_obj_prev, *g_wt_obj_cur;
 static int g_wt_obj_n, g_wt_obj_have_prev;
+/* (Codex CR15, 11-20) each assembly swaps cur into prev at its end, before main
+   knows whether that area is shown: an area discarded unseen left the next build
+   comparing against it (a full model taken as already on screen: its stand-in's
+   fade-out skipped; or a re-fade of what the player saw). The swap is kept
+   undoable: after it, g_wt_obj_cur still holds the old prev, so a discard of that
+   generation swaps back. g_wt_vis_lock keeps the undo and a new assembly apart. */
+static unsigned g_wt_vis_gen;
+static int g_wt_vis_undo_ok, g_wt_vis_old_have;
+static volatile int g_wt_vis_lock;
+static void wt_vis_lock(void) { while (__sync_lock_test_and_set(&g_wt_vis_lock, 1)) SDL_Delay(0); }
+static void wt_vis_unlock(void) { __sync_lock_release(&g_wt_vis_lock); }
+void world_tiles_visibility_undo(unsigned gen) {
+    if (!gen) return;
+    wt_vis_lock();
+    if (g_wt_vis_undo_ok && gen == g_wt_vis_gen && g_wt_obj_n) {
+        unsigned char *sw = g_wt_obj_prev; g_wt_obj_prev = g_wt_obj_cur; g_wt_obj_cur = sw;
+        g_wt_obj_have_prev = g_wt_vis_old_have;
+        g_wt_vis_undo_ok = 0;
+        printf("world tiles: area %u discarded unseen, fade history back to the area on screen\n", gen);
+    }
+    wt_vis_unlock();
+}
 
 /* Same near/far rule as the instance build (WINST_LOD_NEAR_M). */
 #define WT_LOD_NEAR_M 280.0f
@@ -2642,6 +2718,7 @@ static void wt_scene_drop(N2Scene *s) {
     free(s->meshes); memset(s, 0, sizeof *s);
 }
 void world_tiles_reset(void) {
+    wt_vis_lock(); g_wt_vis_undo_ok = 0; wt_vis_unlock();
     g_wt_obj_have_prev = 0;
     int was_paused = g_wt_paused;
     g_wt_paused = 1;
@@ -2808,7 +2885,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
     if (!g_wt_aim_set) world_tiles_aim(fx, fy);
     wt_prefetch_start();
     g_wt_read_ms = g_wt_decode_ms = 0;
-    g_wt_up_ready = g_wt_up_now = 0;
+    g_wt_up_ready = g_wt_up_now = 0; g_wt_regrade_ready = g_wt_regrade_now = 0;
     if (!g_wt_have_global) {
         g_wt_have_global = wt_read_decode(track, -32768, -32768, &g_wt_global, 0);
         if (!g_wt_have_global) return 0;
@@ -2873,6 +2950,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         g_wt_loaded[kept++] = *t;
     }
     g_wt_nloaded = kept;
+    wt_vis_lock(); g_wt_vis_undo_ok = 0; wt_vis_unlock();   /* (CR15) cur is about to be written: no undo past here */
     if (g_wt_obj_n != g_wt_nindex) {
         free(g_wt_obj_prev); free(g_wt_obj_cur);
         g_wt_obj_prev = (unsigned char *)calloc((size_t)(g_wt_nindex ? g_wt_nindex : 1), 1);
@@ -2898,7 +2976,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         if (!t) return 0;
         loaded_now += g_wt_nloaded > had;
         if (tile_objects && t->ground && !wt_upgrade(track, k, t)) return 0;
-        if (!tile_objects && in_reach && t->ground == WT_FAR_ONLY) { if (!wt_regrade(track, t)) return 0; regraded++; }
+        if (!tile_objects && in_reach && t->ground == WT_FAR_ONLY) { if (!wt_regrade(track, k, t)) return 0; regraded++; }
         /* Whole-tile decisions: a world batch is one tile's run of one
            material, so its GPU buffers carry over to the next build only if
            the tile contributes exactly the same meshes. Per-mesh radius and
@@ -3004,8 +3082,13 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
         faded = 0;
     }
     if (g_wt_obj_n) {
+        wt_vis_lock();
+        g_wt_vis_old_have = g_wt_obj_have_prev;
         unsigned char *sw = g_wt_obj_prev; g_wt_obj_prev = g_wt_obj_cur; g_wt_obj_cur = sw;
         g_wt_obj_have_prev = 1;
+        if (!++g_wt_vis_gen) g_wt_vis_gen = 1;
+        g_wt_vis_undo_ok = 1;
+        wt_vis_unlock();
     }
     if (faded) printf("world tiles: %d new edge tiles, %d meshes fade in\n", obj_new, faded);
     if (xfaded) printf("world tiles: %d stand-ins fade out over their full models\n", xfaded);
@@ -3027,6 +3110,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
     }
     if (stats) {
         memset(stats, 0, sizeof *stats);
+        if (g_wt_obj_n) stats->tile_vis_gen = g_wt_vis_gen;   /* (CR15) this assembly's generation */
         snprintf(stats->bundle, sizeof stats->bundle, "%s", track);
         stats->scenery_effective = sel_effective;
         stats->scenery_hidden = hidden;
@@ -3042,11 +3126,11 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
     /* reads by the loader itself, by source: pack / loose file / preloaded bytes */
     printf("world tiles: %d meshes at (%.0f, %.0f) r %.0f: %ld new tiles (%lld ready from read-ahead, %lld from its stored bytes, "
            "%lld KB read now: read %u ms, decode %u ms; %lld pack, %lld loose, %lld preloaded), %d kept "
-           "(%u KB, %d ground only; upgrades %d ready, %d read now; %d cut to ground; far ring %d tiles %u KB, %d regraded), %ld hidden by scenery, %u ms\n",
+           "(%u KB, %d ground only; upgrades %d ready, %d read now; %d cut to ground; far ring %d tiles %u KB, %d regraded: %d ready, %d read now), %ld hidden by scenery, %u ms\n",
            scene->count, fx, fy, radius, loaded_now, (long long)(g_wt_prefetch_hits - hits0),
            (long long)(g_wt_raw_hits - rawh0), (g_wt_bytes_read - read0) >> 10, g_wt_read_ms, g_wt_decode_ms, g_wt_n_pack - npack0,
            g_wt_n_loose - nloose0, g_wt_n_pre - npre0, kept, (unsigned)(kept_bytes >> 10),
-           kept_ground, g_wt_up_ready, g_wt_up_now, downgraded, kept_far, (unsigned)(far_bytes >> 10), regraded, hidden, wt_ms() - t0);
+           kept_ground, g_wt_up_ready, g_wt_up_now, downgraded, kept_far, (unsigned)(far_bytes >> 10), regraded, g_wt_regrade_ready, g_wt_regrade_now, hidden, wt_ms() - t0);
     printf("world tiles: geometry %lld KB live: %u KB this cache, %lld KB read-ahead (+%lld KB stored bytes), %lld KB held by older areas\n",
            (long long)(g_wt_geo_live >> 10), (unsigned)(kept_bytes >> 10), (long long)(g_wt_ready_bytes >> 10),
            (long long)(g_wt_raw_bytes >> 10),

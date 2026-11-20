@@ -38,6 +38,10 @@ volatile int g_purge = 0;
 volatile int g_sput_out = 0;
 static volatile int g_shift_event;   /* gearbox: +1 upshift, -1 downshift */
 static volatile int g_audio_hold, g_audio_held, g_audio_live;
+/* (Codex review CR1, 11-20) the mixer is inside audio_mix: audio_hold waits for
+   this to drop instead of a fixed 250 ms for a fresh callback's ack, so a slow or
+   stalled callback can no longer still be in the old data when the caller frees it */
+static volatile int g_mix_busy;
 
 /* piecewise-linear crossfade: full L at/below C_L, full H at/above C_H */
 void eng_band_weights(float rpm, float w[3]) {
@@ -1402,7 +1406,14 @@ void audio_hold(int on) {
         g_audio_held = 0;
         __sync_synchronize();
         g_audio_hold = 1;
-        for (int i = 0; i < 250 && !g_audio_held; i++) SDL_Delay(1);
+        __sync_synchronize();
+        /* hold is set before busy is read and the mixer sets busy before it reads
+           hold (both fenced): once busy is seen 0, every later callback sees the
+           hold. A paused device (no callbacks) returns at once. One buffer is
+           ~23 ms of audio and mixes in a few ms; 2 s means the mixer is stuck. */
+        int i = 0;
+        for (; i < 2000 && g_mix_busy; i++) SDL_Delay(1);
+        if (i >= 2000) printf("audio: hold timed out with the mixer still busy (2 s)\n");
     } else {
         g_audio_hold = 0;
         __sync_synchronize();
@@ -1578,7 +1589,15 @@ static void sim_mix_stats(const float *mus, float lvmus, const float *spk, float
     g_sm_n = 0; g_sm_sp = 0; g_sm_t++;
 }
 #endif
+static void audio_mix_body(void *ud, Uint8 *stream, int len);
 static void audio_mix(void *ud, Uint8 *stream, int len) {
+    g_mix_busy = 1;
+    __sync_synchronize();
+    audio_mix_body(ud, stream, len);
+    __sync_synchronize();
+    g_mix_busy = 0;
+}
+static void audio_mix_body(void *ud, Uint8 *stream, int len) {
     (void)ud;
     if (g_audio_hold) {   /* a reload is swapping the data under us */
         memset(stream, 0, (size_t)len);
@@ -1609,14 +1628,17 @@ static void audio_mix(void *ud, Uint8 *stream, int len) {
             if (g_shift_clip[g_shift_which].n) g_shift_pos = 0.0f;
         }
     }
-    if (g_movie_pull) {   /* IG_PlayMovie: the movie's own sound, nothing else */
+    int (*mpull)(void *, float *, int, int) = g_movie_pull;   /* read once (CR1): a close can clear it */
+    if (mpull) {   /* IG_PlayMovie: the movie's own sound, nothing else */
+        __sync_synchronize();   /* pairs with audio_set_movie's user-then-pull */
+        void *muser = g_movie_user;
         static float mv[2 * 4096];
         int16_t *o = (int16_t *)stream;
         int nm = len / 4;
         if (nm > 4096) nm = 4096;
         memset(stream, 0, (size_t)len);
         memset(mv, 0, sizeof(float) * 2 * (size_t)nm);
-        g_movie_pull(g_movie_user, mv, nm, 44100);
+        mpull(muser, mv, nm, 44100);
         for (int i = 0; i < 2 * nm; i++) {
             float x = mv[i] * g_lv_master;
             if (x > 1.0f) x = 1.0f; if (x < -1.0f) x = -1.0f;

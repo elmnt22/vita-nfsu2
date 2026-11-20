@@ -39,6 +39,7 @@ static void world_scene_free(N2Scene *scene) {
 
 void world_neighborhood_free(WorldNeighborhood *neighborhood) {
     if (!neighborhood) return;
+    free(neighborhood->cat_idx); neighborhood->cat_idx = NULL;
     world_ground_grid_free(&neighborhood->grid);
     world_scene_free(&neighborhood->scene);
     world_scene_free(&neighborhood->vista);
@@ -322,7 +323,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         g->data = res_take(trackp, &g->len);      /* startup may have read it already */
         if (!g->data) g->data = n2_read_file(trackp, &g->len);
         g->mesh0 = g->mesh1 = w->neighborhood.scene.count;
-        if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); continue; }
+        if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); w->neighborhood.load_failed = 1; continue; }
         VMARK("  region %s in memory (%ld MB)", regs[r], g->len >> 20);
         if (world_region_hook) world_region_hook(g->data, g->len, r, nreg);
 #ifdef __vita__
@@ -460,6 +461,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
             if (!built) {   /* the bundle is stripped of models: no old-style build to fall back on */
                 world_scene_free(&w->neighborhood.scene); world_scene_free(&w->neighborhood.vista);
                 printf("world tiles: assembly failed; this area waits for the next build\n");
+                w->neighborhood.load_failed = 1;
                 return 0;
             }
         }
@@ -474,7 +476,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         }
         world_instance_lend_bundle(NULL, NULL, 0);
         VMARK("  instance build done: %d", built);
-        if (built && world_build_aborted()) return 0;
+        if (built && world_build_aborted()) { w->neighborhood.load_failed = 1; return 0; }
         if (!built) {
             fprintf(stderr, "instance world: no complete home district at "
                             "(%.1f, %.1f)\n",
@@ -535,6 +537,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
     if (!w->neighborhood.mbb) {   /* low memory: this area waits for the next build */
         world_scene_free(&w->neighborhood.scene); world_scene_free(&w->neighborhood.vista);
         printf("world: no memory for mesh bounds (%d meshes); this area waits for the next build\n", nm);
+        w->neighborhood.load_failed = 1;
         return 0;
     }
     for (int i = 0; i < nm; i++) {

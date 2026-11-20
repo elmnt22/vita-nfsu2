@@ -7929,7 +7929,13 @@ static void crib_play(Shop *s) {
     if (s->trip_city) {   /* port: the World Expansion trip (main.c: SHOP_ACT_XP_TRIP) */
         if (s->trip_share) profile_xf_leave();   /* the shared garage: the Bayview career */
         else {   /* Start fresh: the city's own career; a new one picks its first car at the lot */
-            profile_xf_enter(s->trip_city);
+            if (!profile_xf_enter(s->trip_city)) {   /* (CR9 / XF6) its file unreadable or no memory: no trip */
+                char t[256];
+                snprintf(t, sizeof t, "The career saved for %s could not be loaded. It has been kept as it is. Try again, "
+                         "or check your memory card.", s->trip_city == 1 ? "Rockport" : "Palmont");
+                dialog_text(s, DLG_AUTO, 1, t, DA_NONE, 0, 0);
+                return;
+            }
             if (!career_current_car()) { xf_lot_enter(s); return; }
         }
         s->fe_action = SHOP_ACT_XP_TRIP;

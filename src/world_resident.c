@@ -10,6 +10,7 @@
 #include "physics.h"
 #include "resource.h"   /* LOAD_PUMP */
 #include "wcoll.h"
+#include "world_tiles.h"   /* world_tiles_visibility_undo (CR15) */
 
 #if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
 #define HITCH_THREAD 1   /* the frame thread counters in hitch_report */
@@ -771,9 +772,13 @@ static int resident_resources_step(WorldResidentResources *resources,
     }
     if (resources->setup_stage == 7) {
         Uint64 batch_begin = SDL_GetPerformanceCounter();
-        resources->sky_count = upload_cat_batches(
-            &neighborhood->scene, N2_SKY, resources->mesh_textures,
-            &resources->sky, NULL);
+        static const int k_none = 0;   /* listed and empty: no meshes of the kind */
+        int listed = neighborhood->cat_count == neighborhood->scene.count &&
+                     (neighborhood->cat_idx || neighborhood->cat_nsky + neighborhood->cat_nglow == 0);
+        resources->sky_count = upload_cat_batches_list(
+            &neighborhood->scene, N2_SKY, listed ? (neighborhood->cat_idx ? neighborhood->cat_idx : &k_none) : NULL,
+            neighborhood->cat_nsky,
+            resources->mesh_textures, &resources->sky, NULL);
         if (resources->sky_count < 0) goto fail;
         hitch_mark("fin.sky");
         resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
@@ -782,9 +787,13 @@ static int resident_resources_step(WorldResidentResources *resources,
     }
     if (resources->setup_stage == 10) {
         Uint64 batch_begin = SDL_GetPerformanceCounter();
-        resources->glow_count = upload_cat_batches(
-            &neighborhood->scene, N2_GLOW, resources->mesh_textures,
-            &resources->glow, NULL);
+        static const int k_none = 0;   /* listed and empty: no meshes of the kind */
+        int listed = neighborhood->cat_count == neighborhood->scene.count &&
+                     (neighborhood->cat_idx || neighborhood->cat_nsky + neighborhood->cat_nglow == 0);
+        resources->glow_count = upload_cat_batches_list(
+            &neighborhood->scene, N2_GLOW,
+            listed ? (neighborhood->cat_idx ? neighborhood->cat_idx + neighborhood->cat_nsky : &k_none) : NULL,
+            neighborhood->cat_nglow, resources->mesh_textures, &resources->glow, NULL);
         if (resources->sky_count < 0 || resources->glow_count < 0) goto fail;
         hitch_mark("fin.sky_glow");
         resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
@@ -1066,10 +1075,24 @@ int world_resident_prepare(WorldResident *candidate,
     };
     if (!world_neighborhood_load(&candidate->world, args->track_root,
                                  args->trackname, &options)) return 0;
-    for (int i = 0; i < candidate->world.scene.count; i++)
-        if (candidate->world.scene.meshes[i].cat == N2_SKY)
-            candidate->world.scene.meshes[i].texkey = n2_sky_remap_key(
-                args->sky_profile, candidate->world.scene.meshes[i].texkey);
+    {   /* (CR13) the sky / glow meshes listed here on the worker for the finish's batches */
+        WorldNeighborhood *w = &candidate->world;
+        int nsky = 0, nglow = 0;
+        for (int i = 0; i < w->scene.count; i++) {
+            N2Mesh *m = &w->scene.meshes[i];
+            if (m->cat == N2_SKY) { m->texkey = n2_sky_remap_key(args->sky_profile, m->texkey); nsky++; }
+            else if (m->cat == N2_GLOW) nglow++;
+        }
+        free(w->cat_idx); w->cat_idx = NULL;
+        if (nsky + nglow > 0 && (w->cat_idx = (int *)malloc((size_t)(nsky + nglow) * sizeof *w->cat_idx))) {
+            int a = 0, b = nsky;
+            for (int i = 0; i < w->scene.count; i++) {
+                if (w->scene.meshes[i].cat == N2_SKY) w->cat_idx[a++] = i;
+                else if (w->scene.meshes[i].cat == N2_GLOW) w->cat_idx[b++] = i;
+            }
+        }
+        w->cat_nsky = nsky; w->cat_nglow = nglow; w->cat_count = w->scene.count;
+    }
     if (timing) { clock_gettime(CLOCK_MONOTONIC, &t1);
                   timing->neighborhood_ms = wrb_ms(&t0, &t1); }
     return 1;
@@ -1303,6 +1326,7 @@ int world_resident_job_take(WResidentJob **slot, WorldResident **candidate,
         printf("resident build aborted at (%.0f,%.0f) after %u ms\n",
                job->candidate->center[0], job->candidate->center[1],
                SDL_GetTicks() - job->start_ms);
+        if (job->candidate) world_tiles_visibility_undo(job->candidate->world.inst_stats.tile_vis_gen);   /* CR15 */
         world_resident_free(job->candidate);
         result = 0;
     } else {
@@ -1338,6 +1362,7 @@ void world_resident_job_cancel(WResidentJob **slot) {
        build on the calling thread (audit 11-17; cleared again below) */
     if (!SDL_AtomicGet(&job->done)) SDL_AtomicSet(&g_resident_abort, 1);
     SDL_WaitThread(job->thread, NULL);
+    if (job->candidate) world_tiles_visibility_undo(job->candidate->world.inst_stats.tile_vis_gen);   /* CR15 */
     world_resident_free(job->candidate);
     resident_job_free(job);
     /* an abort asked of this job must not stop the next prepare (the track
@@ -1372,7 +1397,7 @@ void world_resident_free(WorldResident *resident) {
    areas held their tiles at once: 40-64 MB of geometry "held by older areas"
    on top of the ~50 MB tile cache (sim route downtown55), and the Vita ran
    out (hwlog55). The batches (GL) still retire on the main thread. */
-typedef struct RelItem { struct RelItem *next; N2Mesh *m; int n; } RelItem;
+typedef struct RelItem { struct RelItem *next; N2Mesh *m; int n; void (*fn)(void *); void *p; } RelItem;   /* fn: a deferred free (CR12) */
 static RelItem *volatile g_rel_head;
 static volatile int g_rel_lock, g_rel_started, g_rel_busy;
 static volatile long g_rel_meshes;
@@ -1388,34 +1413,51 @@ static int rel_thread(void *unused) {
         if (!it) { SDL_Delay(15); continue; }
         while (it) {
             RelItem *nx = it->next;
-            for (int i = 0; i < it->n; i++) n2_mesh_geometry_release(&it->m[i]);
-            __sync_fetch_and_sub(&g_rel_meshes, (long)it->n);
-            free(it->m); free(it);
+            if (it->fn) it->fn(it->p);
+            else {
+                for (int i = 0; i < it->n; i++) n2_mesh_geometry_release(&it->m[i]);
+                __sync_fetch_and_sub(&g_rel_meshes, (long)it->n);
+                free(it->m);
+            }
+            free(it);
             it = nx;
         }
         g_rel_busy = 0;
     }
     return 0;
 }
-int world_resident_release_meshes_async(WorldResident *r) {
-    if (!r) return 0;
+static int rel_start(void) {
     if (!g_rel_started) {
         g_rel_started = 1;
         if (!SDL_CreateThread(rel_thread, "area-release", NULL)) g_rel_started = 2;
     }
-    if (g_rel_started != 1) return 0;   /* no thread: the retire step does it */
+    return g_rel_started == 1;
+}
+/* fn(p) on the area-release worker (plain CPU frees only); 0: no worker, do it yourself */
+static int rel_later(void (*fn)(void *), void *p) {
+    if (!fn || !rel_start()) return 0;
+    RelItem *it = (RelItem *)calloc(1, sizeof *it);
+    if (!it) return 0;
+    it->fn = fn; it->p = p;
+    rel_lock(); it->next = g_rel_head; g_rel_head = it; rel_unlock();
+    return 1;
+}
+int world_resident_release_meshes_async(WorldResident *r) {
+    if (!r) return 0;
+    if (!rel_start()) return 0;   /* no thread: the retire step does it */
     int moved = 0;
     N2Scene *scenes[] = { &r->world.scene, &r->world.vista };
     for (int g = 0; g < 2; g++) {
         N2Scene *sc = scenes[g];
         if (!sc->meshes || sc->count <= 0) continue;
-        RelItem *it = (RelItem *)malloc(sizeof *it);
+        RelItem *it = (RelItem *)calloc(1, sizeof *it);
         if (!it) continue;
         it->m = sc->meshes; it->n = sc->count;
         sc->meshes = NULL; sc->count = 0; sc->cap = 0;
-        __sync_fetch_and_add(&g_rel_meshes, (long)it->n);
+        int n = it->n;   /* counted before publishing: the worker may free it at once (CR4) */
+        __sync_fetch_and_add(&g_rel_meshes, (long)n);
         rel_lock(); it->next = g_rel_head; g_rel_head = it; rel_unlock();
-        moved += it->n;
+        moved += n;
     }
     /* its ground grid indexes those meshes and is no longer the active one
        (world_resident swap activated the new area's): ~3 MB downtown */
@@ -1429,6 +1471,10 @@ int world_resident_retire_step(WorldResident **slot, int max_items) {
     if (max_items <= 0) return 0;
     WorldResident *r = *slot;
     WorldResidentResources *v = &r->resources;
+    /* (CR12) a partial upload's own batches + arena, over frames like the rest */
+    if (!upload_world_batches_retire(&v->upload, &max_items, rel_later)) return 0;
+    if (!upload_world_batches_retire(&v->cpu_plan, &max_items, rel_later)) return 0;
+    hitch_mark("ret.upload");
     N2Batch *batches[] = {v->ordinary, v->sky, v->glow, v->vista};
     int *counts[] = {&v->ordinary_count, &v->sky_count,
                     &v->glow_count, &v->vista_count};

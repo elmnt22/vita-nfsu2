@@ -493,10 +493,21 @@ unsigned char *beyond_trackmap(int id, int *w, int *h) {
 #define BX_PROG BEYOND_DIR "/progress.txt"
 static struct { int id, won, best, place; } g_bx_prog[BX_MAXEV];
 static int g_bx_progn = -1;
+/* (Codex CR8 / GAPS XF1, 11-20) one progress file per profile and mode: the game
+   hooks in the profile's own path (profile.c profile_xp_progress_path); without a
+   hook or a named profile it stays the old shared beyond/progress.txt. The cache is
+   keyed by the path, so a profile or Start fresh switch reads the right file. */
+static int (*g_bx_path_fn)(char *out, int cap);
+static char g_bx_prog_path[320];
+void beyond_progress_path_fn(int (*fn)(char *out, int cap)) { g_bx_path_fn = fn; }
+const char *beyond_progress_legacy_path(void) { return BX_PROG; }
 static void bx_prog_load(void) {
-    if (g_bx_progn >= 0) return;
+    char p[320];
+    if (!g_bx_path_fn || !g_bx_path_fn(p, (int)sizeof p)) snprintf(p, sizeof p, "%s", BX_PROG);
+    if (g_bx_progn >= 0 && !strcmp(p, g_bx_prog_path)) return;
+    snprintf(g_bx_prog_path, sizeof g_bx_prog_path, "%s", p);
     g_bx_progn = 0;
-    FILE *f = fopen(BX_PROG, "r");
+    FILE *f = fopen(p, "r");
     if (!f) return;
     while (g_bx_progn < BX_MAXEV &&
            fscanf(f, "%d %d %d %d", &g_bx_prog[g_bx_progn].id, &g_bx_prog[g_bx_progn].won,
@@ -534,14 +545,15 @@ int beyond_progress_record(int id, int won, int ticks, int place) {
     if (won) g_bx_prog[i].won = 1;
     if (ticks > 0 && (!g_bx_prog[i].best || ticks < g_bx_prog[i].best)) g_bx_prog[i].best = ticks;
     if (place > 0 && (!g_bx_prog[i].place || place < g_bx_prog[i].place)) g_bx_prog[i].place = place;
-    mkdir(BEYOND_DIR, 0777);   /* an expansion-only install has no beyond folder yet */
-    const char *tmp = BX_PROG ".tmp";
+    if (!strcmp(g_bx_prog_path, BX_PROG))
+        mkdir(BEYOND_DIR, 0777);   /* an expansion-only install has no beyond folder yet */
+    char tmp[330]; snprintf(tmp, sizeof tmp, "%s.tmp", g_bx_prog_path);
     FILE *f = fopen(tmp, "w");
     if (!f) return 0;
     int ok = 1;
     for (int k = 0; k < g_bx_progn; k++)
         if (fprintf(f, "%d %d %d %d\n", g_bx_prog[k].id, g_bx_prog[k].won, g_bx_prog[k].best, g_bx_prog[k].place) < 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
-    if (ok) { remove(BX_PROG); ok = rename(tmp, BX_PROG) == 0; }
+    if (ok) { remove(g_bx_prog_path); ok = rename(tmp, g_bx_prog_path) == 0; }
     return ok;
 }

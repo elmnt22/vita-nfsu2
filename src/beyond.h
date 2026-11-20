@@ -60,5 +60,9 @@ int beyond_event_gates(int id, const BxGate **g);                 /* BX_MODE_*; 
 int beyond_progress(int id, int *won, int *best_ticks, int *best_place);
 int beyond_progress_record(int id, int won, int ticks, int place);
 int beyond_progress_won_count(void);
+/* where the progress lives (Codex CR8): fn writes the path and returns 1, or 0 for the
+   shared beyond/progress.txt (no profile). The game sets profile_xp_progress_path. */
+void beyond_progress_path_fn(int (*fn)(char *out, int cap));
+const char *beyond_progress_legacy_path(void);
 unsigned char *beyond_trackmap(int id, int *w, int *h);   /* its Quick Race map, RGBA (free it); NULL: none */
 #endif
