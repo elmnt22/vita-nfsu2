@@ -7959,8 +7959,9 @@ static void crib_dlg(Shop *s, int act) {
         printf("crib: back to the main menu\n");
         break;
     case DA_CRIB_TEST:   /* 0x34dc1bec: DoStartTuning -> BeginCarTuning (the test track) */
-        /* FEngSetLastButton, BeginCarTuning(0, current career car, entry 0) (tuning.c, main.c) */
-        profile_drop_snapshot();
+        /* FEngSetLastButton, BeginCarTuning(0, current career car, entry 0) (tuning.c, main.c).
+           The backup stays: the crib comes back after the Test Track (crib_return, no new
+           AllocBackupDB), and its Play / CheckMemory still compares with it (GitHub #3 S1) */
         s->fe_action = SHOP_ACT_TEST_TRACK;
         printf("crib: Test Track -- BeginCarTuning\n");
         break;
