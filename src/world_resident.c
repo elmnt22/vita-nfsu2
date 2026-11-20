@@ -1094,6 +1094,10 @@ int world_resident_finish(WorldResident *candidate, float x, float y, float z,
 int world_resident_finish_step(WorldResident *candidate, float x, float y, float z,
                                int max_batches, WResidentBuildTiming *timing) {
     if (!candidate || max_batches <= 0) return -1;
+    /* GitHub #4: a mark spans the time since the previous one, so close the
+       caller's own work (the loading loop / frame) here; "fin.validate" is
+       then only the CPU validate, and only on the slice that runs it */
+    hitch_mark("fin.caller");
     if (!candidate->resources.mesh_count) {
         Uint64 begin = SDL_GetPerformanceCounter();
         if (!world_resident_validate_cpu(candidate, x, y, z)) {
@@ -1104,8 +1108,8 @@ int world_resident_finish_step(WorldResident *candidate, float x, float y, float
         }
         if (timing) timing->validate_ms = (uint32_t)(
             (SDL_GetPerformanceCounter() - begin) * 1000 / SDL_GetPerformanceFrequency());
+        hitch_mark("fin.validate");
     }
-    hitch_mark("fin.validate");
     int status = resident_resources_step(&candidate->resources, &candidate->world,
                                          max_batches, !candidate->omit_vista, timing);
     if (status < 0) printf("resident finish failed: resources step (upload / room) in the area at %.0f %.0f\n",
