@@ -15233,7 +15233,7 @@ static void tt_car_draw(const TtCar *tc, const RProg *rp, const float MVP[16], c
     for (int w = 0; w < 4; w++) { mat_mul(WV, tc->wheelT[w], wmvp[w]); mat_mul(W, tc->wheelT[w], ww[w]); }
     int lib_tire = 0, lib_inner = 0;
     for (int li = 0; li < tc->nrim; li++) {
-        if (tc->rgm[li].cat == N2_CAR_TIRE) lib_tire = 1;
+        if (tc->rgm[li].cat == N2_CAR_TIRE || tc->rgm[li].car_material == N2_MAT_RUBBER) lib_tire = 1;
         if (tc->rgm[li].cat == N2_CAR_INTERIOR) lib_inner = 1;
     }
     int sw = tc->stock_wheel;
@@ -26483,7 +26483,16 @@ int main(int argc, char **argv) {
         /* The showroom backdrop is framed for the game's narrow front-end
            camera (measured off the reference: ~40 deg across at 16:9); the
            driving FOV sees past its edges. */
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_ZOOM=<k> narrows the view k times (close looks at a car) */
+            const char *zm = getenv("OPENUG2_SIM_ZOOM");
+            if (zm && atof(zm) > 1.0) cam_fovy = 2.0f * atanf(tanf(0.5f * cam_fovy) / (float)atof(zm));
+        }
+#endif
         mat_persp(cam_fovy, cam_aspect, znear, zfar, P);
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_SIM_ZOOMY")) P[9] += (float)atof(getenv("OPENUG2_SIM_ZOOMY"));   /* (test aid) the zoomed view's centre up/down */
+#endif
         phys_landing_camera(&landing_offset,&landing_velocity,
             g_ride_ready && !sstatic && !capture_policy.freeze_motion && !race_auto
             ? g_ride.impact:0,1.0f/60.0f);
@@ -29347,7 +29356,7 @@ int main(int argc, char **argv) {
                         !draw_scene->meshes[draw_stock_wheel].vcol;
                     int orims=olk&&olk->nr>0&&olk->rgm, olib_tire=0, olib_inner=0;
                     for(int li=0;orims&&li<olk->nr;li++){
-                        if(olk->rgm[li].cat==N2_CAR_TIRE)olib_tire=1;
+                        if(olk->rgm[li].cat==N2_CAR_TIRE||olk->rgm[li].car_material==N2_MAT_RUBBER)olib_tire=1;
                         if(olk->rgm[li].cat==N2_CAR_INTERIOR)olib_inner=1;
                     }
                     int orubber=0;   /* the model's wheel slices are all TIRE: under a library rim only its RUBBER */
@@ -29860,12 +29869,21 @@ int main(int argc, char **argv) {
                        INTERIOR and rim slices. Drawing the car's authored tyre
                        underneath as well double-renders the sidewall/barrel
                        and produces the black faceted cavity. Keep the old
-                       authored fallback only for an incomplete/corrupt library. */
+                       authored fallback only for an incomplete/corrupt library.
+                       The library's tyre is a RUBBER slice whose category is
+                       BODY (its name is <BRAND>_STYLEnn_..., no TIRE token):
+                       judged by category alone it was never found, so the
+                       stock tyre was drawn over every aftermarket rim and its
+                       sidewall stayed the stock thickness at every rim size
+                       (GitHub #14). */
                     int library_tire = 0, library_interior = 0;
                     for (int li = 0; li < nwheelgm; li++) {
-                        if (wheelgm[li].cat == N2_CAR_TIRE) library_tire = 1;
+                        if (wheelgm[li].cat == N2_CAR_TIRE || wheelgm[li].car_material == N2_MAT_RUBBER) library_tire = 1;
                         if (wheelgm[li].cat == N2_CAR_INTERIOR) library_interior = 1;
                     }
+#ifdef OPENUG2_SIM_PRE_H
+                    if (getenv("OPENUG2_SIM_STOCKTYRE")) library_tire = 0;   /* test aid: the old double tyre */
+#endif
                     if (stock_wheel >= 0 && !(library_tire && library_interior)) {
                         /* Draw rubber first, then the authored annular INTERIOR
                            backing produced by n2_open_wheel_backing(). Every
