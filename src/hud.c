@@ -4669,8 +4669,11 @@ static void hud_draw_screen(Hud *h, const HudDC *dc, const HudState *s) {
             }
             break;
         case R_SHIFT:
-            if (s->have_rpm && s->gear > 0 && s->rpm_redline > 0.0f &&
-                s->rpm >= s->rpm_redline * 0.93f)
+            /* GitHub #15: Tachometer::Update 0x4c68d0 lights it above the gear's
+               shift point less 0.95 x its window, so low-redline engines light too */
+            if (s->have_rpm && s->gear > 0 &&
+                (s->shift_rpm > 0.0f ? s->rpm > s->shift_rpm
+                                     : s->rpm_redline > 0.0f && s->rpm >= s->rpm_redline * 0.93f))
                 fe_sprite(h, dc, i);
             break;
         case R_NOS_FILL: {

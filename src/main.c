@@ -30611,6 +30611,21 @@ int main(int argc, char **argv) {
             if (g_n2 && g_n2rec_ok) {   /* GitHub #15: the tach's dial and needle scale by the engine (0x5ed9b0) */
                 hs.tach_red = n2sim_param(g_n2, 0x1f4);
                 hs.tach_lim = n2sim_param(g_n2, 0x1f8);
+                /* GitHub #15: the shift light (Tachometer::Update 0x4c68d0, +0x78): shown while
+                   the tach (car +0x440) is above GetOptimalShiftUpRPM(gear) - 0x7fbf5c 0.95 x the
+                   window -- GetPerfectShiftRange 0x594f00 for a physics mover (car +0x28 == 1) */
+                int sg = g_n2s.gear;          /* car +0x434: 0 R, 1 N, 2 1st */
+                hs.shift_rpm = n2sim_gear_up(g_n2, sg) - 0.95f * n2sim_shift_win(g_n2, sg);
+                if (!(hs.shift_rpm > 0.0f)) hs.shift_rpm = 0.0f;
+#ifdef OPENUG2_SIM_PRE_H
+                {   static int tl;   /* test aid: the tach, its dial and the shift light */
+                    if (getenv("OPENUG2_SIM_TACHPIN")) hs.rpm = (float)atof(getenv("OPENUG2_SIM_TACHPIN"));
+                    if (getenv("OPENUG2_SIM_TACHLOG") && ++tl % 6 == 0)
+                        printf("tach: gear %d rpm %.0f red %.0f lim %.0f shift_on %.0f light %d snd %.0f\n", sg,
+                               (double)hs.rpm, (double)hs.tach_red, (double)hs.tach_lim, (double)hs.shift_rpm,
+                               hs.shift_rpm > 0.0f && sg >= 2 && hs.rpm > hs.shift_rpm, (double)g_engine.current_rpm);
+                }
+#endif
             }
             /* manual shows the selected gear (N, R); automatic shows R
                while rolling backwards */

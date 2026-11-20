@@ -47,6 +47,8 @@ typedef struct {
     float rpm, rpm_redline;   /* PROVISIONAL: the virtual AUDIO gearbox */
     float tach_red, tach_lim; /* engine record +0x1f0 +4 / +8: the tach's dial class (0x5ed9b0) and
                                  needle scale; 0 = the default 10500 dial */
+    float shift_rpm;          /* the shift light's turn-on rpm (0x4c68d0: OptimalShiftUpRPM(gear) - 0.95 x
+                                 the gear's shift window); 0 = rpm_redline x 0.93 */
     int   gear;               /* <0 reverse, 0 neutral, 1..n forward */
     int   gear_out;           /* car +0x448 == 0 (gearbox mid-shift): orange gear */
     int   nitro_active;       /* REAL, but binary: there is no tank model */
