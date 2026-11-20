@@ -1948,6 +1948,44 @@ int hud_set_trackmap(Hud *h, const char *dataroot, int event,
    TRACKMAP layout. "BMAP", u32 w, u32 h, f32 x0, y0 (top-left), size, zoom,
    then w*h RGBA. Kept under the pseudo event -2 so the city's TRACKMAP
    reloads when the track switches back. */
+/* A World Expansion race map (<city>_RACE<id>.MAP: MW's own MINI_MAP, or Carbon's
+   city map with the route baked in) holds its route as a ~2.6 px white line in a
+   1024/512 px picture of the whole city; shrunk onto the panel it is ~1.5 px and
+   reads as grey as the streets (user 11-19). Bayview's TRACKMAPs draw the route
+   ~3 px white over dark grey streets: the route widened by a pixel each side and
+   the streets darkened, to match. Route = near-white neutral (MW 232-255, the
+   bake 251); streets are <= ~170, water is tinted (left alone). */
+static void hud_race_map_route(unsigned char *px, int w)
+{
+    size_t n = (size_t)w * w;
+    unsigned char *m = calloc(n, 1);
+    if (!m) return;
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char *q = px + i * 4;
+        int lo = q[0] < q[1] ? q[0] : q[1], hi = q[0] > q[1] ? q[0] : q[1];
+        if (q[2] < lo) lo = q[2];
+        if (q[2] > hi) hi = q[2];
+        if (q[3] > 128 && lo >= 220 && hi - lo <= 16) m[i] = 1;
+    }
+    for (int y = 0; y < w; y++)
+        for (int x = 0; x < w; x++) {
+            unsigned char *q = px + ((size_t)y * w + x) * 4;
+            if (m[(size_t)y * w + x]) continue;
+            int near = 0;
+            for (int dy = -1; dy <= 1 && !near; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    int xx = x + dx, yy = y + dy;
+                    if (xx >= 0 && yy >= 0 && xx < w && yy < w && m[(size_t)yy * w + xx]) { near = 1; break; }
+                }
+            if (near) { q[0] = q[1] = q[2] = 245; q[3] = 255; continue; }
+            int lo = q[0] < q[1] ? q[0] : q[1], hi = q[0] > q[1] ? q[0] : q[1];
+            if (q[2] < lo) lo = q[2];
+            if (q[2] > hi) hi = q[2];
+            if (hi - lo <= 16) for (int k = 0; k < 3; k++) q[k] = (unsigned char)(q[k] * 0.65f);   /* streets */
+        }
+    free(m);
+}
+
 int hud_set_trackmap_file(Hud *h, const char *path) {
     if (!h) return 0;
     static char cur[256], bad[256];   /* the map loaded / the file that failed (one per world) */
@@ -1962,6 +2000,7 @@ int hud_set_trackmap_file(Hud *h, const char *path) {
         printf("minimap: %s missing or unreadable\n", path);
         free(d); snprintf(bad, sizeof bad, "%s", path); return 0;
     }
+    if (strstr(path, "_RACE")) hud_race_map_route(d + 28, (int)w);
     if (!h->tm_tex) glGenTextures(1, &h->tm_tex);
     glBindTexture(GL_TEXTURE_2D, h->tm_tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
