@@ -15138,6 +15138,60 @@ static void car_alpha_part_draw(const RProg *r, GpuMesh *m, int mode) {
         if (!blend) glDisable(GL_BLEND);
     }
 }
+/* PERF_PLAN_1120 item 2: a car model's parts in material order (see the
+   player body loop). The opponents' and traffic's loop sets every uniform
+   per part, so the order only changes how many writes repeat the value
+   already set (the uniform cache drops those). Alpha parts keep their own
+   order after the rest. Cached per model (its GpuMesh array); nocarsort.txt
+   = mesh order. */
+#define CAR_ORDER_SLOTS 24
+static int car_order_off(void) {
+    static int off = -1;
+    if (off < 0) {
+        FILE *f = fopen("ux0:data/NFSU2/nocarsort.txt", "r");
+        off = f != NULL; if (f) fclose(f);
+#ifdef OPENUG2_SIM_PRE_H
+        if (getenv("OPENUG2_SIM_NOCARSORT")) off = 1;
+#endif
+    }
+    return off;
+}
+static const short *car_draw_order(const GpuMesh *gpu, const N2Mesh *meshes, int n,
+                                   const uint32_t *mapkey, const GLuint *maptex, const char *mapmode, int nmap) {
+    static struct { const GpuMesh *gpu; int n; unsigned sig, used; short *ord; } slot[CAR_ORDER_SLOTS];
+    static unsigned tick;
+    if (car_order_off() || !gpu || !meshes || n <= 1 || n > 4000) return NULL;
+    unsigned sig = (unsigned)n * 40503u ^ (unsigned)(uintptr_t)meshes;
+    for (int i = 0; i < n; i++) sig = sig * 31u + gpu[i].texkey + gpu[i].car_material * 7u + (unsigned)gpu[i].cat;
+    for (int j = 0; j < nmap; j++) sig = sig * 31u + mapkey[j] + (unsigned)maptex[j] * 3u + (unsigned)(unsigned char)mapmode[j];
+    tick++;
+    int lru = 0;
+    for (int k = 0; k < CAR_ORDER_SLOTS; k++) {
+        if (slot[k].gpu == gpu && slot[k].n == n && slot[k].sig == sig && slot[k].ord) { slot[k].used = tick; return slot[k].ord; }
+        if (slot[k].used < slot[lru].used) lru = k;
+    }
+    short *ord = (short *)realloc(slot[lru].ord, (size_t)n * sizeof *ord);
+    uint64_t *key = (uint64_t *)malloc((size_t)n * sizeof *key);
+    if (!ord || !key) { free(key); if (ord) slot[lru].ord = ord; slot[lru].gpu = NULL; return NULL; }
+    for (int i = 0; i < n; i++) {
+        int tm = N2_DRAW_OPAQUE; GLuint tx = 0;
+        for (int j = 0; j < nmap; j++) if (mapkey[j] == gpu[i].texkey) { tx = maptex[j]; tm = mapmode[j]; break; }
+        uint32_t h = gpu[i].car_material * 2654435761u ^ gpu[i].texkey * 40503u
+                   ^ (uint32_t)meshes[i].car_part * 97u ^ (uint32_t)meshes[i].car_cf * 389u;
+        key[i] = (uint64_t)(gpu[i].cat & 0xff) << 54 | (uint64_t)(gpu[i].trim ? 1 : 0) << 53
+               | (uint64_t)(meshes[i].vcol ? 1 : 0) << 52 | (uint64_t)h << 16;
+        if (car_alpha_part(tx, tm, gpu[i].cat)) key[i] = (uint64_t)1 << 63 | (uint64_t)i;
+        ord[i] = (short)i;
+    }
+    for (int a = 1; a < n; a++) {
+        short v = ord[a]; int b = a - 1;
+        while (b >= 0 && key[ord[b]] > key[v]) { ord[b + 1] = ord[b]; b--; }
+        ord[b + 1] = v;
+    }
+    free(key);
+    slot[lru].ord = ord; slot[lru].gpu = gpu; slot[lru].n = n; slot[lru].sig = sig; slot[lru].used = tick;
+    return ord;
+}
 /* a car of the garage by its body / wheel matrices M / W (world, possibly
    mirrored for the floor reflection); at: where its light is taken. The
    body by its texture map, vinyl skin, base paint and the category paints
@@ -29528,7 +29582,10 @@ int main(int argc, char **argv) {
 #ifdef __vita__
                 unsigned pf_body_switches = pf_rival_body ? vita_variant_switch_total() : 0;
 #endif
-                for (int i = 0; i < draw_nmesh; i++) {
+                const short *rord = car_draw_order(draw_gpu, draw_scene->meshes, draw_nmesh,
+                                                   draw_mapkey, draw_maptex, draw_mapmode, draw_nmap);
+                for (int oi = 0; oi < draw_nmesh; oi++) {
+                    int i = rord ? rord[oi] : oi;
                     if (mlead && mlead[i] == -1) continue;   /* drawn with its group */
                     /* a merged body batch stays whole: it is one draw at any LOD */
                     if (!(mlead && mlead[i] >= 0) && !AI_LOD_HAS(&draw_scene->meshes[i], alod)) continue;
