@@ -116,16 +116,29 @@ static const unsigned char *container_payload(const unsigned char *f, long n, in
     if (crc_ok) *crc_ok = rd32(f + 0x14) == rmc_crc(f + RMC_HDR, RETAIL_SIZE);
     return f + RMC_HDR;
 }
-static int name_from(const unsigned char *p, char name[32]) {
-    memcpy(name, p + P_NAME, 31); name[31] = 0;
+static int name_usable(const char *name) {   /* MC_List's filter: < 8 chars, no space */
     size_t l = strlen(name);
     if (!l || l > 7 || strchr(name, ' ') || strchr(name, '/') || strchr(name, '\\') || name[0] == '.') return 0;
+    return 1;
+}
+/* the save's own name (payload +0xd201); a save with no usable one (hand
+   edited) takes its file's name, which the PC game lists it by (MC_List names
+   a profile after its <NAME>/<NAME> folder) */
+static int name_from(const unsigned char *p, const char *savefile, char name[32]) {
+    memcpy(name, p + P_NAME, 31); name[31] = 0;
+    if (name_usable(name)) return 1;
+    const char *b = savefile;
+    for (const char *c = savefile; *c; c++) if (*c == '/' || *c == '\\' || *c == ':') b = c + 1;
+    char fn[32]; snprintf(fn, sizeof fn, "%s", b);
+    if (!name_usable(fn)) return 0;
+    for (char *c = fn; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);   /* name entry: A-Z / 0-9 */
+    memcpy(name, fn, 32);
     return 1;
 }
 int pcsave_peek(const char *savefile, char name[32]) {
     long n; unsigned char *f = read_all(savefile, &n);
     const unsigned char *p = f ? container_payload(f, n, NULL) : NULL;
-    int ok = p && name_from(p, name);
+    int ok = p && name_from(p, savefile, name);
     free(f);
     return ok;
 }
@@ -304,7 +317,7 @@ int pcsave_import(const char *savefile, const char *dataroot, const char *profdi
     if (!f) { snprintf(info->msg, sizeof info->msg, "cannot read %s", savefile); return 0; }
     const unsigned char *p = container_payload(f, n, &info->crc_ok);
     if (!p) { snprintf(info->msg, sizeof info->msg, "not an NFSU2 PC save (20CM, version 0x10d, 0xd692 bytes)"); free(f); return 0; }
-    if (!name_from(p, info->name)) { snprintf(info->msg, sizeof info->msg, "the save's profile name is not usable"); free(f); return 0; }
+    if (!name_from(p, savefile, info->name)) { snprintf(info->msg, sizeof info->msg, "the save's profile name is not usable"); free(f); return 0; }
     if (!info->crc_ok) printf("pcsave: %s: the payload CRC does not match (the PC game would call it corrupt); importing anyway\n", info->name);
     if (rd32(p + CDB_TUNED - 4) > 0x30 || rd32(p + CDB_PC - 4) != 5 || rd32(p + P_CAREER - 4) > 6)
         printf("pcsave: unexpected FEPlayerCarDB counts %u %u %u\n", (unsigned)rd32(p + CDB_TUNED - 4),
@@ -362,24 +375,36 @@ int pcsave_import(const char *savefile, const char *dataroot, const char *profdi
     return ok;
 }
 
-int pcsave_find_new(const char *profdir, char *path, int cap, char name[32]) {
-    DIR *d = opendir(PCSAVE_DIR);
+/* A save is known by its contents (the realmc container checks), not where
+   it sits: the PC's <NAME>/<NAME> folder copied as is, the file alone, a
+   renamed folder or file, or a downloaded archive unpacked with a folder of
+   its own around it (up to three folders deep). Only files of a save's exact
+   size are read. */
+static int find_in(const char *dir, int depth, const char *profdir, char *path, int cap, char name[32]) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
     struct dirent *e;
     int found = 0;
-    while (d && !found && (e = readdir(d))) {
+    while (!found && (e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         char p[600], q[600];
-        snprintf(p, sizeof p, "%s/%s/%s", PCSAVE_DIR, e->d_name, e->d_name);   /* the PC's folder copied */
-        if (!pcsave_peek(p, name)) {
-            snprintf(p, sizeof p, "%s/%s", PCSAVE_DIR, e->d_name);            /* or the file alone */
-            if (!pcsave_peek(p, name)) continue;
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(p, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth < 3) found = find_in(p, depth + 1, profdir, path, cap, name);
+            continue;
         }
+        if ((long)st.st_size != RMC_HDR + RETAIL_SIZE || !pcsave_peek(p, name)) continue;
         snprintf(q, sizeof q, "%s/%s/%s", profdir, name, name);
         FILE *f = fopen(q, "rb");
         if (f) { fclose(f); continue; }
         snprintf(path, (size_t)cap, "%s", p);
         found = 1;
     }
-    if (d) closedir(d);
+    closedir(d);
     return found;
+}
+int pcsave_find_new(const char *profdir, char *path, int cap, char name[32]) {
+    return find_in(PCSAVE_DIR, 0, profdir, path, cap, name);
 }

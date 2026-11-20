@@ -125,6 +125,30 @@ title screen without the "OPTIMIZING WORLD DATA" screen.
    `ux0:data/NFSU2/profiles`. Or copy the `profiles` folder there by hand.
 4. In the game, load the profile from the **Profile Manager**.
 
+### A save downloaded from a save site
+
+Saves shared online (for example 100% saves from sites such as nfsu2.xyz)
+are ordinary PC profile files and import the same way. Unzip the download
+first, then either:
+
+- In the Prep Tool, click **Import PC save...** and pick the save file
+  itself (the file with no extension inside the profile folder, about 54 KB).
+  Its name and folder don't matter.
+- Or copy it to the Vita without the Prep Tool: put the file (or the whole
+  unzipped folder) anywhere under `ux0:data/NFSU2/pcsave/`, up to three
+  folders deep. In the game, **Profile Manager → Load** offers it.
+
+The profile is named after the name stored in the save. A hand-edited save
+without a usable name (1-7 characters, no spaces) is named after its file.
+If you already have a profile with that name, delete or rename it first, or
+the save is skipped.
+
+It won't import if the file isn't a PC save of Underground 2 (exactly
+54,966 bytes): console saves (PS2, GameCube, Xbox) and
+saves converted for other tools are a different format. A save whose
+checksum doesn't match its contents (common with edited saves) is still
+imported, and the Prep Tool says so.
+
 ## World Expansion (Rockport and Palmont)
 
 Optional. If you own **Need for Speed Most Wanted (2005)** or **Need for Speed

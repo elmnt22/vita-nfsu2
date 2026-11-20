@@ -854,6 +854,20 @@ static void load_strings(Shop *s) {
     n2_lang_path(path, sizeof path, s->dataroot);
     s->lang = n2_read_file(path, &s->langlen);
     printf("shop: language %d %s (%s)\n", n2_lang(), k_n2_lang_name[n2_lang()], s->lang ? "loaded" : "MISSING");
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* sim test aid: the Profile Manager's PC save search + import, at once */
+        static int pcs_done;
+        char pp[600], pn[32];
+        if (!pcs_done && getenv("OPENUG2_SIM_PCSAVE")) {
+            pcs_done = 1;
+            if (pcsave_find_new(PROFILE_DIR_PATH, pp, sizeof pp, pn)) {
+                PcSaveInfo pi;
+                printf("simpcsave: found %s at %s, import %d\n", pn, pp,
+                       pcsave_import(pp, s->dataroot, PROFILE_DIR_PATH, &pi));
+            } else printf("simpcsave: no new PC save\n");
+        }
+    }
+#endif
     if (!s->lang) return;
     for (long o = 0; o + 8 <= s->langlen; ) {
         uint32_t id = n2_u32(s->lang + o), sz = n2_u32(s->lang + o + 4);

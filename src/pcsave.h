@@ -13,7 +13,7 @@
 #ifndef OPENUG2_PCSAVE_H
 #define OPENUG2_PCSAVE_H
 
-#define PCSAVE_DIR "ux0:data/NFSU2/pcsave"   /* in game: <dir>/<NAME>/<NAME> or <dir>/<NAME> */
+#define PCSAVE_DIR "ux0:data/NFSU2/pcsave"   /* in game: any save file under it, up to 3 folders deep */
 
 typedef struct {
     char name[32];          /* the profile's name (payload +0xd201) */
