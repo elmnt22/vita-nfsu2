@@ -20285,8 +20285,20 @@ int main(int argc, char **argv) {
         pf_mark(PF_FRAME_TOP);
 #ifdef __vita__
         { extern void vita_step(const char *label); vita_step("frame"); }   /* the hang recorder's frame tick */
-        vita_wd_armed = RT_RACE && race_state == 0 && !race_place_pending && !race_start_pending
-                        && g_rt.t > 1.0f;
+        /* armed in a race: the countdown state (0), or an open-world race
+           running in state 1 -- the "racing" test of the post-race screens
+           below. Freeze 11-20 (logs/userlogf): races run in state 1, so a hang
+           mid-race fell to the 90 s idle limit and the player quit before the
+           core dump. Finished races (results, the car reloads after) stay out. */
+        vita_wd_armed = RT_RACE && !race_place_pending && !race_start_pending && g_rt.t > 1.0f
+                        && (race_state == 0 || (race_state == 1 && world.city.race.active
+                                                && !world.city.race.finished));
+        {   static int wd_was;   /* one log line per change (a race start / end) */
+            if (vita_wd_armed != wd_was) {
+                printf("watchdog: %s (race_state %d, race t %.1f s)\n",
+                       vita_wd_armed ? "armed in a race" : "disarmed", race_state, g_rt.t);
+                wd_was = vita_wd_armed;
+            } }
         int vita_ticks = 1;
         {   Uint64 now = SDL_GetPerformanceCounter();
             if (vita_tick_prev) {
@@ -21608,6 +21620,9 @@ int main(int argc, char **argv) {
         if (g_post.action >= 0) {
             int act = g_post.action;
             g_post.action = -1;
+#ifdef __vita__
+            vita_wd_armed = 0;   /* quit / restart / next race: the loads below are not a race hang */
+#endif
             int q = -1;
             for (int k = 0; k < nsprint; k++) if (sprintev[k] == world.city.race.ev) q = k;
             post_close();
@@ -32449,6 +32464,9 @@ int main(int argc, char **argv) {
             render_scene_end(&rp, &quad, sw, sh, g_dbg.fog_density); }   /* no-HUD frames */
 #endif
         pf_mark(PF_SCENE_END);
+#ifdef __vita__
+        { extern void vita_step(const char *label); vita_step("scene_end"); }   /* hang recorder: mark 21 hangs (11-20) */
+#endif
         {   /* the cover photos (ScreenShot 0x5c3120): the finished frame */
             int sw, sh; SDL_GL_GetDrawableSize(win, &sw, &sh);
             const unsigned char *csc = g_fe && g_showroom ? shop_cover_due(g_fe) : NULL;
@@ -32460,9 +32478,13 @@ int main(int argc, char **argv) {
                 if (e && SDL_GetTicks() > (Uint32)atoi(e)) { sn_done = 1; printf("sim: save note test, profile_save %d%c", profile_named() ? profile_save() : -1, 10); }
             }
 #endif
+#ifdef __vita__
+            { extern void vita_step(const char *label); vita_step("savenote"); }
+#endif
             savenote_draw(dataroot, sw, sh);   /* "Save complete." in the corner (port addition, after the photos) */
         }
 #ifdef __vita__
+        { extern void vita_step(const char *label); vita_step("swap"); }
         {   Uint64 sw0 = SDL_GetPerformanceCounter();
             static Uint64 swap_end;   /* last frame's swap return: busy = to this swap's start */
             if (swap_end) g_vita_busy_us = (unsigned)((sw0 - swap_end) * 1000000u / SDL_GetPerformanceFrequency());

@@ -668,6 +668,14 @@ volatile int vita_wd_load;
    crumbs.txt once the loop has gone WD_STALL_SECONDS without a beat, long
    before it faults, so a player who quits a frozen game still leaves the
    place it stopped behind (crumbs_prev.txt after a relaunch). */
+/* the GXM call the main thread is inside (GX_TIMED below sets it, 0 = none)
+   and when it went in: a stall inside the swap then names the wait
+   (display queue / notification / finish) or shows it is in vitaGL's own
+   code (none set) -- freeze 11-20, mark 21 hangs */
+static volatile int g_gx_in;
+static volatile uint32_t g_gx_in_t;
+static const char *const g_gx_in_name[] = { "-", "sceGxmEndScene", "sceGxmBeginScene",
+    "sceGxmDisplayQueueAddEntry", "sceGxmNotificationWait", "sceGxmFinish" };
 #define STEP_RING 64
 typedef struct { const char *label; unsigned ms, n; int sec; } VitaStep;
 static VitaStep g_step[STEP_RING];
@@ -695,6 +703,13 @@ static void step_dump(void) {
     }
 }
 #define WD_STALL_SECONDS 6
+static void gx_in_report(void) {
+    int in = g_gx_in;
+    if (in > 0 && in < (int)(sizeof g_gx_in_name / sizeof *g_gx_in_name))
+        vita_crumb("  gpu: main thread inside %s for %u ms", g_gx_in_name[in],
+                   (unsigned)((sceKernelGetProcessTimeLow() - g_gx_in_t) / 1000u));
+    else vita_crumb("  gpu: main thread in no GXM call");
+}
 /* the watchdog's flush: up to 1 s for the log writer to empty the ring,
    without fflush (stdout's lock may be held by the hung thread, audit 11-17) */
 static void wd_log_drain(void) {
@@ -730,6 +745,7 @@ static int wd_thread(SceSize args, void *argp) {
                        WD_STALL_SECONDS, vita_wd_sec, b,
                        load ? "boot world load" : armed ? "in a race" : "outside a race");
             step_dump();
+            gx_in_report();
             wd_log_drain();
         }
         unsigned lim = load ? WD_LOAD_SECONDS : armed ? WD_SECONDS : WD_IDLE_SECONDS;
@@ -738,6 +754,7 @@ static int wd_thread(SceSize args, void *argp) {
                    "faulting for a core dump", (unsigned)((now - since) / 1000000u), vita_wd_sec, b,
                    load ? "in the boot world load, step in the crumbs above"
                    : armed ? "armed in a race" : "outside a race (front end / shop / free roam / load)");
+        gx_in_report();
         wd_log_drain();                             /* let the log writer drain */
         *(volatile int *)0 = 0x57d;                 /* the core dump */
         return 0;
@@ -1467,7 +1484,8 @@ void vita_gx_row(FILE *f) {
 }
 
 #define GX_TIMED(slot, call) \
-    uint32_t t0 = sceKernelGetProcessTimeLow(); int r = call; \
+    uint32_t t0 = sceKernelGetProcessTimeLow(); g_gx_in_t = t0; g_gx_in = (slot) + 1; \
+    int r = call; g_gx_in = 0; \
     if (gx_on) gx_wait_us[slot] += sceKernelGetProcessTimeLow() - t0;
 
 int __real_sceGxmEndScene(SceGxmContext *, const SceGxmNotification *, const SceGxmNotification *);
@@ -1516,7 +1534,9 @@ void SDL_GL_SwapWindow(SDL_Window *w) {
         if (used > g_pool_peak_kb) g_pool_peak_kb = used; }
     {   uint32_t t0 = sceKernelGetProcessTimeLow(), e0 = gx_wait_us[GXW_END], q0 = gx_wait_us[GXW_QUEUE];
         gx_in_swap = 1;
+        vita_step("swap.vgl");   /* hang recorder: inside vglSwapBuffers */
         vglSwapBuffers(GL_FALSE);
+        vita_step("swap.vgl_done");
         gx_in_swap = 0;
         if (gx_on) gx_wait_us[GXW_SWAP] += (sceKernelGetProcessTimeLow() - t0)
                                          - (gx_wait_us[GXW_END] - e0) - (gx_wait_us[GXW_QUEUE] - q0); }
