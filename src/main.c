@@ -1960,11 +1960,20 @@ static int rec_ride(const unsigned char *rec, float *base, float wz[4]) {
  * (GTO 0.889 front / 0.892 rear vs fender 0.907/0.914, CIVIC 0.807 vs 0.839,
  * HUMMER 0.986 vs 1.028); +0x20 is the same with the wide body kit. The tyre
  * runs inward from it. Not the physics contact y (+0x04), which the GTO's
- * rear (0.840) would push 5 cm out of the arch. Sim order FL FR RR RL. */
-static int rec_wheel_outer(const unsigned char *rec, float out[4]) {
+ * rear (0.840) would push 5 cm out of the arch. Sim order FL FR RR RL.
+ * 0x61fe10 keeps both faces per wheel (+0x400 = -(+0x1c), +0x404 = -(+0x20))
+ * and the render 0x620ae0 takes the second when the WIDE_BODY slot (config
+ * +0x590 + 6*4 = +0x5a8) holds a part of level (byte +5 >> 5) != 0, i.e. a
+ * wide body kit (our parts[N2_PART_WIDE] > 1). GitHub #23: we always took
+ * +0x1c, so a wide kit left the tyres 15 cm inside its arches on the COROLLA
+ * (0.780 vs 0.932), 7-11 cm on the others. */
+static int rec_wheel_outer(const unsigned char *rec, float out[4], int wide) {
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_SIM_NARROWWHEEL")) wide = 0;   /* test aid (simulator): the old placement */
+#endif
     for (int i = 0; i < 4; i++) {
         float y;
-        memcpy(&y, rec + 0x110 + 0x10 + 0x30 * i + 0x1c, 4);
+        memcpy(&y, rec + 0x110 + 0x10 + 0x30 * i + (wide ? 0x20 : 0x1c), 4);
         if (!(fabsf(y) > 0.3f && fabsf(y) < 2.0f)) return 0;
         out[i] = y;
     }
@@ -21004,7 +21013,7 @@ int main(int argc, char **argv) {
                           if (g_n2rec_ok && rec_ride(g_n2rec, &rb, rw))
                               printf("  stance %s: record body ride %.3f, wheel z F %.3f R %.3f\n",
                                      carname, rb, rw[0], rw[2]);
-                          if (g_n2rec_ok && rec_wheel_outer(g_n2rec, rw))
+                          if (g_n2rec_ok && rec_wheel_outer(g_n2rec, rw, carcfg.parts[N2_PART_WIDE] > 1))
                               printf("  stance %s: tyre outer face F %.3f R %.3f (wheel half width %.3f)\n",
                                      carname, rw[0], rw[3], stock_wheel >= 0 ?
                                      wheel_half_width(&car.meshes[stock_wheel]) : 0.0f); }
@@ -28597,7 +28606,7 @@ int main(int argc, char **argv) {
                                      wheel_brand == 0 && wheel_style == 1 ? &car.meshes[stock_wheel]
                                    : wheellib.count > 0 ? &wheellib.meshes[0] : NULL;
                   float hw = wheel_half_width(wm) * s;
-                  if (car_rec && hw > 0.0f && rec_wheel_outer(g_n2rec, wo)) {
+                  if (car_rec && hw > 0.0f && rec_wheel_outer(g_n2rec, wo, carcfg.parts[N2_PART_WIDE] > 1)) {
                       static const int RWo[4] = { 0, 1, 3, 2 };
                       for (int k = 0; k < 4; k++) {
                           float o = wo[RWo[k]];
