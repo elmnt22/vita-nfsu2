@@ -1,4 +1,4 @@
-# Need for Speed Underground 2 — Vita Edition
+# Need for Speed Underground 2 — Ultimate Vita Edition
 
 A native PlayStation Vita port of **Need for Speed Underground 2**. It is not
 emulation and not a wrapper: the engine is rebuilt in C and runs the PC
