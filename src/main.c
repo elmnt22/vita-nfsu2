@@ -20133,6 +20133,7 @@ int main(int argc, char **argv) {
     int cam_snap = 0;            /* jump the chase camera (after a teleport) */
     int post_hold = 0;           /* post-race marker outside the loaded area: held there until it streams in */
     int ft_hold = 0;             /* ... a fast travel's hold (the World Map), not a race's */
+    int rp_hold = 0;             /* ... the replay's exit: THE_PRESENT spot outside the area the replay streamed in (GH #26) */
     float post_hold_pos[4];      /* the marker spot + heading */
     int cc_cycle = 0;            /* D-pad Up while driving: next camera view */
 #endif
@@ -20349,6 +20350,23 @@ int main(int argc, char **argv) {
                 const CareerRecord *r = g_career.engaged_event ? career_record(n2_u32(g_career.engaged_event + 8)) : NULL;
                 g_post.action = !strcmp(pa, "quit") ? PR_QUIT_PAUSE : !strcmp(pa, "wmap") ? PR_WORLDMAP_PAUSE : PR_EXPLORE_ABANDON;
                 printf("sim pause: %s mid-race (record +6 = %d, cash %d)\n", pa, r ? r->flag[CREC_DONE] : -1, (int)g_career.cash);
+            }
+        }
+        {   /* test aid (simulator): OPENUG2_SIM_REPLAY=<s> -- once the post-race menu is up, its Replay
+               (GH #26 repro); after s seconds of replay its START exit; then the car's height
+               logged every second for 20 s */
+            static int sr_state; static Uint32 sr_t;
+            const char *sr = getenv("OPENUG2_SIM_REPLAY");
+            if (sr && sr_state == 0 && g_post.menu && !rp_up() && !g_rp_req) {
+                sr_state = 1; sr_t = SDL_GetTicks(); g_rp_req = RP_FROM_POSTRACE; hud_free(&g_post.menu);
+                printf("sim: OPENUG2_SIM_REPLAY -- Replay from the post-race menu, car at (%.1f %.1f %.2f)\n", carpos[0], carpos[1], carpos[2]);
+            } else if (sr && sr_state == 1 && rp_up() && SDL_GetTicks() - sr_t > (Uint32)(atof(sr) * 1000.0)) {
+                sr_state = 2; sr_t = SDL_GetTicks(); rp_key(RP_K_START);
+                printf("sim: OPENUG2_SIM_REPLAY -- START (exit)\n");
+            } else if (sr && sr_state == 2 && !rp_up() && SDL_GetTicks() - sr_t > 1000) {
+                sr_t = SDL_GetTicks();
+                static int n; if (n++ < 20) printf("sim: after the replay, car at (%.1f %.1f %.2f) race_state %d ride %d post menu %d\n",
+                                                   carpos[0], carpos[1], carpos[2], race_state, g_ride_ready, g_post.menu != NULL);
             }
         }
 #endif
@@ -25058,7 +25076,8 @@ int main(int argc, char **argv) {
         }
         if (post_hold) {   /* the post-race marker: stood there once the resident covers it */
             if (ft_hold && !(race_state == 1 && (g_rt.roam || beyond_is_track(trackname)))) post_hold = ft_hold = 0;
-            else if (!ft_hold && (!g_rt.active || !g_rt.post_done)) post_hold = 0;
+            else if (rp_hold && !g_rt.active) post_hold = rp_hold = 0;   /* the race gone (quit) */
+            else if (!ft_hold && !rp_hold && (!g_rt.active || !g_rt.post_done)) post_hold = 0;
             else if (active_resident && hypotf(post_hold_pos[0] - active_resident->center[0],
                                                post_hold_pos[1] - active_resident->center[1]) <
                                             active_resident->radius - 50.0f) {
@@ -25075,8 +25094,8 @@ int main(int argc, char **argv) {
                 heading = post_hold_pos[3]; vel[0] = vel[1] = 0; speed = 0;
                 g_n2_live = 0; g_rt.put_down = 1; g_ride_ready = 0; cam_snap = 1;
                 printf("race: %s area in (gen %lu), the car put down at (%.0f %.0f z %.2f)\n",
-                       ft_hold ? "fast travel" : "post-race marker", active_resident->generation, carpos[0], carpos[1], z);
-                ft_hold = 0;
+                       ft_hold ? "fast travel" : rp_hold ? "replay exit" : "post-race marker", active_resident->generation, carpos[0], carpos[1], z);
+                ft_hold = rp_hold = 0;
             } else {
                 memcpy(carpos, post_hold_pos, 3 * sizeof(float)); heading = post_hold_pos[3];
                 vel[0] = vel[1] = 0; speed = 0;
@@ -25523,6 +25542,21 @@ int main(int argc, char **argv) {
                 heading = rp_heading; vel[0] = rp_vel[0]; vel[1] = rp_vel[1]; speed = rp_speed;
                 g_ride_ready = rp_ride_ready;
                 g_cc_snap = 1;
+#ifdef __vita__
+                /* GH #26: the replay's frames moved the car round the course and the
+                   streaming followed them, so the area in now may be far from
+                   THE_PRESENT's spot: with no ground under it the car fell through
+                   (and on into the menus). Held there, as a post-race marker or a
+                   fast travel is, until the area round it is in, then put down. */
+                if (race_state != 0 && active_resident && hypotf(carpos[0] - active_resident->center[0], carpos[1] - active_resident->center[1]) >=
+                                                         active_resident->radius - 50.0f) {
+                    memcpy(post_hold_pos, carpos, 3 * sizeof(float)); post_hold_pos[3] = heading;
+                    vel[0] = vel[1] = 0; speed = 0; g_n2_live = 0; cam_snap = 1;
+                    post_hold = 1; ft_hold = 0; rp_hold = 1;
+                    printf("replay: exit to (%.0f, %.0f), outside the area in (centre %.0f, %.0f): held until it streams in\n",
+                           carpos[0], carpos[1], active_resident->center[0], active_resident->center[1]);
+                }
+#endif
                 /* Exit (GC 800f9894) switches back to the package before (FEngSwitchPackages):
                    PostRaceMenu::Setup (800f3190) focuses FEngGetLastButton, the option
                    the IconScrollerMenu stored when it was chosen (8015a134): Replay;
