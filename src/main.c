@@ -15078,6 +15078,39 @@ static void tt_old_take(const N2Scene *car, GpuMesh *cgm, int ncar, int own_mesh
     printf("turntable: the outgoing car kept (%d meshes%s, %d textures, %d rim meshes)\n",
            ncar, own_mesh ? "" : " shared", n, g_tt_old.nrim);
 }
+/* An unpainted textured car part (not body/misc paint, not a lamp) whose
+   texture asks for cutout or blending in its TPK record -- the cabin's DRIVER
+   silhouette (GLOBALB, DXT3, usage 2 / blend 1, on every stock car's BASE
+   meshes; GitHub #25): drawn opaque its transparent texels showed as a white
+   card. Retail draws it by the texture's own alpha state. The cutout discard
+   keeps the clear texels out of the depth buffer, so it can stay in the
+   opaque pass (whatever cabin part is drawn after it still shows through);
+   a blended texture also blends its soft edge. */
+static int car_alpha_part(GLuint tex, int mode, int cat) {
+#ifdef OPENUG2_SIM_PRE_H
+    static int off = -1;   /* test aid (simulator): OPENUG2_SIM_NOALPHAPART=1 draws them opaque, as before */
+    if (off < 0) off = getenv("OPENUG2_SIM_NOALPHAPART") != NULL;
+    if (off) return 0;
+#endif
+    return tex && (mode == N2_DRAW_CUTOUT || mode == N2_DRAW_BLEND) &&
+           cat != N2_CAR_BODY && cat != N2_CAR_MISC && cat != N2_CAR_LIGHT && cat != N2_CAR_BRAKELIGHT;
+}
+static void car_alpha_part_draw(const RProg *r, GpuMesh *m, int mode) {
+    GLboolean blend = glIsEnabled(GL_BLEND);
+    GLint src = GL_SRC_ALPHA, dst = GL_ONE_MINUS_SRC_ALPHA;
+    glUniform1f(r->uAlphaTest, 1.0f);
+    if (mode == N2_DRAW_BLEND) {
+        glGetIntegerv(GL_BLEND_SRC_RGB, &src); glGetIntegerv(GL_BLEND_DST_RGB, &dst);
+        glUniform1f(r->uTextureAlpha, 1.0f);
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+    draw_gpumesh(m);
+    glUniform1f(r->uAlphaTest, 0.0f); glUniform1f(r->uTextureAlpha, 0.0f);
+    if (mode == N2_DRAW_BLEND) {
+        glBlendFunc((GLenum)src, (GLenum)dst);
+        if (!blend) glDisable(GL_BLEND);
+    }
+}
 /* a car of the garage by its body / wheel matrices M / W (world, possibly
    mirrored for the floor reflection); at: where its light is taken. The
    body by its texture map, vinyl skin, base paint and the category paints
@@ -15190,7 +15223,8 @@ static void tt_car_draw(const TtCar *tc, const RProg *rp, const float MVP[16], c
                 render_wheel_mesh(rp, &gm[i], tex, texmode); g_dbg.drawn++;
             }
             glUniformMatrix4fv(rp->uMVP, 1, GL_FALSE, MV); render_model(rp, M);
-        } else { draw_gpumesh(&gm[i]); g_dbg.drawn++; }
+        } else if (car_alpha_part(tex, texmode, cat)) { car_alpha_part_draw(rp, &gm[i], texmode); g_dbg.drawn++; }
+        else { draw_gpumesh(&gm[i]); g_dbg.drawn++; }
         if (own) carfx_use_paint(tc->pmat);
     }
     glUniform3f(rp->uEmissive, 0, 0, 0); glUniform1f(rp->uVColor, 0.0f); glUniform1f(rp->uDecal, 0.0f);
@@ -29000,7 +29034,8 @@ int main(int argc, char **argv) {
                 } else {
                     GpuMesh *mesh = plead && plead[i] >= 0 ? &pm_gpu[plead[i]] : &cgm[i];
                     Uint64 pf_submit_start = pf_live_body ? SDL_GetPerformanceCounter() : 0;
-                    draw_gpumesh(mesh);
+                    if (!swp && !cft && car_alpha_part(tex, texmode, c)) car_alpha_part_draw(&rp, mesh, texmode);
+                    else draw_gpumesh(mesh);
                     pf_submit_ticks += pf_elapsed(pf_submit_start);
                     g_dbg.drawn++;
                 }
@@ -29285,7 +29320,12 @@ int main(int argc, char **argv) {
                         pf_body_binds += 4; /* bind and restore per wheel */
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,AIMVPc);
                         render_model(&rp,AIModel);
-                    } else { draw_gpumesh(mlead && mlead[i] >= 0 ? &tv->mgpu[mlead[i]] : &draw_gpu[i]); g_dbg.drawn++; }
+                    } else {
+                        GpuMesh *dm = mlead && mlead[i] >= 0 ? &tv->mgpu[mlead[i]] : &draw_gpu[i];
+                        if (car_alpha_part(tex, texmode, c)) car_alpha_part_draw(&rp, dm, texmode);
+                        else draw_gpumesh(dm);
+                        g_dbg.drawn++;
+                    }
                 }
                 ads_t[2] = SDL_GetPerformanceCounter();
                 if (pf_rival_body) {
