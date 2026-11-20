@@ -20987,6 +20987,9 @@ int main(int argc, char **argv) {
                    0x5eb5d0), the race manager -- is the original's
                    (rt_race_setup). Without it the race does not start: there
                    is no other race. */
+#ifdef OPENUG2_SIM_PRE_H
+                if (getenv("OPENUG2_SIM_REVERSE")) g_rt_reverse = 1;   /* test aid: the race run backwards */
+#endif
                 int ng = world_race_start(&world, troot, ev, laps);
                 if (ng > 0 && g_rt_reverse) world_race_reverse(&world);   /* 0x89e7a4 */
                 hitch_mark("race.world_start");
@@ -20999,6 +21002,7 @@ int main(int argc, char **argv) {
                 hitch_mark("race.setup");
                 if (setup_ok) {
                     resident_args.scenery_event = world.city.ev[ev].id;
+                    g_wg_reverse = g_rt_reverse;   /* its 0x200 scenery mirrored (world_scenery.h) */
                     vel[0] = vel[1] = 0; speed = 0; g_ride_ready = 0;
                     race_state = 0; racetimer = 0; race_place_pending = 1; cam_snap = 1;
                     printf("garage: race %d (%s) starting from start slot %d\n",
@@ -21187,6 +21191,7 @@ int main(int argc, char **argv) {
             /* a venue's event loads with its own scenery: the race start
                then finds its area built instead of rebuilding it */
             resident_args.scenery_event = next_ev > 0 ? next_ev : runtime_scenery_event;
+            if (next_ev > 0) g_wg_reverse = g_rt_reverse;
             nai = 0;
             if (aipath.xy) { free(aipath.xy); aipath.xy = NULL; aipath.n = 0; }
             if (beyond_is_track(next_track) && !beyond_is_track(trackname)) {   /* the city is still loaded: its sky for Beyond */

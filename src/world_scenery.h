@@ -30,6 +30,12 @@ extern int g_wg_career_stage, g_wg_career_owns_car;
  * NULL outside an expansion city) says: 1 the event's own, 0 not (another race's, or
  * free roam: MW shows none there), -1 the event has no barrier list. */
 extern int (*g_wg_xp_barrier_on)(const char *name,int event);
+/* The race runs its track backwards (FwdRevTrack 0x89e7a4). Retail mirrors every
+ * scenery placement flagged 0x200 then (GC ScenerySectionHeader::
+ * FlipObjectsOnBackwardsTrack 80209850: the instance matrix times diag(-1,1,1)),
+ * which turns the race barriers' arrows round. UG2 data only: an expansion city's
+ * barriers take their direction from barriers.txt (WG_FLIP). */
+extern int g_wg_reverse;
 static int wg_xp_barrier(const char *name) { return !strncmp(name,"BARRIER_SPLINE_",15); }
 static int wg_lock_group(const char *name) {
     return !strncmp(name,"BARRIERS_CAREER",15) || !strcmp(name,"BARRIERS_DEMO");
@@ -137,10 +143,13 @@ static const WGSelected *wg_selection_find(const WGSelection *s,unsigned section
     WGSelected key={0};key.section=(uint16_t)section;key.row=(uint16_t)row;
     return bsearch(&key,s->items,s->count,sizeof *s->items,wg_selected_cmp);
 }
-/* an MW race barrier the race uses the other way round: its artwork mirrored */
-static int wg_selection_flipped(const WGSelection *s,unsigned section,unsigned row) {
+/* a placement whose artwork is mirrored: an MW race barrier the race uses the other
+   way round, or a UG2 0x200 placement on a backwards track */
+static int wg_selection_flipped(const WGSelection *s,unsigned section,unsigned row,int race) {
     const WGSelected *i=wg_selection_find(s,section,row);
-    return i&&(i->membership&WG_FLIP)&&(i->membership&WG_ACTIVE);
+    if(!i)return 0;
+    if(g_wg_xp_barrier_on)return (i->membership&WG_FLIP)&&(i->membership&WG_ACTIVE);
+    return race&&g_wg_reverse&&(i->flags&0x200);   /* race: the selection is a race event's */
 }
 static int wg_selection_visible(const WGSelection *s,unsigned section,unsigned row) {
     const WGSelected *i=wg_selection_find(s,section,row);

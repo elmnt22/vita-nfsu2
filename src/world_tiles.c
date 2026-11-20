@@ -2968,7 +2968,7 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
             if (role != 1 && role != 4 && m->scen_has && smk_is_prop(m->scen_region, m->scen_index)) role = 3;
             if (!wt_push(scene, m, role, drop_vcol)) return 0;
             if (m->scen_has && sel.count && role != 1 && role != 4 &&
-                wg_selection_flipped(&sel, m->scen_region, m->scen_index))
+                wg_selection_flipped(&sel, m->scen_region, m->scen_index, sel_effective > 0))
                 wt_flip_artwork(&scene->meshes[scene->count - 1]);
             if (!strcmp(m->sname, "PAN_OCEAN_XENON") && xpcity_is_city(track)) {
                 const WtSea *sea = wt_sea_mask(track);
@@ -2977,10 +2977,23 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
 #ifdef OPENUG2_SIM_PRE_H
             if (getenv("OPENUG2_SIM_FLIPLOG") && strstr(m->sname, "TRACKBARRIER")) {   /* test aid: each barrier's arrow axis */
                 const N2Mesh *q = &scene->meshes[scene->count - 1];
-                int a0 = -1, a1 = -1;
-                for (int v = 0; v < q->nverts; v++) { if (a0 < 0 || q->verts[v*5+3] < q->verts[a0*5+3]) a0 = v; if (a1 < 0 || q->verts[v*5+3] > q->verts[a1*5+3]) a1 = v; }
-                if (a0 >= 0) printf("barrierdir: %u/%u tex %08x flip %d from %.1f %.1f to %.1f %.1f\n", q->scen_region, q->scen_index, q->texkey,
-                                    wg_selection_flipped(&sel, m->scen_region, m->scen_index), q->verts[a0*5], q->verts[a0*5+1], q->verts[a1*5], q->verts[a1*5+1]);
+                /* the way u grows (the arrow axis), summed over the triangles' tangents */
+                double tx = 0, ty = 0, cx = 0, cy = 0;
+                for (int t = 0; t + 2 < q->nidx; t += 3) {
+                    const float *p0 = q->verts + q->idx[t]*5, *p1 = q->verts + q->idx[t+1]*5, *p2 = q->verts + q->idx[t+2]*5;
+                    double e1[3] = { p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2] }, e2[3] = { p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2] };
+                    double du1 = p1[3]-p0[3], dv1 = p1[4]-p0[4], du2 = p2[3]-p0[3], dv2 = p2[4]-p0[4];
+                    double det = du1*dv2 - du2*dv1;
+                    if (fabs(det) < 1e-9) continue;
+                    double gx = (e1[0]*dv2 - e2[0]*dv1) / det, gy = (e1[1]*dv2 - e2[1]*dv1) / det, gl = sqrt(gx*gx + gy*gy);
+                    if (gl < 1e-6) continue;
+                    tx += gx / gl; ty += gy / gl;
+                }
+                for (int v = 0; v < q->nverts; v++) { cx += q->verts[v*5]; cy += q->verts[v*5+1]; }
+                if (q->nverts) { cx /= q->nverts; cy /= q->nverts; }
+                double tl = sqrt(tx*tx + ty*ty);
+                if (tl > 1e-6) printf("barrierdir: %u/%u tex %08x flip %d from %.1f %.1f to %.1f %.1f\n", q->scen_region, q->scen_index, q->texkey,
+                                      wg_selection_flipped(&sel, m->scen_region, m->scen_index, sel_effective > 0), cx, cy, cx + 5*tx/tl, cy + 5*ty/tl);
             }
 #endif
             if (fresh && !ground && role != 3) { scene->meshes[scene->count - 1].fade_in = 1; faded++; }
