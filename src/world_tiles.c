@@ -2945,6 +2945,11 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                nfsu2.h drops them from new conversions. Bayview has none. */
             if (strstr(m->sname, "REFLECTIONBARRI") && m->world_role != 1 && m->world_role != 4) continue;
             if (!strcmp(m->sname, "PAN_OCEAN_CG") && xpcity_is_city(track)) continue;   /* Carbon's low-detail sea (wt_sea_mask) */
+            /* Most Wanted's SHADOW_ meshes (black, vertex alpha to 251) lie on tunnel walls and
+               ceilings; drawn, they were black patches z-fighting the wall (Rockport tunnels,
+               11-19), and blended they blacked the tunnel out. MW's tunnels show lit walls:
+               not drawn (port). Bayview has no SHADOW_ meshes. */
+            if (!strncmp(m->sname, "SHADOW_", 7) && xpcity_is_city(track)) continue;
 #ifdef OPENUG2_SIM_PRE_H
             if (getenv("OPENUG2_SIM_NOSHEET") && !strncmp(m->sname, getenv("OPENUG2_SIM_NOSHEET"), strlen(getenv("OPENUG2_SIM_NOSHEET")))) continue;   /* test aid: hide meshes by name prefix */
 #endif

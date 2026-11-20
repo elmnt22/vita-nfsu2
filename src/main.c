@@ -24963,6 +24963,10 @@ int main(int argc, char **argv) {
                     memcpy(g_ft.p, sp, sizeof sp); g_ft.go = 1; heading = sh;
                     printf("sim: OPENUG2_SIM_BEYOND_AT %s -> (%.0f %.0f %.1f)\n", ba, sp[0], sp[1], sp[2]);
                 }
+                if (!strncmp(ba, "xy:", 3) && sscanf(ba + 3, "%f,%f,%f,%f", &sp[0], &sp[1], &sp[2], &sh) == 4) {   /* "xy:x,y,z,heading" */
+                    memcpy(g_ft.p, sp, sizeof sp); g_ft.go = 1; heading = sh;
+                    printf("sim: OPENUG2_SIM_BEYOND_AT %s\n", ba);
+                }
                 for (int i = 0; i < beyond_event_count(); i++) {
                     int id, t, l; float p[3], hd;
                     if (beyond_event_at(i, &id, &t, &l) && id == atoi(ba) && beyond_event_start(i, p, &hd)) {
