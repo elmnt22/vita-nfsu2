@@ -77,6 +77,7 @@ typedef struct {
     int parent;                     /* index into g.ent, -1 the tree's root */
     int model;                      /* index into g.mdl, -1 none */
     int has_ctrl, pending, seen;
+    unsigned posever;               /* bumped at every pose_update (the draw's matrix cache key) */
     WaCtrl c;
     float local[16];                /* the SpaceNode's local matrix */
 } WaEnt;
@@ -110,6 +111,7 @@ static struct {
     unsigned watch; int watch_n;         /* test aid (OPENUG2_WATEST): the last ANIM_POSITION target */
     int logged;
     float planes[6][4]; int have_planes; /* the main view's frustum of the last drawn frame */
+    unsigned gen;                        /* bumped by tree_free: the draw's matrix cache is stale */
 } g;
 
 static void ent_defs(const unsigned char *d, long len)
@@ -452,6 +454,7 @@ static void pose_update(WaEnt *e)
     if (c->ch[0]) nis_chan_eval(c->ch[0], c->time, c->pose, 24);
     nis_root_bone1(c->pose, e->local);
     e->pending = 0;
+    e->posever++;
 }
 
 /* ---- StartWorldAnimations ----------------------------------------------------- */
@@ -472,6 +475,7 @@ static void tree_free(void)
         for (int k = 0; k < 3; k++) nis_chan_free(g.ent[i].c.ch[k]);
     free(g.ent); free(g.tr);
     g.ent = NULL; g.tr = NULL; g.nent = g.ntr = 0;
+    g.gen++;
 }
 void wa_start(int event, int reverse)
 {
@@ -616,28 +620,87 @@ static void ent_world(const WaEnt *e, float W[16])
         m4mul(W, g.tr[e->tree].in->M, W);
 }
 
-/* The draw's world matrices, the parent chain's product kept per entity for
-   the frame (11-15, PERF_PLAN P3): hwlog62 the per-entity chain walk was
-   ~0.48 ms/frame for 124 entities. Same product (L_e . L_p1 . L_p2 ...);
-   a parent with a pending pose is brought up to date first (SpaceNode::Update
-   order: the parent's matrix before the child's). */
-static float (*g_wc)[16]; static unsigned *g_wcs; static int g_wc_cap; static unsigned g_wframe;
+/* The draw's world matrices, the parent chain's product kept per entity
+   (11-15, PERF_PLAN P3: hwlog62 the per-entity chain walk was ~0.48 ms/frame
+   for 124 entities). Same product (L_e . L_p1 . L_p2 ...); a parent with a
+   pending pose is brought up to date first (SpaceNode::Update order: the
+   parent's matrix before the child's).
+   11-20 (PERF_PLAN_1120 item 3): kept ACROSS frames. An entry is recomputed
+   only when its own pose changed (posever), its parent's chain changed
+   (the parent's wver) or the trees were rebuilt (g.gen); the world matrix
+   and the model's world box follow from it. Most entities hold their pose
+   (no controller, or out of view in wa_update), so the frame no longer
+   multiplies matrices for them. The result is bit-identical: the same
+   multiplications on the same inputs. nowacache.txt = per-frame only. */
+typedef struct {
+    float chain[16];                /* L_e . chain(parent) */
+    float W[16];                    /* the draw's world matrix (a second root at the instance) */
+    float lo[3], hi[3];             /* the model's box in world space */
+    unsigned frame, gen, posever, parver, wver;
+    int boxok;
+} WaCache;
+static WaCache *g_wcc; static int g_wc_cap; static unsigned g_wframe;
+static int g_wa_keep = -1;          /* 1 = keep across frames (default), 0 = nowacache.txt */
+static long c_chain_calc, c_box_calc;   /* census */
 static const float *ent_chain(int i, int depth)
 {
     WaEnt *e = &g.ent[i];
-    if (g_wcs[i] == g_wframe) return g_wc[i];
+    WaCache *C = &g_wcc[i];
+    if (C->frame == g_wframe && C->gen == g.gen) return C->chain;
     if (e->pending) pose_update(e);
-    if (e->parent >= 0 && depth < 16) m4mul(e->local, ent_chain(e->parent, depth + 1), g_wc[i]);
-    else memcpy(g_wc[i], e->local, sizeof e->local);
-    g_wcs[i] = g_wframe;
-    return g_wc[i];
+    const float *pc = NULL; unsigned pv = 0;
+    if (e->parent >= 0 && depth < 16) { pc = ent_chain(e->parent, depth + 1); pv = g_wcc[e->parent].wver; }
+    if (!g_wa_keep || C->gen != g.gen || C->posever != e->posever || C->parver != pv) {
+        if (pc) m4mul(e->local, pc, C->chain);
+        else memcpy(C->chain, e->local, sizeof e->local);
+        C->gen = g.gen; C->posever = e->posever; C->parver = pv;
+        C->wver++; C->boxok = 0;
+        c_chain_calc++;
+    }
+    C->frame = g_wframe;
+    return C->chain;
 }
-static void ent_world_frame(int i, float W[16])
+static void box_of(const WaModel *m, const float W[16], float lo[3], float hi[3])
+{
+    for (int k = 0; k < 3; k++) { lo[k] = W[12 + k]; hi[k] = W[12 + k]; }
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++) {
+            float a = W[r * 4 + k] * m->lo[r], b = W[r * 4 + k] * m->hi[r];
+            lo[k] += a < b ? a : b; hi[k] += a < b ? b : a;
+        }
+}
+static const WaCache *ent_cached(int i, const WaModel *m)
 {
     const WaEnt *e = &g.ent[i];
-    memcpy(W, ent_chain(i, 0), 16 * sizeof(float));
-    if (e->parent < 0 && e->d->name != g.tr[e->tree].in->tree)      /* a second root: at the instance */
-        m4mul(W, g.tr[e->tree].in->M, W);
+    WaCache *C = &g_wcc[i];
+    ent_chain(i, 0);
+    if (!C->boxok) {
+        memcpy(C->W, C->chain, sizeof C->W);
+        if (e->parent < 0 && e->d->name != g.tr[e->tree].in->tree)      /* a second root: at the instance */
+            m4mul(C->W, g.tr[e->tree].in->M, C->W);
+        box_of(m, C->W, C->lo, C->hi);
+        C->boxok = 1;
+        c_box_calc++;
+    }
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_WACHECK=1 -- the kept matrix against a
+           fresh parent walk (ent_world), every entity every frame */
+        static int chk = -1; static long n_chk, n_bad;
+        if (chk < 0) chk = getenv("OPENUG2_WACHECK") != NULL;
+        if (chk) {
+            float F[16]; ent_world(e, F);
+            int bad = 0;
+            for (int k = 0; k < 16; k++) {
+                float d = F[k] - C->W[k], a = fabsf(F[k]) > 1.0f ? fabsf(F[k]) : 1.0f;
+                if (fabsf(d) > 1e-4f * a) bad = 1;
+            }
+            n_chk++; n_bad += bad;
+            if (bad && n_bad < 10) printf("wacheck: entity %d (%08x) kept matrix differs\n", i, e->d->name);
+            if (n_chk % 20000 == 0) printf("wacheck: %ld checks, %ld mismatches\n", n_chk, n_bad);
+        }
+    }
+#endif
+    return C;
 }
 
 int wa_entity_pos(unsigned name, float pos[3])
@@ -792,13 +855,20 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
     static Uint64 t_all; static long c_ent, c_drawn, c_frames;
     Uint64 tq = SDL_GetPerformanceCounter();
     int chain = 1;
-    if (g.nent > g_wc_cap) {
-        free(g_wc); free(g_wcs);
-        g_wc = malloc((size_t)g.nent * sizeof *g_wc); g_wcs = calloc((size_t)g.nent, sizeof *g_wcs);
-        g_wc_cap = g_wc && g_wcs ? g.nent : 0;
+    if (g_wa_keep < 0) {
+        FILE *f = fopen("ux0:data/NFSU2/nowacache.txt", "r");
+        g_wa_keep = !f;
+        if (f) fclose(f);
+        printf("world anims: draw matrices kept %s\n", g_wa_keep ? "across frames" : "per frame (nowacache.txt)");
     }
+    if (g.nent > g_wc_cap) {
+        free(g_wcc);
+        g_wcc = (WaCache *)calloc((size_t)g.nent, sizeof *g_wcc);   /* gen 0 never matches: g.gen starts at 1 */
+        g_wc_cap = g_wcc ? g.nent : 0;
+    }
+    if (!g.gen) g.gen = 1;
     if (g_wc_cap < g.nent) chain = 0;
-    if (++g_wframe == 0) { g_wframe = 1; if (g_wcs) memset(g_wcs, 0, (size_t)g_wc_cap * sizeof *g_wcs); }
+    if (++g_wframe == 0) { g_wframe = 1; if (g_wcc) for (int k = 0; k < g_wc_cap; k++) g_wcc[k].frame = 0; }
     for (int i = 0; i < g.nent; i++) {
         WaEnt *e = &g.ent[i];
         if (e->model < 0) continue;
@@ -812,16 +882,14 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
            only brought up to date (SpaceNode::Update 0x60bb10). The
            camera-inside-box skip (WorldModel +0x18) is never armed: the ctor
            (GC 8024ca1c) stores 0 and nothing else writes it for these. */
-        float W[16];
-        if (chain) ent_world_frame(i, W);
-        else { if (e->pending) pose_update(e); ent_world(e, W); }
-        float lo[3], hi[3];
-        for (int k = 0; k < 3; k++) { lo[k] = W[12 + k]; hi[k] = W[12 + k]; }
-        for (int r = 0; r < 3; r++)
-            for (int k = 0; k < 3; k++) {
-                float a = W[r * 4 + k] * m->lo[r], b = W[r * 4 + k] * m->hi[r];
-                lo[k] += a < b ? a : b; hi[k] += a < b ? b : a;
-            }
+        float Wl[16], lol[3], hil[3];
+        const float *W, *lo, *hi;
+        if (chain) { const WaCache *C = ent_cached(i, m); W = C->W; lo = C->lo; hi = C->hi; }
+        else {
+            if (e->pending) pose_update(e);
+            ent_world(e, Wl); box_of(m, Wl, lol, hil);
+            W = Wl; lo = lol; hi = hil;
+        }
         if (g.watch && e->d->name == g.watch && g.watch_n++ % 30 == 0) {   /* test aid: where it is on screen */
             float c[4];
             for (int r = 0; r < 4; r++) c[r] = MVP[r] * W[12] + MVP[4 + r] * W[13] + MVP[8 + r] * W[14] + MVP[12 + r];
@@ -881,10 +949,12 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
     t_all += SDL_GetPerformanceCounter() - tq;
     if (++c_frames >= 600) {
         double f = 1000.0 / (double)SDL_GetPerformanceFrequency() / (double)c_frames;
-        printf("world anims draw over %ld frames: %.3f ms/frame; %.1f entities, %.1f drawn%s\n",
+        printf("world anims draw over %ld frames: %.3f ms/frame; %.1f entities, %.1f drawn, %.1f chains / %.1f boxes"
+               " recomputed%s\n",
                c_frames, (double)t_all * f, (double)c_ent / c_frames, (double)c_drawn / c_frames,
-               chain ? "" : " (no chain cache)");
-        t_all = 0; c_ent = c_drawn = c_frames = 0;
+               (double)c_chain_calc / c_frames, (double)c_box_calc / c_frames,
+               !chain ? " (no chain cache)" : g_wa_keep ? "" : " (per frame: nowacache.txt)");
+        t_all = 0; c_ent = c_drawn = c_frames = 0; c_chain_calc = c_box_calc = 0;
     }
     if (cur_cut) glUniform1f(rp->uAlphaTest, 0.0f);
     if (cur_blend) {
