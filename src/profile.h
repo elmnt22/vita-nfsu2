@@ -64,6 +64,7 @@ int profile_snapshot(void);   /* 0: out of memory, no snapshot */
 int  profile_dirty(void);           /* the working set differs from the snapshot */
 void profile_restore(void);         /* back to the snapshot (cancel) */
 void profile_drop_snapshot(void);   /* DeallocBackup 0x5032c0 */
+int  profile_has_snapshot(void);
 
 /* High scores (HighScoresDatabase, 320 entries {short track, char, char
    direction, int value}): the track is the track record's number (+0x8a),

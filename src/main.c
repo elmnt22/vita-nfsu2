@@ -22056,15 +22056,21 @@ int main(int argc, char **argv) {
         }
         /* 0x552cc0(3): Customize -> the Car Shop for the picked car (UI_ChooseCustomizeCategory),
            back to the Customize Car Select after */
-        if (g_tt_cust_back && g_fe && g_fe_in) { g_tt_cust_back = 0; g_cust_pending = 1; }
+        /* (GitHub #3 S2) back from the Test Track: the backup taken when this Car Shop first
+           opened stays the save check's reference -- the shop's changes went to garage.txt
+           before the Test Track, so a new snapshot here would hide them */
+        static int cust_keep_snap;
+        if (g_tt_cust_back && g_fe && g_fe_in) { g_tt_cust_back = 0; g_cust_pending = 1; cust_keep_snap = 1; }
         if (g_cust_pending && g_fe && pending_car < 0) {
+            int keep = cust_keep_snap;
+            cust_keep_snap = 0;
             g_cust_pending = 0;
             shop_close(&g_fe);
             g_fe_in = 0;
             g_shop = shop_open(dataroot, carname, &carcfg, modification,
                                wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
             g_shop_from_fe = g_shop != NULL;
-            if (g_shop) profile_snapshot();   /* the save check on the way out compares with this */
+            if (g_shop && !(keep && profile_has_snapshot())) profile_snapshot();   /* the save check on the way out compares with this */
             if (!g_shop) { world_tiles_trim(0); race_state = 1; g_ride_ready = 0; }
         }
         /* CCChangeParts: BeginCarCustomize(1, "UI_CareerCrib.fng", ..., the career car)

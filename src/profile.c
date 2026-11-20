@@ -448,6 +448,7 @@ void profile_restore(void) {   /* the name too: a cancelled "lose changes" is th
     }
 }
 void profile_drop_snapshot(void) { free(g_snap); g_snap = NULL; g_snaplen = 0; }
+int profile_has_snapshot(void) { return g_snap != NULL; }
 
 /* ---------------------------------------------------------- high scores */
 
