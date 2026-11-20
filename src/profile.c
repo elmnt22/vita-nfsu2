@@ -195,6 +195,13 @@ static int apply(const unsigned char *p, long n) {
         else if (!memcmp(p + i, "TRPH", 4)) { tr = d; trn = l; }
         i += 8 + l;
     }
+    /* (GitHub #3 S7) a career block of another size cannot be read: refuse the load
+       before anything is written ("Unable to load"), not a reset career under the
+       profile's name that the next autosave writes over the real one */
+    if (car && !g_xf_city && carn != career_save(NULL, 0)) {
+        printf("profile: career block %ld bytes, want %ld -- not loaded\n", carn, career_save(NULL, 0));
+        return 0;
+    }
     uint32_t sz = 0;
     if (opt && optn >= 4) memcpy(&sz, opt, 4);
     if (opt && sz == sizeof g_opt && optn == (long)(4 + sz)) memcpy(&g_opt, opt + 4, sizeof g_opt);
