@@ -22618,6 +22618,18 @@ int main(int argc, char **argv) {
                        (unsigned)g_sim_sc_zone);
             }
         }
+        {   /* test aid (simulator): OPENUG2_SIM_CSOPEN=N opens the Status screen N times once driving
+                   stands (the d-pad Down open's load time, GitHub #4) */
+            static int sim_cs_n = -1; static Uint32 sim_cs_at;
+            if (sim_cs_n < 0) sim_cs_n = getenv("OPENUG2_SIM_CSOPEN") ? atoi(getenv("OPENUG2_SIM_CSOPEN")) : 0;
+            if (sim_cs_n > 0 && race_state == 1 && g_ride_ready && !g_fe && !g_cs.m && SDL_GetTicks() > sim_cs_at) {
+                Uint32 t0 = SDL_GetTicks();
+                int ok = cs_open(dataroot);
+                printf("sim: status screen open %s in %u ms\n", ok ? "ok" : "FAILED", SDL_GetTicks() - t0);
+                if (ok) cs_free();
+                sim_cs_n--; sim_cs_at = SDL_GetTicks() + 1000;
+            }
+        }
         {   /* test aid (simulator): OPENUG2_SIM_CSHOP=<type> walks into that city shop once free roam stands
                ("goal": the running world challenge's goal shop, as its zone would) */
             static int sim_cshop_done;

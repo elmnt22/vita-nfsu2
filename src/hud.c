@@ -723,6 +723,72 @@ static unsigned char *hud_read_bundle(const char *path, long *len) {
     return u;
 }
 
+/* GitHub #4 P1: the Status screens (UI_Status_Master + a page, d-pad Down),
+   PC_Loading and the other whole screens come from GLOBAL/GLOBALB.BUN, 8 MB
+   of which only the FEng package chunks (0x30203 plain / 0x30210 packed,
+   19 chunks, ~180 KB) are a package. Each open read the whole file (hwlog49:
+   ~0.7 s a package, two per Status open). Those chunks alone, read once by
+   seeking over the rest and kept in memory; feng_load_package walks the
+   same top-level chunks in the same order, so it finds the same package. */
+static unsigned char *g_hfc_feng; static long g_hfc_feng_len;
+static unsigned char *hud_feng_chunks_read(const char *path, long *len) {
+    *len = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    long flen = -1;
+    if (fseek(f, 0, SEEK_END) == 0) flen = ftell(f);
+    unsigned char *out = NULL; long n = 0, cap = 0; int ok = flen >= 8;
+    for (long o = 0; ok && o + 8 <= flen; ) {
+        unsigned char hd[8];
+        if (fseek(f, o, SEEK_SET) || fread(hd, 1, 8, f) != 8) { ok = 0; break; }
+        if (!o && !memcmp(hd, "JDLZ", 4)) { ok = 0; break; }   /* packed: the whole-file path */
+        uint32_t id = n2_u32(hd), sz = n2_u32(hd + 4);
+        if ((unsigned long)sz > (unsigned long)(flen - o - 8)) break;
+        if (id == 0x00030203u || id == 0x00030210u) {
+            if (n + 8 + (long)sz > cap) {
+                long nc = cap ? cap * 2 : 256 * 1024;
+                while (nc < n + 8 + (long)sz) nc *= 2;
+                unsigned char *g = (unsigned char *)realloc(out, (size_t)nc);
+                if (!g) { ok = 0; break; }
+                out = g; cap = nc;
+            }
+            memcpy(out + n, hd, 8);
+            if (sz && fread(out + n + 8, 1, sz, f) != sz) { ok = 0; break; }
+            n += 8 + (long)sz;
+        }
+        o += 8 + (long)sz;
+    }
+    fclose(f);
+    if (!ok || !n) { free(out); return NULL; }
+    *len = n;
+    return out;
+}
+/* a package's source bundle: GLOBALB through its kept FEng chunks */
+static unsigned char *hud_read_pkg_bundle(const char *path, long *len) {
+    static const char tail[] = "/GLOBALB.BUN";
+    size_t pl = strlen(path), tl = sizeof tail - 1;
+    if (pl < tl || strcmp(path + pl - tl, tail)) return hud_read_bundle(path, len);
+    unsigned char *d = NULL;
+    for (int n_ = 0; __sync_lock_test_and_set(&g_hfc_lock, 1); n_++) if (n_ > 64) SDL_Delay(1);
+    if (g_hfc_feng && (d = (unsigned char *)malloc((size_t)g_hfc_feng_len)) != NULL) {
+        memcpy(d, g_hfc_feng, (size_t)g_hfc_feng_len);
+        *len = g_hfc_feng_len;
+    }
+    __sync_lock_release(&g_hfc_lock);
+    if (d) return d;
+    long kl = 0;
+    unsigned char *keep = hud_feng_chunks_read(path, &kl);
+    if (!keep) return hud_read_bundle(path, len);
+    printf("player HUD: %s FEng packages kept (%ld KB)\n", path, kl >> 10);
+    d = (unsigned char *)malloc((size_t)kl);
+    if (d) { memcpy(d, keep, (size_t)kl); *len = kl; }
+    for (int n_ = 0; __sync_lock_test_and_set(&g_hfc_lock, 1); n_++) if (n_ > 64) SDL_Delay(1);
+    if (!g_hfc_feng) { g_hfc_feng = keep; g_hfc_feng_len = kl; keep = NULL; }
+    __sync_lock_release(&g_hfc_lock);
+    free(keep);
+    return d ? d : hud_read_bundle(path, len);
+}
+
 /* Decoded art / font atlases kept between screen opens (HW 11-02: each
    SMS / Pause / engage dialog open re-walked every pack and re-decoded its
    art, ~0.6 s, and its fonts, ~0.16 s). Same pixels as a fresh load: an
@@ -1048,7 +1114,7 @@ static Hud *hud_build(const char *dataroot, const char *const *pkg_from, int nfr
         char path[1024];
         snprintf(path, sizeof path, "%s/%s", dataroot, pkg_from[f]);
         long len = 0;
-        unsigned char *d = hud_read_bundle(path, &len);
+        unsigned char *d = hud_read_pkg_bundle(path, &len);
         if (!d) continue;
         tq[1] = SDL_GetPerformanceCounter();
         loaded = feng_load_package(d, len, package, h->pk);
