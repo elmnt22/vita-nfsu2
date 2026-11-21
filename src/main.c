@@ -3162,10 +3162,20 @@ static struct {
     unsigned player_draws, rival_draws, rival_binds, rival_switches;
     Uint64 world_us[PF_WORLD_PARTS];
     unsigned road_reflection_updated, car_env_updated;
+    Uint64 refl_near, refl_rt, refl_flares;   /* P9 11-20: splits of cpu_world_reflection / _env */
     int race_event;
 } pf_detail;
 static Uint64 pf_stamp(void) { return pf_csv ? SDL_GetPerformanceCounter() : 0; }
 static Uint64 pf_elapsed(Uint64 start) { return start ? SDL_GetPerformanceCounter() - start : 0; }
+#ifdef __vita__
+/* P9 11-20: the reflection / env passes' render-target switches and flares, timed */
+static int pf_refl_begin(int w, int h, const float c[3]) { Uint64 t = pf_stamp(); int r = render_refl_begin(w, h, c); pf_detail.refl_rt += pf_elapsed(t); return r; }
+static void pf_refl_end(int w, int h) { Uint64 t = pf_stamp(); render_refl_end(w, h); pf_detail.refl_rt += pf_elapsed(t); }
+static int pf_env_begin(int f, const float c[3]) { Uint64 t = pf_stamp(); int r = render_env_begin(f, c); pf_detail.refl_rt += pf_elapsed(t); return r; }
+static void pf_env_end(int w, int h) { Uint64 t = pf_stamp(); render_env_end(w, h); pf_detail.refl_rt += pf_elapsed(t); }
+static int pf_refl_flares(const float V[16], const float PV[16], float proj, float wet, int (*ground)(const float p[3], float *z)) {
+    Uint64 t = pf_stamp(); int r = aciddraw_reflect_flares(V, PV, proj, wet, ground); pf_detail.refl_flares += pf_elapsed(t); return r; }
+#endif
 #ifdef PF_VITA_THREAD
 static int pf_thread_info(SceKernelThreadInfo *info) {
     memset(info, 0, sizeof *info);
@@ -3271,7 +3281,8 @@ static void pf_open(const char *path) {
           "cpu_player_brakes,player_brake_meshes,player_brake_pair_setup,"
           "cpu_player_mesh_state,cpu_player_mesh_submit,player_body_thread_sample,"
           "player_body_thread_ms,player_body_preempts,player_body_interrupts,player_body_releases,"
-          "car_light_grid_builds,cpu_car_light_grid", pf_csv);
+          "car_light_grid_builds,cpu_car_light_grid,"
+          "cpu_refl_near_scan,cpu_refl_targets,cpu_refl_flares", pf_csv);
     fputc('\n',pf_csv);
     pf_last=SDL_GetPerformanceCounter();
 }
@@ -3325,6 +3336,7 @@ static void pf_row(long frame,const int counts[12]) {
     uint64_t light_grid_ticks;
     carfx_light_grid_stats(&light_grid_builds, &light_grid_ticks);
     fprintf(pf_csv, ",%u,%.4f", light_grid_builds, light_grid_ticks * ms);
+    fprintf(pf_csv, ",%.4f,%.4f,%.4f", pf_detail.refl_near * ms, pf_detail.refl_rt * ms, pf_detail.refl_flares * ms);
     memset(&pf_detail, 0, sizeof pf_detail);
     fputc('\n',pf_csv);
 }
@@ -26849,21 +26861,64 @@ int main(int argc, char **argv) {
                 int *nq = (int *)realloc(nearq, (size_t)nbatch * sizeof *nearq);
                 if (nq) { nearq = nq; nearcap = nbatch; }
             }
+            Uint64 near_t0 = pf_stamp();
             if (nearq && nbatch <= nearcap) {
                 float ox = view_cam[0] - carpos[0], oy = view_cam[1] - carpos[1];
                 float nr = 130.0f + sqrtf(ox*ox + oy*oy) + 1.0f;
+#define NEAR_IN(bmin, bmax) ({ \
+                    float dx_ = carpos[0] < (bmin)[0] ? (bmin)[0]-carpos[0] : carpos[0] > (bmax)[0] ? carpos[0]-(bmax)[0] : 0.0f; \
+                    float dy_ = carpos[1] < (bmin)[1] ? (bmin)[1]-carpos[1] : carpos[1] > (bmax)[1] ? carpos[1]-(bmax)[1] : 0.0f; \
+                    dx_*dx_ + dy_*dy_ <= nr*nr; })
+                /* P9 11-20: the finish step's 128 m cell table (P2) first -- a cell
+                   whose box (the union of its batches' boxes) is out of reach has
+                   no batch in reach, so its ~100-byte records are not walked; the
+                   batches of cells in reach take the same test as before, in the
+                   same order: the list is exactly the full scan's */
+                const WorldResidentResources *nrr = active_resident ? &active_resident->resources : NULL;
+                static unsigned char *ncell_in; static int ncell_cap;
+                int use_cells = nrr && nrr->cell_of && nrr->cell_src == wbatch && nrr->cell_n == nbatch &&
+                                nrr->cell_count > 0;
+                if (use_cells && nrr->cell_count > ncell_cap) {
+                    unsigned char *ci = (unsigned char *)realloc(ncell_in, (size_t)nrr->cell_count);
+                    if (ci) { ncell_in = ci; ncell_cap = nrr->cell_count; } else use_cells = 0;
+                }
+                if (use_cells) {
+                    for (int c = 0; c < nrr->cell_count; c++)
+                        ncell_in[c] = (unsigned char)NEAR_IN(nrr->cell_box[c], nrr->cell_box[c] + 3);
+                    const int *co = nrr->cell_of;
+                    for (int k = 0; k < nbatch; k++) {
+                        if (!ncell_in[co[k]]) continue;
+                        const N2Batch *b = &wbatch[k];
+                        if (b->unresolved) continue;
+                        if (NEAR_IN(b->bbox_min, b->bbox_max)) nearq[nnear++] = k;
+                    }
+#ifdef OPENUG2_SIM_PRE_H
+                    static int nv_on = -1; static long nv_calls, nv_bad;
+                    if (nv_on < 0) nv_on = getenv("OPENUG2_CELLCULL_VERIFY") != NULL;
+                    if (nv_on) {   /* test aid: the full scan must give the same list */
+                        int m = 0, bad = 0;
+                        for (int k = 0; k < nbatch; k++) {
+                            const N2Batch *b = &wbatch[k];
+                            if (b->unresolved || !NEAR_IN(b->bbox_min, b->bbox_max)) continue;
+                            if (m >= nnear || nearq[m] != k) bad = 1;
+                            m++;
+                        }
+                        if (m != nnear) bad = 1;
+                        nv_bad += bad;
+                        if (++nv_calls % 600 == 0) printf("refl near scan verify: %ld frames, %ld wrong\n", nv_calls, nv_bad);
+                    }
+#endif
+                } else
                 for (int k = 0; k < nbatch; k++) {
                     const N2Batch *b = &wbatch[k];
                     if (b->unresolved) continue;
-                    float dx = carpos[0] < b->bbox_min[0] ? b->bbox_min[0]-carpos[0]
-                             : carpos[0] > b->bbox_max[0] ? carpos[0]-b->bbox_max[0] : 0.0f;
-                    float dy = carpos[1] < b->bbox_min[1] ? b->bbox_min[1]-carpos[1]
-                             : carpos[1] > b->bbox_max[1] ? carpos[1]-b->bbox_max[1] : 0.0f;
-                    if (dx*dx + dy*dy <= nr*nr) nearq[nnear++] = k;
+                    if (NEAR_IN(b->bbox_min, b->bbox_max)) nearq[nnear++] = k;
                 }
+#undef NEAR_IN
             } else {   /* no list: every batch is a candidate */
                 nnear = 0;
             }
+            pf_detail.refl_near += pf_elapsed(near_t0);
             int near_all = !(nearq && nbatch <= nearcap);
             int ncand = near_all ? nbatch : nnear;
 #define NEAR_K(q) (near_all ? (q) : nearq[(q)])
@@ -26915,10 +26970,10 @@ int main(int argc, char **argv) {
             }
             if (refl_wanted && !(catchup && refl_valid) && ((refl_tick++ & 1) == 0 || refl_every || rlite)) {
                 float fc[3] = { g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b };
-                if (rscreen && render_prev_valid() && render_refl_begin(240, 136, fc)) {
+                if (rscreen && render_prev_valid() && pf_refl_begin(240, 136, fc)) {
                     int rdraws = render_refl_screen(&quad, MVP, 1.0f, fc);
                     if (g_acid_ok) {   /* the reflection view's flares, as below */
-                        rdraws += aciddraw_reflect_flares(V, MVP, 0.5f * (float)H / tanf(0.5f * cam_fovy),
+                        rdraws += pf_refl_flares(V, MVP, 0.5f * (float)H / tanf(0.5f * cam_fovy),
                                                           rain_wetness(), refl_flare_ground);
                         glUseProgram(rp.prog);
                         glEnable(GL_DEPTH_TEST);
@@ -26928,7 +26983,7 @@ int main(int argc, char **argv) {
                     pf_detail.road_reflection_updated = 1;
                     static int rs_logged;
                     if (!rs_logged++) printf("road reflection: first screen frame (%d)\n", rdraws);
-                } else if (render_refl_begin(240, 136, fc)) {
+                } else if (pf_refl_begin(240, 136, fc)) {
                     float h = carpos[2];
                     float Rm[16] = { 1,0,0,0, 0,1,0,0, 0,0,-1,0, 0,0,2.0f*h,1 };
                     float MVPr[16]; mat_mul(MVP, Rm, MVPr);
@@ -27013,7 +27068,7 @@ int main(int argc, char **argv) {
                     }
                     if (nglow) render_world_glows(&rp, glowbatch, nglow, MVPr);
                     if (g_acid_ok) {   /* the reflection view's flares (flareType 2), the camera unmirrored */
-                        rdraws += aciddraw_reflect_flares(V, MVP, 0.5f * (float)H / tanf(0.5f * cam_fovy),
+                        rdraws += pf_refl_flares(V, MVP, 0.5f * (float)H / tanf(0.5f * cam_fovy),
                                                           rain_wetness(), refl_flare_ground);
                         glUseProgram(rp.prog);
                         glEnable(GL_DEPTH_TEST);
@@ -27026,7 +27081,7 @@ int main(int argc, char **argv) {
                     static int refl_logged;
                     if (!refl_logged++) printf("road reflection: first frame, %d world draws\n", rdraws);
                 }
-                render_refl_end(W, H);
+                pf_refl_end(W, H);
                 render_scene_begin(W, H, 720.0f / (float)W);
             }
             /* The garage floor reflection (view 4): 0x5cab15's reflection view with
@@ -27053,7 +27108,7 @@ int main(int argc, char **argv) {
                     if (rr_cost) { glFinish(); rr_t0 = SDL_GetPerformanceCounter(); }
 #endif
                     float black[3] = { 0, 0, 0 };
-                    if (render_refl_begin(240, 136, black)) {
+                    if (pf_refl_begin(240, 136, black)) {
                         float T[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0,
                                         carpos[0] - g_room_anchor[0], carpos[1] - g_room_anchor[1],
                                         carpos[2] - g_room_anchor[2], 1 }, MRr[16];
@@ -27113,7 +27168,7 @@ int main(int argc, char **argv) {
                         static int rr_logged;
                         if (!rr_logged++) printf("garage floor reflection: first frame\n");
                     }
-                    render_refl_end(W, H);
+                    pf_refl_end(W, H);
                     render_scene_begin(W, H, 720.0f / (float)W);
 #ifdef OPENUG2_SIM_PRE_H
                     if (rr_cost) {
@@ -27300,7 +27355,7 @@ int main(int argc, char **argv) {
             if (env_wanted && !(catchup && !g_showroom) && (!refl_wanted || (refl_tick & 1) == 0 || refl_every)) {
                 float fc[3] = { g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b };
                 int face = env_face; env_face = (env_face + 1) % 6;
-                if (render_env_begin(face, fc)) {
+                if (pf_env_begin(face, fc)) {
                     pf_detail.car_env_updated = 1;
                     float eye[3] = { carpos[0], carpos[1], carpos[2] + 1.0f };
                     float Ve[16], Pe[16], MVPe[16];
@@ -27330,7 +27385,7 @@ int main(int argc, char **argv) {
                         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
                         if (cull) glEnable(GL_CULL_FACE);
                         vita_use_lite(0);
-                        render_env_end(W, H);
+                        pf_env_end(W, H);
                         render_scene_begin(W, H, 720.0f / (float)W);
                         goto env_done;
                     }
@@ -27419,7 +27474,7 @@ int main(int argc, char **argv) {
                     if (env_logged < 6) { env_logged++;
                         printf("car environment face %d: %d world draws\n", face, edraws); }
                 }
-                render_env_end(W, H);
+                pf_env_end(W, H);
                 render_scene_begin(W, H, 720.0f / (float)W);
             }
             env_done:
@@ -29174,6 +29229,59 @@ int main(int argc, char **argv) {
                 }
                 if (pord && pord_n == ncar) pdo = pord;
             }
+            /* P9 11-20 (PERF_PLAN_1120 item 2's draw records, the exact part): what
+               the loop below looked up per part every frame although it only
+               follows the car and its textures -- the texture map search, the
+               centre brake lamp test (a sum over the part's vertices) and the tail
+               lens test (a scan of the whole car) -- kept per part, rebuilt when
+               any input changes. The uniform state itself stays per frame (paint,
+               lamps, beams, quality are live). */
+            typedef struct { GLuint tex; char hasalpha, texmode, body_lamp, tail_lens; } PartRec;
+            static PartRec *prec; static int prec_cap, prec_n = -1; static unsigned prec_sig;
+            const PartRec *prc = NULL;
+            if (ncar > 0 && car.count >= ncar) {
+                unsigned sig = (unsigned)(uintptr_t)cgm * 2654435761u ^ (unsigned)(uintptr_t)car.meshes ^
+                               (unsigned)ncar * 40503u ^ (unsigned)g_car_gen * 97u;
+                for (int i = 0; i < ncar; i++) {
+                    const N2Mesh *m = &car.meshes[i];
+                    sig = sig * 31u + cgm[i].texkey + m->car_material * 7u + (unsigned)m->cat * 13u +
+                          (unsigned)m->tierid * 5u + (unsigned)m->nverts + (unsigned)(uintptr_t)m->verts;
+                }
+                for (int j = 0; j < nmap; j++)
+                    sig = sig * 31u + mapkey[j] + (unsigned)maptex[j] * 3u + (unsigned)(unsigned char)mapmode[j] * 5u +
+                          (unsigned)(unsigned char)mapalpha[j];
+                if (ncar > prec_cap) {
+                    PartRec *np = (PartRec *)realloc(prec, (size_t)ncar * sizeof *prec);
+                    if (np) { prec = np; prec_cap = ncar; }
+                }
+                if (prec && prec_cap >= ncar) {
+                    if (sig != prec_sig || prec_n != ncar) {
+                        prec_sig = sig; prec_n = ncar;
+                        for (int i = 0; i < ncar; i++) {
+                            PartRec *r = &prec[i];
+                            r->tex = 0; r->hasalpha = 0; r->texmode = N2_DRAW_OPAQUE;
+                            for (int j = 0; j < nmap; j++) if (mapkey[j] == cgm[i].texkey) {
+                                r->tex = maptex[j]; r->hasalpha = mapalpha[j]; r->texmode = mapmode[j]; break; }
+                            r->body_lamp = (char)n2_car_body_lamp(&car, i);
+                            r->tail_lens = (char)n2_car_tail_lens(&car, i);
+                        }
+                    }
+                    prc = prec;
+#ifdef OPENUG2_SIM_PRE_H
+                    static int pv_on = -1; static long pv_n, pv_bad;
+                    if (pv_on < 0) pv_on = getenv("OPENUG2_CELLCULL_VERIFY") != NULL;
+                    if (pv_on && ++pv_n % 300 == 0) {   /* test aid: the records against a fresh look-up */
+                        for (int i = 0; i < ncar; i++) {
+                            GLuint t = 0; int ha = 0, tm = N2_DRAW_OPAQUE;
+                            for (int j = 0; j < nmap; j++) if (mapkey[j] == cgm[i].texkey) { t = maptex[j]; ha = mapalpha[j]; tm = mapmode[j]; break; }
+                            if (t != prc[i].tex || ha != prc[i].hasalpha || tm != prc[i].texmode ||
+                                n2_car_body_lamp(&car, i) != prc[i].body_lamp || n2_car_tail_lens(&car, i) != prc[i].tail_lens) { pv_bad++; break; }
+                        }
+                        if (pv_n % 3000 == 0) printf("car part records verify: %ld checks, %ld wrong\n", pv_n / 300, pv_bad);
+                    }
+#endif
+                }
+            }
             for (int oi = 0; !follow_roam_ai && !g_cc_hide_car && oi < ncar; oi++) {
                 int i = pdo ? pdo[oi] : oi;
                 if (plead && plead[i] == -1) continue;   /* drawn with its group */
@@ -29236,7 +29344,8 @@ int main(int argc, char **argv) {
                                    : (c==N2_CAR_MECH||c==N2_CAR_INTERIOR)?0.0f : 0.15f);
                 glUniform1f(rp.uDecal, 0.0f);   /* body branch may re-enable */
                 GLuint tex = 0; int hasalpha = 0, texmode = N2_DRAW_OPAQUE;
-                for (int j = 0; j < nmap; j++) if (mapkey[j]==cgm[i].texkey) {
+                if (prc) { tex = prc[i].tex; hasalpha = prc[i].hasalpha; texmode = prc[i].texmode; }
+                else for (int j = 0; j < nmap; j++) if (mapkey[j]==cgm[i].texkey) {
                     tex = maptex[j]; hasalpha = mapalpha[j]; texmode = mapmode[j]; break; }
                 if (g_skin_diag && (c == N2_CAR_BODY || c == N2_CAR_MISC) && !tex) {
                     if (skin_mesh(cgm[i].texkey)) g_skin_diag_hit++;
@@ -29257,7 +29366,7 @@ int main(int argc, char **argv) {
                                     ? &cp_brake : NULL;
                 /* carbon fibre: the part's skin swapped for CARBONFIBRE and its
                    paint for the CARBONFIBER material (0x620ae0 / 0x636840) */
-                int body_lamp = n2_car_body_lamp(&car, i);   /* centre brake light lens */
+                int body_lamp = prc ? prc[i].body_lamp : n2_car_body_lamp(&car, i);   /* centre brake light lens */
                 if (body_lamp) { own = NULL; swp = NULL; }
                 GLuint cft = !body_lamp && (c == N2_CAR_BODY || c == N2_CAR_MISC) &&
                              (cgm[i].texkey == N2_CF_TEX ||
@@ -29310,7 +29419,7 @@ int main(int argc, char **argv) {
                         glUniform3f(uColor,level,level,level);
                     glUniform1f(uUseTex,tex?1.0f:0.0f);
                     if(tex)glBindTexture(GL_TEXTURE_2D,tex);
-                } else if (c == N2_CAR_BRAKELIGHT && n2_car_tail_lens(&car,i)) {
+                } else if (c == N2_CAR_BRAKELIGHT && (prc ? prc[i].tail_lens : n2_car_tail_lens(&car,i))) {
                     render_tail_lamp(&rp,tex,0,0,0,   /* _OFF always (0x60c940): flares light it */
                                      light_variant_gain(carcfg.parts[N2_PART_TAILLIGHT]));
                 } else if (body_lamp) {
@@ -29360,7 +29469,7 @@ int main(int argc, char **argv) {
                     glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, tex);  /* wheel/brake */
                 } else {
                     glUniform1f(uUseTex, 0.0f);
-                    if (c == N2_CAR_BRAKELIGHT && !n2_car_tail_lens(&car,i)) {
+                    if (c == N2_CAR_BRAKELIGHT && !(prc ? prc[i].tail_lens : n2_car_tail_lens(&car,i))) {
                         /* Unresolved non-lens material: conservative dark housing.
                            Known plastic and metal were handled above. */
                         glUniform3f(uColor,.055f,.055f,.058f);
