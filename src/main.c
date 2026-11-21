@@ -3857,6 +3857,10 @@ static int g_reset_req;          /* the Reset binding pressed (keypad 1 event), 
 static float g_reset_blink;      /* car +0x974 / +0x978: seconds of the 2 s reset blink left (0x5fbd60 / 0x5ebf70) */
 static int g_pose_ring_clear;    /* a new Player (ctor 0x5f1670 sets +0xbc = 0): the saved poses start over */
 static int g_fall_good_clear;    /* the fell-through check's last poses start over (a fast travel) */
+static float g_fall_seed[4];     /* ... from this pose (the trip's put-down spot, on collision ground) */
+static int g_fall_seed_ok, g_ring_seed_ok;   /* ... and Reset's poses (else empty until the car has ground) */
+static float g_ft_from[4];       /* where the car stood when the trip began */
+static int g_ft_back;            /* the trip turned back (no collision ground at the spot or its road) */
 /* M130: the player's authoritative vertical pose. carpos[0..1] stay owned by
    the XY arcade model; carpos[2], the chassis tilt and every wheel's own height
    now come from here. There is exactly one body-pose filter, not two. */
@@ -25306,12 +25310,13 @@ int main(int argc, char **argv) {
                a fast travel to each World Map entry (wm_bey_cands) in turn, 12 s apart, from
                entry <first>; the car's height is logged 4 s after each put-down */
             static int fa_i = -1, fa_n; static Uint32 fa_t; static WmCand fa_c[512]; static float fa_want[3];
-            if (getenv("OPENUG2_SIM_FTALL") && race_state == 1 && beyond_is_track(trackname) && g_ride_ready && !post_hold) {
+            if (getenv("OPENUG2_SIM_FTALL") && race_state == 1 && (g_rt.roam || beyond_is_track(trackname)) && g_ride_ready && !post_hold) {
                 if (fa_i < 0) { fa_n = wm_bey_cands(fa_c, 512, 0, 0); fa_i = atoi(getenv("OPENUG2_SIM_FTALL")); fa_t = SDL_GetTicks();
                                 printf("sim ftall: %d entries\n", fa_n); }
                 if (fa_i > 0 && fa_want[0] != 0 && SDL_GetTicks() - fa_t > 4000 && SDL_GetTicks() - fa_t < 4100)
                     printf("sim ftall: entry %d 4 s on: car (%.0f %.0f z %.1f) wanted z %.1f, contact %x%s\n", fa_i - 1, carpos[0], carpos[1], carpos[2],
                            fa_want[2], (unsigned)g_ride.contact_mask, carpos[2] < fa_want[2] - 8.0f ? " FELL" : "");
+                if (SDL_GetTicks() - fa_t > 12000) fa_n = wm_bey_cands(fa_c, 512, 0, 0);   /* the city's set (selected later in the frame) */
                 if (fa_i < fa_n && SDL_GetTicks() - fa_t > 12000) {
                     fa_t = SDL_GetTicks();
                     g_ft.p[0] = fa_c[fa_i].x; g_ft.p[1] = fa_c[fa_i].y; g_ft.p[2] = fa_c[fa_i].z; g_ft.go = 1;
@@ -25325,6 +25330,8 @@ int main(int argc, char **argv) {
         if (g_ft.go) {   /* fast travel (the World Map): held on the zone like a post-race marker */
             g_ft.go = 0;
             if (race_state == 1 && (g_rt.roam || beyond_is_track(trackname))) {   /* (Beyond: free roam without the city's AI world) */
+                g_ft_from[0] = carpos[0]; g_ft_from[1] = carpos[1]; g_ft_from[2] = carpos[2]; g_ft_from[3] = heading;
+                g_ft_back = 0;
                 memcpy(post_hold_pos, g_ft.p, sizeof g_ft.p); post_hold_pos[3] = heading;
                 memcpy(carpos, g_ft.p, sizeof g_ft.p);
                 vel[0] = vel[1] = 0; speed = 0;
@@ -25341,6 +25348,7 @@ int main(int argc, char **argv) {
                                             active_resident->radius - 50.0f) {
                 post_hold = 0;
                 float z = post_hold_pos[2];
+                int put_found = 0;
                 if (g_wcoll) {
                     WCollCtx gc; wcoll_ctx_init(&gc);
                     float q[3] = { post_hold_pos[0], post_hold_pos[1], post_hold_pos[2] + 1.0f };
@@ -25360,16 +25368,40 @@ int main(int argc, char **argv) {
                                post_hold_pos[0], post_hold_pos[1], post_hold_pos[2], rp[0], rp[1], rp[2], found ? "has it" : "has none either");
                         post_hold_pos[0] = rp[0]; post_hold_pos[1] = rp[1]; z = found ? gz : rp[2];
                     }
+                    put_found = found;
+#ifdef OPENUG2_SIM_PRE_H
+                    if (ft_hold && !g_ft_back && getenv("OPENUG2_SIM_FTNOGROUND")) put_found = 0;   /* test aid: the turn-back */
+#endif
                 }
-                if (ft_hold) {   /* GH #7: what was saved before the trip (Reset's poses, the fall check's) is not where the car is now */
-                    g_pose_ring_clear = 1; g_fall_good_clear = 1;
+                if (ft_hold && g_wcoll && !put_found && !g_ft_back) {
+                    /* 11-21 (player report, 0.2.0: fast travel on the expansion maps "sometimes
+                       free falling"): no collision ground at the spot nor on its nearest road --
+                       put down there the car would fall. The trip turns back to where it began
+                       (held for that area like the trip itself). */
+                    printf("fast travel: no collision ground at (%.0f %.0f %.1f) or its road, back to (%.0f %.0f %.1f)\n",
+                           post_hold_pos[0], post_hold_pos[1], post_hold_pos[2], g_ft_from[0], g_ft_from[1], g_ft_from[2]);
+                    g_ft_back = 1; post_hold = 1;
+                    memcpy(post_hold_pos, g_ft_from, sizeof post_hold_pos);
+                    memcpy(carpos, g_ft_from, 3 * sizeof(float)); heading = g_ft_from[3];
+                    vel[0] = vel[1] = 0; speed = 0; g_n2_live = 0;
+                } else {
+                    if (ft_hold) {   /* GH #7: what was saved before the trip (Reset's poses, the fall check's) is not where the car is now */
+                        g_pose_ring_clear = 1; g_fall_good_clear = 1;
+                        /* 11-21 (player report, 0.2.0: fast travel on the expansion maps "sometimes free
+                           falling"): with no pose kept the fell-through check had nothing to put the
+                           car back on, so a drop after the trip fell for good. The put-down spot
+                           starts the poses (collision ground found under it). */
+                        g_fall_seed_ok = g_ring_seed_ok = put_found;
+                        g_fall_seed[0] = post_hold_pos[0]; g_fall_seed[1] = post_hold_pos[1];
+                        g_fall_seed[2] = z; g_fall_seed[3] = post_hold_pos[3];
+                    }
+                    carpos[0] = post_hold_pos[0]; carpos[1] = post_hold_pos[1]; carpos[2] = z;
+                    heading = post_hold_pos[3]; vel[0] = vel[1] = 0; speed = 0;
+                    g_n2_live = 0; g_rt.put_down = 1; g_ride_ready = 0; cam_snap = 1;
+                    printf("race: %s area in (gen %lu), the car put down at (%.0f %.0f z %.2f)\n",
+                           ft_hold ? "fast travel" : rp_hold ? "replay exit" : "post-race marker", active_resident->generation, carpos[0], carpos[1], z);
+                    ft_hold = rp_hold = 0;
                 }
-                carpos[0] = post_hold_pos[0]; carpos[1] = post_hold_pos[1]; carpos[2] = z;
-                heading = post_hold_pos[3]; vel[0] = vel[1] = 0; speed = 0;
-                g_n2_live = 0; g_rt.put_down = 1; g_ride_ready = 0; cam_snap = 1;
-                printf("race: %s area in (gen %lu), the car put down at (%.0f %.0f z %.2f)\n",
-                       ft_hold ? "fast travel" : rp_hold ? "replay exit" : "post-race marker", active_resident->generation, carpos[0], carpos[1], z);
-                ft_hold = rp_hold = 0;
             } else {
                 memcpy(carpos, post_hold_pos, 3 * sizeof(float)); heading = post_hold_pos[3];
                 vel[0] = vel[1] = 0; speed = 0;
@@ -25546,7 +25578,14 @@ int main(int argc, char **argv) {
            put the car back on an earlier all-wheels-down pose. */
         if (race_state == 1 && g_ride_ready && active_resident && !post_hold) {
             static float good[2][4]; static int have_good, ground_run, air_run;
-            if (g_fall_good_clear) { g_fall_good_clear = 0; have_good = ground_run = air_run = 0; }
+            if (g_fall_good_clear) {
+                g_fall_good_clear = 0; have_good = ground_run = air_run = 0;
+                if (g_fall_seed_ok) {
+                    memcpy(good[0], g_fall_seed, sizeof good[0]); memcpy(good[1], g_fall_seed, sizeof good[1]);
+                    good[0][2] += 0.5f; good[1][2] += 0.5f;   /* stood on it, not in it */
+                    have_good = 2; g_fall_seed_ok = 0;
+                }
+            }
             static float lost[3];
             if (g_ride.contact_mask == 0xf) {
                 air_run = 0;
@@ -25641,7 +25680,14 @@ int main(int argc, char **argv) {
             int rs = g_reset_req; g_reset_req = 0;
             rs_ticks++;
             if (g_reset_blink > 0.0f && !g_pause.on) g_reset_blink -= FE_DT;   /* the frame's game ticks */
-            if (g_pose_ring_clear) { g_pose_ring_clear = 0; ring_i = ring_n = 0; ring_run = 0; }
+            if (g_pose_ring_clear) {
+                g_pose_ring_clear = 0; ring_i = ring_n = 0; ring_run = 0;
+                if (g_ring_seed_ok) {   /* the trip's seed pose (see g_fall_seed) */
+                    for (int k = 0; k < 4; k++) memcpy(ring[k], g_fall_seed, sizeof ring[k]);
+                    ring_n = 4;
+                }
+                g_ring_seed_ok = 0;
+            }
             if (race_state == 1 && g_ride_ready && ((++ring_run & 31) == 0 || !ring_n)) {
                 const float *nw = ring[ring_i];
                 int has = !g_wcoll;
