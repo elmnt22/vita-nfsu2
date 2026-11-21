@@ -107,8 +107,14 @@ static void boot_open_full(const char *dataroot) {
    first need and kept -- every track switch and race start shows it. */
 static Shop *g_ls_fe;
 static int g_career_mode;   /* (defined with the career state below) */
+#ifdef __vita__
+void vita_gpu_mem_log(const char *why);
+#endif
 static Shop *loading_screen(const char *dataroot) {
     static int tried;
+#ifdef __vita__
+    vita_gpu_mem_log("loading screen");
+#endif
     if (!g_ls_fe && !tried) { tried = 1; g_ls_fe = shop_open_loading(dataroot); }
     if (g_ls_fe) { shop_loading_text(g_ls_fe, NULL, NULL); shop_loading_pick(g_ls_fe, g_career_mode); }
     return g_ls_fe;
@@ -7538,6 +7544,7 @@ static int rt_spawn(const N2Scene *scene)
     if ((g_rt.nopp && !g_rt.n) || !rt_start_ai(path, ppath, tpath, g_rt.ev, g_rt.circuit, klass, suv, skill, g_rt.laps)) {
         rt_end(); return 0;
     }
+    xpcity_race_map_prepare(g_rt.reg, g_rt.ev);   /* World Expansion: its route map baked here, not on the first HUD frame */
     rt_sound_begin();
     return 1;
 }
@@ -9795,6 +9802,9 @@ static void pause_open(const char *dataroot, int in_race)
 {
     if (g_sc.h) return;                             /* 0x606730: none over UI_ShowCase_Preview */
     pause_close();
+#ifdef __vita__
+    vita_gpu_mem_log("pause");
+#endif
     g_pause.menu = hud_init_screen(dataroot, "GLOBAL/InGameCommon.bun", "UI_Pause.fng");
     if (!g_pause.menu) { printf("pause: UI_Pause.fng not loaded\n"); return; }
     g_pause.race = in_race;

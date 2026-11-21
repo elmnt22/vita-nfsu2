@@ -292,6 +292,7 @@ void vita_heap_report(const char *label) {
     sim_heap_report(label, detail);
 }
 unsigned vita_heap_top_mb(void) { return sim_heap_on() > 0 ? sim_heap_brk_mb() : 0; }
+void vita_gpu_mem_log(const char *why) { (void)why; }
 unsigned vita_bigblk_room_mb(void) { return sim_heap_on() > 0 ? sim_heap_room_mb() : 512; }
 size_t vita_bigblk_live(void) { return sim_heap_on() > 0 ? sim_heap_big_live() : 0; }
 void vita_bigblk_report(char *out, size_t cap) {

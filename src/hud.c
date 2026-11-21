@@ -1980,18 +1980,21 @@ int hud_set_trackmap(Hud *h, const char *dataroot, int event,
     h->tm_x0 = x0; h->tm_y0 = y0; h->tm_size = size; h->tm_zoom = zoom;
     if (event == h->tm_event && h->tm_tex) return 1;
     if (!h->pk || feng_find(h->pk, FE_MAP_SLOT) < 0) return 0;  /* no minimap in this HUD */
+    /* a failed map is tried again after 10 s, not read every frame (S6 11-20) */
+    static int bad_ev = -1000000; static Uint32 bad_t;
+    if (event == bad_ev && SDL_GetTicks() - bad_t < 10000u) return 0;
     char path[1024], name[32];
     snprintf(path, sizeof path, "%s/TRACKS/TRACKMAP%d.BIN", dataroot ? dataroot : ".", event);
     snprintf(name, sizeof name, "TRACKMAP%d", event);
     long len = 0;
     unsigned char *d = n2_read_file(path, &len);
-    if (!d) { printf("minimap: %s missing\n", path); return 0; }
+    if (!d) { printf("minimap: %s missing\n", path); bad_ev = event; bad_t = SDL_GetTicks(); return 0; }
     uint32_t key = 0xffffffffu;                                  /* bin hash of the name */
     for (const char *c = name; *c; c++) key = key * 33u + (unsigned char)*c;
     FengImage img; memset(&img, 0, sizeof img);
     int ok = feng_tpk_load(d, len, &key, 1, &img) && img.rgba;
     free(d);
-    if (!ok) { printf("minimap: %s holds no %s\n", path, name); return 0; }
+    if (!ok) { printf("minimap: %s holds no %s\n", path, name); bad_ev = event; bad_t = SDL_GetTicks(); return 0; }
     /* its alpha is 0 throughout: Track4000_map draws it by colour alone */
     for (int i = 0; i < img.w * img.h; i++) img.rgba[i * 4 + 3] = 255;
     if (!h->tm_tex) glGenTextures(1, &h->tm_tex);
@@ -2052,14 +2055,61 @@ static void hud_race_map_route(unsigned char *px, int w)
     free(m);
 }
 
+/* perf 11-20: a World Expansion area change read its whole .MAP (4 MB) on the
+   frame thread. While a map is up, the next one is read on a thread of its
+   own and the old one stays on screen until it is in; the first map of a
+   world still loads at once. */
+static struct {
+    char path[256]; unsigned char *d; long len;
+    volatile int done; SDL_Thread *thr;
+} g_tmload;
+static int tmload_thread(void *arg) {
+    (void)arg;
+    g_tmload.d = n2_read_file(g_tmload.path, &g_tmload.len);
+    __sync_synchronize();
+    g_tmload.done = 1;
+    return 0;
+}
+static void tmload_reap(void) {
+    if (g_tmload.thr && g_tmload.done) { SDL_WaitThread(g_tmload.thr, NULL); g_tmload.thr = NULL; }
+}
 int hud_set_trackmap_file(Hud *h, const char *path) {
     if (!h) return 0;
     static char cur[256], bad[256];   /* the map loaded / the file that failed (one per world) */
+    static Uint32 oom_retry;          /* a read that failed for memory: try again later, not every frame */
     if (h->tm_event == -2 && h->tm_tex && !strcmp(cur, path)) return 1;
     if (!h->pk || feng_find(h->pk, FE_MAP_SLOT) < 0) return 0;
     if (!strcmp(bad, path)) return 0;
+    if (oom_retry && (Sint32)(SDL_GetTicks() - oom_retry) < 0) return 0;
     long len = 0;
-    unsigned char *d = n2_read_file(path, &len);
+    unsigned char *d = NULL;
+    tmload_reap();
+    if (h->tm_event == -2 && h->tm_tex && strlen(path) < sizeof g_tmload.path) {
+        /* a map is up: read this one on the loader thread */
+        if (g_tmload.thr) return 1;                                  /* one read at a time */
+        if (g_tmload.done && !strcmp(g_tmload.path, path)) {         /* it is in */
+            d = g_tmload.d; len = g_tmload.len;
+            g_tmload.d = NULL; g_tmload.done = 0; g_tmload.path[0] = 0;
+        } else {
+            free(g_tmload.d); g_tmload.d = NULL;                     /* a stale one (the car moved on) */
+            snprintf(g_tmload.path, sizeof g_tmload.path, "%s", path);
+            g_tmload.done = 0; g_tmload.len = 0;
+            g_tmload.thr = SDL_CreateThread(tmload_thread, "minimap-read", NULL);
+            if (g_tmload.thr) return 1;
+            g_tmload.path[0] = 0;
+            d = n2_read_file(path, &len);                            /* no thread: here */
+        }
+    } else d = n2_read_file(path, &len);
+    if (!d) {   /* missing, or no memory for it (S4 11-20: that was latched as a bad file for good) */
+        FILE *ef = fopen(path, "rb");
+        if (ef) {
+            fclose(ef);
+            printf("minimap: %s could not be read (memory?), retrying in 5 s\n", path);
+            oom_retry = SDL_GetTicks() + 5000; if (!oom_retry) oom_retry = 1;
+            return 0;
+        }
+    }
+    oom_retry = 0;
     uint32_t w = 0, hh = 0; float fl[4] = { 0 };
     if (d && len >= 28 && !memcmp(d, "BMAP", 4)) { memcpy(&w, d + 4, 4); memcpy(&hh, d + 8, 4); memcpy(fl, d + 12, 16); }
     if (!d || !w || w > 4096 || hh != w || (long)(28 + (size_t)w * hh * 4) > len || !(fl[2] > 0) || !(fl[3] > 0)) {

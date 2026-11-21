@@ -21,6 +21,9 @@ const char *xpcity_map(const char *track);
 const char *xpcity_map_at(const char *track, float x, float y);
 /* MW: that race's own map (its route drawn in), made once from MINI_MAP_<race>.BIN; else NULL */
 const char *xpcity_race_map(const char *track, int event_id);
+/* race setup (perf 11-20): make the current city's race map for event_id now,
+   behind the race's loading, not on the first race HUD frame */
+void xpcity_race_map_prepare(const char *region, int event_id);   /* region: the race's ROUTES suffix (L2RA, L5RA) */
 /* Carbon: the race's minimap route (its own search, the converter's mmroute.bin): x y pairs; else NULL */
 const float *xpcity_race_route(const char *track, int event_id, int *n_out);
 /* the Free Run world picker: 0 Bayview, 1 Rockport, 2 Palmont */

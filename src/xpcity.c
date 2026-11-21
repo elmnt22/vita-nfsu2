@@ -345,6 +345,13 @@ static int bake_route_map(int c, const char *troot, int event_id, const char *ds
     return ok;
 }
 
+const char *xpcity_race_map(const char *track, int event_id);
+void xpcity_race_map_prepare(const char *region, int event_id)
+{
+    if (!g_map[0] || !region) return;
+    for (int c = 0; c < NCITY; c++)
+        if (!strcmp(region, k_city[c].companion) && strstr(g_map, k_city[c].companion)) { (void)xpcity_race_map(k_city[c].bun, event_id); return; }
+}
 const char *xpcity_race_map(const char *track, int event_id)
 {
     static char out[1100]; static int out_ev = -1;

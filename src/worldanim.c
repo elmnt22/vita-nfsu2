@@ -89,7 +89,8 @@ typedef struct {
 
 typedef struct {
     uint32_t hash;
-    int state;                      /* 0 not found, 1 meshes on the CPU, 2 uploaded, -1 failed */
+    int state;                      /* 0 not found, 1 meshes on the CPU, 2 uploaded, -1 failed,
+                                       3 (Vita) textures decoding on the worker */
     N2Scene sc;
     GpuMesh *gm; int n;
     GLuint *tex; unsigned char *mode;
@@ -320,8 +321,14 @@ static void solids_load(const char *stream_path)
                    g.mdl[i].at[2], g.mdl[i].lo[0], g.mdl[i].lo[1], g.mdl[i].lo[2], g.mdl[i].hi[0], g.mdl[i].hi[1], g.mdl[i].hi[2]);
 }
 
+#ifdef __vita__
+static void wa_job_drop(void);
+#endif
 void wa_free(void)
 {
+#ifdef __vita__
+    wa_job_drop();                                  /* its model and bundle go now */
+#endif
     for (int i = 0; i < g.nent; i++)
         for (int k = 0; k < 3; k++) nis_chan_free(g.ent[i].c.ch[k]);
     for (int i = 0; i < g.nmdl; i++) {
@@ -818,18 +825,44 @@ static GLuint tex_of(uint32_t key, unsigned char *mode)
 #endif
     return t;
 }
-static int mdl_upload(WaModel *m)
+#ifdef __vita__
+/* perf 11-20: a first-sight upload decoded its missing textures from the
+   card on the frame thread (17-90 ms frames, ~10 a route run). The world
+   cache is asked on the frame thread; the keys it lacks are decoded on a
+   thread of their own (pixel reads are thread-safe: n2_pix_read pread), one
+   model at a time, and uploaded when done. Same textures, a few frames later. */
+typedef struct {
+    WaModel *m; int n; int *mesh; uint32_t *key; N2Tex *tx;
+    unsigned char *d; long len;
+    volatile int done;
+    SDL_Thread *thr;
+} WaJob;
+static WaJob g_job;
+static int wa_job_thread(void *arg)
 {
-    if (m->state == 2) return 1;
-    if (m->state != 1) return 0;
-    m->n = m->sc.count;
-    m->gm = upload_scene(&m->sc);
-    m->tex = (GLuint *)calloc((size_t)m->n + 1, sizeof *m->tex);
-    m->mode = (unsigned char *)calloc((size_t)m->n + 1, 1);
-    if (!m->gm || !m->tex || !m->mode) { m->state = -1; return 0; }
+    WaJob *j = (WaJob *)arg;
+    N2Tpk tp = n2_tpk_open(j->d, j->len);
+    for (int k = 0; k < j->n; k++) {
+        memset(&j->tx[k], 0, sizeof j->tx[k]);
+        if (!n2_tpk_decode(j->d, j->len, tp, j->key[k], &j->tx[k])) memset(&j->tx[k], 0, sizeof j->tx[k]);
+    }
+    free(tp.blk);
+    __sync_synchronize();
+    j->done = 1;
+    return 0;
+}
+static void wa_job_drop(void)
+{
+    if (g_job.thr) { SDL_WaitThread(g_job.thr, NULL); g_job.thr = NULL; }
+    for (int k = 0; g_job.tx && k < g_job.n; k++) { free(g_job.tx[k].rgb); free(g_job.tx[k].alpha); free(g_job.tx[k].dxt); }
+    free(g_job.mesh); free(g_job.key); free(g_job.tx);
+    memset(&g_job, 0, sizeof g_job);
+}
+#endif
+static int mdl_finish(WaModel *m)
+{
     int miss = 0;
     for (int i = 0; i < m->n; i++) {
-        m->tex[i] = tex_of(m->sc.meshes[i].texkey, &m->mode[i]);
         miss += m->sc.meshes[i].texkey && !m->tex[i];
         if (wa_test(NULL))                                   /* test aid */
             printf("world anims: solid %08x mesh %d: texture %08x mode %d, %d vertices%s\n", m->hash, i,
@@ -839,6 +872,76 @@ static int mdl_upload(WaModel *m)
     n2_free_scene(&m->sc);
     m->state = 2;
     return 1;
+}
+static int mdl_upload(WaModel *m)
+{
+    if (m->state == 2) return 1;
+#ifdef __vita__
+    if (m->state == 3) {
+        if (g_job.m != m || !g_job.done) return 0;
+        SDL_WaitThread(g_job.thr, NULL); g_job.thr = NULL;
+        for (int k = 0; k < g_job.n; k++) {
+            N2Tex *tx = &g_job.tx[k];
+            int i = g_job.mesh[k];
+            /* the world may have loaded it meanwhile: same answer as tex_of */
+            unsigned char md = N2_DRAW_OPAQUE;
+            GLuint t = world_texture_lookup(g_job.key[k], &md);
+            if (!t && tx->rgb) { t = upload_tex(tx); md = (unsigned char)n2_tex_mode(tx); }
+            for (int q = i; q < m->n; q++)            /* every mesh with this key */
+                if (m->sc.meshes[q].texkey == g_job.key[k] && !m->tex[q]) { m->tex[q] = t; m->mode[q] = md; }
+        }
+        wa_job_drop();
+        return mdl_finish(m);
+    }
+#endif
+    if (m->state != 1) return 0;
+#ifdef __vita__
+    if (g_job.m) return 0;                           /* one model's decode at a time */
+#endif
+    m->n = m->sc.count;
+    m->gm = upload_scene(&m->sc);
+    m->tex = (GLuint *)calloc((size_t)m->n + 1, sizeof *m->tex);
+    m->mode = (unsigned char *)calloc((size_t)m->n + 1, 1);
+    if (!m->gm || !m->tex || !m->mode) { m->state = -1; return 0; }
+#ifdef __vita__
+    {   /* the world cache now; the rest (distinct keys) on the decode thread */
+        long len = 0;
+        unsigned char *d = res_bundle_file_len() > 0 ? res_bundle(g.pin, &len) : NULL;
+        int nk = 0;
+        int *mesh = (int *)malloc((size_t)(m->n + 1) * sizeof *mesh);
+        uint32_t *key = (uint32_t *)malloc((size_t)(m->n + 1) * sizeof *key);
+        for (int i = 0; i < m->n; i++) {
+            uint32_t k = m->sc.meshes[i].texkey;
+            m->mode[i] = N2_DRAW_OPAQUE;
+            if (!k) continue;
+            m->tex[i] = world_texture_lookup(k, &m->mode[i]);
+            if (m->tex[i] || !d || !mesh || !key) continue;
+            int dup = 0;
+            for (int q = 0; q < nk && !dup; q++) dup = key[q] == k;
+            if (!dup) { mesh[nk] = i; key[nk] = k; nk++; }
+        }
+        N2Tex *tx = nk ? (N2Tex *)calloc((size_t)nk, sizeof *tx) : NULL;
+        if (nk && tx) {
+            memset(&g_job, 0, sizeof g_job);
+            g_job.m = m; g_job.n = nk; g_job.mesh = mesh; g_job.key = key; g_job.tx = tx;
+            g_job.d = d; g_job.len = len;
+            g_job.thr = SDL_CreateThread(wa_job_thread, "wa-decode", &g_job);
+            if (g_job.thr) { m->state = 3; return 0; }
+            memset(&g_job, 0, sizeof g_job);                 /* no thread: the old way below */
+        }
+        free(tx);
+        if (nk) {                                            /* decode here (no memory / thread) */
+            for (int i = 0; i < m->n; i++)
+                if (m->sc.meshes[i].texkey && !m->tex[i]) m->tex[i] = tex_of(m->sc.meshes[i].texkey, &m->mode[i]);
+        }
+        free(mesh); free(key);
+        return mdl_finish(m);
+    }
+#else
+    for (int i = 0; i < m->n; i++)
+        m->tex[i] = tex_of(m->sc.meshes[i].texkey, &m->mode[i]);
+    return mdl_finish(m);
+#endif
 }
 void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
 {
@@ -867,6 +970,9 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
         g_wc_cap = g_wcc ? g.nent : 0;
     }
     if (!g.gen) g.gen = 1;
+#ifdef __vita__
+    if (g_job.m && g_job.done) { mdl_upload(g_job.m); budget--; }   /* collect it even if out of view now */
+#endif
     if (g_wc_cap < g.nent) chain = 0;
     if (++g_wframe == 0) { g_wframe = 1; if (g_wcc) for (int k = 0; k < g_wc_cap; k++) g_wcc[k].frame = 0; }
     for (int i = 0; i < g.nent; i++) {
@@ -911,7 +1017,7 @@ void wa_draw(const RProg *rp, const float MVP[16], const float (*planes)[4])
             printf("world anims: %08x (solid %08x) in view at (%.0f %.0f %.0f), frame %.1f\n", e->d->name, e->d->solid,
                    W[12], W[13], W[14], e->c.time);
         }
-        if (m->state == 1) {
+        if (m->state == 1 || m->state == 3) {
             if (budget-- <= 0) continue;
             if (!mdl_upload(m)) continue;
         }

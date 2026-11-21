@@ -379,8 +379,34 @@ int airace_grid(const char *path, int event, int backward, float (*pos)[3], floa
     while (got < max && got < 64 && have[got]) got++;                   /* slots 0..got-1 present */
     return got;
 }
+/* perf 11-20: the race-end placement read the whole TrackPosMarkersAll.bin on
+   the frame the car crossed the line. One read now keeps every marker of the
+   event (all types), so the start line lookup at race start also answers the
+   finish line's. */
+#define AIM_MAX 48
+static struct { char path[256]; int event, n; struct { unsigned hash, h16; float pos[3]; } m[AIM_MAX]; } g_aim;
+static volatile int g_aim_lock;
+static int airace_marker_file(const char *path, int event, const char *type, float pos[3], unsigned *heading16, int memo);
 int airace_marker(const char *path, int event, const char *type, float pos[3], unsigned *heading16)
 {
+    if (__sync_lock_test_and_set(&g_aim_lock, 1))     /* another thread has it: no memo */
+        return airace_marker_file(path, event, type, pos, heading16, 0);
+    int r = airace_marker_file(path, event, type, pos, heading16, 1);
+    __sync_lock_release(&g_aim_lock);
+    return r;
+}
+static int airace_marker_file(const char *path, int event, const char *type, float pos[3], unsigned *heading16, int memo)
+{
+    if (memo && g_aim.n >= 0 && g_aim.event == event && g_aim.path[0] && !strcmp(g_aim.path, path)) {
+        unsigned want = airace_hash(type);
+        for (int k = 0; k < g_aim.n; k++)
+            if (g_aim.m[k].hash == want) {
+                pos[0] = g_aim.m[k].pos[0]; pos[1] = g_aim.m[k].pos[1]; pos[2] = g_aim.m[k].pos[2];
+                *heading16 = g_aim.m[k].h16;
+                return 1;
+            }
+        if (g_aim.n < AIM_MAX) return 0;   /* complete list: not there */
+    }
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
@@ -388,10 +414,11 @@ int airace_marker(const char *path, int event, const char *type, float pos[3], u
     if (!d || fread(d, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(d); return 0; }
     fclose(f);
     unsigned want = airace_hash(type);
-    int found = 0;
+    int found = 0, memo_n = 0, memo_full = 0;
+    if (memo) g_aim.path[0] = 0;   /* being refilled */
     long stack[8]; int depth = 0;
     long o = 0, end = len;
-    while (o + 8 <= end && !found) {
+    while (o + 8 <= end) {   /* the whole file: every marker of the event for the memo */
         uint32_t id = rd32(d + o), sz = rd32(d + o + 4);
         long body = o + 8, next = body + (long)sz;
         if (next > end || next < body) break;
@@ -399,16 +426,33 @@ int airace_marker(const char *path, int event, const char *type, float pos[3], u
         if (id == 0x34146) {
             for (long s = (body + 15) & ~15L; s + 48 <= next; s += 48) {
                 const unsigned char *m = d + s;
-                if (rd32(m + 8) != want || (int)rd32(m + 0x24) != event) continue;
+                if (memo && (int)rd32(m + 0x24) == event && memo_n < AIM_MAX) {
+                    int dup = 0;
+                    for (int k = 0; k < memo_n && !dup; k++) dup = g_aim.m[k].hash == rd32(m + 8);
+                    if (!dup) {   /* first of a type wins, as the scan's break does */
+                        g_aim.m[memo_n].hash = rd32(m + 8);
+                        g_aim.m[memo_n].pos[0] = rdf(m + 0x10); g_aim.m[memo_n].pos[1] = rdf(m + 0x14);
+                        g_aim.m[memo_n].pos[2] = rdf(m + 0x18);
+                        g_aim.m[memo_n].h16 = (unsigned)(m[0x20] | m[0x21] << 8);
+                        memo_n++;
+                    }
+                } else if ((int)rd32(m + 0x24) == event) memo_full = 1;
+                if (found || rd32(m + 8) != want || (int)rd32(m + 0x24) != event) continue;
                 pos[0] = rdf(m + 0x10); pos[1] = rdf(m + 0x14); pos[2] = rdf(m + 0x18);
                 *heading16 = (unsigned)(m[0x20] | m[0x21] << 8);
                 found = 1;
-                break;
             }
         }
         o = next;
         while (o >= end && depth > 0) { o = end; end = stack[--depth]; }
     }
     free(d);
+    /* the whole file was walked (no early stop), so the list is complete
+       unless it overflowed (n = AIM_MAX then means "ask the file") */
+    if (memo) {
+        snprintf(g_aim.path, sizeof g_aim.path, "%s", path);
+        g_aim.event = event; g_aim.n = memo_full ? AIM_MAX : memo_n;
+        if (strlen(path) >= sizeof g_aim.path) g_aim.path[0] = 0;
+    }
     return found;
 }

@@ -1564,20 +1564,26 @@ void SDL_GL_SwapWindow(SDL_Window *w) {
             printf("vita: frame %u (%.1f fps avg), heap break %u MB, vram free %u KB\n", frames,
                    secs > 0 ? frames / secs : 0.0, vita_heap_top_mb(),
                    (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10));
-        else if (frames % 9000) {   /* 20 s: the frame rate only */
+        else {   /* 20 s: the frame rate only. GPU memory is logged behind a pause or
+                    loading screen (vita_gpu_mem_log): in play the 5-min poll was a 48 ms
+                    swap stall (new1120_K frame 9000) */
             printf("vita: frame %u (%.1f fps avg), heap break %u MB\n", frames,
                    secs > 0 ? frames / secs : 0.0, vita_heap_top_mb());
         }
-        else {   /* GPU memory every 5 min (freeze hunt 11-19: none logged after boot); timed, as it is slow:
-                    every 20 s it was a 25-76 ms swap stall in every run (base1120 HW, 11-20) */
-            Uint64 m0 = sceKernelGetProcessTimeWide();
-            unsigned vr = (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10), rm = (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10);
-            printf("vita: frame %u (%.1f fps avg), heap break %u MB, gpu free vram %u ram %u KB (%.2f ms)\n", frames,
-                   secs > 0 ? frames / secs : 0.0, vita_heap_top_mb(), vr, rm,
-                   (double)(sceKernelGetProcessTimeWide() - m0) / 1000.0);
-        }
         vita_log_flush();
     }
+}
+/* GPU pool headroom for the freeze hunt (11-19), at most once a minute, only
+   where a stall cannot be seen: the pause menu opening, a loading screen.
+   vglMemFree walks the pool (up to ~50 ms once VRAM fragments). */
+void vita_gpu_mem_log(const char *why) {
+    static Uint64 last;
+    Uint64 now = sceKernelGetProcessTimeWide();
+    if (last && now - last < 60000000ull) return;
+    last = now;
+    unsigned vr = (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10), rm = (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10);
+    printf("vita: gpu free vram %u ram %u KB at %s (%.2f ms), heap break %u MB\n", vr, rm, why,
+           (double)(sceKernelGetProcessTimeWide() - now) / 1000.0, vita_heap_top_mb());
 }
 void *SDL_GL_GetProcAddress(const char *name) { return vglGetProcAddress(name); }
 
