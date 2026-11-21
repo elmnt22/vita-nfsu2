@@ -1297,6 +1297,10 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
     }
     Uint64 c2 = SDL_GetPerformanceCounter();
     int iters = 0, it_world = 0, it_prop = 0, it_car = 0, it_pw = 0;
+    /* P8 11-20: the resolve loop split (the impulse + rewind/advance, the moved
+       bodies' broadphase, their pairs' narrowphase), for a function-level
+       look before any change to the solver */
+    Uint64 rl_res = 0, rl_bp = 0, rl_nr = 0; int rl_narrows = 0;
     for (int iter = 0; nl > 0 && iter < 20; iter++) {     /* DAT_802080 */
         iters++;
         Contact k = list[0];
@@ -1309,8 +1313,11 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
         }
         if (p->b < 0 && cars[p->a].ops) it_pw++;
         if (p->b < 0) it_world++; else if (cars[p->a].ops || cars[p->b].ops) it_prop++; else it_car++;
+        Uint64 r0 = SDL_GetPerformanceCounter();
         if (resolve(&W, &k, done < maxhits && hits ? &hits[done] : NULL, wake, user))
             done++;
+        Uint64 r1 = SDL_GetPerformanceCounter();
+        rl_res += r1 - r0;
         p->count++;
         /* 0x5af090: drop the contacts of the moved cars, look for new
            neighbours (0x5b23b0) and test their pairs again, under 2 tries */
@@ -1325,15 +1332,20 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
         int first = W.npairs;
         {   N2Body rb = body_of(&cars[ma]); memcpy(bpos[ma], rb.pos, sizeof bpos[ma]);   /* the moved bodies */
             if (mb >= 0) { rb = body_of(&cars[mb]); memcpy(bpos[mb], rb.pos, sizeof bpos[mb]); } }
+        Uint64 b0 = SDL_GetPerformanceCounter();
         broadphase(&W, ma);
         if (mb >= 0) broadphase(&W, mb);
+        Uint64 b1 = SDL_GetPerformanceCounter();
+        rl_bp += b1 - b0;
         for (int i = 0; i < W.npairs; i++) {
             const CPair *q = &pairs[i];
             int touches = q->a == ma || q->b == ma || (mb >= 0 && (q->a == mb || q->b == mb));
             if (!touches || q->count >= 2) continue;       /* DAT_802084 */
             Contact c2;
+            rl_narrows++;
             if (narrow(&W, i, &c2)) insert_contact(list, &nl, &c2);
         }
+        rl_nr += SDL_GetPerformanceCounter() - b1;
         (void)first;
     }
     {   double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
@@ -1343,17 +1355,19 @@ int carcoll_run_all(CarCollCar *cars, int n, WColl *w, CarCollHit *hits, int max
         tb += (double)(c1 - c0) * f; tn += (double)(c2 - c1) * f; tr += (double)(c3 - c2) * f;
         pairs_sum += W.npairs; iters_sum += iters;
         {   /* the worst run of the window and what its resolves were against */
-            static double wms, wbp, wnr, wrs, wwg; static int wit, ww, wp, wc, wn, wpairs, wpolys;
+            static double wms, wbp, wnr, wrs, wwg, wlr, wlb, wln; static int wit, ww, wp, wc, wn, wpairs, wpolys, wlnn;
             double ms = (double)(c3 - c0) * f;
             if (ms > wms) {
                 int polys = 0; for (int i = 0; i < n; i++) polys += np[i];
                 wms = ms; wit = iters; ww = it_world; wp = it_prop; wc = it_car; wn = n; wpairs = W.npairs; wpolys = polys;
                 wbp = (double)(c1 - c0) * f; wnr = (double)(c2 - c1) * f; wrs = (double)(c3 - c2) * f; wwg = run_world;
+                wlr = (double)rl_res * f; wlb = (double)rl_bp * f; wln = (double)rl_nr * f; wlnn = rl_narrows;
             }
             if (n > 1 && runs + 1 >= 1200 && wms > 0) {
                 printf("contacts worst run: %.2f ms, %d resolves (%d world, %d prop, %d car), %d pairs, %d bodies, %d world polys"
-                       " | first broadphase %.2f narrow %.2f resolve loop %.2f, world gathers %.2f ms\n",
-                       wms, wit, ww, wp, wc, wpairs, wn, wpolys, wbp, wnr, wrs, wwg);
+                       " | first broadphase %.2f narrow %.2f resolve loop %.2f, world gathers %.2f ms"
+                       " | loop: impulses %.2f re-broadphase %.2f re-narrow %.2f (%d pairs)\n",
+                       wms, wit, ww, wp, wc, wpairs, wn, wpolys, wbp, wnr, wrs, wwg, wlr, wlb, wln, wlnn);
                 wms = 0;
             }
         }
