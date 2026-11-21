@@ -187,6 +187,8 @@ void world_resident_resources_free(WorldResidentResources *resources) {
                 resources->textures[i] == resources->terrain_texture) shared = 1;
         if (!shared) glDeleteTextures(1, &resources->terrain_texture);
     }
+    free(resources->cell_of); free(resources->cell_box);
+    resources->cell_of = NULL; resources->cell_box = NULL; resources->cell_count = 0; resources->cell_src = NULL;
     render_batch_array_free(&resources->ordinary, &resources->ordinary_count);
     render_batch_array_free(&resources->sky, &resources->sky_count);
     render_batch_array_free(&resources->glow, &resources->glow_count);
@@ -415,6 +417,19 @@ static int resident_worker_precompute(WorldResident *candidate) {
         int filled=render_world_plan_fill(r->cpu_plan);
         VMARK("  worker: %d meshes packed for batches the GPU lacks, %u ms",filled,
             (unsigned)((SDL_GetPerformanceCounter()-f0)*1000/SDL_GetPerformanceFrequency()));
+    }
+    {   /* smokeable candidates (perf 11-20: smk_resident walked 8-14k meshes on the activation frame) */
+        const N2Scene *s = &candidate->world.scene;
+        int n = 0;
+        for (int m = 0; m < s->count; m++) n += s->meshes[m].world_role == 3 && s->meshes[m].scen_has;
+        free(candidate->prop_meshes);
+        candidate->prop_meshes = (int *)malloc((size_t)(n ? n : 1) * sizeof(int));
+        candidate->nprop_meshes = 0;
+        if (candidate->prop_meshes) {
+            for (int m = 0; m < s->count; m++)
+                if (s->meshes[m].world_role == 3 && s->meshes[m].scen_has) candidate->prop_meshes[candidate->nprop_meshes++] = m;
+            candidate->prop_scene_count = s->count; candidate->prop_scene_meshes = s->meshes;
+        }
     }
     extern void vita_mark_stats(void);
     vita_mark_stats();
@@ -843,6 +858,19 @@ static int resident_resources_step(WorldResidentResources *resources,
         VMARK("  resident: %d world batches uploaded", resources->ordinary_count);
         hitch_mark("fin.vmark_batches");
         resources->setup_stage = 9;
+        if (smooth) { resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin; return 0; }
+    }
+    if (resources->setup_stage == 9) {   /* the cell-cull table, a slice of its own */
+        free(resources->cell_of); free(resources->cell_box);
+        resources->cell_of = NULL; resources->cell_box = NULL; resources->cell_src = NULL;
+        int nc = world_cell_table(resources->ordinary, resources->ordinary_count,
+                                  &resources->cell_of, &resources->cell_box);
+        if (nc > 0) {
+            resources->cell_count = nc; resources->cell_src = resources->ordinary;
+            resources->cell_n = resources->ordinary_count;
+        } else { free(resources->cell_of); free(resources->cell_box); resources->cell_of = NULL; resources->cell_box = NULL; }
+        hitch_mark("fin.cell_table");
+        resources->setup_stage = 11;
         if (smooth) { resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin; return 0; }
     }
 #ifdef __vita__
@@ -1383,10 +1411,52 @@ void world_resident_activate(WorldResident **active,
     world_ground_grid_activate(&next->world.grid);
 }
 
+int world_cell_table(const N2Batch *wbatch, int nbatch, int **cell_of, float (**cell_box)[6]) {
+    *cell_of = NULL; *cell_box = NULL;
+    if (!wbatch || nbatch <= 0) return -1;
+    int *cell = (int *)malloc((size_t)nbatch * sizeof *cell);
+    int hcap = 1; while (hcap < 2 * nbatch) hcap <<= 1;
+    int *hkey = (int *)malloc((size_t)hcap * 2 * sizeof(int));
+    int boxcap = 0, ncell = 0;
+    float (*box)[6] = NULL;
+    if (!cell || !hkey) { free(cell); free(hkey); return -1; }
+    for (int i = 0; i < hcap; i++) hkey[2*i+1] = -1;
+    for (int k = 0; k < nbatch; k++) {
+        const N2Batch *b = &wbatch[k];
+        int cx = (int)floorf(0.5f * (b->bbox_min[0] + b->bbox_max[0]) * (1.0f / 128.0f));
+        int cy = (int)floorf(0.5f * (b->bbox_min[1] + b->bbox_max[1]) * (1.0f / 128.0f));
+        int key = (cx & 0xffff) | (cy << 16);
+        unsigned h = ((unsigned)key * 2654435761u) & (unsigned)(hcap - 1);
+        while (hkey[2*h+1] >= 0 && hkey[2*h] != key) h = (h + 1) & (unsigned)(hcap - 1);
+        if (hkey[2*h+1] < 0) {
+            if (ncell >= boxcap) {
+                int nb = boxcap ? boxcap * 2 : 1024;
+                float (*bx)[6] = (float (*)[6])realloc(box, (size_t)nb * sizeof *bx);
+                if (!bx) { free(box); free(cell); free(hkey); return -1; }
+                box = bx; boxcap = nb;
+            }
+            hkey[2*h] = key; hkey[2*h+1] = ncell;
+            float *bx = box[ncell++];
+            for (int c = 0; c < 3; c++) { bx[c] = b->bbox_min[c]; bx[c+3] = b->bbox_max[c]; }
+        } else {
+            float *bx = box[hkey[2*h+1]];
+            for (int c = 0; c < 3; c++) {
+                if (b->bbox_min[c] < bx[c]) bx[c] = b->bbox_min[c];
+                if (b->bbox_max[c] > bx[c+3]) bx[c+3] = b->bbox_max[c];
+            }
+        }
+        cell[k] = hkey[2*h+1];
+    }
+    free(hkey);
+    *cell_of = cell; *cell_box = box;
+    return ncell;
+}
+
 void world_resident_free(WorldResident *resident) {
     if (!resident) return;
     world_resident_resources_free(&resident->resources);
     world_neighborhood_free(&resident->world);
+    free(resident->prop_meshes);
     free(resident);
 }
 

@@ -44,7 +44,8 @@ void smk_world_reset(void);
 /* The active resident (once per frame; acts when the generation changes):
    which spawners are loaded, their meshes and textures. */
 void smk_resident(const N2Scene *scene, const GLuint *mesh_tex,
-                  const unsigned char *mesh_mode, unsigned long generation);
+                  const unsigned char *mesh_mode, unsigned long generation,
+                  const int *cand, int ncand);   /* cand: role-3 mesh list, or NULL = walk all */
 
 /* ---- the frame, from the player's 60 Hz tick ---------------------------- */
 /* Smokeable::Move for every live prop over dt: step-start poses for the

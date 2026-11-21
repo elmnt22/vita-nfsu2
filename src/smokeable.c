@@ -399,7 +399,7 @@ void smk_world_reset(void)
 
 /* ---- the active resident ------------------------------------------------- */
 void smk_resident(const N2Scene *scene, const GLuint *mtex, const unsigned char *mmode,
-                  unsigned long gen)
+                  unsigned long gen, const int *cand, int ncand)
 {
     if (!g_nsp || !scene) return;
     g_cur_scene = scene; g_cur_tex = mtex; g_cur_mode = mmode;
@@ -407,7 +407,11 @@ void smk_resident(const N2Scene *scene, const GLuint *mtex, const unsigned char 
     g_gen = gen;
     for (int i = 0; i < g_nsp; i++) { g_sp[i].nmesh = 0; g_sp[i].sig = 0; }
     g_npres = 0;
-    for (int m = 0; m < scene->count; m++) {
+    /* cand: the worker's role-3 list (same meshes in the same order as the walk) */
+    int nwalk = cand ? ncand : scene->count;
+    for (int ci = 0; ci < nwalk; ci++) {
+        int m = cand ? cand[ci] : ci;
+        if (m < 0 || m >= scene->count) continue;
         const N2Mesh *x = &scene->meshes[m];
         if (x->world_role != 3 || !x->scen_has) continue;
         int s = spawner_of(x->scen_region, x->scen_index);

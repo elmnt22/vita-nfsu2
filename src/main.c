@@ -27960,9 +27960,29 @@ int main(int argc, char **argv) {
         static const N2Batch *cc_src;
         static float (*cc_box)[6];
         static unsigned char *cc_vis;
-        static long cc_skipped, cc_tested, cc_bad, cc_frames;
+        static long cc_skipped, cc_tested, cc_bad, cc_frames, cc_from_res;
         int cc_use = cc_on && !mapaudit && nbatch > 0;
-        if (cc_use) {
+        const int *cc_cellp = cc_cell;
+        float (*cc_boxp)[6] = cc_box;
+        int cc_ncellp = cc_ncell, cc_np = cc_n;
+        unsigned char *cc_visp = cc_vis;
+        const WorldResidentResources *ccr = active_resident ? &active_resident->resources : NULL;
+        if (cc_use && ccr && ccr->cell_of && ccr->cell_src == wbatch && ccr->cell_n == nbatch && ccr->cell_count > 0) {
+            /* the finish step's table (no rebuild on the activation frame) */
+            static unsigned char *cc_vis2; static int cc_vis2cap;
+            cc_from_res++;
+            cc_cellp = ccr->cell_of; cc_boxp = ccr->cell_box; cc_ncellp = ccr->cell_count; cc_np = nbatch;
+            if (cc_ncellp > cc_vis2cap) {
+                unsigned char *vs = (unsigned char *)realloc(cc_vis2, (size_t)cc_ncellp);
+                if (vs) { cc_vis2 = vs; cc_vis2cap = cc_ncellp; }
+                else cc_np = -1;
+            }
+            cc_visp = cc_vis2;
+            if (cc_np == nbatch)
+                for (int c = 0; c < cc_ncellp; c++)
+                    cc_vis2[c] = (unsigned char)world_box_in_view(world_planes, cc_boxp[c], cc_boxp[c] + 3);
+            else cc_use = 0;
+        } else if (cc_use) {
             int gen = active_resident ? (int)active_resident->generation : -1;
             if (cc_src != wbatch || cc_n != nbatch || cc_gen != gen) {
                 cc_src = wbatch; cc_n = nbatch; cc_gen = gen; cc_ncell = 0;
@@ -28011,7 +28031,9 @@ int main(int argc, char **argv) {
                 for (int c = 0; c < cc_ncell; c++)
                     cc_vis[c] = (unsigned char)world_box_in_view(world_planes, cc_box[c], cc_box[c] + 3);
             else cc_use = 0;
+            cc_cellp = cc_cell; cc_boxp = cc_box; cc_ncellp = cc_ncell; cc_np = cc_n; cc_visp = cc_vis;
         }
+        (void)cc_np;
 #endif
 #ifdef __vita__
         /* PERF_PLAN P3.2 (11-15): the game's own visible-section list.
@@ -28116,7 +28138,7 @@ int main(int argc, char **argv) {
             wv.opq = wv_opq;
 #ifdef __vita__
             memcpy(wv.planes, world_planes, sizeof wv.planes);
-            wv.cc_use = cc_use; wv.cc_verify = cc_verify; wv.cc_cell = cc_cell; wv.cc_vis = cc_vis;
+            wv.cc_use = cc_use; wv.cc_verify = cc_verify; wv.cc_cell = cc_cellp; wv.cc_vis = cc_visp;
             wv.vl_use = vl_use; wv.vl_cnt = vl_cnt; wv.vl_sec = (const uint16_t (*)[4])vl_sec; wv.vl_bits = vl_bits;
             wv.fade_p = fade_p; wv.dfade = dfade_on && !render_dof_writes();
             wv.fadeq = fadeq; wv.fadea = fadea; wv.fadecap = (int)(sizeof fadeq / sizeof *fadeq);
@@ -28183,8 +28205,8 @@ int main(int argc, char **argv) {
         }
         #ifdef __vita__
         if (cc_use && ++cc_frames >= 600) {
-            printf("world: cell cull over %ld frames: %.0f cells, %.0f batches skipped, %.0f tested per frame%s\n",
-                   cc_frames, (double)cc_ncell, (double)cc_skipped / cc_frames, (double)cc_tested / cc_frames,
+            printf("world: cell cull over %ld frames (%ld on the finish table): %.0f cells, %.0f batches skipped, %.0f tested per frame%s\n",
+                   cc_frames, cc_from_res, (double)cc_ncellp, (double)cc_skipped / cc_frames, (double)cc_tested / cc_frames,
                    cc_verify ? (cc_bad ? " -- VERIFY FAILED" : " (verify: 0 wrong)") : "");
             if (cc_verify && cc_bad) printf("world: cell cull verify: %ld skipped batches were in view\n", cc_bad);
             if (vl_frames)
@@ -28192,7 +28214,7 @@ int main(int argc, char **argv) {
                        " (%.1f of them in the frustum)\n", vl_frames, vl_listed,
                        (double)vl_skipped / vl_frames, (double)vl_wouldview / vl_frames);
             vl_skipped = vl_frames = vl_listed = vl_wouldview = 0;
-            cc_skipped = cc_tested = cc_bad = cc_frames = 0;
+            cc_skipped = cc_tested = cc_bad = cc_frames = cc_from_res = 0;
             if (wv_frames)
                 printf("world: opaque visibility on the worker %ld of %ld frames; the draws caught up with it in %ld\n",
                        wv_async, wv_frames, wv_waited);
@@ -28375,8 +28397,12 @@ int main(int argc, char **argv) {
                garage: it stands on the car's world spot, so nearby signs showed in it (GH #28) */
             cbw_up = smk_upload_count();
             Uint64 sr0 = SDL_GetPerformanceCounter();
-            smk_resident(&active_resident->world.scene, active_resident->resources.mesh_textures,
-                         active_resident->resources.mesh_modes, active_resident->generation);
+            {   const WorldResident *ar = active_resident;
+                int listok = ar->prop_meshes && ar->prop_scene_count == ar->world.scene.count &&
+                             ar->prop_scene_meshes == (const void *)ar->world.scene.meshes;
+                smk_resident(&ar->world.scene, ar->resources.mesh_textures, ar->resources.mesh_modes,
+                             ar->generation, listok ? ar->prop_meshes : NULL, listok ? ar->nprop_meshes : 0);
+            }
             cbw_res = SDL_GetPerformanceCounter() - sr0;
             #ifdef __vita__
             {   Uint64 p0 = SDL_GetPerformanceCounter();

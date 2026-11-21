@@ -217,8 +217,13 @@ static int light_grid(const void *lights, int n, int stride, uint32_t revision) 
        retain their global invalidation without invalidating resident lists. */
     uint64_t generation = revision ? (uint64_t)revision << 32
                                    : __atomic_load_n(&g_lights_gen, __ATOMIC_RELAXED);
-    if (g_lg.lights == lights && g_lg.n == n && g_lg.stride == stride && g_lg.gen == generation)
+    /* An explicit revision names the light list's contents, so a fresh copy
+       of the same list (every area build copies the cached one) keeps the grid;
+       queries index through the caller's pointer, never g_lg.lights. */
+    if ((revision || g_lg.lights == lights) && g_lg.n == n && g_lg.stride == stride && g_lg.gen == generation) {
+        g_lg.lights = lights;
         return g_lg.ok;
+    }
     Uint64 begin = SDL_GetPerformanceCounter();
     int ok = light_grid_build(lights, n, stride, generation);
     g_light_grid_ticks += SDL_GetPerformanceCounter() - begin;

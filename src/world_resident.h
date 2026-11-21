@@ -67,7 +67,13 @@ typedef struct {
     int setup_stage;           /* 0 bind, 1 lookup, 2 grass/sky/plan, 3 uploads */
     uint64_t texture_ticks;
     uint64_t batch_ticks;      /* aggregate across sliced GL-thread work */
+    /* the 128 m cell-cull table of `ordinary` (perf 11-20: built in a finish
+       slice, not on the activation frame); valid while cell_src/cell_n match */
+    int *cell_of; float (*cell_box)[6]; int cell_count; const N2Batch *cell_src; int cell_n;
 } WorldResidentResources;
+/* the cell-cull grouping (main.c P3a): batches by box-centre 128 m cell, each
+   cell's union box. Returns the cell count, or -1 (no memory: caller frees nothing). */
+int world_cell_table(const N2Batch *b, int n, int **cell_of, float (**cell_box)[6]);
 
 /* Optional build timing output (M151). Pass NULL to skip. */
 typedef struct {
@@ -94,6 +100,10 @@ struct WorldResident {
     unsigned long generation;
     int meshes_validated;      /* Vita: worker already ran the mesh checks */
     int omit_vista;            /* ordinary/baseline never draw backdrop batches */
+    /* worker-built list of scene meshes that can be smokeable props (role 3
+       with a scenery id), so activation does not walk every mesh; valid only
+       while scene.meshes / scene.count still match */
+    int *prop_meshes; int nprop_meshes; int prop_scene_count; const void *prop_scene_meshes;
 };
 
 typedef struct {

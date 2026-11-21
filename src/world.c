@@ -330,7 +330,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         /* The pinned bundle never changes, so its light list (a whole-bundle
            scan plus an O(n^2) de-duplication) is built once and copied. */
         static const unsigned char *lights_src; static N2LightSrc *lights_cache; static int nlights_cache;
-        static unsigned lights_gen;
+        static unsigned lights_gen; static uint32_t lights_cache_rev;
         if (g->pinned && nreg == 1 && lights_cache && lights_src == g->data && lights_gen == res_pin_gen() &&
             w->neighborhood.nlights == 0) {
             w->neighborhood.lights = (N2LightSrc *)malloc((size_t)(nlights_cache ? nlights_cache : 1) *
@@ -339,7 +339,10 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
                 memcpy(w->neighborhood.lights, lights_cache, (size_t)nlights_cache * sizeof *lights_cache);
                 w->neighborhood.nlights = w->neighborhood.lightcap = nlights_cache;
             }
-            w->neighborhood.lights_revision = carfx_new_light_revision();
+            /* same contents as the cached list -> same revision, so the car
+               light grid is not rebuilt (3.7-4.3 ms) on every activation */
+            w->neighborhood.lights_revision = (w->neighborhood.lights && lights_cache_rev) ?
+                lights_cache_rev : carfx_new_light_revision();
         } else
 #endif
         {
@@ -361,6 +364,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
                     memcpy(lights_cache, w->neighborhood.lights,
                            (size_t)w->neighborhood.nlights * sizeof *lights_cache);
                     nlights_cache = w->neighborhood.nlights; lights_src = g->data; lights_gen = res_pin_gen();
+                    lights_cache_rev = w->neighborhood.lights_revision;
                 }
             }
 #endif
@@ -2061,14 +2065,126 @@ int world_race_update(World *w, float x, float y) {
     return 1;
 }
 
-int world_nav_nearest(const World *w, float x, float y) {
-    int best = -1; float bd = 1e30f;
-    for (int i = 0; i < w->city.nnav; i++) {
-        float dx = w->city.nav[i*2]-x, dy = w->city.nav[i*2+1]-y;
+/* Nearest nav node (perf 11-20): a 32 m bucket grid over the nodes, built once
+   per node list, searched ring by ring. The answer is the linear scan's: same
+   d2 arithmetic, strict "<" with the lowest index winning ties, and the search
+   stops only once every node in the remaining rings is provably farther.
+   Rockport's 56,619 nodes cost 6.8 ms per scan on the Vita every 10 frames
+   (district lookup) and every 30 (road lead). One grid at a time, under a spin
+   flag; a caller that finds the flag taken (another thread) scans linearly.
+   OPENUG2_NAV_VERIFY=1 (simulator) runs the scan too and counts mismatches. */
+static int nav_linear(const float *nav, int n, float x, float y, float bd) {
+    int best = -1;
+    for (int i = 0; i < n; i++) {
+        float dx = nav[i*2]-x, dy = nav[i*2+1]-y;
         float d2 = dx*dx + dy*dy;
         if (d2 < bd) { bd = d2; best = i; }
     }
     return best;
+}
+#define NAVG_CELL 32.0f
+static struct {
+    const float *nav; int n; float k0, k1;       /* key: list, count, two node values */
+    float x0, y0; int w, h; int *start, *idx; int ok;
+} g_navg;
+static volatile int g_navg_lock;
+static long g_navg_verify_calls, g_navg_verify_bad;
+static int navg_cell_of(float v, float v0, int lim) {
+    int c = (int)((v - v0) / NAVG_CELL);
+    return c < 0 ? 0 : c >= lim ? lim - 1 : c;
+}
+static void navg_build(const float *nav, int n) {
+    free(g_navg.start); free(g_navg.idx);
+    memset(&g_navg, 0, sizeof g_navg);
+    g_navg.nav = nav; g_navg.n = n;
+    g_navg.k0 = nav[0]; g_navg.k1 = nav[(n - 1) * 2 + 1];
+    float mn[2] = { 1e30f, 1e30f }, mx[2] = { -1e30f, -1e30f };
+    for (int i = 0; i < n; i++)
+        for (int a = 0; a < 2; a++) {
+            float v = nav[i*2+a];
+            if (!(v == v) || v > 1e7f || v < -1e7f) return;   /* odd data: linear scans */
+            if (v < mn[a]) mn[a] = v;
+            if (v > mx[a]) mx[a] = v;
+        }
+    g_navg.x0 = mn[0]; g_navg.y0 = mn[1];
+    g_navg.w = (int)((mx[0] - mn[0]) / NAVG_CELL) + 1; g_navg.h = (int)((mx[1] - mn[1]) / NAVG_CELL) + 1;
+    if (g_navg.w > 2048 || g_navg.h > 2048) return;
+    int nc = g_navg.w * g_navg.h;
+    g_navg.start = (int *)calloc((size_t)nc + 1, sizeof(int));
+    g_navg.idx = (int *)malloc((size_t)n * sizeof(int));
+    int *cur = (int *)malloc((size_t)nc * sizeof(int));
+    if (!g_navg.start || !g_navg.idx || !cur) {
+        free(cur); free(g_navg.start); free(g_navg.idx); g_navg.start = NULL; g_navg.idx = NULL; return;
+    }
+    for (int i = 0; i < n; i++)
+        g_navg.start[navg_cell_of(nav[i*2+1], g_navg.y0, g_navg.h) * g_navg.w +
+                     navg_cell_of(nav[i*2], g_navg.x0, g_navg.w) + 1]++;
+    for (int c = 0; c < nc; c++) g_navg.start[c + 1] += g_navg.start[c];
+    memcpy(cur, g_navg.start, (size_t)nc * sizeof(int));
+    for (int i = 0; i < n; i++)                         /* index order inside each cell */
+        g_navg.idx[cur[navg_cell_of(nav[i*2+1], g_navg.y0, g_navg.h) * g_navg.w +
+                       navg_cell_of(nav[i*2], g_navg.x0, g_navg.w)]++] = i;
+    free(cur);
+    g_navg.ok = 1;
+}
+static void navg_cell_scan(const float *nav, int c, float x, float y, float *bd, int *best) {
+    for (int k = g_navg.start[c]; k < g_navg.start[c + 1]; k++) {
+        int i = g_navg.idx[k];
+        float dx = nav[i*2]-x, dy = nav[i*2+1]-y;
+        float d2 = dx*dx + dy*dy;
+        if (d2 < *bd || (d2 == *bd && *best >= 0 && i < *best)) { *bd = d2; *best = i; }
+    }
+}
+/* bd: the starting bound (the scan only takes d2 < bd) */
+static int nav_nearest_bd(const float *nav, int n, float x, float y, float bd) {
+    if (!nav || n <= 0) return -1;
+    const float bd0 = bd;
+    int best = -1, used_grid = 0;
+    if (n >= 512 && x == x && y == y && !__sync_lock_test_and_set(&g_navg_lock, 1)) {
+        if (g_navg.nav != nav || g_navg.n != n || g_navg.k0 != nav[0] || g_navg.k1 != nav[(n - 1) * 2 + 1])
+            navg_build(nav, n);
+        if (g_navg.ok) {
+            used_grid = 1;
+            int qx = navg_cell_of(x, g_navg.x0, g_navg.w), qy = navg_cell_of(y, g_navg.y0, g_navg.h);
+            for (int r = 0; ; r++) {
+                /* any node in ring r (Chebyshev, around the query's cell after
+                   projecting the query onto the grid) is >= (r-1) cells away */
+                if (r > 0) {
+                    float lim = (float)(r - 1) * NAVG_CELL;
+                    if (bd * 1.0001f + 0.01f < lim * lim) break;
+                }
+                int x0 = qx - r, x1 = qx + r, y0 = qy - r, y1 = qy + r;
+                for (int cy = y0; cy <= y1; cy++) {
+                    if (cy < 0 || cy >= g_navg.h) continue;
+                    if (cy == y0 || cy == y1) {
+                        for (int cx = x0 < 0 ? 0 : x0; cx <= x1 && cx < g_navg.w; cx++)
+                            navg_cell_scan(nav, cy * g_navg.w + cx, x, y, &bd, &best);
+                    } else {
+                        if (x0 >= 0) navg_cell_scan(nav, cy * g_navg.w + x0, x, y, &bd, &best);
+                        if (x1 < g_navg.w && x1 != x0) navg_cell_scan(nav, cy * g_navg.w + x1, x, y, &bd, &best);
+                    }
+                }
+                if (x0 <= 0 && y0 <= 0 && x1 >= g_navg.w - 1 && y1 >= g_navg.h - 1) break;   /* whole grid seen */
+            }
+        }
+        __sync_lock_release(&g_navg_lock);
+    }
+    if (!used_grid) return nav_linear(nav, n, x, y, bd0);
+    static int verify = -1;
+    if (verify < 0) { const char *e = getenv("OPENUG2_NAV_VERIFY"); verify = e && e[0] == '1'; }
+    if (verify) {
+        int lin = nav_linear(nav, n, x, y, bd0);
+        g_navg_verify_calls++;
+        if (lin != best && g_navg_verify_bad++ < 5)
+            printf("nav grid VERIFY: (%.1f %.1f) grid %d linear %d\n", x, y, best, lin);
+        if ((g_navg_verify_calls & 127) == 0)
+            printf("nav grid verify: %ld calls, %ld wrong\n", g_navg_verify_calls, g_navg_verify_bad);
+    }
+    return best;
+}
+
+int world_nav_nearest(const World *w, float x, float y) {
+    return nav_nearest_bd(w->city.nav, w->city.nnav, x, y, 1e30f);
 }
 
 /* binary min-heap over (f, node) */
@@ -2254,12 +2370,7 @@ int world_district_at(const World *w, float x, float y, float maxdist) {
        TRN_RDP_ and TRN_ROADDRAG_, three-letter tokens the slot parser skips. No
        districts means no district here. */
     if (!w->city.navcomp) return -1;
-    int best = -1; float bd = maxdist*maxdist;
-    for (int i = 0; i < w->city.nnav; i++) {
-        float dx = w->city.nav[i*2]-x, dy = w->city.nav[i*2+1]-y;
-        float d2 = dx*dx + dy*dy;
-        if (d2 < bd) { bd = d2; best = i; }
-    }
+    int best = nav_nearest_bd(w->city.nav, w->city.nnav, x, y, maxdist*maxdist);
     return best >= 0 ? w->city.navcomp[best] : -1;
 }
 
