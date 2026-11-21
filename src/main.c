@@ -12507,8 +12507,16 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
 #endif
     /* every car's route locator (car +0x8d8, 0x5da330) */
     if (g_rt.rp) {
-        if (player_n2) racepath_locate(g_rt.rp, &g_rt.loc[0], g_n2s.pos);
-        for (int k = 0; k < g_rt.n; k++) racepath_locate(g_rt.rp, &g_rt.loc[1 + k], g_rt.car[k].st.pos);
+        /* port only, generated (World Expansion) routes: until the race starts
+           every racer's locator is found afresh each tick, so the first locate
+           is not left from a frame the car still had its free-roam heading
+           (racepath_locate_facing: it then took the route's other pass, the
+           racer WRONG WAY and kilometres along) */
+        if (g_rt.start < 0 && racepath_generated(g_rt.rp))
+            for (int k = 0; k <= g_rt.n; k++) rploc_init(&g_rt.loc[k]);
+        if (player_n2) racepath_locate_facing(g_rt.rp, &g_rt.loc[0], g_n2s.pos, g_n2s.heading);
+        for (int k = 0; k < g_rt.n; k++)
+            racepath_locate_facing(g_rt.rp, &g_rt.loc[1 + k], g_rt.car[k].st.pos, g_rt.car[k].st.heading);
         for (int i = 0; i < g_rt.ntr; i++)
             if (rt_tshown(i)) racepath_locate(g_rt.rp, &g_rt.tloc[i], g_rt.tcar[i].st.pos);
         if (player_n2) g_rt.pwrong = rt_wrong_way(g_rt.pwrong);   /* 0x602650 -> 0x600710 */
@@ -25290,6 +25298,27 @@ int main(int argc, char **argv) {
                     }
                     ft_l = strchr(ft_l, '_'); ft_l = ft_l ? ft_l + 1 : "";
                 }
+            }
+        }
+#endif
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_FTALL=<first> -- in an expansion city's free roam,
+               a fast travel to each World Map entry (wm_bey_cands) in turn, 12 s apart, from
+               entry <first>; the car's height is logged 4 s after each put-down */
+            static int fa_i = -1, fa_n; static Uint32 fa_t; static WmCand fa_c[512]; static float fa_want[3];
+            if (getenv("OPENUG2_SIM_FTALL") && race_state == 1 && beyond_is_track(trackname) && g_ride_ready && !post_hold) {
+                if (fa_i < 0) { fa_n = wm_bey_cands(fa_c, 512, 0, 0); fa_i = atoi(getenv("OPENUG2_SIM_FTALL")); fa_t = SDL_GetTicks();
+                                printf("sim ftall: %d entries\n", fa_n); }
+                if (fa_i > 0 && fa_want[0] != 0 && SDL_GetTicks() - fa_t > 4000 && SDL_GetTicks() - fa_t < 4100)
+                    printf("sim ftall: entry %d 4 s on: car (%.0f %.0f z %.1f) wanted z %.1f, contact %x%s\n", fa_i - 1, carpos[0], carpos[1], carpos[2],
+                           fa_want[2], (unsigned)g_ride.contact_mask, carpos[2] < fa_want[2] - 8.0f ? " FELL" : "");
+                if (fa_i < fa_n && SDL_GetTicks() - fa_t > 12000) {
+                    fa_t = SDL_GetTicks();
+                    g_ft.p[0] = fa_c[fa_i].x; g_ft.p[1] = fa_c[fa_i].y; g_ft.p[2] = fa_c[fa_i].z; g_ft.go = 1;
+                    memcpy(fa_want, g_ft.p, sizeof fa_want);
+                    printf("sim ftall: entry %d id %08x to (%.0f %.0f %.1f)\n", fa_i, (unsigned)fa_c[fa_i].id, fa_c[fa_i].x, fa_c[fa_i].y, fa_c[fa_i].z);
+                    fa_i++;
+                } else if (fa_i >= fa_n && SDL_GetTicks() - fa_t > 12000) { printf("sim ftall: done\n"); exit(0); }
             }
         }
 #endif

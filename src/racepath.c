@@ -163,6 +163,7 @@ struct RacePath {
        a type) with their boxes read once, for FindZone's walks */
     struct RpZoneIx { const unsigned char *z; int type; float bb[4]; } *zix;
     int nzix;
+    int gen;                                     /* port only: see locate's window */
 };
 
 static void zone_index(RacePath *p);
@@ -272,6 +273,51 @@ void rploc_init(RpLoc *l)                                               /* 0x5da
     l->node = -1;
     l->dir[0] = 1.0f;
 }
+/* Port only, for the World Expansion's generated Paths: a route that drives
+   one road twice in opposite directions (a lap's end down its start, an out
+   and back) has two lines a lane apart there, and a fresh locate (race
+   start, a reset, a jump over 128 m) takes the nearest node, so half the
+   time the other pass -- the car is then WRONG WAY with the wrong progress
+   until the passes part, as the progress-jump cost keeps the locator on it.
+   The first locate here takes the route segment within 25 m that runs the
+   car's way, the one nearest the locator's last progress (0 at the race
+   start: a route can also come back over its start the same way later, and
+   the nearest node there took a racer kilometres along the race) with the
+   neighbour test's progress-jump cost. Retail Paths (and no such segment)
+   locate as 0x5da330 does. */
+static int facing_node(const RacePath *p, const float *q, float hx, float hy, float pref)
+{
+    int best = -1; float bd = 25.0f, bc = 1e8f;
+    for (int r = 0; r < p->nroute; r++)
+        for (int j = 0; j < p->route[r].count; j++) {
+            const RpSec *s = p->list[p->route[r].first + j];
+            if (!s->sp || !in_box(s->bbmin, s->bbmax, q, bd)) continue;
+            float sg = s->scale < 0 ? -1.0f : 1.0f;
+            for (int k = s->first; k + 1 < s->end; k++) {
+                const RpNode *a = &p->node[k], *b = &p->node[k + 1];
+                if ((b->x - a->x) * hx * sg + (b->y - a->y) * hy * sg <= 0) continue;
+                int w;
+                float d = seg_dist(a, b, q, &w);
+                if (!(d < 25.0f)) continue;
+                float c = pref > -1e8f ? (fabsf(racepath_diff(p, pref, p->node[k + w].prog)) - 40.0f) * 0.25f : 0;
+                if (c < 0) c = 0;
+                if (d + c < bc) { bc = d + c; best = k + w; }
+            }
+        }
+    return best;
+}
+static int g_hd_on;                     /* racepath_locate_facing's car heading for locate */
+static float g_hd[2];
+static float against(const RacePath *p, int k)    /* the cost of node k's segment running against it */
+{
+    if (!g_hd_on || k < 0) return 0;
+    const RpSec *s = &p->sec[p->node[k].sec];
+    int a = k, b = k + 1;
+    if (b >= s->end) { a = k - 1; b = k; }
+    if (a < s->first) return 0;
+    float sg = s->scale < 0 ? -1.0f : 1.0f;
+    return ((p->node[b].x - p->node[a].x) * g_hd[0] + (p->node[b].y - p->node[a].y) * g_hd[1]) * sg < 0 ? 15.0f : 0;
+}
 static void locate(const RacePath *p, RpLoc *l, const float *q, int hint)   /* 0x5d9e30 */
 {
     if (hint < 0) {
@@ -322,6 +368,54 @@ static void locate(const RacePath *p, RpLoc *l, const float *q, int hint)   /* 0
             }
         }
     }
+    if (p->gen) {
+        /* Port only, for the World Expansion's generated Paths: their lines
+           can zigzag where road pieces join and many section ends have no
+           neighbour (+0xa 0xff), so node_refine's one-step walk can stop in
+           a local minimum behind the car and the locator then stays there,
+           its direction against the car's (WRONG WAY for kilometres, the
+           racers' progress frozen). The retail files never need it. The
+           segments within 12 nodes either side (in route order, across
+           section joins) are searched, with the same progress-jump cost as
+           the neighbour test above, and the nearest wins. With the car's
+           heading (racepath_locate_facing) the nearest segment within 25 m
+           running its way is a candidate too and a segment against it costs
+           15 m more: where a route drives a road both ways a lane apart (a
+           lap's end down its start) only the heading tells the passes apart
+           -- a circuit's progress wraps there. Where every candidate runs
+           one way (the rest of a route) it changes nothing, so driving the
+           wrong way still shows WRONG WAY. */
+        int lo = hint - 12, hi = hint + 12, best = hint, m = hint;
+        if (lo < 0) lo = 0;
+        if (hi > p->nnode - 1) hi = p->nnode - 1;
+        float hp = p->node[hint].prog, bc = node_refine(p, q, &m);
+        if (m >= 0) { best = m; bc += against(p, m); } else bc = 1e8f;
+        if (g_hd_on) {
+            int f = facing_node(p, q, g_hd[0], g_hd[1], hp);
+            if (f >= 0) {
+                int w = f;
+                float fd = node_refine(p, q, &w);
+                if (w >= 0) {
+                    float c = (fabsf(racepath_diff(p, hp, p->node[w].prog)) - 40.0f) * 0.25f;
+                    if (c < 0) c = 0;
+                    fd += c + against(p, w);
+                    if (fd + 0.5f < bc) { bc = fd; best = w; }
+                }
+            }
+        }
+        for (int i = lo; i < hi; i++) {
+            const RpNode *a = &p->node[i], *b = &p->node[i + 1];
+            if (a->sec != b->sec || !p->sec[a->sec].sp) continue;
+            int w;
+            float sd = seg_dist(a, b, q, &w);
+            if (!(sd + 0.5f < bc)) continue;
+            sd += against(p, i);
+            float c = (fabsf(racepath_diff(p, hp, p->node[i + w].prog)) - 40.0f) * 0.25f;
+            if (c < 0) c = 0;
+            if (sd + c + 0.5f < bc) { bc = sd + c; best = i + w; }
+        }
+        hint = best;
+    }
     const RpSec *s = &p->sec[p->node[hint].sec];
     if (!s->sp) return;
     float t0 = l->t;
@@ -363,6 +457,25 @@ void racepath_locate(const RacePath *p, RpLoc *l, const float pos[3])   /* 0x5da
             }
         }
     }
+}
+int racepath_generated(const RacePath *p) { return p && p->gen; }
+void racepath_locate_facing(const RacePath *p, RpLoc *l, const float pos[3], float heading)
+{
+    if (!p || !p->sec) return;
+    if (p->gen) {
+        int fresh = l->node < 0;
+        if (!fresh) {
+            float dx = pos[0] - l->pos[0], dy = pos[1] - l->pos[1];
+            fresh = 128.0f < sqrtf(dx * dx + dy * dy);
+        }
+        g_hd[0] = cosf(heading); g_hd[1] = sinf(heading); g_hd_on = 1;
+        int k = fresh ? facing_node(p, pos, g_hd[0], g_hd[1], l->progress) : -1;
+        if (k >= 0) locate(p, l, pos, k);
+        else racepath_locate(p, l, pos);
+        g_hd_on = 0;
+        return;
+    }
+    racepath_locate(p, l, pos);
 }
 static float locate_at(const RacePath *p, const float *q)               /* 0x5ded90 */
 {
@@ -760,6 +873,8 @@ static RacePath *load(const char *path, int event, int reversed, int zones_only)
         }
     }
     if (!build(p, evr) || !(p->lap > 1.0f)) { racepath_free(p); return NULL; }
+    p->gen = 1;                         /* generated (World Expansion) Paths: every node's +0xb is 0xff */
+    for (int i = 0; i < p->nnode; i++) if (p->node[i].b11 != 0xff) { p->gen = 0; break; }
     return p;
 }
 void racepath_free(RacePath *p)

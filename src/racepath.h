@@ -48,6 +48,11 @@ typedef struct {
 void  rploc_init(RpLoc *l);
 /* 0x5da330 -> 0x5d9e30 */
 void  racepath_locate(const RacePath *p, RpLoc *l, const float pos[3]);
+/* port only: racepath_locate, but a fresh locate on generated (World
+   Expansion) Paths takes the nearest route segment running the car's way
+   (heading in radians, atan2 of its forward) */
+void  racepath_locate_facing(const RacePath *p, RpLoc *l, const float pos[3], float heading);
+int   racepath_generated(const RacePath *p);   /* port only: World Expansion Paths */
 /* 0x5d5cd0: a - b, wrapped by half a lap on a circuit */
 float racepath_diff(const RacePath *p, float a, float b);
 /* 0x5eb5d0's grid when the event has too few starting-position markers:
