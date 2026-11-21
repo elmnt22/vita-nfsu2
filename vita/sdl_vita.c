@@ -1246,11 +1246,20 @@ int vita_lock30 = -1;
 static unsigned lock30_vc;
 static void lock30_cb(void *fb) {
     (void)fb;
-    while ((int)(sceDisplayGetVcount() - lock30_vc) < 2) sceDisplayWaitVblankStart();
+    /* The vblank counter's width is not documented: if it wraps (16 bits =
+       65536 refreshes = 1093 s, which is when five freeze logs end), the old
+       "now - last < 2" test went negative forever and the display thread
+       never flipped again. Any step backwards or a jump beyond a few refreshes
+       counts as "time is up", and the wait is capped at 4 refreshes. */
+    for (int waits = 0; waits < 4; waits++) {
+        unsigned d0 = (unsigned)sceDisplayGetVcount() - lock30_vc;
+        if (d0 >= 2) break;            /* also catches a wrap: d0 becomes huge */
+        sceDisplayWaitVblankStart();
+    }
     unsigned vc = sceDisplayGetVcount();
     /* proof: how many refreshes the previous frame stayed up (2 = on time) */
     static unsigned held[4], n;
-    unsigned d = vc - lock30_vc;
+    unsigned d = vc - lock30_vc;   /* wrap: huge -> counted as 5+ */
     held[d >= 5 ? 3 : d < 2 ? 0 : d - 2]++;
     lock30_vc = vc;
     if (++n == 300) {
