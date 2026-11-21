@@ -429,6 +429,7 @@ int  career_decal_brand_unlocked(uint32_t brand);
 void career_spend(int cost);                                  /* CareerWallet::Spend */
 long career_cars_save(unsigned char *out, long cap);
 int  career_cars_load(const unsigned char *p, long n);
+int  career_cars_check(const unsigned char *p, long n);   /* the same parse, nothing kept (profile load S3) */
 
 /* the save (PlayerCareerState::SaveToBuffer 0x514530 order) */
 long career_save(unsigned char *out, long cap);               /* bytes written, or the size with out NULL */

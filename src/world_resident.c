@@ -1471,7 +1471,7 @@ typedef struct RelItem { struct RelItem *next; N2Mesh *m; int n; void (*fn)(void
 static RelItem *volatile g_rel_head;
 static volatile int g_rel_lock, g_rel_started, g_rel_busy;
 static volatile long g_rel_meshes;
-static void rel_lock(void) { while (__sync_lock_test_and_set(&g_rel_lock, 1)) SDL_Delay(0); }
+static void rel_lock(void) { for (int n_ = 0; __sync_lock_test_and_set(&g_rel_lock, 1); n_++) SDL_Delay(n_ > 64 ? 1 : 0); }   /* S6: a lower-priority holder gets to run */
 static void rel_unlock(void) { __sync_lock_release(&g_rel_lock); }
 static int rel_thread(void *unused) {
     (void)unused;

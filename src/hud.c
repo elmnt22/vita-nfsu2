@@ -693,7 +693,17 @@ static unsigned char *hud_read_file(const char *path, long *len) {
     if (slot < 0) return n2_read_file(path, len);
     unsigned char *d = NULL;
     for (int n_ = 0; __sync_lock_test_and_set(&g_hfc_lock, 1); n_++) if (n_ > 64) SDL_Delay(1);
-    if (g_hfc_data[slot] && (d = (unsigned char *)malloc((size_t)g_hfc_len[slot])) != NULL) {
+    if (g_hfc_data[slot] && (d = (unsigned char *)malloc((size_t)g_hfc_len[slot])) == NULL) {
+        /* S4 11-20: no room for the copy on a fragmented heap (a pause menu that
+           silently did not open): the other kept bundles go first, then retry */
+        long freed = 0;
+        for (int i = 0; i < HUD_NCACHED; i++)
+            if (i != slot && g_hfc_data[i]) { freed += g_hfc_len[i]; free(g_hfc_data[i]); g_hfc_data[i] = NULL; g_hfc_len[i] = 0; }
+        d = freed ? (unsigned char *)malloc((size_t)g_hfc_len[slot]) : NULL;
+        printf("hud: no %ld KB for a copy of %s; %ld KB of other kept bundles let go, %s\n",
+               g_hfc_len[slot] >> 10, path, freed >> 10, d ? "copied" : "still none");
+    }
+    if (d) {
         memcpy(d, g_hfc_data[slot], (size_t)g_hfc_len[slot]);
         *len = g_hfc_len[slot];
     }

@@ -1090,6 +1090,9 @@ static int wt_decode_ready(unsigned char *data, long len, const uint32_t *hdr, i
                            WtLoaded *out, WtScratch *scr, int ground_only) {
     size_t plen = hdr[5];
     int ok = hdr[4] < 200000 && hdr[6] == (uint32_t)(len - 32) && plen < (256u << 20) && plen >= 12;
+    /* S5 11-20: an uncompressed payload is exactly its stored bytes (the copy
+       below read plen bytes from a block of hdr[6]) */
+    if (ok && !(hdr[7] & 1) && hdr[5] != hdr[6]) ok = 0;
     if (!ok) return 0;
     unsigned char *buf = ground_only ? (scr ? wt_scratch(scr, plen) : (unsigned char *)malloc(plen))
                                      : (unsigned char *)malloc(plen);
@@ -1098,6 +1101,7 @@ static int wt_decode_ready(unsigned char *data, long len, const uint32_t *hdr, i
     else memcpy(buf, data + 32, plen);
     uint32_t rh[3];
     if (ok) { memcpy(rh, buf, sizeof rh); ok = rh[0] == WT_READY_MAGIC && rh[1] == hdr[4] && rh[2] >= 16 &&
+                                               rh[2] <= plen &&   /* S5: no 32-bit wrap in the sum below */
                                                rh[2] + (size_t)rh[1] * sizeof(WTileMesh) == plen; }
     uint32_t nm = ok ? rh[1] : 0, nsel = 0;
     size_t gp = 0, total = 0;
@@ -1183,6 +1187,7 @@ static int wt_decode(unsigned char *data, long len, int tx, int ty, WtLoaded *ou
         return wt_decode_ready(data, len, hdr, tx, ty, out, scr, ground_only);
     ok = ok && hdr[0] == 0x54324755u && (hdr[1] == WTILE_VERSION || hdr[1] == WTILE_BEYOND_VERSION) && hdr[4] < 200000 &&
          hdr[6] == (uint32_t)(len - (long)sizeof hdr) && hdr[5] < (256u << 20);
+    if (ok && !(hdr[7] & 1) && hdr[5] > hdr[6]) ok = 0;   /* S5 11-20: an uncompressed payload lies within the file */
     unsigned char *payload = NULL;
     if (ok) {
         if (hdr[7] & 1) {
@@ -2682,7 +2687,7 @@ static int g_wt_obj_n, g_wt_obj_have_prev;
 static unsigned g_wt_vis_gen;
 static int g_wt_vis_undo_ok, g_wt_vis_old_have;
 static volatile int g_wt_vis_lock;
-static void wt_vis_lock(void) { while (__sync_lock_test_and_set(&g_wt_vis_lock, 1)) SDL_Delay(0); }
+static void wt_vis_lock(void) { for (int n_ = 0; __sync_lock_test_and_set(&g_wt_vis_lock, 1); n_++) SDL_Delay(n_ > 64 ? 1 : 0); }   /* S6: a lower-priority holder gets to run */
 static void wt_vis_unlock(void) { __sync_lock_release(&g_wt_vis_lock); }
 void world_tiles_visibility_undo(unsigned gen) {
     if (!gen) return;

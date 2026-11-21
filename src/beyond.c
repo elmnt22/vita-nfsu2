@@ -501,19 +501,46 @@ static int (*g_bx_path_fn)(char *out, int cap);
 static char g_bx_prog_path[320];
 void beyond_progress_path_fn(int (*fn)(char *out, int cap)) { g_bx_path_fn = fn; }
 const char *beyond_progress_legacy_path(void) { return BX_PROG; }
+/* S2 11-20: a progress file that exists but could not be opened was taken as
+   "no wins", and the next win rewrote it with that one event. Now writes are
+   refused until it reads (the load is retried each time); a file that stops
+   parsing part-way is kept as <path>.bad before the next write; and the save
+   swaps through <path>.savebak (as profile.c write_file), which the load puts
+   back -- or the finished .tmp the old remove + rename could leave alone. */
+static int g_bx_prog_unread;
+static int bx_file_there(const char *p) { struct stat st; return stat(p, &st) == 0; }
+static void bx_prog_recover(const char *p) {
+    if (bx_file_there(p)) return;
+    char alt[340];
+    snprintf(alt, sizeof alt, "%s.savebak", p);
+    if (bx_file_there(alt) && rename(alt, p) == 0) { printf("beyond: %s restored from its .savebak\n", p); return; }
+    snprintf(alt, sizeof alt, "%s.tmp", p);
+    if (bx_file_there(alt) && rename(alt, p) == 0) printf("beyond: %s restored from its .tmp\n", p);
+}
 static void bx_prog_load(void) {
     char p[320];
     if (!g_bx_path_fn || !g_bx_path_fn(p, (int)sizeof p)) snprintf(p, sizeof p, "%s", BX_PROG);
-    if (g_bx_progn >= 0 && !strcmp(p, g_bx_prog_path)) return;
+    if (g_bx_progn >= 0 && !g_bx_prog_unread && !strcmp(p, g_bx_prog_path)) return;
     snprintf(g_bx_prog_path, sizeof g_bx_prog_path, "%s", p);
-    g_bx_progn = 0;
+    g_bx_progn = 0; g_bx_prog_unread = 0;
+    bx_prog_recover(p);
     FILE *f = fopen(p, "r");
-    if (!f) return;
+    if (!f) {
+        if (bx_file_there(p)) { g_bx_prog_unread = 1; printf("beyond: %s exists but cannot be read: progress not saved until it can\n", p); }
+        return;
+    }
+    int r = 0;
     while (g_bx_progn < BX_MAXEV &&
-           fscanf(f, "%d %d %d %d", &g_bx_prog[g_bx_progn].id, &g_bx_prog[g_bx_progn].won,
-                  &g_bx_prog[g_bx_progn].best, &g_bx_prog[g_bx_progn].place) == 4)
+           (r = fscanf(f, "%d %d %d %d", &g_bx_prog[g_bx_progn].id, &g_bx_prog[g_bx_progn].won,
+                       &g_bx_prog[g_bx_progn].best, &g_bx_prog[g_bx_progn].place)) == 4)
         g_bx_progn++;
+    int stopped = g_bx_progn < BX_MAXEV && r != EOF;   /* not the end: an unreadable line */
     fclose(f);
+    if (stopped) {
+        char bad[340]; snprintf(bad, sizeof bad, "%s.bad", p);
+        remove(bad);
+        printf("beyond: %s unreadable after %d events, kept as %s\n", p, g_bx_progn, rename(p, bad) == 0 ? bad : "(rename failed)");
+    }
 }
 int beyond_progress(int id, int *won, int *best_ticks, int *best_place) {
     bx_prog_load();
@@ -535,6 +562,7 @@ int beyond_progress_won_count(void) {
 int beyond_progress_record(int id, int won, int ticks, int place) {
     if (beyond_event_type(id) < 0) return 0;
     bx_prog_load();
+    if (g_bx_prog_unread) return 0;                 /* never over a file we could not read */
     int i = 0;
     while (i < g_bx_progn && g_bx_prog[i].id != id) i++;
     if (i == g_bx_progn) {
@@ -554,6 +582,16 @@ int beyond_progress_record(int id, int won, int ticks, int place) {
     for (int k = 0; k < g_bx_progn; k++)
         if (fprintf(f, "%d %d %d %d\n", g_bx_prog[k].id, g_bx_prog[k].won, g_bx_prog[k].best, g_bx_prog[k].place) < 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
-    if (ok) { remove(g_bx_prog_path); ok = rename(tmp, g_bx_prog_path) == 0; }
-    return ok;
+    if (!ok) { remove(tmp); return 0; }
+    char bak[340]; snprintf(bak, sizeof bak, "%s.savebak", g_bx_prog_path);
+    remove(bak);
+    int had = bx_file_there(g_bx_prog_path);
+    if (had && rename(g_bx_prog_path, bak) != 0) { remove(tmp); return 0; }
+    if (rename(tmp, g_bx_prog_path) != 0) {
+        if (had) rename(bak, g_bx_prog_path);
+        remove(tmp);
+        return 0;
+    }
+    if (had) remove(bak);
+    return 1;
 }

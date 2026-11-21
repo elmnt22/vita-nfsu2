@@ -482,11 +482,25 @@ void skyline_pump(void) {
         }
         N2Batch *b = &S.batch[S.nbatch];
         memset(b, 0, sizeof *b);
+        while (glGetError() != GL_NO_ERROR) {}
         glGenBuffers(1, &b->vbo); glGenBuffers(1, &b->ibo);
         glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)vo * sizeof *bv), bv, GL_STATIC_DRAW);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)((size_t)io * 2), bi, GL_STATIC_DRAW);
+        if (glGetError() != GL_NO_ERROR) {
+            /* S6 11-20: no GPU memory for this cell -- an empty buffer drawn with
+               its index count reads garbage; the run is tried again next frame */
+            glBindBuffer(GL_ARRAY_BUFFER, 0); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+            glDeleteBuffers(1, &b->vbo); glDeleteBuffers(1, &b->ibo);
+            memset(b, 0, sizeof *b);
+            static int fails;
+            if (++fails <= 30) S.next_run--;   /* after 30 frames that run is left out */
+            if (fails == 1 || fails == 31)
+                printf("skyline: no GPU memory for run %d, %s\n", S.next_run, fails <= 30 ? "retried next frame" : "left out");
+            if (fails > 30) fails = 0;
+            break;
+        }
         b->index_count = io; b->nmesh = r->m1 - r->m0; b->tall = 1; b->drawmode = N2_DRAW_OPAQUE;
         for (int c = 0; c < 3; c++) { b->bbox_min[c] = r->bb[c]; b->bbox_max[c] = r->bb[c+3]; }
         S.bsub[S.nbatch] = *r;   /* its cell ranges beside it, whatever the run index */

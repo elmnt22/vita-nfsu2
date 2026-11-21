@@ -2506,13 +2506,14 @@ long career_cars_save(unsigned char *out, long cap)
 #undef CC_PUT
     return n;
 }
-int career_cars_load(const unsigned char *p, long n)
+static CareerCar g_cc_parse[CAREER_NSLOTS];
+static int cc_parse(const unsigned char *p, long n)   /* into g_cc_parse; 1 = the whole block read */
 {
-    static CareerCar tmp[CAREER_NSLOTS];
+    CareerCar *tmp = g_cc_parse;
     long i = 8;
     uint32_t ver = n >= 8 ? rd32(p) : 0;
     if (n < 8 || ver < 1 || ver > 6 || rd32(p + 4) != CAREER_NSLOTS) return 0;
-    memset(tmp, 0, sizeof tmp);
+    memset(g_cc_parse, 0, sizeof g_cc_parse);
     for (int k = 0; k < CAREER_NSLOTS; k++) {
         CareerCar *c = &tmp[k];
         if (i + 12 > n) return 0;
@@ -2553,7 +2554,16 @@ int career_cars_load(const unsigned char *p, long n)
         }
     }
     if (i != n) return 0;
-    memcpy(g_ccar, tmp, sizeof tmp);
+    return 1;
+}
+/* S3 11-20: the profile load asks this before it writes anything, so a block
+   it cannot read refuses the load instead of an empty garage that the next
+   autosave makes permanent */
+int career_cars_check(const unsigned char *p, long n) { return cc_parse(p, n); }
+int career_cars_load(const unsigned char *p, long n)
+{
+    if (!cc_parse(p, n)) return 0;
+    memcpy(g_ccar, g_cc_parse, sizeof g_cc_parse);
     g_nccar = CAREER_NSLOTS;
     return 1;
 }

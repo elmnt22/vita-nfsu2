@@ -203,6 +203,10 @@ static int apply(const unsigned char *p, long n) {
         printf("profile: career block %ld bytes, want %ld -- not loaded\n", carn, career_save(NULL, 0));
         return 0;
     }
+    if (cc && !g_xf_city && !career_cars_check(cc, ccn)) {   /* S3 11-20: the same for the career cars */
+        printf("profile: career cars block (%ld bytes) unreadable -- not loaded\n", ccn);
+        return 0;
+    }
     uint32_t sz = 0;
     if (opt && optn >= 4) memcpy(&sz, opt, 4);
     if (opt && sz == sizeof g_opt && optn == (long)(4 + sz)) memcpy(&g_opt, opt + 4, sizeof g_opt);
@@ -523,6 +527,11 @@ int profile_delete(const char *name) {
     profile_path(name, path, sizeof path);
     snprintf(dir, sizeof dir, "%s/%s", PROFILE_DIR, name);
     int ok = remove(path) == 0;
+    /* S6 11-20: its .savebak / .tmp too -- left behind, file_recover brought
+       the deleted profile back on the next read of that name */
+    {   char x[320];
+        snprintf(x, sizeof x, "%s.savebak", path); if (remove(x) == 0) ok = 1;
+        snprintf(x, sizeof x, "%s.tmp", path); remove(x); }
     rmdir(dir);
     if (ok && g_named && !strcmp(name, g_name)) profile_default();
     printf("profile: %s %s\n", ok ? "deleted" : "cannot delete", name);

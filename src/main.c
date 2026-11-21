@@ -4382,9 +4382,11 @@ static struct { uint32_t key; GLuint tex; } g_decal_cache[64]; static int g_ndec
 /* CARBONFIBRE (GLOBALB's texture pack): what a carbon part wears in place
    of the skin (0x636840 texture tables), loaded on first need and kept. */
 static GLuint carbon_tex(const char *dataroot) {
-    static GLuint id; static int tried;
+    static GLuint id; static int tried; static Uint32 retry_at;
     if (id || tried) return id;
-    tried = 1;
+    /* S4 11-20: only a read GLOBALB settles it; a failed read (memory) tries
+       again in 10 s instead of switching the texture off for the session */
+    if (retry_at && (Sint32)(SDL_GetTicks() - retry_at) < 0) return 0;
     long len = 0;
     unsigned char *d = car_global_get(dataroot, &len);
     unsigned char *own = NULL;
@@ -4392,6 +4394,8 @@ static GLuint carbon_tex(const char *dataroot) {
         char gp[1024]; snprintf(gp, sizeof gp, "%s/GLOBAL/GLOBALB.BUN", dataroot);
         own = d = n2_read_file(gp, &len);
     }
+    if (!d) { retry_at = SDL_GetTicks() + 10000; if (!retry_at) retry_at = 1; return 0; }
+    tried = 1;
     if (d) {
         N2Tpk tpk = n2_tpk_open(d, len);
         N2Tex t; memset(&t, 0, sizeof t);
@@ -4501,9 +4505,11 @@ static void part_anim_tick(Shop *vs, const char *dataroot, const char *car, cons
     }
 }
 static GLuint neon_blur_tex(const char *dataroot) {
-    static GLuint id; static int tried;
+    static GLuint id; static int tried; static Uint32 retry_at;
     if (id || tried) return id;
-    tried = 1;
+    /* S4 11-20: only a read GLOBALB settles it; a failed read (memory) tries
+       again in 10 s instead of switching the texture off for the session */
+    if (retry_at && (Sint32)(SDL_GetTicks() - retry_at) < 0) return 0;
     long len = 0;
     unsigned char *d = car_global_get(dataroot, &len);
     unsigned char *own = NULL;
@@ -4511,6 +4517,8 @@ static GLuint neon_blur_tex(const char *dataroot) {
         char gp[1024]; snprintf(gp, sizeof gp, "%s/GLOBAL/GLOBALB.BUN", dataroot);
         own = d = n2_read_file(gp, &len);
     }
+    if (!d) { retry_at = SDL_GetTicks() + 10000; if (!retry_at) retry_at = 1; return 0; }
+    tried = 1;
     if (d) {
         N2Tpk tpk = n2_tpk_open(d, len);
         N2Tex t; memset(&t, 0, sizeof t);

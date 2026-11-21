@@ -7953,6 +7953,10 @@ static void crib_play(Shop *s) {
 #define XP_GARAGE_FILE "ux0:data/NFSU2/xpgarage.txt"
 int xp_garage_choice(int city) {
     FILE *f = fopen(XP_GARAGE_FILE, "r");
+    if (!f) {   /* S6: a write cut off between its remove and rename left the whole .tmp */
+        if (rename(XP_GARAGE_FILE ".tmp", XP_GARAGE_FILE) == 0) printf("xp garage: restored from its .tmp\n");
+        f = fopen(XP_GARAGE_FILE, "r");
+    }
     if (!f) return -1;
     char l[160]; int r = -1;
     const char *me = profile_name();
@@ -7981,9 +7985,15 @@ void xp_garage_choice_set(int city, int share) {
         fclose(f);
     }
     snprintf(lines[n++], sizeof lines[0], "%d %d %s\n", city, share ? 1 : 0, me);
-    if (!(f = fopen(XP_GARAGE_FILE, "w"))) { printf("xp garage: %s not written\n", XP_GARAGE_FILE); return; }
-    for (int i = 0; i < n; i++) fputs(lines[i], f);
-    fclose(f);
+    /* S6 11-20: written whole to .tmp, then swapped in -- a cut-off write lost
+       every profile's Share / Start fresh choice */
+    char tmp[300]; snprintf(tmp, sizeof tmp, "%s.tmp", XP_GARAGE_FILE);
+    if (!(f = fopen(tmp, "w"))) { printf("xp garage: %s not written\n", XP_GARAGE_FILE); return; }
+    int ok = 1;
+    for (int i = 0; i < n; i++) if (fputs(lines[i], f) < 0) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    if (ok) { remove(XP_GARAGE_FILE); ok = rename(tmp, XP_GARAGE_FILE) == 0; }
+    if (!ok) { remove(tmp); printf("xp garage: %s not written\n", XP_GARAGE_FILE); }
 }
 static void crib_trip(Shop *s, int city) {
     s->trip_city = city;
