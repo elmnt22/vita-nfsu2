@@ -2,6 +2,7 @@
 #include "trophy.h"
 #include "career.h"
 #include "options.h"
+#include "profile.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -267,6 +268,7 @@ static const struct { int stage; uint32_t clear, shops, suv, full, spon, world; 
 void trophy_check(void)
 {
     if (!career_nevents()) return;
+    if (profile_xf_city()) return;   /* XF8 11-22: a city's own career (Start fresh) is no Bayview progress */
     /* the tutorial (stage 0) */
     if (career_stage_cleared(0)) unlock(261034u);
     if (open_(0) && st(0)->dc > 0) unlock(261033u);
@@ -292,6 +294,7 @@ void trophy_check(void)
    is decided here -- the stage's final, the last race, was just won */
 void trophy_stage_cleared(int stage)
 {
+    if (profile_xf_city()) return;
     for (unsigned k = 0; k < sizeof k_stage / sizeof k_stage[0]; k++)
         if (k_stage[k].stage == stage && k_stage[k].full && full_clear(stage)) unlock(k_stage[k].full);
     trophy_check();
@@ -301,7 +304,7 @@ void trophy_stage_cleared(int stage)
 void trophy_event_won(const unsigned char *ev)
 {
     static const uint32_t hard[6] = { 0, 0, 261053u, 261054u, 261055u, 261056u };
-    if (!ev) return;
+    if (!ev || profile_xf_city()) return;
     int s = ev_stage(ev);
     const unsigned char *sd = s >= 2 && s <= 5 ? career_stage_data(s) : NULL;
     if (sd && u32le(sd + 0x28) == u32le(ev + 8) && g_opt.career_diff == 2) unlock(hard[s]);
