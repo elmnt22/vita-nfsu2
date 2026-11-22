@@ -3263,3 +3263,4 @@ void world_fog_set_rain(float I, const float *vals, int n)
     for (int i = 0; i < g_fog_rain.n; i++) g_fog_rain.v[i] = vals[i];
 }
 const float *world_fog_values(void) { return g_fog.ok ? g_fog_rain.mix : NULL; }
+int world_fog_has_table(void) { return g_fog.ok; }

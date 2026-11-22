@@ -26793,6 +26793,14 @@ int main(int argc, char **argv) {
             {   /* CalculateFogInfo 0x614300: "Night Raining Fog" by the rain's intensity */
                 float rv[8]; int rn = rain_intensity() > 0.0f ? rain_fog_values(cam[0], cam[1], rv) : 0;
                 world_fog_set_rain(rain_intensity(), rn ? rv : NULL, rn);
+                /* The venue tracks (drag L4RB, drift L4RC, Street X L4RF, URL L4RG) carry
+                   Rain + "Night Raining Fog" but no "Normal Fog". CalculateFogInfo then
+                   returns before it sets the rain's tint colour (Rain +0x4edc, zeroed
+                   in the ctor 0x61e356), and slot 2's ((c/128 - 1) x I + 1) multiplied
+                   the frame by ~0.05 once it rained: a black screen with only lights
+                   and reflections (GitHub #31/#33, URL 4702). There the tint takes the
+                   rain fog's own colour (same values 2..4 the blend uses). */
+                if (rn >= 5 && !world_fog_has_table()) rain_set_fog_colour((int)rv[2], (int)rv[3], (int)rv[4]);
             }
             if (!old_fog && world_fog_eval(cam[0], cam[1], &fstart, &ffloor, frgb)) {
                 const float *fm = world_fog_values();   /* the rain's tint colour (Rain +0x4edc..): confirmed G2

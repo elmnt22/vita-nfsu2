@@ -412,5 +412,6 @@ int world_fog_eval(float x, float y, float *start, float *floor_f, float rgb[3])
 void world_fog_set_rain(float I, const float *vals, int n);
 /* the last evaluated (rain-mixed) raw fog values, NULL without a table */
 const float *world_fog_values(void);
+int world_fog_has_table(void);   /* the track has a "Normal Fog" table */
 
 #endif
