@@ -64,6 +64,7 @@ static void refresh_focus(int c);
 const char *xpp_city_name(int c) { return k_city[c].name; }
 const char *xpp_game_name(int c) { return k_city[c].game_name; }
 const char *xpp_bun(int c) { return k_city[c].bun; }
+int xpp_city_game(int c) { return k_city[c].game; }
 void xpp_set_out(const char *out) { snprintf(g_out, sizeof g_out, "%s", out); }
 void xpp_set_dir(int c, const char *dir) { snprintf(g_dir[c], sizeof g_dir[c], "%s", dir ? dir : ""); }
 int xpp_any_dir(void) { for (int c = 0; c < NCITY; c++) if (g_dir[c][0]) return 1; return 0; }

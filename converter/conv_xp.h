@@ -21,6 +21,7 @@ typedef struct {
 const char *xpp_city_name(int c);              /* "Rockport" */
 const char *xpp_game_name(int c);              /* "Need for Speed Most Wanted" */
 const char *xpp_bun(int c);                    /* "STREAML2RA" */
+int  xpp_city_game(int c);                     /* XP_GAME_* (the marker test, xp_marker_text_ok) */
 void xpp_set_out(const char *out);             /* the Prep Tool's output folder */
 void xpp_set_dir(int c, const char *dir);      /* "" = leave the city out */
 int  xpp_any_dir(void);

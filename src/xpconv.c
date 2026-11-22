@@ -1176,6 +1176,14 @@ int xp_marker_write(const char *marker_path, int game, long long source_size)
     int ok = fprintf(f, "xpconv %d %d %lld\n", XP_VERSION, game, source_size) > 0;
     return fclose(f) == 0 && ok;
 }
+int xp_marker_text_ok(const char *text, int game, long long source_size)
+{
+    if (!text || !text[0]) return -1;
+    int v = 0, g = 0; long long n = -1;
+    int got = sscanf(text, "xpconv %d %d %lld", &v, &g, &n);
+    int lo = game == XP_GAME_CARBON ? XP_MIN_CARBON : XP_MIN_MW;   /* V4: per game */
+    return got == 3 && v >= lo && v <= XP_VERSION && g == game && (source_size < 0 || n == source_size);
+}
 int xp_marker_ok(const char *marker_path, int game, long long source_size)
 {
     FILE *f = fopen(marker_path, "r"); if (!f) return 0;

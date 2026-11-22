@@ -27,6 +27,9 @@ int xp_convert(const char *in_path, const char *out_path, int game,
    any source, for a city sent from the PC tool without its raw files). */
 int xp_marker_write(const char *marker_path, int game, long long source_size);
 int xp_marker_ok(const char *marker_path, int game, long long source_size);
+/* the same test on a marker's text (the Prep Tool reads the Vita's over FTP): 1 ok, 0 too old /
+   another game / bad, -1 no text */
+int xp_marker_text_ok(const char *text, int game, long long source_size);
 long long xp_file_size(const char *path);
 /* The city's minimap (MW: TRACKS/L2RA/MINI_MAP.BIN) -> the game's BMAP file
    (hud_set_trackmap_file): 1024 px RGBA + its world window. */
