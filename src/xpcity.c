@@ -425,6 +425,8 @@ keep:
     return out;
 }
 
+static int g_failed[NCITY];   /* XF3: a translation that failed this session */
+static int g_known[NCITY], g_ok[NCITY];   /* xpcity_installed: the files do not change while the game runs */
 int xpcity_prepare(const char *troot, const char *track) {
     int c = city_of(track);
     if (c < 0) return 1;
@@ -444,6 +446,7 @@ int xpcity_prepare(const char *troot, const char *track) {
                   k_city[c].name, k_city[c].dir);
         return 0;
     }
+    if (g_failed[c]) { vita_mark("xpcity: %s failed to translate this session; not again until a restart", k_city[c].name); return 0; }
     vita_mark("xpcity: translating %s from %s (%lld bytes)", k_city[c].name, raw, raw_size);
     remove(mark);
     /* everything built from an older translation goes with it */
@@ -457,6 +460,12 @@ int xpcity_prepare(const char *troot, const char *track) {
     snprintf(p, sizeof p, "%s/ROUTES%s/RoutesFreeRoam.bin", troot, k_city[c].companion); remove(p);   /* road net: rebuilt below */
     snprintf(p, sizeof p, "%s/ROUTES%s/events.txt", troot, k_city[c].companion); remove(p);       /* race events too */
     snprintf(p, sizeof p, "%s/XPSMK%s.BUN", troot, k_city[c].companion); remove(p);              /* the props */
+    {   /* XF3 11-22: the minimap and its parts were kept from the old translation (make_map skips a map that is there) */
+        char q[1100];
+        snprintf(q, sizeof q, "%s/%s.MAP", troot, k_city[c].companion); remove(q);
+        snprintf(q, sizeof q, "%s/%s.SEA", troot, k_city[c].companion); remove(q);
+        for (int a = 0; a < 8; a++) { snprintf(q, sizeof q, "%s/%s_A%d.MAP", troot, k_city[c].companion, a); remove(q); }
+    }
     if (!g_window) {   /* graphics up early: the world load's own screens come later */
         vita_fast_clocks();
         SDL_Window *w = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
@@ -484,6 +493,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     vita_mark("xpcity: %s %s in %.1f s", k_city[c].name, ok ? "translated" : "FAILED", (SDL_GetTicks() - t0) / 1000.0);
     if (!ok) {
         remove(mark);
+        g_failed[c] = 1; g_known[c] = 0;   /* XF3: the picker stops offering it; no rerun on every pick */
         Uint32 e0 = SDL_GetTicks();
         while (SDL_GetTicks() - e0 < 5000) {
             vita_progress_screen(title, "COULD NOT TRANSLATE THE CITY", "SEE THE LOG. BACK TO BAYVIEW.", 0.0f);
@@ -507,26 +517,35 @@ int xpcity_enabled(void)
     }
     return on;
 }
+/* 1 usable (translated, or raw files to translate), 2 translated but too old for this
+   build and no raw files to translate again (V3: "run the Prep Tool again"), 0 none */
 static int city_ok(int c)
 {
-    if (!xpcity_enabled()) return 0;
+    if (!xpcity_enabled() || g_failed[c]) return 0;
     char a[256], b[256], m[256];
     snprintf(a, sizeof a, "ux0:data/NFSU2/TRACKS/%s.BUN", k_city[c].bun);
     snprintf(b, sizeof b, "ux0:data/NFSU2/TRACKS/%s.BUN", k_city[c].companion);
     snprintf(m, sizeof m, "ux0:data/NFSU2/TRACKS/%s.xp", k_city[c].bun);
-    if (xp_file_size(a) > 0 && xp_file_size(b) > 0 && xp_marker_ok(m, k_city[c].game, -1)) return 1;   /* translated */
+    int have = xp_file_size(a) > 0 && xp_file_size(b) > 0;
+    if (have && xp_marker_ok(m, k_city[c].game, -1)) return 1;   /* translated */
     snprintf(a, sizeof a, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
     snprintf(b, sizeof b, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
-    return xp_file_size(a) > 0 && xp_file_size(b) > 0;   /* raw: translated on the way in */
+    if (xp_file_size(a) > 0 && xp_file_size(b) > 0) return 1;   /* raw: translated on the way in */
+    if (have && xp_file_size(m) > 0) {
+        printf("xpcity: %s is translated for an older build (%s); the Prep Tool has to send it again%c", k_city[c].name, m, 10);
+        return 2;
+    }
+    return 0;
 }
-int xpcity_installed(int pick)
+static int city_state(int pick)
 {
-    static int known[NCITY], ok[NCITY];   /* the files do not change while the game runs */
     int c = pick - 1;
     if (c < 0 || c >= NCITY) return pick == 0;
-    if (!known[c]) { ok[c] = city_ok(c); known[c] = 1; }
-    return ok[c];
+    if (!g_known[c]) { g_ok[c] = city_ok(c); g_known[c] = 1; }
+    return g_ok[c];
 }
+int xpcity_installed(int pick) { return city_state(pick) != 0; }
+int xpcity_outdated(int pick) { return city_state(pick) == 2; }
 const char *xpcity_track(int pick) { return pick >= 1 && pick <= NCITY ? k_city[pick - 1].bun : NULL; }
 
 /* ---- race barriers (MW BARRIER_SPLINE_<n> groups; xpconv xp_companion) ----

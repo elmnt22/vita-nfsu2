@@ -14963,6 +14963,10 @@ static void venue_list_build(const char *troot, const char *stem) {
 }
 void vita_relaunch(void);
 static void venue_relaunch(const char *track, int ev_id) {
+    /* XF5 11-22: a city's own career (Start fresh) is saved to its file before the
+       process starts over -- the relaunch went without it (the main profile is not
+       written here: its save prompts stay the player's) */
+    if (profile_xf_city()) printf("venue: city career %s before the relaunch\n", profile_xf_save() ? "saved" : "NOT saved");
     FILE *f = fopen(VENUE_FILE, "w");
     if (f) { if (track) fprintf(f, "%s %d\n", track, ev_id); fclose(f); }
     if (!track) remove(VENUE_FILE);

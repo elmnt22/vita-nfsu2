@@ -28,6 +28,7 @@ void xpcity_race_map_prepare(const char *region, int event_id);   /* region: the
 const float *xpcity_race_route(const char *track, int event_id, int *n_out);
 /* the Free Run world picker: 0 Bayview, 1 Rockport, 2 Palmont */
 extern int g_xpcity_pick;
+int xpcity_outdated(int pick);           /* V3: translated for an older build, no raw files (the Prep Tool has to send it again) */
 int xpcity_installed(int pick);          /* translated or raw files there (Bayview: 1) */
 int xpcity_enabled(void);              /* ux0:data/NFSU2/expansion/enable.txt (the switch; the cities need it and their files) */
 const char *xpcity_track(int pick);      /* its stream name (STREAML2RA ...), Bayview NULL */

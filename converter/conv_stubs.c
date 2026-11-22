@@ -81,3 +81,4 @@ int g_xpcity_pick;
 int xpcity_is_city(const char *track) { (void)track; return 0; }
 const char *xpcity_map(const char *track) { (void)track; return NULL; }   /* world_tiles' sea mask: never reached (no city) */
 int xpcity_installed(int pick) { return pick == 0; }
+int xpcity_outdated(int pick) { (void)pick; return 0; }

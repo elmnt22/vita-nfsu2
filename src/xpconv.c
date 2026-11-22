@@ -1182,7 +1182,8 @@ int xp_marker_ok(const char *marker_path, int game, long long source_size)
     int v = 0, g = 0; long long n = -1;
     int got = fscanf(f, "xpconv %d %d %lld", &v, &g, &n);
     fclose(f);
-    return got == 3 && v == XP_VERSION && g == game && (source_size < 0 || n == source_size);
+    int lo = game == XP_GAME_CARBON ? XP_MIN_CARBON : XP_MIN_MW;   /* V4: per game */
+    return got == 3 && v >= lo && v <= XP_VERSION && g == game && (source_size < 0 || n == source_size);
 }
 
 /* ---- the companion stream (L2RA.BUN): MW's scenery groups -> UG2's ----

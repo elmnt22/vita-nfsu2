@@ -3,6 +3,9 @@
 #ifndef XPCONV_H
 #define XPCONV_H
 /* bumped whenever the translated output changes: an older marker = translate again */
+/* the oldest translation each game still takes (V4 11-22: 12 changed only the Rockport relight) */
+#define XP_MIN_MW     12
+#define XP_MIN_CARBON 11
 #define XP_VERSION 12   /* 12: brighter Rockport night relight, clamped (11-19), 11: Carbon vertex orders for effects 5/25/26 (11-19, rainbow building fronts), 10: per-submesh vertex compaction (11-18), 9: caches rebuilt for TRN_PANO as backdrop (11-18), 8: chunks padded to 4 bytes (11-18: odd index counts misaligned ~11k objects per city), 2: collision packs (11-17), 3: night prelight + lamp flares (11-18), 4: endless walls fitted to the ground (11-18), 5: road curve tangents (11-18, RoutesFreeRoam rebuilt), 6: race barrier groups (11-18: polygon group ids, companion group tables), 7: zero-padded barrier names */
 enum { XP_GAME_MW = 1, XP_GAME_CARBON = 2 };
 enum { XP_OK = 0, XP_ERR_OPEN_IN, XP_ERR_OPEN_OUT, XP_ERR_READ, XP_ERR_WRITE,

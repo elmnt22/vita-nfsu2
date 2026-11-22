@@ -8038,7 +8038,17 @@ static void crib_trip(Shop *s, int city) {
     if (profile_dirty()) { s->crib_play = 1; mc_enter(s, 0x151, SC_CRIB); }   /* CheckMemory first, like Play */
     else crib_play(s);
 }
+/* V3 11-22: a city translated for an older build stays in the picker with this */
+static int xp_outdated_msg(Shop *s, int city) {
+    if (!xpcity_outdated(city)) return 0;
+    static char t[200];
+    snprintf(t, sizeof t, "%s needs updating. Run the Prep Tool again and send the files to your Vita.",
+             city == 1 ? "Rockport" : "Palmont");
+    dialog_text(s, DLG_AUTO, 1, t, DA_NONE, 0, 0);
+    return 1;
+}
 static void crib_city(Shop *s, int city) {
+    if (xp_outdated_msg(s, city)) return;
     int was = xp_garage_choice(city);
     s->trip_city = city;
     char b[256];
@@ -9963,6 +9973,7 @@ static void dlg_act(Shop *s, int act) {
         s->dlg_sel = 0; dlg_focus(s);
         break;
     case DA_QR_BAYVIEW: case DA_QR_BEYOND: case DA_QR_ROCKPORT: case DA_QR_PALMONT:   /* Free Run: which world */
+        if (xp_outdated_msg(s, act == DA_QR_ROCKPORT ? 1 : act == DA_QR_PALMONT ? 2 : 0)) break;
         g_beyond_pick = act == DA_QR_BEYOND;
         g_xpcity_pick = act == DA_QR_ROCKPORT ? 1 : act == DA_QR_PALMONT ? 2 : 0;
         printf("quick race: Free Run in %s\n", g_beyond_pick ? "the World Expansion" : g_xpcity_pick == 1 ? "Rockport" :
