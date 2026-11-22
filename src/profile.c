@@ -143,6 +143,12 @@ static void put_block(Buf *b, const char tag[4], const void *p, long n) {
 /* World Expansion "Start fresh" (port): while a city's own career is in, the Bayview
    career (its CARR / CCAR blocks) waits here and is what the profile saves */
 static unsigned char *g_xf_car, *g_xf_cc; static long g_xf_carn, g_xf_ccn; static int g_xf_city, g_xf_wins;
+static unsigned char *xf_build(long *n);
+/* XF7 11-22: for the save check (snapshot / dirty / restore) the city career that is
+   in goes into the image too, as block XPCT (u32 city + its XPCITY file) -- without it
+   a fresh city's purchases and wins never made the profile "changed" (no save prompt).
+   Never in the saved file (the city career has its own). */
+static int g_ser_check;
 static unsigned char *serialize(long *len) {
     Buf b = {0};
     char nm[32]; memset(nm, 0, sizeof nm); memcpy(nm, g_name, sizeof nm - 1);
@@ -173,6 +179,16 @@ static unsigned char *serialize(long *len) {
     {   unsigned char tb[64];                        /* the port's trophies (trophy.c), not the original's */
         long tl = trophy_save(tb, sizeof tb);
         if (tl > 0) put_block(&b, "TRPH", tb, tl); }
+    if (g_ser_check && g_xf_city) {
+        long xn = 0; unsigned char *x = xf_build(&xn);
+        unsigned char *blk = x ? (unsigned char *)malloc((size_t)xn + 4) : NULL;
+        if (blk) {
+            uint32_t c = (uint32_t)g_xf_city;
+            memcpy(blk, &c, 4); memcpy(blk + 4, x, (size_t)xn);
+            put_block(&b, "XPCT", blk, xn + 4);
+        } else b.fail = 1;
+        free(blk); free(x);
+    }
     if (b.fail) {   /* a part missing: no save beats a save that loses it */
         printf("profile: out of memory while gathering the profile, not saved\n");
         free(b.p); *len = 0; return NULL;
@@ -182,8 +198,8 @@ static unsigned char *serialize(long *len) {
 }
 /* the blocks back into the working files; 1 ok */
 static int apply(const unsigned char *p, long n) {
-    const unsigned char *opt = NULL, *gar = NULL, *hs = NULL, *car = NULL, *cc = NULL, *tr = NULL;
-    long optn = 0, garn = 0, hsn = 0, carn = 0, ccn = 0, trn = 0;
+    const unsigned char *opt = NULL, *gar = NULL, *hs = NULL, *car = NULL, *cc = NULL, *tr = NULL, *xc = NULL;
+    long optn = 0, garn = 0, hsn = 0, carn = 0, ccn = 0, trn = 0, xcn = 0;
     for (long i = 0; i + 8 <= n; ) {
         uint32_t l; memcpy(&l, p + i + 4, 4);
         if (l > (uint32_t)(n - i - 8)) return 0;   /* unsigned: a huge l is no negative length */
@@ -194,6 +210,7 @@ static int apply(const unsigned char *p, long n) {
         else if (!memcmp(p + i, "CARR", 4)) { car = d; carn = l; }
         else if (!memcmp(p + i, "CCAR", 4)) { cc = d; ccn = l; }
         else if (!memcmp(p + i, "TRPH", 4)) { tr = d; trn = l; }
+        else if (!memcmp(p + i, "XPCT", 4)) { xc = d; xcn = l; }
         i += 8 + l;
     }
     /* (GitHub #3 S7) a career block of another size cannot be read: refuse the load
@@ -235,6 +252,17 @@ static int apply(const unsigned char *p, long n) {
             memcpy(a, car, (size_t)carn); memcpy(k, cc, (size_t)ccn);
             free(g_xf_car); free(g_xf_cc); g_xf_car = a; g_xf_cc = k; g_xf_carn = carn; g_xf_ccn = ccn;
         } else { free(a); free(k); }
+        /* XF7: a check image of this city's career (a cancelled "lose changes") puts it back */
+        if (xc && xcn >= 20) {
+            uint32_t c; memcpy(&c, xc, 4);
+            const unsigned char *x = xc + 4; long xn = xcn - 4;
+            uint32_t an, kn; memcpy(&an, x + 8, 4); memcpy(&kn, x + 12, 4);
+            if ((int)c == g_xf_city && !memcmp(x, "XPF1", 4) && 16 + (long)an + (long)kn == xn &&
+                career_load(x + 16, (long)an) && career_cars_load(x + 16 + an, (long)kn)) {
+                uint32_t w; memcpy(&w, x + 4, 4); g_xf_wins = (int)w;
+                printf("xp fresh: city %d career put back as it was\n", g_xf_city);
+            }
+        }
     } else {
     if (!car || !career_load(car, carn)) career_default();
     if (cc && !career_cars_load(cc, ccn)) printf("profile: career cars from another build, defaulted\n");
@@ -532,6 +560,21 @@ int profile_delete(const char *name) {
     {   char x[320];
         snprintf(x, sizeof x, "%s.savebak", path); if (remove(x) == 0) ok = 1;
         snprintf(x, sizeof x, "%s.tmp", path); remove(x); }
+    /* XF4 11-22: the rest of the folder too (XPCITY<n> city careers, XPPROG* race
+       progress, their .savebak / .tmp) -- left there, a new profile of the same name
+       took up the deleted one's city careers */
+    if (ok) {
+        DIR *d = opendir(dir);
+        struct dirent *e;
+        while (d && (e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            char x[600];
+            snprintf(x, sizeof x, "%s/%s", dir, e->d_name);
+            if (remove(x) == 0) printf("profile: %s removed with it\n", e->d_name);
+        }
+        if (d) closedir(d);
+        if (g_xf_unsaved && !strcmp(g_xf_unsaved_name, name)) xf_unsaved_drop();
+    }
     rmdir(dir);
     if (ok && g_named && !strcmp(name, g_name)) profile_default();
     printf("profile: %s %s\n", ok ? "deleted" : "cannot delete", name);
@@ -550,12 +593,17 @@ void profile_default(void) {
 
 int profile_snapshot(void) {
     free(g_snap);
+    g_ser_check = 1;
     g_snap = serialize(&g_snaplen);
+    g_ser_check = 0;
     return g_snap != NULL;
 }
 int profile_dirty(void) {
     if (!g_snap) return 0;
-    long n; unsigned char *b = serialize(&n);
+    long n;
+    g_ser_check = 1;
+    unsigned char *b = serialize(&n);
+    g_ser_check = 0;
     int d = !b || n != g_snaplen || memcmp(b, g_snap, (size_t)n);
     free(b);
     return d;

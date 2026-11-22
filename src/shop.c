@@ -7747,7 +7747,8 @@ static void mc_answer(Shop *s, int yes) {
             snprintf(nm, sizeof nm, "%s", s->mc_names[s->mc_lsel]);
             int cur = profile_named() && !strcmp(nm, profile_name());
             if (profile_delete(nm)) {
-                if (cur) s->mc_changed = 1;                /* DeleteDone 0x4c6330: unnamed, defaults */
+                xp_garage_forget(nm);                      /* XF4: its Share / Start fresh answers too */
+                if (cur) s->mc_changed = 1;               /* DeleteDone 0x4c6330: unnamed, defaults */
                 mc_rmc(s, RM_DELETED, 13, nm, 1);          /* "Saved game deleted." */
             } else mc_rmc(s, RM_DELETE_FAIL, 14, nm, 1);   /* "Unable to delete %1." */
             break;
@@ -7951,12 +7952,20 @@ static void crib_play(Shop *s) {
    "Share Your Garage?" -- the answer per profile in ux0:data/NFSU2/xpgarage.txt,
    lines "<city> <share> <profile name>" ---- */
 #define XP_GARAGE_FILE "ux0:data/NFSU2/xpgarage.txt"
-int xp_garage_choice(int city) {
+/* XF8 11-22: an unnamed session's answers live only as long as the session (they used
+   to be saved under "", shared by every unnamed session) */
+static signed char g_xpg_unnamed[3] = { -1, -1, -1 };
+static FILE *xpg_open(void) {
     FILE *f = fopen(XP_GARAGE_FILE, "r");
     if (!f) {   /* S6: a write cut off between its remove and rename left the whole .tmp */
         if (rename(XP_GARAGE_FILE ".tmp", XP_GARAGE_FILE) == 0) printf("xp garage: restored from its .tmp\n");
         f = fopen(XP_GARAGE_FILE, "r");
     }
+    return f;
+}
+int xp_garage_choice(int city) {
+    if (!profile_named()) return city >= 1 && city <= 2 ? g_xpg_unnamed[city] : -1;
+    FILE *f = xpg_open();
     if (!f) return -1;
     char l[160]; int r = -1;
     const char *me = profile_name();
@@ -7969,31 +7978,59 @@ int xp_garage_choice(int city) {
     fclose(f);
     return r;
 }
-void xp_garage_choice_set(int city, int share) {
-    char lines[64][160]; int n = 0;
-    const char *me = profile_name();
-    FILE *f = fopen(XP_GARAGE_FILE, "r");
+/* the file again without the lines of `name` (city 0: every city), plus `add` if given;
+   any number of lines (XF8: it stopped at 63) */
+static void xpg_rewrite(const char *name, int city, const char *add) {
+    char *keep = NULL; size_t kn = 0, kcap = 0;
+    FILE *f = xpg_open();
+    int dropped = 0;
     if (f) {
         char l[160];
-        while (n < 63 && fgets(l, sizeof l, f)) {
+        while (fgets(l, sizeof l, f)) {
             int c, sh, k = 0;
             if (sscanf(l, "%d %d %n", &c, &sh, &k) < 2) continue;
             char nm[128]; snprintf(nm, sizeof nm, "%s", l + k); nm[strcspn(nm, "\r\n")] = 0;
-            if (c == city && !strcmp(nm, me)) continue;
-            snprintf(lines[n++], sizeof lines[0], "%s", l);
+            if ((city == 0 || c == city) && !strcmp(nm, name)) { dropped++; continue; }
+            size_t ln = strlen(l);
+            if (ln == sizeof l - 1 && l[ln - 1] != '\n') {   /* longer than any real entry: skip the rest of it */
+                int ch; while ((ch = fgetc(f)) != EOF && ch != '\n') {}
+                continue;
+            }
+            if (!ln || l[ln - 1] != '\n') { if (ln + 1 < sizeof l) { l[ln++] = '\n'; l[ln] = 0; } }   /* the last line without one */
+            if (kn + ln + 1 > kcap) {
+                size_t nc = kcap ? kcap * 2 : 1024;
+                while (nc < kn + ln + 1) nc *= 2;
+                char *t = (char *)realloc(keep, nc);
+                if (!t) { free(keep); fclose(f); printf("xp garage: out of memory, %s not written\n", XP_GARAGE_FILE); return; }
+                keep = t; kcap = nc;
+            }
+            memcpy(keep + kn, l, ln); kn += ln;
         }
         fclose(f);
     }
-    snprintf(lines[n++], sizeof lines[0], "%d %d %s\n", city, share ? 1 : 0, me);
+    if (!add && !dropped) { free(keep); return; }   /* nothing to change */
     /* S6 11-20: written whole to .tmp, then swapped in -- a cut-off write lost
        every profile's Share / Start fresh choice */
     char tmp[300]; snprintf(tmp, sizeof tmp, "%s.tmp", XP_GARAGE_FILE);
-    if (!(f = fopen(tmp, "w"))) { printf("xp garage: %s not written\n", XP_GARAGE_FILE); return; }
+    if (!(f = fopen(tmp, "w"))) { free(keep); printf("xp garage: %s not written\n", XP_GARAGE_FILE); return; }
     int ok = 1;
-    for (int i = 0; i < n; i++) if (fputs(lines[i], f) < 0) ok = 0;
+    if (kn && fwrite(keep, 1, kn, f) != kn) ok = 0;
+    if (add && fputs(add, f) < 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
+    free(keep);
     if (ok) { remove(XP_GARAGE_FILE); ok = rename(tmp, XP_GARAGE_FILE) == 0; }
     if (!ok) { remove(tmp); printf("xp garage: %s not written\n", XP_GARAGE_FILE); }
+    else if (!add) printf("xp garage: %d answer(s) of %s removed\n", dropped, name);
+}
+void xp_garage_choice_set(int city, int share) {
+    if (!profile_named()) { if (city >= 1 && city <= 2) g_xpg_unnamed[city] = (signed char)(share ? 1 : 0); return; }
+    char add[160];
+    snprintf(add, sizeof add, "%d %d %s\n", city, share ? 1 : 0, profile_name());
+    xpg_rewrite(profile_name(), city, add);
+}
+/* XF4 11-22: a deleted profile's answers go with it (a new profile of that name asks again) */
+void xp_garage_forget(const char *name) {
+    if (name && name[0]) xpg_rewrite(name, 0, NULL);
 }
 static void crib_trip(Shop *s, int city) {
     s->trip_city = city;

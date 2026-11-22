@@ -215,6 +215,7 @@ int   shop_trip_share(const Shop *s);
 /* the profile's "Share Your Garage?" answer for a city: 1 share, 0 start fresh, -1 not asked */
 int   xp_garage_choice(int city);
 void  xp_garage_choice_set(int city, int share);
+void  xp_garage_forget(const char *name);   /* XF4: a deleted profile's answers */
 /* the UniquesBrowser ended the world challenge (a part chosen or forfeited): the save is due */
 int   shop_uniques_done(const Shop *s);
 float shop_rate(const Shop *s, const N2CarConfig *c, const char *rim_folder, int rim_style);   /* 0x5234c0 */
