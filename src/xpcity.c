@@ -142,14 +142,17 @@ static void make_events(int c, const char *troot)
     snprintf(ev, sizeof ev, "%s/mmroute.bin", dir);                  /* + Carbon's minimap routes (11-19) */
     have_shops = have_shops && xp_file_size(ev) > 0;
     snprintf(ev, sizeof ev, "%s/events.txt", dir);
-    if (have_shops && xp_file_size(ev) > 0) return;
+    int have = have_shops && xp_file_size(ev) > 0;
+    if (have && xp_events_current(dir)) return;
     snprintf(gp, sizeof gp, XP_RAW_ROOT "/%s/GLOBAL/gameplay.bin", k_city[c].dir);
     snprintf(rawc, sizeof rawc, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
     snprintf(raws, sizeof raws, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
     if (xp_file_size(gp) <= 0 || xp_file_size(rawc) <= 0 || xp_file_size(raws) <= 0) {
-        vita_mark("xpcity: no race events for %s (no raw gameplay.bin / %s / %s)", k_city[c].name, k_city[c].companion, k_city[c].bun);
+        if (have) vita_mark("xpcity: %s race events are an older set (no raw files to make them again; the Prep Tool sends new ones)", k_city[c].name);
+        else vita_mark("xpcity: no race events for %s (no raw gameplay.bin / %s / %s)", k_city[c].name, k_city[c].companion, k_city[c].bun);
         return;
     }
+    if (have) remove(ev);   /* WW2: an older set -- made again (a failed run leaves none, as before) */
     mkdir(dir, 0777);
     char title[64]; snprintf(title, sizeof title, "PREPARING %s", k_city[c].name);
     if (g_window) vita_progress_screen(title, "BUILDING THE RACES", "ONE TIME ONLY", 0.0f);

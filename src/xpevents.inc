@@ -687,8 +687,13 @@ static void blocked_lanes(const G *g, const Grid *G2, const BSeg *s, int ns, int
     }
 }
 
+#ifndef XPEV_TRACE   /* a test harness's look at each route's lane chain (compiled out) */
+#define XPEV_TRACE(...) ((void)0)
+#endif
 /* ---- the lane chain (one Dijkstra over (lane, waypoints passed)) ---- */
 #define BLOCK 5000.0
+#define UTURN_COST 8000.0   /* WW2: a turn round through a short connector (a dead end still can) */
+#define UTURN_COS (-0.866)  /* 150 degrees */
 typedef struct { double d; int a, k; } HE;
 typedef struct { HE *v; int n, cap; } Heap;
 static int he_less(const HE *x, const HE *y) { return x->d != y->d ? x->d < y->d : x->a != y->a ? x->a < y->a : x->k < y->k; }
@@ -711,7 +716,7 @@ static HE heap_pop(Heap *h)
     if (h->n) h->v[i] = e;
     return top;
 }
-typedef struct { const G *g; const Grid *grid; double *dist; int *prev; int *touched; int ntouched; unsigned char *W; Heap heap; NLs nl; } ChainCtx;
+typedef struct { const G *g; const Grid *grid; double *dist; int *prev; int *touched; int ntouched; unsigned char *W; Heap heap; NLs nl; int uturn; } ChainCtx;
 static int nl_cmp(const void *x, const void *y) { const NL *a = x, *b = y; return (a->d > b->d) - (a->d < b->d); }
 /* the chain (lanes) into *out / *nout; 0 none, -1 out of memory. blk: stamp/tag, or NULL */
 static int chain(ChainCtx *C, const Race *r, const int *stamp, int tag, int **out, int *nout)
@@ -750,10 +755,23 @@ static int chain(ChainCtx *C, const Race *r, const int *stamp, int tag, int **ou
             if (e.d > C->dist[sa]) continue;
             if (e.k == n - 1 && (!circ || e.a == s) && sa != st0) { goal = sa; break; }
             if (best && e.d >= best_d) break;
+            /* WW2 11-22: the way the car comes in -- its heading some 30 m back (connectors of
+               3-20 m between a road's two sides, or a teardrop of them, are no heading) */
+            double ui[2] = { 0, 0 }, acc = 0; int hin = 0;
+            for (int x = sa, step = 0; C->uturn && x >= 0 && step < 8 && !hin; x = C->prev[x], step++) {
+                const Lane *q = &g->l[x / n];
+                acc += q->len;
+                if (acc < 30.0 || q->pts.n < 2) continue;
+                dunit(lpt(g, x / n, q->pts.n - 2), lpt(g, x / n, q->pts.n - 1), ui); hin = 1;
+            }
             for (int j = 0; j < g->nsucc[e.a]; j++) {
                 int bl = g->succ[e.a][j], kk = e.k;
                 while (kk + 1 < n && C->W[(size_t)(kk + 1) * nl + bl]) kk++;
                 double nd = e.d + g->l[bl].len + (stamp && stamp[bl] == tag ? BLOCK : 0.0);
+                if (C->uturn && hin && g->l[bl].pts.n >= 2) {   /* turning round onto the road's other side: a U-turn */
+                    double uo[2]; dunit(lpt(g, bl, 0), lpt(g, bl, 1), uo);
+                    if (ui[0] * uo[0] + ui[1] * uo[1] < UTURN_COS) nd += UTURN_COST;
+                }
                 int sb = bl * n + kk;
                 if (nd < C->dist[sb]) {
                     if (C->dist[sb] >= 1e18) C->touched[C->ntouched++] = sb;
@@ -781,6 +799,21 @@ static int has_repeat(const int *c, int n, unsigned char *mark)
     for (int i = 0; i < n; i++) { if (mark[c[i]]) rep = 1; mark[c[i]] = 1; }
     for (int i = 0; i < n; i++) mark[c[i]] = 0;
     return rep;
+}
+/* a race's lane chain the format holds: round its barriers, else the plain shortest one
+   (*fb = 1). 1 ok, 0 none (skipped), -1 out of memory */
+static int route_chain(ChainCtx *C, const Race *r, const int *stamp, int rt, unsigned char *mark, int **out, int *nout, int *fb)
+{
+    int *ch = NULL, nch = 0, x = chain(C, r, stamp, rt, &ch, &nch);
+    *out = NULL; *nout = 0; *fb = 0;
+    if (x < 0) return -1;
+    if (!x || has_repeat(ch, nch, mark)) {
+        free(ch); ch = NULL;
+        x = chain(C, r, NULL, 0, &ch, &nch); *fb = 1;
+        if (x < 0) return -1;
+    }
+    if (!ch || !nch || has_repeat(ch, nch, mark)) { free(ch); return 0; }
+    *out = ch; *nout = nch; return 1;
 }
 
 /* ---- the chain as polylines (writers.section_polylines), unkink, recut ---- */
@@ -1448,6 +1481,13 @@ static int mr_race(Mr *m, const Race *rc, float **out, int *nout, long *nfail)
     return 1;
 }
 
+int xp_events_current(const char *routes_dir)
+{
+    char p[600]; snprintf(p, sizeof p, "%s/evver.txt", routes_dir);
+    FILE *f = fopen(p, "r"); int v = 0;
+    if (f) { if (fscanf(f, "%d", &v) != 1) v = 0; fclose(f); }
+    return v == XP_EVENTS_VERSION;
+}
 int xp_events(const char *gameplay_bin, const char *raw_companion, const char *raw_stream,
               const char *out_dir, int game, const char *city, int first_id, XpEventStats *st)
 {
@@ -1507,16 +1547,24 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
             const BSeg *s; int ns;
             for (int w = 0; bar_segs(&B, r->bar[b], &s, &ns, w); w++) blocked_lanes(&g, &grid, s, ns, stamp, rt, seen, &seentag);
         }
-        int *ch = NULL, nch = 0, x = chain(&C, r, stamp, rt, &ch, &nch);
+        /* WW2 11-22: which races exist (and so every event id after them) stays as the first
+           sets had it -- found without the U-turn cost; the route itself is the U-turn-free
+           one when that is whole too */
+        int *ch = NULL, nch = 0, fb = 0, x;
+        C.uturn = 0;
+        x = route_chain(&C, r, stamp, rt, mark, &ch, &nch, &fb);
         if (x < 0) goto done;
-        if (!x || has_repeat(ch, nch, mark)) {     /* no way round its barriers the format holds: the plain shortest one */
-            free(ch); ch = NULL;
-            x = chain(&C, r, NULL, 0, &ch, &nch); st->fallback++;
-            if (x < 0) goto done;
+        if (!x) { st->skipped++; continue; }
+        {
+            int *ch2 = NULL, nch2 = 0, fb2 = 0;
+            C.uturn = 1;
+            int x2 = route_chain(&C, r, stamp, rt, mark, &ch2, &nch2, &fb2);
+            if (x2 < 0) { free(ch); goto done; }
+            if (x2 > 0) { free(ch); ch = ch2; nch = nch2; fb = fb2; }
         }
+        st->fallback += fb;
         int thru = 0; for (int i = 0; ch && i < nch; i++) thru += stamp[ch[i]] == rt;
         if (thru) st->through++;
-        if (!ch || !nch || has_repeat(ch, nch, mark)) { free(ch); st->skipped++; continue; }
         int closed = r->closed;
         if (!recut(&g, ch, nch, closed, &g2) || !g2.n) { free(ch); if (!g2.n) { st->skipped++; continue; } goto done; }
         const DPoly **pc = malloc((size_t)g2.n * sizeof *pc);
@@ -1529,6 +1577,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         uint8_t *rec = recs + 0x110 * (size_t)nm;
         x = paths_bin(&S, ev, closed, &part, rec);
         if (x <= 0) { free(ch); if (!x) goto done; st->skipped++; continue; }
+        XPEV_TRACE(ev, r, &g, ch, nch, stamp, rt, &C);
         double L = 0; for (int s = 0; s < S.n; s++) L += poly_len(&S.v[s]);
         double l100 = pyround(L / 100); rec[5] = (uint8_t)(l100 > 255 ? 255 : l100);
         char p[600]; snprintf(p, sizeof p, "%s/Paths%d.bin", out_dir, ev);
@@ -1663,6 +1712,12 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         if (fmo && fclose(fmo)) okw = 0;
         if (fg && fclose(fg)) okw = 0;
         if (fn && fclose(fn)) okw = 0;
+        if (okw) {   /* last: the set is whole at this version */
+            char vp[600]; snprintf(vp, sizeof vp, "%s/evver.txt", out_dir);
+            FILE *fv = fopen(vp, "w");
+            okw = fv && fprintf(fv, "%d%c", XP_EVENTS_VERSION, 10) > 0;
+            if (fv && fclose(fv)) okw = 0;
+        }
         rc = okw ? XP_OK : XP_ERR_WRITE;
     }
 done:

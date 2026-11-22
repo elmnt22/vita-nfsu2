@@ -48,6 +48,11 @@ int xp_companion(const char *in_path, const char *out_path, int game);
    (STREAML2RA.BUN, for the race barrier walls). */
 typedef struct { long races, events, circuits, sprints, drags, drifts, fallback, through, skipped, dropped,
                  barriers_on, barriers_off, barrier_segs, shops; } XpEventStats;
+/* the race events' own version (ROUTES<region>/evver.txt, written last by xp_events): an
+   older set is made again from the raw files -- the city's translation stays (WW2 11-22:
+   2 = routes without U-turns; event ids unchanged) */
+#define XP_EVENTS_VERSION 2
+int xp_events_current(const char *routes_dir);
 int xp_events(const char *gameplay_bin, const char *raw_companion, const char *raw_stream,
               const char *out_dir, int game, const char *city, int first_id, XpEventStats *stats);
 

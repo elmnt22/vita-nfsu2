@@ -196,6 +196,8 @@ int xpp_city_done(int c) {   /* translated + tiles + compact bundle + skyline */
     char f[MAX_PATH + 96];
     snprintf(f, sizeof f, "%s\\stage\\TRACKS\\ROUTES%s\\names.txt", g_out, k_city[c].companion);
     if (!file_exists(f)) return 0;
+    snprintf(f, sizeof f, "%s\\stage\\TRACKS\\ROUTES%s", g_out, k_city[c].companion);
+    if (!xp_events_current(f)) return 0;   /* WW2: an older race set (made again by Convert) */
     if (k_city[c].game == XP_GAME_CARBON) {
         snprintf(f, sizeof f, "%s\\stage\\TRACKS\\ROUTES%s\\mmroute.bin", g_out, k_city[c].companion); if (!file_exists(f)) return 0;
         snprintf(f, sizeof f, "%s\\stage\\TRACKS\\%s.SEA", g_out, k_city[c].companion); if (!file_exists(f)) return 0;
@@ -337,7 +339,7 @@ int xpp_convert(XppJob *job, int ask_on_bad, HWND owner) {
             snprintf(rdir, sizeof rdir, "%s\\stage\\TRACKS\\ROUTES%s", g_out, k_city[c].companion);
             snprintf(np, sizeof np, "%s\\names.txt", rdir);
             snprintf(mp, sizeof mp, "%s\\mmroute.bin", rdir);
-            if (!file_exists(np) || (k_city[c].game == XP_GAME_CARBON && !file_exists(mp))) {
+            if (!file_exists(np) || !xp_events_current(rdir) || (k_city[c].game == XP_GAME_CARBON && !file_exists(mp))) {
                 char csrc[MAX_PATH + 64], gp[MAX_PATH + 64]; XpEventStats es;
                 snprintf(csrc, sizeof csrc, "%s\\TRACKS\\%s.BUN", g_dir[c], k_city[c].companion);
                 snprintf(gp, sizeof gp, "%s\\GLOBAL\\gameplay.bin", g_dir[c]);
@@ -451,7 +453,7 @@ static int send_events(XppSendFn add, void *ud, int n, int cap, int c) {
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    static const char *const k_txt[] = { "starts.txt", "barriers.txt", "shops.txt", "trackpoly.bin", "modes.txt", "gates.txt", "names.txt", "mmroute.bin", "events.txt" };
+    static const char *const k_txt[] = { "starts.txt", "barriers.txt", "shops.txt", "trackpoly.bin", "modes.txt", "gates.txt", "names.txt", "mmroute.bin", "evver.txt", "events.txt" };
     /* MW: each race's own map (MINI_MAP_<race>.BIN, copied at Convert; xpcity_race_map) */
     snprintf(pat, sizeof pat, "%s\\stage\\TRACKS\\RACEMAPS%s\\*.BIN", g_out, k_city[c].companion);
     {
