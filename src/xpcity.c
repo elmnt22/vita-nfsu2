@@ -18,6 +18,7 @@
 #include "xpconv.h"
 #include "xpcity.h"
 #include "skyline.h"
+#include "beyond.h"
 #include "world_tiles.h"
 
 void vita_mark(const char *fmt, ...);
@@ -61,6 +62,7 @@ int xpcity_fixed_focus(const char *track, float xy[2]) {
 }
 const char *xpcity_region(const char *track) { int c = city_of(track); return c >= 0 ? k_city[c].bun + 6 : NULL; }
 
+static char g_bar_region[16] = "";   /* the race barriers' region (read below); "" = read again */
 static int g_window;
 int xpcity_window_made(void) { return g_window; }
 
@@ -157,6 +159,7 @@ static void make_events(int c, const char *troot)
     int rc = xp_events(gp, rawc, raws, dir, k_city[c].game, k_city[c].name[0] == 'R' ? "Rockport" : "Palmont",
                        k_city[c].game == XP_GAME_CARBON ? 7601 : 7301, &st);
     if (rc != XP_OK) remove(ev);
+    else { beyond_events_reload(); g_bar_region[0] = 0; }   /* XF2: the new set (and barriers), not none until a restart */
     vita_mark("xpcity: race events %s: %s in %.1f s (%ld MW races -> %ld events: %ld circuits %ld sprints %ld drags, %ld skipped, "
               "%ld dropped; barriers %ld on %ld off)", dir, rc == XP_OK ? "made" : "FAILED", (SDL_GetTicks() - t0) / 1000.0,
               st.races, st.events, st.circuits, st.sprints, st.drags, st.skipped, st.dropped, st.barriers_on, st.barriers_off);
@@ -558,7 +561,6 @@ typedef struct { int ev, first, n; } XpBarEv;
 static XpBarEv *g_bar_ev; static int g_bar_nev;
 static char (*g_bar_nm)[24]; static int g_bar_nnm;
 static unsigned char *g_bar_flip;   /* per name: '*' */
-static char g_bar_region[16] = "";
 static const XpBarEv *bar_find(int event)
 {
     for (int i = 0; i < g_bar_nev; i++) if (g_bar_ev[i].ev == event) return &g_bar_ev[i];

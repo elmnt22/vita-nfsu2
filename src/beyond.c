@@ -275,6 +275,9 @@ static void bx_events_load(void) {
         bx_events_set(d, xp[k]);
     }
 }
+/* XF2 11-22: a city's events made on the device mid-session (xpcity make_events): read
+   again on the next look (they were read once per session: none until a restart) */
+void beyond_events_reload(void) { g_bx_nev = -1; g_bx_nview = -1; g_bx_nshop = -1; }
 static void bx_view(void) {
     bx_events_load();
     if (g_bx_nview >= 0) return;

@@ -40,6 +40,7 @@ int beyond_event_count(void);
 /* every set (the World Expansion's + each expansion city's): i < 0 returns the count; stem
    "BEYOND", "L2RA" (Rockport), "L5RA" (Palmont) */
 int beyond_event_all(int i, int *id, int *type, int *len_m, const char **stem);
+void beyond_events_reload(void);               /* XF2: the event files changed (a city translated mid-session) */
 void beyond_events_select(const char *stem);   /* the set the free-roam calls see (NULL: BEYOND) */
 int beyond_event_at(int i, int *id, int *type, int *len_m);
 int beyond_event_type(int id);                 /* -1: not a Beyond event */

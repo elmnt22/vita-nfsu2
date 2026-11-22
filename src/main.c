@@ -5334,7 +5334,52 @@ static void n2_fill_ride(PhysRideState *r)
    drawn from the AiCar slots RT_K0.. with their own models. */
 static unsigned char g_ai_blob[2784], g_ai_curves[1072];   /* GLOBALB 0x34b00, 0x34a33 */
 static unsigned char *g_ai_races; static int g_ai_nraces;    /* GLOBALB 0x34201 */
+static int g_ai_nretail;   /* the retail records before the expansion's (ai_beyond_records) */
 static int g_ai_have;
+/* the World Expansion's + the expansion cities' events as track records (Quick Race lists,
+   race setup); XF2 11-22: again after a city's events were made mid-session -- only the ids
+   not there yet (shop.c keeps the array: handed over again when it moved) */
+static void ai_beyond_records(void)
+{
+    int nall = beyond_event_all(-1, NULL, NULL, NULL, NULL);
+    if (!g_ai_races || nall <= 0) return;
+    int nb = 0;
+    for (int k = 0; k < nall; k++) {
+        int id = 0; beyond_event_all(k, &id, NULL, NULL, NULL);
+        int have = 0;
+        for (int i = g_ai_nretail; i < g_ai_nraces && !have; i++)
+            have = (int)(int16_t)(g_ai_races[i * 0x128 + 0x8a] | g_ai_races[i * 0x128 + 0x8b] << 8) == (int)(int16_t)id;
+        if (!have) nb++;
+    }
+    if (!nb) return;
+    unsigned char *t = (unsigned char *)realloc(g_ai_races, (size_t)(g_ai_nraces + nb) * 0x128);
+    if (!t) { printf("beyond: no memory for %d more track records%c", nb, 10); return; }
+    g_ai_races = t;
+    int added = 0;
+    for (int k = 0; k < nall && added < nb; k++) {
+        int id = 0, type = 0, len = 0; const char *bstem = "BEYOND";
+        beyond_event_all(k, &id, &type, &len, &bstem);
+        int have = 0;
+        for (int i = g_ai_nretail; i < g_ai_nraces + added && !have; i++)
+            have = (int)(int16_t)(g_ai_races[i * 0x128 + 0x8a] | g_ai_races[i * 0x128 + 0x8b] << 8) == (int)(int16_t)id;
+        if (have) continue;
+        unsigned char *r = g_ai_races + (size_t)(g_ai_nraces + added++) * 0x128;
+        memset(r, 0, 0x128);
+        snprintf((char *)r + 0x40, 8, "%s", bstem);                   /* the stem (STREAM<stem>) */
+        r[0x7c] = 5;                                                  /* the mode's own icon */
+        r[0x85] = type == AIRACE_SPRINT || type == AIRACE_DRAG;       /* point to point */
+        r[0x8a] = (unsigned char)id; r[0x8b] = (unsigned char)(id >> 8);
+        unsigned bit = type == AIRACE_CIRCUIT ? 0 : type == AIRACE_SPRINT ? 2 : type == AIRACE_DRAG ? 1
+                     : type == AIRACE_DRIFT ? 3 : type == AIRACE_URL ? 13 : 11;   /* the QR mode bits (0x4987c0) */
+        uint32_t m = 1u << bit;
+        memcpy(r + 0x94, &m, 4);
+        uint32_t L = (uint32_t)len; memcpy(r + 0x98, &L, 4);
+        r[0xf6] = 0xff;                                               /* no pre-race scene */
+    }
+    g_ai_nraces += added;
+    if (g_fe) shop_set_tracks(g_fe, g_ai_races, g_ai_nraces);
+    printf("beyond: %d race events added to the track records%c", added, 10);
+}
 static void ai_take_global(const unsigned char *g, long n)
 {
     int got = 0;
@@ -5344,35 +5389,11 @@ static void ai_take_global(const unsigned char *g, long n)
         else if (id == 0x34a33 && sz == sizeof g_ai_curves && i + 8 + (long)sz <= n) { memcpy(g_ai_curves, g + i + 8, sz); got |= 2; }
         else if (id == 0x34201 && sz % 0x128 == 0 && sz > 0x128 * 16 && i + 8 + (long)sz <= n && !g_ai_races) {
             g_ai_races = (unsigned char *)malloc(sz);
-            if (g_ai_races) { memcpy(g_ai_races, g + i + 8, sz); g_ai_nraces = (int)(sz / 0x128); got |= 4; }
+            if (g_ai_races) { memcpy(g_ai_races, g + i + 8, sz); g_ai_nraces = g_ai_nretail = (int)(sz / 0x128); got |= 4; }
         }
     }
     g_ai_have = got == 7;
-    if (g_ai_races && beyond_event_all(-1, NULL, NULL, NULL, NULL) > 0) {   /* the World Expansion's + the expansion cities' events as track records (Quick Race lists, race setup) */
-        int nb = beyond_event_all(-1, NULL, NULL, NULL, NULL);
-        unsigned char *t = (unsigned char *)realloc(g_ai_races, (size_t)(g_ai_nraces + nb) * 0x128);
-        if (t) {
-            g_ai_races = t;
-            for (int k = 0; k < nb; k++) {
-                int id = 0, type = 0, len = 0; const char *bstem = "BEYOND";
-                beyond_event_all(k, &id, &type, &len, &bstem);
-                unsigned char *r = g_ai_races + (size_t)(g_ai_nraces + k) * 0x128;
-                memset(r, 0, 0x128);
-                snprintf((char *)r + 0x40, 8, "%s", bstem);                   /* the stem (STREAM<stem>) */
-                r[0x7c] = 5;                                                  /* the mode's own icon */
-                r[0x85] = type == AIRACE_SPRINT || type == AIRACE_DRAG;       /* point to point */
-                r[0x8a] = (unsigned char)id; r[0x8b] = (unsigned char)(id >> 8);
-                unsigned bit = type == AIRACE_CIRCUIT ? 0 : type == AIRACE_SPRINT ? 2 : type == AIRACE_DRAG ? 1
-                             : type == AIRACE_DRIFT ? 3 : type == AIRACE_URL ? 13 : 11;   /* the QR mode bits (0x4987c0) */
-                uint32_t m = 1u << bit;
-                memcpy(r + 0x94, &m, 4);
-                uint32_t L = (uint32_t)len; memcpy(r + 0x98, &L, 4);
-                r[0xf6] = 0xff;                                               /* no pre-race scene */
-            }
-            g_ai_nraces += nb;
-            printf("beyond: %d race events added to the track records%c", nb, 10);
-        }
-    }
+    ai_beyond_records();
     int perf = perf_init(g, n), types = airace_types_init(g, n);
     int races = airace_races_init(g, n), moments = style_init(g, n);
     career_init(g, n);
@@ -21425,6 +21446,7 @@ int main(int argc, char **argv) {
                 vita_mark("track switch: %s could not be prepared -- the city instead", next_track);
                 next_track = "STREAML4RA"; next_ev = 0;
             }
+            if (xpcity_is_city(next_track)) ai_beyond_records();   /* XF2: its events made just now */
             xpcity_barriers_select(troot, next_track);   /* before the build: the scenery selection hides the MW race barriers */
             vita_heap_report("switch: old track freed");
             Hud *sw_ls = NULL;
