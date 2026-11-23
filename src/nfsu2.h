@@ -1869,6 +1869,10 @@ static void n2_car_mesh_name(const unsigned char *d,long beg,long end,char out[6
                name always has a separator; do not promote that token into a
                mesh name and accidentally render every unselected KITW body. */
             if(j-i>=5 && memchr(p+i,'_',(size_t)(j-i))) {
+                /* GitHub #41: a name that starts with digits (240SX_, 350Z_, 3000GT_) -- the
+                   leading digits too, when a NUL (or the leaf start) is before them */
+                long b=i; while(b>0 && p[b-1]>='0' && p[b-1]<='9')b--;
+                if(b<i && (b==0 || p[b-1]==0))i=b;
                 int n=j-i<63?(int)(j-i):63;memcpy(out,p+i,(size_t)n);out[n]=0;return;
             }
             i=j;
@@ -3306,7 +3310,10 @@ static int n2_open_wheel_backing(N2Scene *s, int mi) {
     if (!(inner>0 && inner<outer)) return 0;
     float bb[6]; n2_mesh_bbox(m,bb);
     float eps=outer*0.001f;
-    int face[2], nf=0;
+    /* GitHub #39: some hubs (O.Z. Superleggera) carry a second, smaller
+       coplanar backing card under the main one; collect up to 8 big flat
+       faces, the largest pair is the rectangle, the rest must lie inside it */
+    int face[8], nf=0; float farea[8];
     for (int j=0;j<m->nidx;j+=3) {
         for (int k=0;k<3;k++) if (m->idx[j+k]>=m->nverts) return 0;
         const float *a=m->verts+5*m->idx[j], *b=m->verts+5*m->idx[j+1],
@@ -3314,10 +3321,14 @@ static int n2_open_wheel_backing(N2Scene *s, int mi) {
         float area=(b[0]-a[0])*(c[2]-a[2])-(b[2]-a[2])*(c[0]-a[0]);
         if (fabsf(a[1]-b[1])>eps || fabsf(a[1]-c[1])>eps ||
             a[1]>bb[2]+0.05f*(bb[3]-bb[2]) || fabsf(area)<outer*outer) continue;
-        if (nf==2) return 0;
-        face[nf++]=j;
+        if (nf==8) return 0;
+        farea[nf]=fabsf(area); face[nf++]=j;
     }
-    if (nf!=2) return 0;
+    if (nf<2 || nf%2) return 0;
+    for (int i=1;i<nf;i++) for (int k=i;k>0 && farea[k]>farea[k-1];k--) {
+        float t=farea[k]; farea[k]=farea[k-1]; farea[k-1]=t;
+        int u=face[k]; face[k]=face[k-1]; face[k-1]=u;
+    }
     float lo[2]={1e30f,1e30f}, hi[2]={-1e30f,-1e30f};
     const float *a=m->verts+5*m->idx[face[0]], *b=m->verts+5*m->idx[face[0]+1],
                 *c=m->verts+5*m->idx[face[0]+2];
@@ -3344,11 +3355,16 @@ static int n2_open_wheel_backing(N2Scene *s, int mi) {
     }
     int shared=facecorners[0]&facecorners[1];
     if (corners!=15 || (shared!=6 && shared!=9)) return 0;
+    for (int f=2;f<nf;f++) for (int k=0;k<3;k++) {   /* extra cards: inside, same plane */
+        const float *v=m->verts+5*m->idx[face[f]+k];
+        if (fabsf(v[1]-a[1])>eps || v[0]<lo[0]-eps || v[0]>hi[0]+eps ||
+            v[2]<lo[1]-eps || v[2]>hi[1]+eps) return 0;
+    }
     outer=fminf(outer,fminf(fminf(-lo[0],hi[0]),fminf(-lo[1],hi[1])));
     /* The polygon's edges, not just its vertices, must clear the tyre opening. */
     inner/=cosf(3.14159265f/SEGMENTS);
     if (inner>=outer) return 0;
-    int nv=m->nverts+2*SEGMENTS, ni=m->nidx-6+6*SEGMENTS;
+    int nv=m->nverts+2*SEGMENTS, ni=m->nidx-3*nf+6*SEGMENTS;
     float *verts=(float *)malloc((size_t)nv*5*sizeof(float));
     uint16_t *idx=(uint16_t *)malloc((size_t)ni*sizeof(uint16_t));
     if (!verts || !idx) { free(verts); free(idx); return 0; }
@@ -3362,8 +3378,10 @@ static int n2_open_wheel_backing(N2Scene *s, int mi) {
             v[3+q]=(1-w)*((1-u)*uv[0][q]+u*uv[1][q])+w*((1-u)*uv[2][q]+u*uv[3][q]);
     }
     int n=0;
-    for (int j=0;j<m->nidx;j+=3) if (j!=face[0] && j!=face[1])
-        for (int k=0;k<3;k++) idx[n++]=m->idx[j+k];
+    for (int j=0;j<m->nidx;j+=3) {
+        int drop=0; for (int f=0;f<nf;f++) drop|=j==face[f];
+        if (!drop) for (int k=0;k<3;k++) idx[n++]=m->idx[j+k];
+    }
     for (int k=0;k<SEGMENTS;k++) {
         int p=m->nverts+2*k, q=m->nverts+2*((k+1)%SEGMENTS);
         const int tri[]={p,p+1,q+1,p,q+1,q};

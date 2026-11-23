@@ -144,7 +144,7 @@ static int n2_mod_attach(const char *root,const unsigned char *data,long len,
                          int slot,int value,N2Scene *car) {
     int lib=value/1000,cf=value%1000>=500,variant=value%500/100,style=value%100;
     if(!root || lib<1 || lib>9 || !style || variant>2 || slot!=n2_lib_slot(lib) || (lib!=5 && variant))return 0;
-    float sockets[2][16];int ns=0;
+    float sockets[2][16];int ns=0,side[2]={0,0};
     int mirror=lib>=N2_LIB_MIRROR0;
     const uint32_t keys[]={mirror?0x9b971511u:slot==N2_PART_SPOILER?0xc93b73fdu:   /* MIRROR_BODY_LEFT */
                            slot==N2_PART_SCOOP?0x90c81258u:0xbcf8a18bu,
@@ -152,6 +152,7 @@ static int n2_mod_attach(const char *root,const unsigned char *data,long len,
     for(int i=0;i<(slot==N2_PART_EXHAUST || mirror?2:1);i++) {
         int found=n2_car_socket(data,len,car,keys[i],sockets[ns]);
         if(found<0)return 0;
+        if(found)side[ns]=i;   /* which marker: a lone right one takes the right mirror */
         ns+=found;
     }
     if(!ns)return 0;
@@ -178,7 +179,7 @@ static int n2_mod_attach(const char *root,const unsigned char *data,long len,
     N2Mesh *grown=(N2Mesh *)realloc(car->meshes,(size_t)total*sizeof *grown);
     if(!grown){n2_free_scene(&part);return 0;}car->meshes=grown;car->cap=total;
     for(int k=0;k<ns;k++)for(int i=0;i<part.count;i++) {
-        if(mirror && part.meshes[i].inst!=k+1)continue;
+        if(mirror && part.meshes[i].inst!=side[k]+1)continue;
         N2Mesh *src=part.meshes+i,*dst=car->meshes+car->count++;
         *dst=*src;dst->inst=0;dst->car_source=0;dst->famkey=0;dst->car_part=(unsigned char)(slot+1);
         dst->verts=(float *)malloc((size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
@@ -186,7 +187,13 @@ static int n2_mod_attach(const char *root,const unsigned char *data,long len,
         if(!dst->verts || !dst->idx){n2_free_scene(&part);return 0;}
         memcpy(dst->verts,src->verts,(size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
         memcpy(dst->idx,src->idx,(size_t)src->nidx*sizeof(uint16_t));
-        n2_car_transform(dst,sockets[k],slot==N2_PART_EXHAUST);
+        float sk[16];memcpy(sk,sockets[k],sizeof sk);
+        if(mirror && src->inst==2) {   /* GitHub #38: the right mirror is modelled on its own side already --
+                                          a reflected MIRROR_BODY_RIGHT would turn it back into the pillar */
+            float det=sk[0]*(sk[5]*sk[10]-sk[6]*sk[9])-sk[4]*(sk[1]*sk[10]-sk[2]*sk[9])+sk[8]*(sk[1]*sk[6]-sk[2]*sk[5]);
+            if(det<0){sk[4]=-sk[4];sk[5]=-sk[5];sk[6]=-sk[6];}
+        }
+        n2_car_transform(dst,sk,slot==N2_PART_EXHAUST);
     }
     n2_free_scene(&part);return 1;
 }
