@@ -108,6 +108,7 @@ typedef struct {
     int tex;                   /* slot in g_tex, -1 none */
     int page;                  /* build: the vertex page; GPU names after upload */
     unsigned char reflect, mat_exact, glow;
+    int nv;                    /* vertices (sizing) */
 } RsMesh;
 
 struct RsSolid {
@@ -117,10 +118,25 @@ struct RsSolid {
     RsSolid *next;             /* hash chain */
 };
 
+/* 0x34103 instance / 0x34104 tree node, parsed once on the worker (the raw
+   records are unaligned little-endian bytes: reading them per frame was most
+   of the 2-3 ms cull on the Vita, hwlog84) */
+typedef struct {
+    float lo[3], hi[3];        /* world box */
+    float pos[3];              /* +0x20 */
+    int pre;                   /* +0x1c precull row, -1 none */
+    short info;                /* +0x18 */
+    unsigned short flags;      /* +0x1a */
+    short rot[9];              /* +0x2c, /8192 */
+} RsInst;
+typedef struct { float lo[3], hi[3]; short n, ch[5]; } RsNode;
 typedef struct {
     int number;
     int ninfo, ninst, nnode, npre;
     unsigned char *info, *inst, *node, *pre;   /* raw records, copied out */
+    RsInst *in; RsNode *nd;                    /* parsed */
+    float *infR;                               /* info +0x3c bounding radius */
+    unsigned char *hide; unsigned hide_gen;    /* group/prop hidden per instance, by g_sel_gen */
     RsSolid *(*model)[3]; unsigned gen;         /* resolved per info, by g_gen */
     RsSec *sec;
 } RsScen;
@@ -149,6 +165,11 @@ typedef struct { int nd, ne; int16_t d[16], e[8]; } RsLoad;
 
 /* texture table: fixed open addressing, never rehashed (slots are stable) */
 #define RS_TEXCAP 8192
+/* the worker stops decoding while this much decoded pixel data waits for its
+   upload: the main thread only uploads while the world draws, so a cold start
+   (X0's 846 textures under the loading screen) piled ~40 MB into the heap
+   (hwlog84: heap 114 of 115 MB, out-of-memory failures elsewhere) */
+#define RS_DEC_CAP (3L << 20)
 typedef struct {
     uint32_t key;
     int state;                 /* 0 empty, 1 queued, 2 decoded (CPU), 3 bound, 4 failed */
@@ -185,6 +206,8 @@ static struct {
     SDL_Thread *thr; int quit;
     /* stats */
     long st_draws, st_inst, st_frames, st_cull[8], st_tex_up, st_sec_up, st_unload;
+    /* decoded pixels waiting for the main thread's upload (state 2) */
+    volatile long dec_bytes; volatile int ndec; long dec_peak; long st_dec_wait_ms;
     double st_up_ms, st_draw_ms, st_upd_ms;
     Uint32 st_t0;
 } g;
@@ -192,6 +215,7 @@ static RsTex g_tex[RS_TEXCAP];
 static RsSolid *g_solhash[16384];
 static RsScen *g_hdr[RS_NUM];
 static unsigned g_gen = 1;
+static unsigned g_sel_gen = 1;   /* bumped when the scenery-group selection changes */
 static RsLock g_mx;
 
 static int rs_letter(int number) { return number / 100; }   /* 1 = A ... 24 = X, 25 = Y, 26 = Z */
@@ -317,6 +341,10 @@ static int rs_tex_slot(uint32_t key, int insert) {
    mesh draws exactly as in the tile build (spec 9.3 maps more blend types; kept
    to the tiles' rules for a like-for-like spike) */
 static unsigned char rs_tex_mode(const N2Tex *t) { return (unsigned char)n2_tex_mode(t); }
+static long rs_tex_bytes(const N2Tex *t) {
+    long px = (long)t->w * (long)t->h;
+    return (t->rgb ? px * 3 : 0) + (t->alpha ? px : 0) + (t->dxt ? t->dxtlen : 0);
+}
 /* worker: decode one queued key from the pinned bundle */
 static void rs_tex_decode(int slot) {
     RsTex *e = &g_tex[slot];
@@ -344,21 +372,27 @@ static void rs_tex_decode(int slot) {
 done:
     n2_tpk_keep_dxt = 0;
     rs_lock(&g_mx);
-    if (ok) { e->t = t; e->mode = rs_tex_mode(&t); e->order = t.order; e->state = 2; }
-    else e->state = 4;
+    if (ok) {
+        e->t = t; e->mode = rs_tex_mode(&t); e->order = t.order; e->state = 2;
+        g.dec_bytes += rs_tex_bytes(&t); g.ndec++;
+        if (g.dec_bytes > g.dec_peak) g.dec_peak = g.dec_bytes;
+    } else e->state = 4;
     rs_unlock(&g_mx);
 }
 /* main: upload decoded textures within the budget */
 static void rs_tex_upload(Uint64 deadline) {
+    if (!g.ndec) return;   /* nothing decoded: no 8192-slot walk */
     for (int i = 0; i < RS_TEXCAP; i++) {
         if (g_tex[i].state != 2) continue;
         if (SDL_GetPerformanceCounter() > deadline) return;
         RsTex *e = &g_tex[i];
         GLuint id = render_world_dxt_enabled() && e->t.dxt && e->t.dxtfmt
                   ? upload_tpk_texture_to_gpu(&e->t) : (e->t.rgb ? upload_tex(&e->t) : 0);
+        long nb = rs_tex_bytes(&e->t);
         free(e->t.rgb); free(e->t.alpha); free(e->t.dxt); memset(&e->t, 0, sizeof e->t);
         rs_lock(&g_mx);
         e->tex = id; e->state = id ? 3 : 4;
+        g.dec_bytes -= nb; g.ndec--;
         rs_unlock(&g_mx);
         g.st_tex_up++;
     }
@@ -440,7 +474,7 @@ static void rs_build_solid(RsBuild *B, long beg, long end) {
         free(nor);
         rm->b.ioff = (unsigned)(p->ni * 2);
         for (int t = 0; t < m->nidx; t++) p->ix[p->ni + t] = (uint16_t)(m->idx[t] + vb);
-        rm->b.index_count = m->nidx;
+        rm->b.index_count = m->nidx; rm->nv = m->nverts;
         rm->b.texkey = m->texkey;
         rm->b.nmesh = 1;
         p->nv += m->nverts; p->ni += m->nidx;
@@ -495,7 +529,30 @@ static void rs_build_scenery(RsBuild *B, long beg, long end) {
         free(sc->info); free(sc->inst); free(sc->node); free(sc->pre); return;
     }
     sc->model = calloc((size_t)sc->ninfo, sizeof *sc->model);
-    if (!sc->model) { free(sc->info); free(sc->inst); free(sc->node); free(sc->pre); return; }
+    sc->in = (RsInst *)malloc((size_t)sc->ninst * sizeof *sc->in);
+    sc->nd = sc->nnode ? (RsNode *)malloc((size_t)sc->nnode * sizeof *sc->nd) : NULL;
+    sc->infR = (float *)malloc((size_t)sc->ninfo * sizeof *sc->infR);
+    sc->hide = (unsigned char *)malloc((size_t)sc->ninst);
+    if (!sc->model || !sc->in || (sc->nnode && !sc->nd) || !sc->infR || !sc->hide) {
+        free(sc->info); free(sc->inst); free(sc->node); free(sc->pre);
+        free(sc->model); free(sc->in); free(sc->nd); free(sc->infR); free(sc->hide); return;
+    }
+    for (int i = 0; i < sc->ninst; i++) {
+        const unsigned char *r = sc->inst + i * 0x40; RsInst *o = &sc->in[i];
+        for (int c = 0; c < 3; c++) { o->lo[c] = rdf(r + 4 * c); o->hi[c] = rdf(r + 12 + 4 * c); o->pos[c] = rdf(r + 0x20 + 4 * c); }
+        o->info = rd16(r + 0x18); o->flags = (unsigned short)(r[0x1a] | r[0x1b] << 8);
+        int pi = (int)rd32(r + 0x1c); o->pre = pi >= 0 && pi < sc->npre ? pi : -1;
+        for (int k = 0; k < 9; k++) o->rot[k] = rd16(r + 0x2c + 2 * k);
+    }
+    for (int i = 0; i < sc->nnode; i++) {
+        const unsigned char *r = sc->node + i * 0x24; RsNode *o = &sc->nd[i];
+        for (int c = 0; c < 3; c++) { o->lo[c] = rdf(r + 4 * c); o->hi[c] = rdf(r + 12 + 4 * c); }
+        o->n = rd16(r + 0x18); if (o->n > 5) o->n = 5; if (o->n < 0) o->n = 0;
+        for (int k = 0; k < 5; k++) o->ch[k] = rd16(r + 0x1a + 2 * k);
+    }
+    for (int k = 0; k < sc->ninfo; k++) sc->infR[k] = rdf(sc->info + k * 0x44 + 0x3c);
+    sc->hide_gen = 0;
+    free(sc->node); sc->node = NULL;   /* parsed copy replaces it */
     s->nscen++;
 }
 
@@ -523,6 +580,7 @@ static void rs_sec_free_all(RsSec *s) {
     for (int i = 0; i < s->nscen; i++) {
         RsScen *c = &s->scen[i];
         free(c->info); free(c->inst); free(c->node); free(c->pre); free(c->model);
+        free(c->in); free(c->nd); free(c->infR); free(c->hide);
     }
     free(s->scen); s->scen = NULL; s->nscen = 0;
     free(s->texs); s->texs = NULL; s->ntex = 0;
@@ -569,7 +627,11 @@ static void rs_build(RsSec *s, int fd) {
         int go = g_tex[t].state == 1;
         if (go) g_tex[t].state = 5;   /* decoding */
         rs_unlock(&g_mx);
-        if (go) rs_tex_decode(t);
+        if (!go) continue;
+        Uint32 w0 = SDL_GetTicks();
+        while (g.dec_bytes > RS_DEC_CAP && !g.quit) SDL_Delay(4);   /* wait for uploads */
+        g.st_dec_wait_ms += SDL_GetTicks() - w0;
+        rs_tex_decode(t);
     }
     Uint32 t2 = SDL_GetTicks();
     static int logn;
@@ -752,6 +814,7 @@ void rstream_stop(void) {
         free(g_tex[i].t.rgb); free(g_tex[i].t.alpha); free(g_tex[i].t.dxt);
     }
     memset(g_tex, 0, sizeof g_tex);
+    g.dec_bytes = 0; g.ndec = 0;
     memset(g_solhash, 0, sizeof g_solhash); memset(g_hdr, 0, sizeof g_hdr);
     rs_free_tables();
     g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0;
@@ -770,6 +833,7 @@ void rstream_set_event(int event) {
     int eff = event;
     if (eff && !wg_event_group_present(&g.wgt, eff)) eff = 0;   /* no group of its own: unfiltered */
     if (eff && wg_selection_open(&g.wgt, eff, &g.sel)) g.sel_on = 1;
+    g_sel_gen++;
     printf("rstream: scenery groups for event %d (career stage %d): %s, %d overrides\n",
            event, g_wg_career_stage, g.sel_on ? "selected" : "unfiltered", (int)g.sel.count);
 }
@@ -883,14 +947,19 @@ void rstream_update(const float cam[3]) {
     int have4 = 0; for (int i = 0; i < g.nsec && !have4; i++) have4 = g.sec[i].state == 4 && rs_letter(g.sec[i].number) < 24;
     Uint64 budget = f * (have4 ? 3 : 30) / 1000, deadline = t0 + budget;
     rs_tex_upload(deadline);
-    for (int pass = 0; pass < 2 && SDL_GetPerformanceCounter() < deadline; pass++)
-        for (int i = 0; i < g.nsec && SDL_GetPerformanceCounter() < deadline; i++) {
+    /* built sections (state 3) are rare: test the state first, read the clock
+       only around real work (hwlog84: ~800 clock reads a frame were 1.7 ms) */
+    int over = 0;
+    for (int pass = 0; pass < 2 && !over; pass++)
+        for (int i = 0; i < g.nsec && !over; i++) {
             RsSec *s = &g.sec[i];
+            if (s->state != 3) continue;   /* only the worker moves 2 -> 3 */
             rs_lock(&g_mx); int st = s->state, w = s->wanted; rs_unlock(&g_mx);
             if (st != 3) continue;
             if (!w && rs_letter(s->number) < 24) { rs_unload(s); continue; }
             if (pass == 0 && rs_letter(s->number) < 24) continue;   /* X/Y/Z first */
             Uint64 a0 = SDL_GetPerformanceCounter();
+            if (a0 >= deadline) { over = 1; break; }
             if (rs_activate(s)) g.st_up_ms += (double)(SDL_GetPerformanceCounter() - a0) * 1000.0 / (double)f;
         }
     g.st_upd_ms += (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)f;
@@ -941,33 +1010,36 @@ typedef struct {
     float dir[3];
 } RsCull;
 
-static void rs_draw_instance(RsCull *K, RsScen *sc, int ii, int state) {
-    const unsigned char *in = sc->inst + ii * 0x40;
-    int info = rd16(in + 0x18);
-    unsigned flags = (unsigned)(in[0x1a] | in[0x1b] << 8);
-    if (info < 0 || info >= sc->ninfo) return;
-    /* scenery groups: the port's rule (tiles), not the 0x10 exclusion bit */
-    if (g.sel_on && !wg_selection_visible(&g.sel, (unsigned)sc->number, (unsigned)ii)) { g.st_cull[7]++; return; }
-    /* smackable props are smokeable.c's (drawn, hit and smashed there) */
-    if (smk_is_prop((unsigned)sc->number, (unsigned)ii)) { g.st_cull[6]++; return; }
-    /* 1 precull */
-    if (K->cell >= 0 && sc->pre) {
-        int pi = (int)rd32(in + 0x1c);
-        if (pi >= 0 && pi < sc->npre && (sc->pre[pi * 0x80 + (K->cell >> 3)] >> (K->cell & 7) & 1)) { g.st_cull[0]++; return; }
+/* groups + smackable props, per instance, once per selection (bsearches) */
+static void rs_hide_fill(RsScen *sc) {
+    for (int i = 0; i < sc->ninst; i++) {
+        unsigned char h = 0;
+        if (g.sel_on && !wg_selection_visible(&g.sel, (unsigned)sc->number, (unsigned)i)) h = 1;   /* the tiles' rule */
+        else if (smk_is_prop((unsigned)sc->number, (unsigned)i)) h = 2;   /* smokeable.c draws, hits and smashes those */
+        sc->hide[i] = h;
     }
+    sc->hide_gen = g_sel_gen;
+}
+
+static void rs_draw_instance(RsCull *K, RsScen *sc, int ii, int state) {
+    const RsInst *in = &sc->in[ii];
+    int info = in->info;
+    unsigned flags = in->flags;
+    if (info < 0 || info >= sc->ninfo) return;
+    /* 1 precull */
+    if (K->cell >= 0 && in->pre >= 0 && (sc->pre[in->pre * 0x80 + (K->cell >> 3)] >> (K->cell & 7) & 1)) { g.st_cull[0]++; return; }
+    /* scenery groups / props (the port's rules, not the 0x10 exclusion bit) */
+    if (sc->hide[ii]) { g.st_cull[sc->hide[ii] == 1 ? 7 : 6]++; return; }
     /* 2 view exclusion */
     if (((flags & 0xff) ^ 0x60) & K->cull) { g.st_cull[1]++; return; }
     /* 3 frustum */
     if (state == 1) {
-        float lo[3] = { rdf(in), rdf(in + 4), rdf(in + 8) }, hi[3] = { rdf(in + 12), rdf(in + 16), rdf(in + 20) };
-        state = rs_box_state(K->c->planes, lo, hi);
+        state = rs_box_state(K->c->planes, in->lo, in->hi);
         if (!state) { g.st_cull[2]++; return; }
     }
     /* 4 pixel size */
-    const unsigned char *inf = sc->info + info * 0x44;
-    float R = rdf(inf + 0x3c) + 6.0f;
-    float pos[3] = { rdf(in + 0x20), rdf(in + 0x24), rdf(in + 0x28) };
-    float v[3] = { pos[0] - K->c->cam[0], pos[1] - K->c->cam[1], pos[2] - K->c->cam[2] };
+    float R = sc->infR[info] + 6.0f;
+    float v[3] = { in->pos[0] - K->c->cam[0], in->pos[1] - K->c->cam[1], in->pos[2] - K->c->cam[2] };
     int pixels;
     if (v[0]*K->dir[0] + v[1]*K->dir[1] + v[2]*K->dir[2] < -R) pixels = 0;
     else {
@@ -989,7 +1061,7 @@ static void rs_draw_instance(RsCull *K, RsScen *sc, int ii, int state) {
     }
     if (fl >= 4.0f) so = m0;   /* worldDetail == 2 (the PC's top setting) */
     if (!so) {
-        if (!m0 && !sc->model[info][1] && rd32(inf + 0x20)) g.st_cull[4]++;   /* the model's section is not in */
+        if (!m0 && !sc->model[info][1] && rd32(sc->info + info * 0x44 + 0x20)) g.st_cull[4]++;   /* the model's section is not in */
         return;
     }
     if (!so->nm) return;
@@ -998,15 +1070,16 @@ static void rs_draw_instance(RsCull *K, RsScen *sc, int ii, int state) {
     r->s = so; r->state = state; r->mtx = -1;
     if (!(flags & 0x100)) {
         float *M = g_mtx[g_nmtx];
-        for (int i = 0; i < 16; i++) M[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+        M[3] = M[7] = M[11] = 0.0f; M[15] = 1.0f;
         for (int row = 0; row < 3; row++)
-            for (int col = 0; col < 3; col++) M[row * 4 + col] = (float)rd16(in + 0x2c + (row * 3 + col) * 2) / 8192.0f;
-        M[12] = pos[0]; M[13] = pos[1]; M[14] = pos[2];
+            for (int col = 0; col < 3; col++) M[row * 4 + col] = (float)in->rot[row * 3 + col] * (1.0f / 8192.0f);
+        M[12] = in->pos[0]; M[13] = in->pos[1]; M[14] = in->pos[2];
         r->mtx = g_nmtx++;
     }
 }
 
 static void rs_tree_cull(RsCull *K, RsScen *sc) {
+    if (sc->hide_gen != g_sel_gen) rs_hide_fill(sc);
     if (!sc->nnode) {
         for (int i = 0; i < sc->ninst; i++) rs_draw_instance(K, sc, i, 1);
         return;
@@ -1017,15 +1090,13 @@ static void rs_tree_cull(RsCull *K, RsScen *sc) {
         sp--;
         int n = stk[sp], st = sst[sp];
         if (n < 0 || n >= sc->nnode) continue;
-        const unsigned char *nd = sc->node + n * 0x24;
+        const RsNode *nd = &sc->nd[n];
         if (st == 1) {
-            float lo[3] = { rdf(nd), rdf(nd + 4), rdf(nd + 8) }, hi[3] = { rdf(nd + 12), rdf(nd + 16), rdf(nd + 20) };
-            st = rs_box_state(K->c->planes, lo, hi);
+            st = rs_box_state(K->c->planes, nd->lo, nd->hi);
             if (!st) continue;
         }
-        int nc = rd16(nd + 0x18); if (nc > 5) nc = 5;
-        for (int k = 0; k < nc; k++) {
-            int ch = rd16(nd + 0x1a + 2 * k);
+        for (int k = 0; k < nd->n; k++) {
+            int ch = nd->ch[k];
             if (ch < 0) { if (sp < 64) { stk[sp] = -ch; sst[sp] = st; sp++; } }
             else if (ch < sc->ninst) rs_draw_instance(K, sc, ch, st);
         }
@@ -1033,18 +1104,21 @@ static void rs_tree_cull(RsCull *K, RsScen *sc) {
 }
 
 static GLuint g_lasttex; static int g_lastcut, g_lastmtx;
+static long g_st_mtxsw, g_st_texsw, g_st_ident;
 static void rs_bind_tex(const RsDrawCtx *c, const RsMesh *m, N2Batch *b) {
     GLuint t = 0;
     if (m->tex >= 0 && g_tex[m->tex].state == 3) t = g_tex[m->tex].tex;
     else if (m->b.texkey) t = world_texture_lookup(m->b.texkey, NULL);
     b->tex = t;
     if (t == g_lasttex) return;
+    g_st_texsw++;
     if (t) { glUniform1f(c->rp->uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, t); }
     else { glUniform1f(c->rp->uUseTex, 0.0f); glUniform3f(c->rp->uColor, 0.28f, 0.29f, 0.31f); }
     g_lasttex = t;
 }
 static void rs_set_mtx(const RsDrawCtx *c, int mtx) {
     if (mtx == g_lastmtx) return;
+    g_st_mtxsw++;
     if (mtx < 0) { glUniformMatrix4fv(c->rp->uMVP, 1, GL_FALSE, c->MVP); render_model(c->rp, NULL); }
     else {
         float M2[16]; rs_mul(c->MVP, g_mtx[mtx], M2);
@@ -1148,7 +1222,7 @@ int rstream_draw(const RsDrawCtx *c) {
 #endif
             rs_set_mtx(c, R->mtx);
             rs_bind_tex(c, m, &m->b);
-            draw_batch(&m->b); draws++;
+            draw_batch(&m->b); draws++; g_st_ident += R->mtx < 0;
         }
     }
     /* worldreflect (row 0, effect 2) */
@@ -1224,14 +1298,33 @@ int rstream_draw(const RsDrawCtx *c) {
             gpu += s->bytes_gpu;
         }
         int ntex = 0; for (int i = 0; i < RS_TEXCAP; i++) ntex += g_tex[i].state == 3;
+        {   /* sizing: world-space copies of the visible list's instances (LOD A) */
+            static int said; long bake = 0, own = 0, xi = 0, ni = 0;
+            for (int i = 0; i < nl && said < 12; i++) {
+                RsScen *sc = list[i];
+                if (sc->gen != g_gen) continue;
+                for (int k = 0; k < sc->ninst; k++) {
+                    int info = rd16(sc->inst + k * 0x40 + 0x18);
+                    if (info < 0 || info >= sc->ninfo) continue;
+                    const RsSolid *so = sc->model[info][0]; if (!so) continue;
+                    long nv = 0; for (int q = 0; q < so->nm; q++) nv += so->sec->mesh[so->m0 + q].nv;
+                    bake += nv; ni++; if (so->sec != sc->sec) xi++;
+                }
+            }
+            for (int i = 0; i < g.nsec; i++) if (g.sec[i].state == 4) for (int q = 0; q < g.sec[i].nmesh; q++) own += g.sec[i].mesh[q].nv;
+            if (said++ < 12) printf("rstream sizing: visible list %ld instances (%ld use another section's model), baked LOD A %ld KB vs resident model vertices %ld KB\n",
+                                    ni, xi, bake * (long)sizeof(BatchedVertex) / 1024, own * (long)sizeof(BatchedVertex) / 1024);
+        }
         printf("rstream: zone %d (pred %d) | %.0f draws %.0f instances/frame, scenery %d hdrs | draw %.2f ms (cull %.2f) update %.2f ms (uploads %.2f) "
                "| culled/frame: groups %.0f props %.0f precull %.0f excl %.0f frustum %.0f pixels %.0f model-missing %.0f full %.0f "
-               "| sections: wanted %d active %d built %d queued %d, wanted-not-in %d, unloads %ld | GPU %ld KB, textures %d (+%ld)\n",
+               "| switches/frame: matrix %.0f texture %.0f, identity draws %.0f | sections: wanted %d active %d built %d queued %d, wanted-not-in %d, unloads %ld | GPU %ld KB, textures %d (+%ld)\n",
                g.zone, g.pzone, g.st_draws / F, g.st_inst / F, nl, g.st_draw_ms / F, cull_ms / F, g.st_upd_ms / F, g.st_up_ms / F,
-               g.st_cull[7] / F, g.st_cull[6] / F, g.st_cull[0] / F, g.st_cull[1] / F, g.st_cull[2] / F, g.st_cull[3] / F, g.st_cull[4] / F, g.st_cull[5] / F,
+               g.st_cull[7] / F, g.st_cull[6] / F, g.st_cull[0] / F, g.st_cull[1] / F, g.st_cull[2] / F, g.st_cull[3] / F, g.st_cull[4] / F, g.st_cull[5] / F, g_st_mtxsw / F, g_st_texsw / F, g_st_ident / F,
                nwant, nact, nbuilt, nq, nmiss, g.st_unload, gpu / 1024, ntex, g.st_tex_up);
         g.st_draws = g.st_inst = g.st_frames = 0; memset(g.st_cull, 0, sizeof g.st_cull);
-        g.st_draw_ms = g.st_upd_ms = g.st_up_ms = cull_ms = 0; g.st_tex_up = 0;
+        printf("rstream: decoded backlog %ld KB now, %ld KB peak, worker waited %ld ms\n",
+               g.dec_bytes / 1024, g.dec_peak / 1024, g.st_dec_wait_ms);
+        g.st_draw_ms = g.st_upd_ms = g.st_up_ms = cull_ms = 0; g.st_tex_up = 0; g_st_mtxsw = g_st_texsw = g_st_ident = 0;
     }
     return draws;
 }
