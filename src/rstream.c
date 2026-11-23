@@ -434,36 +434,49 @@ static void rs_build_solid(RsBuild *B, long beg, long end) {
     for (int i = 0; i < sc.count; i++) {
         const N2Mesh *m = &sc.meshes[i];
         if (m->nverts <= 0 || m->nidx < 3 || m->nverts > RS_MAXV || m->cat == N2_SKY) continue;
-        int pg = rs_page_room(s, m->nverts);
+        /* a material piece carries its solid's whole vertex pool (n2_add_pair
+           takes an index sub-range): keep only the vertices its indices use
+           (X0: 973k vertices for 468k indices before this) */
+        int *remap = (int *)malloc((size_t)m->nverts * sizeof *remap);
+        if (!remap) break;
+        for (int v = 0; v < m->nverts; v++) remap[v] = -1;
+        int used = 0;
+        for (int t = 0; t < m->nidx; t++) {
+            int v = m->idx[t];
+            if (v >= 0 && v < m->nverts && remap[v] < 0) remap[v] = used++;
+        }
+        int pg = rs_page_room(s, used);
+        if (pg < 0) { free(remap); break; }
         if (pg < 0) break;
         RsPage *p = &s->page[pg];
-        if (p->nv + m->nverts > p->cv) {
-            int c = p->cv ? p->cv : 4096; while (c < p->nv + m->nverts) c *= 2;
+        if (p->nv + used > p->cv) {
+            int c = p->cv ? p->cv : 4096; while (c < p->nv + used) c *= 2;
             if (c > RS_MAXV + 1) c = RS_MAXV + 1;
             BatchedVertex *nv = (BatchedVertex *)realloc(p->v, (size_t)c * sizeof *nv);
-            if (!nv) break;
+            if (!nv) { free(remap); break; }
             p->v = nv; p->cv = c;
         }
         if (p->ni + m->nidx > p->ci) {
             int c = p->ci ? p->ci : 8192; while (c < p->ni + m->nidx) c *= 2;
             uint16_t *ni = (uint16_t *)realloc(p->ix, (size_t)c * sizeof *ni);
-            if (!ni) break;
+            if (!ni) { free(remap); break; }
             p->ix = ni; p->ci = c;
         }
         if (s->nmesh == B->nmesh_cap) {
             int c = B->nmesh_cap ? B->nmesh_cap * 2 : 512;
             RsMesh *nm = (RsMesh *)realloc(s->mesh, (size_t)c * sizeof *nm);
-            if (!nm) break;
+            if (!nm) { free(remap); break; }
             s->mesh = nm; B->nmesh_cap = c;
         }
         float *nor = (float *)calloc((size_t)m->nverts * 3, sizeof(float));
-        if (!nor) break;
+        if (!nor) { free(remap); break; }
         render_mesh_normals(m, nor);
         RsMesh *rm = &s->mesh[s->nmesh++]; memset(rm, 0, sizeof *rm);
         for (int c = 0; c < 3; c++) { rm->lo[c] = 1e30f; rm->hi[c] = -1e30f; }
         int vb = p->nv;
         for (int v = 0; v < m->nverts; v++) {
-            BatchedVertex *o = &p->v[vb + v]; const float *q = m->verts + v * 5;
+            if (remap[v] < 0) continue;
+            BatchedVertex *o = &p->v[vb + remap[v]]; const float *q = m->verts + v * 5;
             o->pos[0] = q[0]; o->pos[1] = q[1]; o->pos[2] = q[2];
             o->uv[0] = q[3]; o->uv[1] = q[4];
             BV_SET_NORMAL(o, nor[v*3], nor[v*3+1], nor[v*3+2]);
@@ -473,11 +486,15 @@ static void rs_build_solid(RsBuild *B, long beg, long end) {
         }
         free(nor);
         rm->b.ioff = (unsigned)(p->ni * 2);
-        for (int t = 0; t < m->nidx; t++) p->ix[p->ni + t] = (uint16_t)(m->idx[t] + vb);
-        rm->b.index_count = m->nidx; rm->nv = m->nverts;
+        for (int t = 0; t < m->nidx; t++) {
+            int v = m->idx[t];
+            p->ix[p->ni + t] = (uint16_t)(vb + (v >= 0 && v < m->nverts ? remap[v] : 0));
+        }
+        free(remap);
+        rm->b.index_count = m->nidx; rm->nv = used;
         rm->b.texkey = m->texkey;
         rm->b.nmesh = 1;
-        p->nv += m->nverts; p->ni += m->nidx;
+        p->nv += used; p->ni += m->nidx;
         rm->page = pg;
         rm->reflect = m->reflect; rm->mat_exact = m->mat_exact; rm->glow = m->cat == N2_GLOW;
         rm->tex = -1;
@@ -634,6 +651,8 @@ static void rs_build(RsSec *s, int fd) {
         rs_tex_decode(t);
     }
     Uint32 t2 = SDL_GetTicks();
+    { long nv = 0, ni = 0; for (int i = 0; i < s->nmesh; i++) { nv += s->mesh[i].nv; ni += s->mesh[i].b.index_count; }
+      if (rs_letter(s->number) == 24) printf("rstream: %s geometry %ld vertices %ld indices\n", s->name, nv, ni); }
     static int logn;
     if (logn++ < 400)
         printf("rstream: built %s (%ld KB): read %u ms, parse+tex %u ms, %d solids %d meshes %d scenery, %d pages, %d textures\n",
