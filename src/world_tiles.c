@@ -6,6 +6,7 @@ int (*g_wt_anim_solid)(uint32_t solid);   /* worldanim.c (#40) */
 #include "smokeable.h"
 #include "beyond.h"
 #include "xpcity.h"
+#include "rstream.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -706,6 +707,10 @@ static WtLoaded g_wt_global; static int g_wt_have_global;
 static WtLoaded g_wt_donor; static int g_wt_have_donor;
 static WtIndexEntry *g_wt_index; static int g_wt_nindex;
 static char g_wt_track[64];
+/* the retail streamer (rstream.c, retailstream.txt) draws this track's scenery:
+   tiles only supply ground, collision and the car's environment view, so the
+   tall stand-ins and the far stand-in ring (nothing else uses them) stay out */
+static int g_wt_rs;
 static long long g_wt_bytes_read;
 
 /* a track's index (any thread; the caller frees *out) */
@@ -926,6 +931,8 @@ static int wt_index_load(const char *track) {
     free(g_wt_index); g_wt_index = NULL; g_wt_nindex = 0;
     if (!wt_index_read(track, &g_wt_index, &g_wt_nindex)) return 0;
     snprintf(g_wt_track, sizeof g_wt_track, "%s", track);
+    g_wt_rs = rstream_track_ok(track);
+    if (g_wt_rs) printf("world tiles: %s scenery drawn by the retail streamer -- no stand-ins, no far ring\n", track);
     WtPackTab *t = wt_pack_probe(track, 0);
     printf("world tiles: %s index %d tiles, %s\n", track, g_wt_nindex,
            t ? "pack" : "loose files (no pack yet)");
@@ -1060,7 +1067,7 @@ static int wt_ground_cat(int cat) { return cat == N2_ROAD || cat == N2_TERRAIN; 
 #define WT_FAR_ONLY    2   /*                  stand-ins only (the far ring, past the ground reach) */
 static int wt_reduced_keep(int mode, int cat, int role, const float *wb) {
     int g = wt_ground_cat(cat);
-    int sa = !g && role == 2 && wb[5] - wb[2] >= WT_STANDIN_MIN_H;
+    int sa = !g && role == 2 && wb[5] - wb[2] >= WT_STANDIN_MIN_H && !g_wt_rs;
     return mode == WT_FAR_ONLY ? sa : g || sa;
 }
 /* The far ring: tiles this far past the ground reach contribute their
@@ -1068,6 +1075,7 @@ static int wt_reduced_keep(int mode, int cat, int role, const float *wb) {
 #define WT_FAR_EXTRA_M 192.0f   /* 11-14: 320 m tried (run G: heap 110/115 MB, GPU hang after 18 min) -- back to 192 */
 static float wt_far_extra(void) {
     static float v = -1.0f;
+    if (g_wt_rs) return 0.0f;
     if (v < 0.0f) {
         v = WT_FAR_EXTRA_M;
         FILE *f = fopen("ux0:data/NFSU2/farring.txt", "r");
@@ -1085,6 +1093,7 @@ static volatile long long g_wt_geo_live;
 /* geometry the source game never shows: Carbon's reflection blockers (all-black
    vertex colours, ~190 m up: the "black blocks" over Palmont 11-19) */
 static int wt_never_drawn(const WTileMesh *h) {
+    if (g_wt_rs && h->world_role == 2) return 1;   /* stand-ins: the streamer draws the scenery */
     return strstr(h->sname, "REFBLOCKER") != NULL || strstr(h->sname, "_REFLECTIONS") != NULL;
 }
 static int wt_decode_ready(unsigned char *data, long len, const uint32_t *hdr, int tx, int ty,
