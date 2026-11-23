@@ -163,6 +163,8 @@ int shop_upgrade_model(const char *dataroot, const char *car, int slot, int leve
 Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *installed,
                 const N2PartMenu menus[N2_PART_COUNT], const char *rim_folder, int rim_style);
 void  shop_close(Shop **s);
+void  shop_close_keep(Shop **s);   /* the same, the next shop_open coming straight after: it reuses the read-only data */
+void  shop_keep_tick(void);   /* once a frame: frees a closed shop's kept data no open came for */
 /* Turn an open shop into the front end: title screen (UG_LS_Splash), then the
  * main menu (UI_Main). Its actions are SHOP_ACT_PLAY / SHOP_ACT_CUSTOMIZE. */
 void  shop_front_end(Shop *s);

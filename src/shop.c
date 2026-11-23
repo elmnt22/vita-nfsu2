@@ -616,6 +616,7 @@ struct Shop {
     short res_ti[PK_COUNT][FENG_MAX_RES];    /* res_tex's ShopTex while not read yet, else -1 */
     ShopTex *tex; int ntex;
     FILE *texf; int tex_read; long tex_read_kb;   /* the cache, open for textures read on first use */
+    int keepable;                            /* a full shop_open: its read-only data may go to the next open (shop_keep) */
     ShopFont font[4]; int nfont;
     GLuint qb_vbo, qb_nbo, qb_ibo;
     GLuint prog; GLint u_color, u_usetex, u_tex;   /* the shop's own 2D program */
@@ -849,8 +850,78 @@ static void movie_stop(Shop *s);
 
 /* -------------------------------------------------------------- strings */
 
+/* Menu speed (11-22): moving between the menus and the Car Shop (Customize,
+   the crib's Change Parts, back again) closes one shop and opens the next in
+   the same frame or a few frames later, and every open read the same files
+   again: the texture list (350 seek + read pairs), the strings, the fonts
+   and their atlases (GLOBALA + LanguageTextures, 1.4 MB), the part database
+   (a chunk walk of GLOBALB) -- and each screen's textures from the cache on
+   its first draw. A full shop closed with shop_close_keep (only where the
+   next shop opens straight after) leaves that read-only data here; an open
+   within SHOP_KEEP_FRAMES takes it (same bytes, same GL textures), otherwise
+   shop_keep_tick frees it. Every other close frees as before, so a race or
+   free roam starting from the menus holds nothing more. The packages are still parsed fresh (screens change
+   their objects), from the cache file as before. */
+#define SHOP_KEEP_FRAMES 3   /* every switch seen reopens in the same frame (0) */
+static struct {
+    int on, frames, lang; char root[512];
+    ShopTex *tex; int ntex;
+    unsigned char *lang_buf; long langlen; uint32_t *str_hash; const char **str_txt; int nstr;
+    ShopFont font[4]; int nfont;
+    unsigned char *db; long dblen;
+    short price[96][3], rep[96][3]; unsigned char unl_type[96][3]; uint32_t unl_arg[96][3];
+} g_keep;
+static int g_keep_req;   /* shop_close_keep's close */
+static void shop_keep_free(void) {
+    if (!g_keep.on) return;
+    for (int i = 0; i < g_keep.ntex; i++) if (g_keep.tex[i].tex) glDeleteTextures(1, &g_keep.tex[i].tex);
+    for (int f = 0; f < g_keep.nfont; f++) if (g_keep.font[f].tex) glDeleteTextures(1, &g_keep.font[f].tex);
+    free(g_keep.tex); free(g_keep.lang_buf); free(g_keep.str_hash); free((void *)g_keep.str_txt); free(g_keep.db);
+    memset(&g_keep, 0, sizeof g_keep);
+}
+/* once a frame (main loop): kept data no open came for goes */
+void shop_keep_tick(void) {
+    if (g_keep.on && ++g_keep.frames > SHOP_KEEP_FRAMES) {
+        printf("shop: kept data unused, freed\n");
+        shop_keep_free();
+    }
+}
+/* shop_close of a full shop: its read-only data to the keep, not freed */
+static void shop_keep_put(Shop *s) {
+    if (!s->keepable || !s->tex || !s->ntex) return;   /* (a loading screen's or database-only shop: a pending keep stays) */
+    shop_keep_free();
+    g_keep.on = 1; g_keep.lang = n2_lang();
+    snprintf(g_keep.root, sizeof g_keep.root, "%s", s->dataroot);
+    g_keep.tex = s->tex; g_keep.ntex = s->ntex; s->tex = NULL; s->ntex = 0;
+    g_keep.lang_buf = s->lang; g_keep.langlen = s->langlen; g_keep.str_hash = s->str_hash;
+    g_keep.str_txt = s->str_txt; g_keep.nstr = s->nstr;
+    s->lang = NULL; s->str_hash = NULL; s->str_txt = NULL; s->nstr = 0;
+    memcpy(g_keep.font, s->font, sizeof g_keep.font); g_keep.nfont = s->nfont; s->nfont = 0;
+    g_keep.db = s->db; g_keep.dblen = s->dblen; s->db = NULL;
+    memcpy(g_keep.price, s->price, sizeof g_keep.price); memcpy(g_keep.rep, s->rep, sizeof g_keep.rep);
+    memcpy(g_keep.unl_type, s->unl_type, sizeof g_keep.unl_type); memcpy(g_keep.unl_arg, s->unl_arg, sizeof g_keep.unl_arg);
+}
+/* shop_open: the kept data, when it is for this data root and language */
+static int shop_keep_take(Shop *s) {
+    if (!g_keep.on) return 0;
+    if (g_keep.lang != n2_lang() || strcmp(g_keep.root, s->dataroot)) { shop_keep_free(); return 0; }
+    int up = 0;
+    for (int i = 0; i < g_keep.ntex; i++) up += g_keep.tex[i].tex != 0;
+    printf("shop: reusing the last shop's data (%d frames; %d textures, %d already uploaded)\n", g_keep.frames, g_keep.ntex, up);
+    s->tex = g_keep.tex; s->ntex = g_keep.ntex;
+    s->lang = g_keep.lang_buf; s->langlen = g_keep.langlen; s->str_hash = g_keep.str_hash;
+    s->str_txt = g_keep.str_txt; s->nstr = g_keep.nstr;
+    memcpy(s->font, g_keep.font, sizeof s->font); s->nfont = g_keep.nfont;
+    s->db = g_keep.db; s->dblen = g_keep.dblen;
+    memcpy(s->price, g_keep.price, sizeof s->price); memcpy(s->rep, g_keep.rep, sizeof s->rep);
+    memcpy(s->unl_type, g_keep.unl_type, sizeof s->unl_type); memcpy(s->unl_arg, g_keep.unl_arg, sizeof s->unl_arg);
+    memset(&g_keep, 0, sizeof g_keep);   /* the shop owns it now */
+    return 1;
+}
+
 static void load_strings(Shop *s) {
     char path[600];
+    if (s->lang) return;   /* kept from the last shop (shop_keep_take) */
     n2_lang_path(path, sizeof path, s->dataroot);
     s->lang = n2_read_file(path, &s->langlen);
     printf("shop: language %d %s (%s)\n", n2_lang(), k_n2_lang_name[n2_lang()], s->lang ? "loaded" : "MISSING");
@@ -917,8 +988,9 @@ static long find_chunk_in_file(FILE *f, uint32_t want, uint32_t *size) {
 static void load_db(Shop *s) {
     char path[600];
     snprintf(path, sizeof path, "%s/GLOBAL/GLOBALB.BUN", s->dataroot);
-    FILE *f = fopen(path, "rb");
-    if (!f) { printf("shop: %s missing -- no part database\n", path); return; }
+    FILE *f = s->db ? NULL : fopen(path, "rb");   /* (kept from the last shop: the offsets only) */
+    if (!f && !s->db) { printf("shop: %s missing -- no part database\n", path); return; }
+    if (f) {
     uint32_t sz = 0;
     long at = find_chunk_in_file(f, 0x80034602u, &sz);
     if (at >= 0 && sz < (8u << 20)) {
@@ -952,6 +1024,7 @@ static void load_db(Shop *s) {
         free(c);
     }
     fclose(f);
+    }
     if (!s->db) { printf("shop: car part database not found\n"); return; }
     for (long o = 0; o + 8 <= s->dblen; ) {
         uint32_t id = n2_u32(s->db + o), cs = n2_u32(s->db + o + 4);
@@ -1034,7 +1107,99 @@ static int part_excluded(const Shop *s, const unsigned char *r) {
 /* Our N2CarConfig value for a part hash: the car's own KITnn/STYLEnn meshes,
    or a shared library style (SPOILER/SPOILER_HATCH/SPOILER_SUV/EXHAUST/ROOF,
    encoded lib*1000 + variant*100 + style as n2_mod_catalog does). -1 = none. */
+/* Menu speed (11-22): part_value ran the name search below for every part
+   record a list looked at (snprintf + hash of up to ~1,700 names a spoiler
+   or roof part; entering Change Body Parts built every category's list, ~84
+   ms in the simulator, several hundred on the Vita). The same names are now
+   hashed once -- the libraries once, a car's own per group once (kept for
+   the last 32 car + group pairs) -- and looked up; same results, same order. */
+typedef struct { uint32_t h; int v; } PvName;
+static int pv_find(const PvName *t, int n, uint32_t hash) {
+    for (int i = 0; i < n; i++) if (t[i].h == hash) return t[i].v;
+    return -1;
+}
+static int part_value_slow(const char *car, int group, uint32_t hash);
+static int part_value_fast(const char *car, int group, uint32_t hash);
 static int part_value(const char *car, int group, uint32_t hash) {
+    int v = part_value_fast(car, group, hash);
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid: OPENUG2_PV_CHECK compares every answer with the old search */
+        static int on = -1; static unsigned calls, bad;
+        if (on < 0) on = getenv("OPENUG2_PV_CHECK") != NULL;
+        if (on) {
+            int w = part_value_slow(car, group, hash);
+            calls++;
+            if (w != v) { bad++; printf("pv check: %s group %d %08x fast %d slow %d%c", car, group, (unsigned)hash, v, w, 10); }
+            if ((calls & 1023) == 0) printf("pv check: %u calls, %u mismatches%c", calls, bad, 10);
+        }
+    }
+#endif
+    return v;
+}
+static int part_value_fast(const char *car, int group, uint32_t hash) {
+    char nm[96];
+    if (group == G_WIDE_BODY) return part_value_slow(car, group, hash);   /* 10 names */
+    const char *g = group_name(group);
+    if (!g) return -1;
+    /* the car's own: <CAR>_KITnn_<G>, <CAR>_STYLEnn_<G> (+ _CF on a hood), in search order */
+    static struct { char car[32]; int group, n; PvName t[180]; } own[32];
+    static int own_next;
+    int k = -1;
+    for (int i = 0; i < 32; i++)
+        if (own[i].n && own[i].group == group && !strcmp(own[i].car, car)) { k = i; break; }
+    if (k < 0) {
+        k = own_next++ & 31;
+        snprintf(own[k].car, sizeof own[k].car, "%s", car);
+        own[k].group = group; own[k].n = 0;
+        for (int kind = 0; kind < 2; kind++)
+            for (int nn = 0; nn < 60; nn++) {
+                snprintf(nm, sizeof nm, "%s_%s%02d_%s", car, kind ? "STYLE" : "KIT", nn, g);
+                own[k].t[own[k].n++] = (PvName){ feng_hash(nm), kind ? 101 + nn : (nn ? 1 + nn : 0) };
+                if (kind && group == G_HOOD)
+                    own[k].t[own[k].n++] = (PvName){ feng_hash(strcat(nm, "_CF")), 101 + nn };
+            }
+        if (strlen(car) >= sizeof own[k].car) own[k].n = 0, own[k].car[0] = 0;   /* (never: car folders are short) */
+    }
+    int v = own[k].n ? pv_find(own[k].t, own[k].n, hash) : part_value_slow(car, group, hash);
+    if (v >= 0 || !own[k].n) return v;
+    if (group == G_LEFT_MIRROR) {   /* STYLEnn_MIRROR_<BODY/POST/SUV/HUMMER> (+ _CF) */
+        static PvName mt_t[4 * 59 * 2]; static int mt_n;
+        if (!mt_n) {
+            static const char *const mt[] = { "BODY", "POST", "SUV", "HUMMER" };
+            for (int l = 0; l < 4; l++)
+                for (int nn = 1; nn < 60; nn++) {
+                    snprintf(nm, sizeof nm, "STYLE%02d_MIRROR_%s", nn, mt[l]);
+                    mt_t[mt_n++] = (PvName){ feng_hash(nm), (6 + l) * 1000 + nn };
+                    mt_t[mt_n++] = (PvName){ feng_hash(strcat(nm, "_CF")), (6 + l) * 1000 + 500 + nn };
+                }
+        }
+        return pv_find(mt_t, mt_n, hash);
+    }
+    /* the shared libraries (any other group) */
+    static PvName lib_t[1200]; static int lib_n;
+    if (!lib_n) {
+        static const char *const lib[] = { "", "SPOILER", "SPOILER_HATCH", "SPOILER_SUV", "EXHAUST", "ROOF" };
+        static const char *const var[] = { "", "_DUAL", "_OFFSET" };
+        for (int l = 1; l <= 5; l++)
+            for (int nn = 1; nn < 60; nn++)
+                for (int vv = 0; vv < 3; vv++) {
+                    if (l == 4) {
+                        if (vv) break;
+                        for (int lv = 1; lv <= 3; lv++) {
+                            snprintf(nm, sizeof nm, "EXHAUST_STYLE%02d_LEVEL%d", nn, lv);
+                            lib_t[lib_n++] = (PvName){ feng_hash(nm), 4000 + nn };
+                        }
+                        continue;
+                    }
+                    if (l != 5 && vv) break;
+                    snprintf(nm, sizeof nm, "%s_STYLE%02d%s", lib[l], nn, var[vv]);
+                    lib_t[lib_n++] = (PvName){ feng_hash(nm), l * 1000 + vv * 100 + nn };
+                    lib_t[lib_n++] = (PvName){ feng_hash(strcat(nm, "_CF")), l * 1000 + 500 + vv * 100 + nn };
+                }
+    }
+    return pv_find(lib_t, lib_n, hash);
+}
+static int part_value_slow(const char *car, int group, uint32_t hash) {
     const char *g = group_name(group);
     char nm[96];
     if (group == G_WIDE_BODY) {   /* "<CAR>_KITWnn_BODY"; KITW00 = no wide body */
@@ -1839,6 +2004,7 @@ static int load_cache(Shop *s) {
        ~7.5 s a shop or crib entry took on the Vita. Same pixels, same file. */
     unsigned char c[12];
     long flen = -1, at = 12 + bunlen + 4;
+    if (s->tex) { fclose(f); return s->pk[PK_CATEGORY] && s->pk[PK_PARTS]; }   /* the list kept from the last shop */
     if (!fseek(f, 0, SEEK_END)) flen = ftell(f);
     uint32_t nt = !fseek(f, 12 + bunlen, SEEK_SET) && fread(c, 1, 4, f) == 4 ? n2_u32(c) : 0;
     s->tex = (ShopTex *)calloc(nt ? nt : 1, sizeof *s->tex);
@@ -1868,7 +2034,8 @@ static void load_fonts(Shop *s) {
     char path[600];
     long glen = 0;
     snprintf(path, sizeof path, "%s/GLOBAL/GLOBALA.BUN", s->dataroot);
-    unsigned char *globa = n2_read_file(path, &glen);
+    unsigned char *globa = NULL; int globa_tried = 0;
+    int nkept = s->nfont;   /* kept from the last shop (shop_keep_take): already with atlases */
     for (int p = 0; p < PK_COUNT; p++) {
         memset(s->font_of[p], -1, sizeof s->font_of[p]);
         const FengPackage *pk = s->pk[p];
@@ -1881,6 +2048,7 @@ static void load_fonts(Shop *s) {
             while (nm[n] && nm[n] != '.' && n < 39) { a[n] = (char)tolower((unsigned char)nm[n]); n++; }
             a[n] = 0;
             for (int f = 0; f < s->nfont; f++) if (!strcmp(a, s->font[f].f.name)) found = f;
+            if (found < 0 && !globa_tried) { globa_tried = 1; globa = n2_read_file(path, &glen); }
             if (found < 0 && s->nfont < 4 &&
                 ((s->lang && feng_load_font(s->lang, s->langlen, nm, &s->font[s->nfont].f)) ||
                  (globa && feng_load_font(globa, glen, nm, &s->font[s->nfont].f))))
@@ -1889,15 +2057,16 @@ static void load_fonts(Shop *s) {
             s->font_of[p][r] = (signed char)found;
         }
     }
-    if (s->nfont) {
+    if (s->nfont > nkept) {
         uint32_t keys[4]; FengImage img[4]; memset(img, 0, sizeof img);
-        for (int f = 0; f < s->nfont; f++) keys[f] = s->font[f].f.atlas_key;
+        for (int f = 0; f < s->nfont; f++) keys[f] = f < nkept ? 0 : s->font[f].f.atlas_key;
+        if (!globa && !globa_tried) globa = n2_read_file(path, &glen);
         if (globa) feng_tpk_load(globa, glen, keys, s->nfont, img);
         long alen = 0;
         snprintf(path, sizeof path, "%s/LANGUAGES/LanguageTextures.bin", s->dataroot);
         unsigned char *atlas = n2_read_file(path, &alen);
         if (atlas) { feng_tpk_load(atlas, alen, keys, s->nfont, img); free(atlas); }
-        for (int f = 0; f < s->nfont; f++) {
+        for (int f = nkept; f < s->nfont; f++) {
             if (img[f].rgba) {
                 s->font[f].tex = upload_rgba(img[f].w, img[f].h, img[f].rgba);
                 s->font[f].aw = img[f].w; s->font[f].ah = img[f].h;
@@ -2116,8 +2285,13 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
     snprintf(s->dataroot, sizeof s->dataroot, "%s", dataroot ? dataroot : ".");
     /* where an open's time goes (GitHub #31: ~7.5 s a shop entry on the Vita) */
     Uint64 tq[7]; tq[0] = SDL_GetPerformanceCounter();
+    shop_keep_take(s);
     if (!load_cache(s)) {
         for (int i = 0; i < PK_COUNT; i++) { feng_free_package(s->pk[i]); free(s->pk[i]); s->pk[i] = NULL; }
+        if (s->tex) {   /* a kept list without its packages: as a first open */
+            for (int i = 0; i < s->ntex; i++) if (s->tex[i].tex) glDeleteTextures(1, &s->tex[i].tex);
+            free(s->tex); s->tex = NULL; s->ntex = 0;
+        }
         printf("shop: building %s (first use)\n", SHOP_CACHE);
         if (!build_cache(s->dataroot) || !load_cache(s)) {
             printf("shop: screens unavailable\n");
@@ -2166,6 +2340,7 @@ Shop *shop_open(const char *dataroot, const char *car, const N2CarConfig *instal
     memcpy(s->prev_folder, s->rim_folder, sizeof s->prev_folder); s->prev_style = s->rim_style;
     shop_set_car(s, car, installed, menus);
     s->screen = SC_CAR_SHOP;
+    s->keepable = 1;
     tq[6] = SDL_GetPerformanceCounter();
     {   double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
         printf("shop: open ms: cache %.1f strings %.1f fonts %.1f prepare %.1f db %.1f rest %.1f = %.1f\n",
@@ -2617,6 +2792,7 @@ static void ls_ctl_from_globalb(Shop *s) {
 }
 
 Shop *shop_open_loading(const char *dataroot) {
+    shop_keep_free();   /* a load is starting: no kept menu data held through it */
     Shop *s = (Shop *)calloc(1, sizeof *s);
     if (!s) return NULL;
     s->dlg_pk = -1; s->vmode = -1;
@@ -2656,6 +2832,13 @@ Shop *shop_open_loading(const char *dataroot) {
     return s;
 }
 
+void shop_close(Shop **sp);
+/* shop_close for a switch to another shop opened straight after (shop_keep) */
+void shop_close_keep(Shop **sp) {
+    g_keep_req = 1;
+    shop_close(sp);
+    g_keep_req = 0;
+}
 void shop_close(Shop **sp) {
     if (sp && *sp) { free((*sp)->opt_anim); (*sp)->opt_anim = NULL; free((*sp)->ctl_anim); (*sp)->ctl_anim = NULL;
                        free((*sp)->juke_anim); (*sp)->juke_anim = NULL;
@@ -2674,6 +2857,7 @@ void shop_close(Shop **sp) {
     Shop *s = *sp;
     if (s->ntex) printf("shop: %d of %d textures read on use (%ld KB)\n", s->tex_read, s->ntex, s->tex_read_kb);
     if (s->texf) fclose(s->texf);
+    if (g_keep_req) shop_keep_put(s);   /* (shop_close_keep: tex, strings, fonts, database go to the next open) */
     for (int i = 0; i < s->ntex; i++) if (s->tex[i].tex) glDeleteTextures(1, &s->tex[i].tex);
     glDeleteTextures(4, s->mag_tex);
     if (s->ls_pic) glDeleteTextures(1, &s->ls_pic);
@@ -2842,7 +3026,21 @@ static void cf_locks(Shop *s, unsigned char lk[6]) {
    In the crib (filter 2) it returns AreAnyRimsOwnedInCareerMode 8012fc0c
    (AnyOwned(0x1d) = the rims region, rims and spinners; PC: car +0x5a0 != 0)
    as is: the category is LOCKED once the car owns a rim (GC and PC agree) */
+static int u32_cmp(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+static int rims_locked_(Shop *s);
+static int rims_locked_old(Shop *s);
 static int rims_locked(Shop *s) {
+    int r = rims_locked_(s);
+#ifdef OPENUG2_SIM_PRE_H
+    if (getenv("OPENUG2_PV_CHECK")) {   /* test aid: the old brand-by-brand search, same answer? */
+        int o = rims_locked_old(s);
+        printf("rims check: %s (new %d, old %d)\n", o == r ? "same" : "MISMATCH", r, o);
+    }
+#endif
+    return r;
+}
+#ifdef OPENUG2_SIM_PRE_H
+static int rims_locked_old(Shop *s) {
     int model = db_model(s, "WHEELS");
     if (s->career == 2) return career_any_owned(slot_ent(0x1d)) || career_any_owned(0x21);
     if (!s->db || model < 0) return 0;
@@ -2850,7 +3048,7 @@ static int rims_locked(Shop *s) {
     for (long p = s->db_parts; p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
         const unsigned char *rec = s->db + p;
         uint32_t hash = n2_u32(rec);
-        unsigned soff = rec[8] | rec[9] << 8, aoff = rec[10] | rec[11] << 8;
+        unsigned soff = rec[8] | rec[9] << 8;
         if (!hash && !soff) break;
         if (rec[7] != model || rec[4] != G_WHEEL || part_excluded(s, rec)) continue;
         if (rim_outer) {
@@ -2861,6 +3059,66 @@ static int rims_locked(Shop *s) {
             if (!fold || out != rim_outer) continue;
         }
         if (part_open(s, 13, (rec[5] >> 5) & 7, hash)) return 0;
+    }
+    return 1;
+}
+#else
+static int rims_locked_old(Shop *s) { (void)s; return 0; }
+#endif
+static int rims_locked_(Shop *s) {
+    int model = db_model(s, "WHEELS");
+    if (s->career == 2) return career_any_owned(slot_ent(0x1d)) || career_any_owned(0x21);
+    if (!s->db || model < 0) return 0;
+    int rim_outer = g_shop_rec_ok ? (signed char)g_shop_rec[0xdc] : 0;
+    /* Menu speed (11-22): the brand loop below asked rim_part_parse about
+       every brand in turn, and its one-brand table was rebuilt (~13,000
+       names hashed + sorted) each time the brand changed -- 55 ms in the
+       simulator entering Change Body Parts. The test only needs "a part of
+       this outer size, in any brand": those names (every brand, style and
+       inner size at this outer) are hashed once and kept per outer size. */
+    static uint32_t *sz_tab; static int sz_n, sz_outer = -1; static const RimBrand *sz_rb; static int sz_nrb;
+    if (rim_outer && (sz_outer != rim_outer || sz_rb != s->rb || sz_nrb != s->nrb || !sz_tab)) {
+        free(sz_tab); sz_n = 0; sz_outer = -1;
+        sz_tab = (uint32_t *)malloc((size_t)(s->nrb > 0 ? s->nrb : 1) * 39 * (RIM_IN_HI - RIM_IN_LO + 1) * sizeof *sz_tab);
+        if (sz_tab) {
+            char pre[48], t[16];
+            snprintf(t, sizeof t, "%d", rim_outer);
+            for (int k = 0; k < s->nrb; k++) {
+                if (!s->rb[k].folder) continue;
+                for (int nn = 1; nn < 40; nn++) {
+                    snprintf(pre, sizeof pre, "%s_STYLE%02d_", s->rb[k].folder, nn);
+                    uint32_t h0 = hash_more(0xffffffffu, pre);
+                    for (int a = RIM_IN_LO; a <= RIM_IN_HI; a++) {
+                        char u[16]; snprintf(u, sizeof u, "%d_", a);
+                        sz_tab[sz_n++] = hash_more(hash_more(h0, u), t);
+                    }
+                }
+            }
+            qsort(sz_tab, (size_t)sz_n, sizeof *sz_tab, u32_cmp);
+            sz_outer = rim_outer; sz_rb = s->rb; sz_nrb = s->nrb;
+        }
+    }
+    for (long p = s->db_parts; p + 14 <= s->db_parts + s->db_parts_len; p += 14) {
+        const unsigned char *rec = s->db + p;
+        uint32_t hash = n2_u32(rec);
+        unsigned soff = rec[8] | rec[9] << 8, aoff = rec[10] | rec[11] << 8;
+        if (!hash && !soff) break;
+        if (rec[7] != model || rec[4] != G_WHEEL || part_excluded(s, rec)) continue;
+        if (!part_open(s, 13, (rec[5] >> 5) & 7, hash)) continue;
+        if (rim_outer) {
+            int hit = 0;
+            if (sz_tab && sz_outer == rim_outer) {
+                hit = bsearch(&hash, sz_tab, (size_t)sz_n, sizeof *sz_tab, u32_cmp) != NULL;
+            } else {   /* (no memory for the table: the old search) */
+                int st, in, out;
+                const char *fold = NULL;
+                for (int k = 0; k < s->nrb && !fold; k++)
+                    if (s->rb[k].folder && rim_part_parse(s->rb[k].folder, hash, &st, &in, &out)) fold = s->rb[k].folder;
+                hit = fold && out == rim_outer;
+            }
+            if (!hit) continue;
+        }
+        return 0;
     }
     return 1;
 }

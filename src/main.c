@@ -20524,6 +20524,7 @@ int main(int argc, char **argv) {
 #define FE_DT (1.0f / 60.0f)
 #endif
         hitch_begin();
+        shop_keep_tick();   /* a closed shop's kept data, freed when no open came for it */
         uint32_t resident_frame_begin = SDL_GetTicks();
         Uint64 resident_frame_counter = SDL_GetPerformanceCounter();
         if (retired_resident) {
@@ -22013,7 +22014,9 @@ int main(int argc, char **argv) {
         }
         if (g_car_sounds_pending && !g_fe) car_load_sounds(dataroot, carname);
         if (g_fe) {
+            hitch_mark("fe.pre");
             shop_update(g_fe, FE_DT);   /* the frame's real time: menus ran half speed at 30 fps */
+            hitch_mark("fe.update");
             ShopAction sa;
             while (g_fe && shop_poll(g_fe, &sa)) {
                 int was_main = 0;
@@ -22264,6 +22267,7 @@ int main(int argc, char **argv) {
                 }
                 if (was_main) g_main_prev_car = -1;
             }
+            hitch_mark("fe.actions");
             /* UI_Main (UIMain ctor): the DDAY_PLAYER_CAR preset while the career has no car,
                else BuildCurrentRideForPlayer(0), the front end's current car */
             if (g_fe && shop_on_main_menu(g_fe)) {   /* a trip ends at the main menu (port), a city's career with it */
@@ -22314,7 +22318,7 @@ int main(int argc, char **argv) {
             int keep = cust_keep_snap;
             cust_keep_snap = 0;
             g_cust_pending = 0;
-            shop_close(&g_fe);
+            shop_close_keep(&g_fe);   /* (menu speed: the Car Shop opens next, on the same data) */
             g_fe_in = 0;
             g_shop = shop_open(dataroot, carname, &carcfg, modification,
                                wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
@@ -22326,13 +22330,13 @@ int main(int argc, char **argv) {
            -- the Car Shop on the crib's car, owned parts only */
         if (g_crib_parts_pending && g_fe && pending_car < 0) {
             g_crib_parts_pending = 0;
-            shop_close(&g_fe);
+            shop_close_keep(&g_fe);
             g_fe_in = 0;
             g_shop = shop_open(dataroot, carname, &carcfg, modification,
                                wheel_brands[wheel_brand], wheel_style); cust_open_mark(&carcfg, wheel_brands[wheel_brand], wheel_style);
             if (g_shop && shop_career_customize(g_shop, 1, NULL)) g_shop_career = 1;
             else {
-                shop_close(&g_shop);
+                shop_close_keep(&g_shop);
                 printf("career: Change Parts could not open -- the crib again\n");
                 g_fe = shop_open(dataroot, carname, &carcfg, modification, wheel_brands[wheel_brand], wheel_style);
                 if (g_fe) { fe_quick_race_data(g_fe, carname, carlist, ncars); shop_crib_return(g_fe, g_crib_from_main); g_fe_in = 1; }
@@ -23022,7 +23026,9 @@ int main(int argc, char **argv) {
                         }
                         profile_drop_snapshot();   /* UnTakeControl: DeallocBackupDB */
                     }
-                    shop_close(&g_shop);
+                    /* (menu speed) the crib or the Customize car select opens next: their shop reuses this one's data */
+                    if (g_bey_shop_type < 0 && (cs == 1 || (cs != 2 && g_shop_from_fe && !tt))) shop_close_keep(&g_shop);
+                    else shop_close(&g_shop);
                     world_tiles_trim(0);
                     kit_globalb_release();
                     if (g_bey_shop_type >= 0) {   /* a World Expansion shop (port): back to its free roam */
@@ -26433,7 +26439,16 @@ int main(int argc, char **argv) {
                 traffic_world.view[1]=sinf(heading);
             }
         }
-        hitch_mark("post_physics"); hitch_report(40.0);
+        hitch_mark("post_physics");
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid: OPENUG2_HITCH_MS=<ms> lowers the hitch line threshold (the sim runs ~5-10x the Vita) */
+            static double th = -1;
+            if (th < 0) th = getenv("OPENUG2_HITCH_MS") ? atof(getenv("OPENUG2_HITCH_MS")) : 40.0;
+            hitch_report(th);
+        }
+#else
+        hitch_report(40.0);
+#endif
         pf_mark(PF_PLAYER_SIM);
         /* Take all speed decisions from the same frame, then apply driver
            inputs through the shared tyre/suspension/collision simulation. */
