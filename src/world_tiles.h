@@ -85,6 +85,12 @@ int world_tiles_migrate_sync(WTileProgress *p);
 const char *world_tiles_migrate_track(void);
 /* Every stand-in (world role 2) at least minh tall in the track's tile set,
    one tile at a time (any thread; skyline.c). Returns tiles read, -1 no set. */
+/* GitHub #40: set by worldanim.c while a track's world animations are loaded:
+   1 when `solid` (a bin hash) is one of its animated models. The placement of
+   such a model (flag 0x10, in no scenery group: the pub's windmill sails,
+   cranes, planes, garage doors, spotlights) is the animation's source, drawn
+   by worldanim.c -- as static scenery it was a frozen duplicate. */
+extern int (*g_wt_anim_solid)(uint32_t solid);
 int world_tiles_each_standin(const char *track, float minh,
                              void (*cb)(void *ctx, const N2Mesh *m), void *ctx,
                              SDL_atomic_t *abort_flag);

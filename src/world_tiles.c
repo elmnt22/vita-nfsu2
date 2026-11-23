@@ -1,4 +1,5 @@
 #include "world_tiles.h"
+int (*g_wt_anim_solid)(uint32_t solid);   /* worldanim.c (#40) */
 #include "world.h"
 #include "world_instance.h"
 #include "nfsu2.h"
@@ -3014,6 +3015,11 @@ static int wt_assemble_once(N2Scene *scene, N2Scene *vista, const char *troot, c
                        : !tile_objects && m->world_role != 2) continue;   /* a tile without buildings: stand-ins */
             if (m->scen_has && sel.count && !wg_selection_visible(&sel, m->scen_region, m->scen_index)) {
                 hidden++; continue;
+            }
+            if (m->scen_has && m->aname[0] && g_wt_anim_solid) {   /* a world animation's model (#40) */
+                uint32_t h = 0xffffffffu;
+                for (const char *c = m->aname; *c; c++) h = h * 33u + (unsigned char)(*c >= 'a' && *c <= 'z' ? *c - 32 : *c);   /* bin hash of the upper-case name */
+                if (g_wt_anim_solid(h)) { hidden++; continue; }
             }
             if (!m->scen_has && ground && sel.count) {   /* tiles built before 11-18: an event-grouped
                                                            identity chunk by name (world_instance.c) */

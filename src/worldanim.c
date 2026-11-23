@@ -3,6 +3,7 @@
 #include "nis.h"
 #include "nfsu2.h"
 #include "world.h"
+#include "world_tiles.h"
 #include "resource.h"
 
 #include <math.h>
@@ -164,6 +165,16 @@ static int mdl_index(uint32_t h)
     for (int i = 0; i < g.nmdl; i++) if (g.mdl[i].hash == h) return i;
     return -1;
 }
+/* world_tiles.c: is this model one we animate? (#40) A fixed copy, not
+   g.mdl: tile builds run on the worker while wa_free can free the models;
+   a stale answer only costs one build. */
+static uint32_t g_wa_anim_hash[64]; static volatile int g_wa_anim_n;
+static int wa_anim_solid(uint32_t h)
+{
+    int n = g_wa_anim_n;
+    for (int i = 0; i < n; i++) if (g_wa_anim_hash[i] == h) return 1;
+    return 0;
+}
 /* a section's bytes in the STREAM bundle (the companion's section table
    0x34110: 0x50-byte rows, +8 section number, +0x14 offset, +0x18 size) */
 static int sec_range(uint32_t num, long *off, long *size)
@@ -312,6 +323,9 @@ static void solids_load(const char *stream_path)
     fclose(f);
     int meshes = 0;
     for (int i = 0; i < g.nmdl; i++) meshes += g.mdl[i].state > 0 ? g.mdl[i].sc.count : 0;
+    {   int k = 0;   /* the animated models' placements are not static scenery (#40) */
+        for (int i = 0; i < g.nmdl && k < 64; i++) if (g.mdl[i].state > 0) g_wa_anim_hash[k++] = g.mdl[i].hash;
+        g_wa_anim_n = k; }
     printf("world anims: %d of %d solids found in %d sections (%d meshes, %.0f ms)\n", found, g.nmdl, secs, meshes,
            (double)(clock() - t0) * 1000.0 / CLOCKS_PER_SEC);
     if (wa_test(NULL))                                /* test aid */
@@ -329,6 +343,7 @@ void wa_free(void)
 #ifdef __vita__
     wa_job_drop();                                  /* its model and bundle go now */
 #endif
+    g_wa_anim_n = 0;
     for (int i = 0; i < g.nent; i++)
         for (int k = 0; k < 3; k++) nis_chan_free(g.ent[i].c.ch[k]);
     for (int i = 0; i < g.nmdl; i++) {
@@ -346,6 +361,7 @@ int wa_load(const char *troot, const char *track)
 {
     wa_free();
     if (!troot || !track) return 0;
+    g_wt_anim_solid = wa_anim_solid;
     const char *stem = !strncmp(track, "STREAM", 6) ? track + 6 : track;
     char p[1100];
     snprintf(p, sizeof p, "%s/%s.BUN", troot, stem);
@@ -540,6 +556,26 @@ void wa_start(int event, int reverse)
                 if (in->flags & 0x40) { c->flags |= 0x40; c->r0 = in->r0; c->r1 = in->r1; }
                 if (in->shop0 || in->shop1) { c->flags &= ~8u; c->flags |= 0x810; }
                 ctrls++;
+                /* GitHub #40 (port choice, not retail): a looping animation whose
+                   last key repeats its first (the pub windmill: a full turn over
+                   keys 0..20, length 21) held that key for a whole frame each
+                   loop -- at the sails' rate 0.02, a 1.7 s stop. Retail's clock
+                   (0x435140) and decoder (0x6e4950) look the same, so it likely
+                   paused too; here such a loop wraps at the repeated key. */
+                if ((c->flags & 0x20) && !(c->flags & 0x850) && c->len >= 2.0f) {
+                    float p0[24], p1[24], ps[24], m0[16], m1[16], ms[16], dmax = 0, dstep = 0;
+                    nis_root_rest(p0); nis_root_rest(p1); nis_root_rest(ps);
+                    for (int ch = 1; ch < 4; ch++) {   /* _q, _s, then _t, as pose_update */
+                        NisChan *q = c->ch[ch % 3];
+                        if (q) { nis_chan_eval(q, 0.0f, p0, 24); nis_chan_eval(q, c->len - 1.0f, p1, 24); nis_chan_eval(q, 1.0f, ps, 24); }
+                    }
+                    nis_root_bone1(p0, m0); nis_root_bone1(p1, m1); nis_root_bone1(ps, ms);
+                    for (int j = 0; j < 16; j++) { dmax = fmaxf(dmax, fabsf(m0[j] - m1[j])); dstep = fmaxf(dstep, fabsf(m0[j] - ms[j])); }
+                    if (dmax < 0.05f && dmax < 0.25f * dstep) {   /* the windmill: 1 degree short of its turn, steps of 18 */
+                        c->len -= 1.0f;
+                        if (wa_test(NULL)) printf("world anims: %08x loops at its repeated key %.0f (off %.4f, step %.4f)%c", d->name, c->len, dmax, dstep, 10);
+                    }
+                }
             }
             if (d->name == in->tree) {                              /* the root: the instance's matrix */
                 memcpy(e->local, in->M, sizeof e->local);

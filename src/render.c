@@ -4089,7 +4089,11 @@ void draw_batch(const N2Batch *b) {
        binding is put back after (callers skip re-binding the same name) */
     GLuint anim = g_world_texanim_n && b->tex && b->texkey ? world_texanim_current(b->texkey) : 0;
     if (anim && anim != b->tex) glBindTexture(GL_TEXTURE_2D, anim); else anim = 0;
-    if (anim) { static int said; if (!said) { said = 1; printf("texture animation: drawing %08x frames%c", (unsigned)b->texkey, 10); } }
+    if (anim) {   /* once per animated texture */
+        static uint32_t said[8]; int k = 0;
+        while (k < 8 && said[k] && said[k] != b->texkey) k++;
+        if (k < 8 && !said[k]) { said[k] = b->texkey; printf("texture animation: drawing %08x frames%c", (unsigned)b->texkey, 10); }
+    }
     draw_batch_gl(b);
     if (anim) glBindTexture(GL_TEXTURE_2D, b->tex);
 }
