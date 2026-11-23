@@ -2865,6 +2865,65 @@ static void shared_cartex_load(const char *dataroot) {
         else printf("car textures: %s not read (memory?), tried again later\n", sp);
     }
 }
+/* GitHub #37: the garage car select's car files (GEOMETRY.BIN + TEXTURES.BIN,
+   ~600 ms of the ~1.2 s switch on the Vita, hwlog play1116b) read on a
+   worker while the menus keep running; the switch then starts from memory.
+   One car at a time; a switch for another car frees it (after its read). */
+static struct {
+    SDL_Thread *th; SDL_atomic_t done;
+    char root[512], name[32];
+    unsigned char *geo, *tex; long geolen, texlen;
+    Uint32 t0;
+} g_cpf;
+static int g_car_async_idx = -1;   /* the car select's scroll target: its switch waits for the read */
+static int car_prefetch_thread(void *u) {
+    (void)u;
+    char p[1024];
+    snprintf(p, sizeof p, "%s/CARS/%s/GEOMETRY.BIN", g_cpf.root, g_cpf.name);
+    g_cpf.geo = n2_read_file(p, &g_cpf.geolen);
+    snprintf(p, sizeof p, "%s/CARS/%s/TEXTURES.BIN", g_cpf.root, g_cpf.name);
+    g_cpf.tex = n2_read_file(p, &g_cpf.texlen);
+    SDL_AtomicSet(&g_cpf.done, 1);
+    return 0;
+}
+static void car_prefetch_join(void) {
+    if (g_cpf.th) { SDL_WaitThread(g_cpf.th, NULL); g_cpf.th = NULL; }
+}
+static void car_prefetch_drop(void) {
+    car_prefetch_join();
+    free(g_cpf.geo); free(g_cpf.tex);
+    g_cpf.geo = g_cpf.tex = NULL; g_cpf.geolen = g_cpf.texlen = 0; g_cpf.name[0] = 0;
+}
+/* 1: the car's files are in memory (or no worker: read in place); 0: being read */
+static int car_prefetch_ready(const char *root, const char *name) {
+    int busy = g_cpf.th && !SDL_AtomicGet(&g_cpf.done);
+    if (g_cpf.name[0] && !strcmp(g_cpf.name, name)) {
+        if (busy) return 0;
+        car_prefetch_join();
+        return 1;
+    }
+    if (busy) return 0;   /* another car's read (scrolled past it): it finishes first */
+    car_prefetch_drop();
+    snprintf(g_cpf.root, sizeof g_cpf.root, "%s", root);
+    snprintf(g_cpf.name, sizeof g_cpf.name, "%s", name);
+    SDL_AtomicSet(&g_cpf.done, 0);
+    g_cpf.t0 = SDL_GetTicks();
+    g_cpf.th = SDL_CreateThread(car_prefetch_thread, "car-read", NULL);
+    if (!g_cpf.th) { g_cpf.name[0] = 0; return 1; }
+    return 0;
+}
+/* hand the car's buffers over (waiting for a read in flight); 0 with nothing
+   for it (any other car's files freed) */
+static int car_prefetch_take(const char *name, unsigned char **geo, long *geolen,
+                             unsigned char **tex, long *texlen) {
+    if (!g_cpf.name[0] || strcmp(g_cpf.name, name)) { car_prefetch_drop(); return 0; }
+    car_prefetch_join();
+    printf("car: %s files read in the background (%u ms)\n", name, (unsigned)(SDL_GetTicks() - g_cpf.t0));
+    *geo = g_cpf.geo; *geolen = g_cpf.geolen; *tex = g_cpf.tex; *texlen = g_cpf.texlen;
+    g_cpf.geo = g_cpf.tex = NULL; g_cpf.geolen = g_cpf.texlen = 0; g_cpf.name[0] = 0;
+    return 1;
+}
+
 /* The skin keys are the player car's: loading a traffic or opponent car
    (or a car to switch to) uses its own while it loads, then puts the
    player's back, or the player's body kit parts lose their skin. */
@@ -2911,10 +2970,12 @@ static int prepare_car_switch_(CarSwitchCandidate *candidate,
        the upload checks below judge only this car's uploads */
     for (int n = 0; n < 16 && glGetError() != GL_NO_ERROR; n++) {}
     char path[1024];
-    snprintf(path, sizeof path, "%s/CARS/%s/GEOMETRY.BIN", dataroot, name);
-    candidate->data = n2_read_file(path, &candidate->len);
-    snprintf(path, sizeof path, "%s/CARS/%s/TEXTURES.BIN", dataroot, name);
-    candidate->texdata = n2_read_file(path, &candidate->texlen);
+    if (!car_prefetch_take(name, &candidate->data, &candidate->len, &candidate->texdata, &candidate->texlen)) {
+        snprintf(path, sizeof path, "%s/CARS/%s/GEOMETRY.BIN", dataroot, name);
+        candidate->data = n2_read_file(path, &candidate->len);
+        snprintf(path, sizeof path, "%s/CARS/%s/TEXTURES.BIN", dataroot, name);
+        candidate->texdata = n2_read_file(path, &candidate->texlen);
+    }
     candidate->nkeys = candidate->texdata
         ? n2_car_tex_keys(candidate->texdata, candidate->texlen,
                           candidate->keys, 512) : 0;
@@ -21060,7 +21121,10 @@ int main(int argc, char **argv) {
                 const char *next_car = carlist[requested];
                 if (fabsf(PHYS_KMH(speed)) > 1.0f) {
                     printf("car switch deferred: stop the car before selecting %s\n", next_car);
+                } else if (requested == g_car_async_idx && !car_prefetch_ready(dataroot, next_car)) {
+                    pending_car = requested; g_car_reload = reload;   /* #37: again once its files are read */
                 } else {
+                    g_car_async_idx = -1;
                     CarSwitchCandidate candidate;
                     if (!prepare_car_switch(&candidate, dataroot, next_car)) {
                         fprintf(stderr, "car switch failed for %s; keeping %s\n",
@@ -21952,7 +22016,8 @@ int main(int argc, char **argv) {
             shop_update(g_fe, FE_DT);   /* the frame's real time: menus ran half speed at 30 fps */
             ShopAction sa;
             while (g_fe && shop_poll(g_fe, &sa)) {
-                int was_main = 0;   /* a screen that builds its own ride: the main menu's preset goes */
+                int was_main = 0;
+                if (sa.kind != SHOP_ACT_PREVIEW && sa.kind != SHOP_ACT_RIM) g_car_async_idx = -1;   /* #37 */   /* a screen that builds its own ride: the main menu's preset goes */
                 if (g_main_preset_on && sa.kind != SHOP_ACT_PREVIEW && sa.kind != SHOP_ACT_RIM) {
                     g_main_preset_on = 0; g_career_preset_on = 0; was_main = 1;
                     if ((sa.kind == SHOP_ACT_CAREER || sa.kind == SHOP_ACT_CAREER_RIDE) && g_career_prev_car < 0)
@@ -21988,6 +22053,7 @@ int main(int argc, char **argv) {
                 } else if (sa.kind == SHOP_ACT_QR_CAR) {           /* the car select's car on the platform */
                     for (int i = 0; i < ncars; i++)
                         if (!strcmp(carlist[i], sa.car) && i != selcar) pending_car = i;
+                    g_car_async_idx = pending_car;   /* #37: its files read in the background */
                 } else if (sa.kind == SHOP_ACT_DELETE_CAR) {   /* DeleteTunedCar: the select has moved on already */
                     int was = g_gslot;
                     garage_delete_slot(sa.slot);
