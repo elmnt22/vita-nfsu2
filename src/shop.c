@@ -8095,6 +8095,7 @@ static void crib_dlg(Shop *s, int act) {
         profile_drop_snapshot();
         s->platform = 1;
         s->crib_from_main = 0;
+        if (!s->main.e || !s->main.n) shop_front_end(s);   /* GitHub #42: the crib came without the main menu (garage -> crib): its list first */
         s->screen = SC_MAIN;
         s->fe_action = SHOP_ACT_CAREER_QUIT;
         printf("crib: back to the main menu\n");
@@ -12196,6 +12197,7 @@ void shop_draw(Shop *s, const RProg *rp, GpuMesh *quad, int width, int height) {
     }
     case SC_MAIN:
         t.title = str_get(s, STR_MAIN_MENU);
+        if (!s->main.e || !s->main.n) shop_front_end(s), s->screen = SC_MAIN;   /* never built (#42) */
         t.option = str_get(s, s->main.e[s->main.sel].str);
         draw_package(s, &dc, s->pk[PK_MAIN] ? PK_MAIN : PK_CATEGORY, &t, 0, &s->main, 0);
         break;
