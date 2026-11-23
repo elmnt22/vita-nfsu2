@@ -347,6 +347,7 @@ game starts. A small menu opens before the game loads:
 | **Logs** | On by default. Off stops `log.txt` and `perf.csv` from being written. `boot.txt` and `crumbs.txt` are always kept. |
 | **Frame rate** | **30 FPS** (default, locked and even) or **Unlocked** (up to 60, varies; experimental). |
 | **Fast travel** | Off by default. On: on the World Map, choosing **No** on the GPS prompt takes you straight to that place (`fasttravel.txt`). |
+| **Ignore Visual Rating** | Off by default. On: in the career, DVD covers unlock without needing their star rating, so the Visual Rating no longer holds up a stage (`novisrating.txt`). The cover still pays by your rating. |
 | **Trophies** | Off by default. On: trophies are reported to the system (`trophies.txt`; needs the NoTrpDrm plugin). Off, progress is still saved in your profile and is reported when you turn them on. |
 | **Full detail** | Off by default: the lighter mix for a steady 30 FPS downtown (road reflection redrawn every second frame, fewer traffic cars, half the particle rate). On: the original rates (`fulldetail.txt`). |
 | **World Expansion: Rockport and Palmont** | Off by default. On: Free Run offers Rockport and Palmont (`expansion/enable.txt`). The right side shows which cities are on the memory card; send them with the [Prep Tool](#world-expansion-rockport-and-palmont) first. |
