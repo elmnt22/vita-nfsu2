@@ -370,6 +370,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
 #endif
         }
         g->tpk = n2_tpk_open(g->data, g->len);
+        world_texanim_scan(g->data, g->len);
         long size_on_disk = g->len;
 #ifdef __vita__
         if (g->pinned) size_on_disk = res_bundle_file_len();   /* compact copy is smaller */
@@ -749,6 +750,7 @@ int world_beyond_keep_tex(const World *w, uint32_t key) {
     if (ok) { beyond_keep_tex(key, &t); free(t.rgb); free(t.alpha); free(t.dxt); }
     return ok;
 }
+static int g_texanim_nkey;   /* texture animations, below (#40) */
 void world_texture_cache_clear(void) {
 #ifdef __vita__
     /* the worker's predecoded textures are keyed by name too, and another
@@ -761,6 +763,7 @@ void world_texture_cache_clear(void) {
     free(g_texcache);
     g_texcache = NULL; g_texcache_cap = g_texcache_used = 0;
     g_texbind_build = g_texbind_pass = 0;
+    g_world_texanim_n = g_texanim_nkey = 0;   /* the next track's packs are scanned again */
 }
 
 /* Bind one requested key from one source, honouring the cache. `last` marks
@@ -794,6 +797,76 @@ GLuint world_texture_lookup(uint32_t key, unsigned char *mode) {
     if (!e || e->state != 1) return 0;
     if (mode) *mode = e->mode;
     return e->tex;
+}
+
+/* ---- texture animations (GitHub #40) ----
+   0xb0300100 holds 0x30300101 (16 bytes), 0x30300102 (52-byte entries:
+   name[24], base key, frame count, frames per second, 16 runtime bytes) and
+   0x30300103 (16-byte frames, key first; the entries' frames in order, the
+   first frame being the base texture itself). */
+#define TEXANIM_MAX 64
+#define TEXANIM_FRAMES 1024
+typedef struct { uint32_t base; int f0, n; float fps; } WTexAnim;
+static WTexAnim g_texanim[TEXANIM_MAX];
+static uint32_t g_texanim_key[TEXANIM_FRAMES];
+int g_world_texanim_n;
+float g_world_texanim_time;
+
+static uint32_t ta_u32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+
+static void texanim_pack(const unsigned char *d, long len) {
+    const unsigned char *ent = NULL, *frm = NULL; long nent = 0, nfrm = 0;
+    for (long o = 0; o + 8 <= len; ) {
+        uint32_t id = ta_u32(d + o), sz = ta_u32(d + o + 4);
+        if ((unsigned long)sz > (unsigned long)(len - o - 8)) return;
+        if (id == 0x30300102u) { ent = d + o + 8; nent = sz / 52; }
+        if (id == 0x30300103u) { frm = d + o + 8; nfrm = sz / 16; }
+        o += 8 + (long)sz;
+    }
+    if (!ent || !frm) return;
+    long f = 0;
+    for (long i = 0; i < nent; i++) {
+        const unsigned char *e = ent + i * 52;
+        uint32_t base = ta_u32(e + 24), n = ta_u32(e + 28), fps = ta_u32(e + 32);
+        if (n == 0 || n > 256 || f + (long)n > nfrm) return;
+        int known = 0;
+        for (int a = 0; a < g_world_texanim_n; a++) known |= g_texanim[a].base == base;
+        if (!known && base && fps && g_world_texanim_n < TEXANIM_MAX &&
+            g_texanim_nkey + (int)n <= TEXANIM_FRAMES) {
+            WTexAnim *a = &g_texanim[g_world_texanim_n++];
+            a->base = base; a->f0 = g_texanim_nkey; a->n = (int)n; a->fps = (float)fps;
+            for (uint32_t k = 0; k < n; k++) g_texanim_key[g_texanim_nkey++] = ta_u32(frm + (f + k) * 16);
+            printf("texture animation %.24s: %08x, %u frames at %u fps%c", (const char *)e,
+                   (unsigned)base, (unsigned)n, (unsigned)fps, 10);
+        }
+        f += (long)n;
+    }
+}
+
+void world_texanim_scan(const unsigned char *d, long len) {
+    if (!d) return;
+    for (long o = 0; o + 8 <= len; ) {
+        uint32_t id = ta_u32(d + o), sz = ta_u32(d + o + 4);
+        if ((unsigned long)sz > (unsigned long)(len - o - 8)) return;
+        if (id == 0xb0300100u) texanim_pack(d + o + 8, (long)sz);
+        o += 8 + (long)sz;
+    }
+}
+
+int world_texanim_frames(uint32_t base, const uint32_t **frames) {
+    for (int a = 0; a < g_world_texanim_n; a++)
+        if (g_texanim[a].base == base) { *frames = g_texanim_key + g_texanim[a].f0; return g_texanim[a].n; }
+    return 0;
+}
+
+GLuint world_texanim_current(uint32_t key) {
+    for (int a = 0; a < g_world_texanim_n; a++) {
+        const WTexAnim *t = &g_texanim[a];
+        if (t->base != key) continue;
+        long k = (long)(g_world_texanim_time * t->fps);
+        return world_texture_lookup(g_texanim_key[t->f0 + (int)(k % t->n)], NULL);
+    }
+    return 0;
 }
 
 static void world_predecode_free(void) {
@@ -1107,6 +1180,13 @@ int world_bind_textures_step(World *w, uint32_t *keys, GLuint *texs,
                 int decoded = world_bind_key(w, g, key, binding->pass, last,
                     keys, texs, modes, cap, binding, owner);
                 if (binding->count < 0) goto done;
+                if (g_world_texanim_n) {   /* an animated texture: its frames too (#40) */
+                    const uint32_t *fk; int nf = world_texanim_frames(key, &fk);
+                    for (int f = 1; f < nf && binding->count >= 0; f++)
+                        decoded += world_bind_key(w, g, fk[f], binding->pass, last,
+                            keys, texs, modes, cap, binding, NULL);
+                    if (binding->count < 0) goto done;
+                }
                 world_bind_decodes += decoded;
                 if (decoded && --max_decodes == 0) return 0;
             }

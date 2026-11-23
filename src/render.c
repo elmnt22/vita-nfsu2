@@ -4081,7 +4081,19 @@ int render_fastbatch_on(void) {
     return g_fastbatch;
 }
 #endif
+static void draw_batch_gl(const N2Batch *b);
+extern int g_world_texanim_n;          /* world.c (#40) */
+GLuint world_texanim_current(uint32_t key);
 void draw_batch(const N2Batch *b) {
+    /* GitHub #40: an animated texture draws its current frame; the caller's
+       binding is put back after (callers skip re-binding the same name) */
+    GLuint anim = g_world_texanim_n && b->tex && b->texkey ? world_texanim_current(b->texkey) : 0;
+    if (anim && anim != b->tex) glBindTexture(GL_TEXTURE_2D, anim); else anim = 0;
+    if (anim) { static int said; if (!said) { said = 1; printf("texture animation: drawing %08x frames%c", (unsigned)b->texkey, 10); } }
+    draw_batch_gl(b);
+    if (anim) glBindTexture(GL_TEXTURE_2D, b->tex);
+}
+static void draw_batch_gl(const N2Batch *b) {
 #if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
     if (g_fastbatch != 0 && render_fastbatch_on()) {
         vu_select();   /* the shader variant pick the glDrawElements shim makes */

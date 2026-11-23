@@ -30716,6 +30716,8 @@ int main(int argc, char **argv) {
             float wa_dt = 1.0f / 60.0f * n2sim_time_scale();
 #endif
             wa_update(wa_dt, g_career_nis_on || (g_rt.active && g_rt.nis && race_state == 0));
+            g_world_texanim_time += wa_dt;   /* the TPK texture animations (#40) */
+            if (g_world_texanim_time > 3600.0f) g_world_texanim_time -= 3600.0f;
         }
         if (g_acid_ok) {
 #ifdef __vita__

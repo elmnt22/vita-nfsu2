@@ -286,6 +286,17 @@ void world_texture_cache_clear(void);
 int world_beyond_keep_tex(const World *w, uint32_t key);
 /* A texture the cache holds, by key (0 = not bound); mode: its N2_DRAW_* */
 GLuint world_texture_lookup(uint32_t key, unsigned char *mode);
+/* GitHub #40: the bundles' texture animations (0xb0300100: fountain water,
+   billboard lights, sky dome, rail-crossing blinkers). world_texanim_scan
+   reads a region's packs; the binder also binds each base key's frames;
+   draw_batch asks world_texanim_current for the frame to draw (0 = not an
+   animated key, or its frame is not bound yet). The clock is seconds of
+   world-animation time (main.c advances it with the world animations). */
+void world_texanim_scan(const unsigned char *d, long len);
+int world_texanim_frames(uint32_t base, const uint32_t **frames);
+GLuint world_texanim_current(uint32_t key);
+extern int g_world_texanim_n;
+extern float g_world_texanim_time;
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */
