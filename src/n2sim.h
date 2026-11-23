@@ -90,6 +90,12 @@ int  n2sim_dampen(const N2Sim *s);
    set before each step: ResetDampenMode's collision mode 2 and the
    hydraulics skip (0x5a2fd0) read it */
 void n2sim_set_body_collisions(N2Sim *s, int n);
+/* GitHub #35 (roof reset, 0x5a5e20): the body's world collisions; a human
+   player's car and its reset blink; the car's reset request (read + clear) */
+void n2sim_set_body_ground(N2Sim *s, int n);
+void n2sim_set_human(N2Sim *s, int human, int blinking);
+int  n2sim_want_reset(N2Sim *s);
+void n2sim_debug_roll(N2Sim *s, float deg, float lift);   /* test aid */
 int  n2sim_drag(const N2Sim *s);    /* n2sim_set_drag's flag */
 /* Drafting, car +0x4dc (0x5ebd80 / 0x5ebc20): the slipstream of every other
    car (n of them, s itself skipped), 0..0.9; set it on each car before it

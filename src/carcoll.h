@@ -129,6 +129,7 @@ int  carcoll_car_pairs(int (*ab)[2], float *dist, int *touch, int max);
    before the tick's runs. */
 void carcoll_world_time(float dt);
 int  carcoll_body_collisions(const void *body);
+int  carcoll_body_world(const void *body);   /* with the world only (#35) */
 
 #ifdef __cplusplus
 }

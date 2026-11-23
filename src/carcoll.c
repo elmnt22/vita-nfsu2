@@ -1008,6 +1008,16 @@ int carcoll_body_collisions(const void *body)
     return n;
 }
 
+/* the same, only those with the world (Collision::IsGroundInvolved) */
+int carcoll_body_world(const void *body)
+{
+    int n = 0;
+    if (!body) return 0;
+    for (int i = 0; i < g_ncoll; i++)
+        if (g_coll[i].a == body && !g_coll[i].b && g_coll_now - g_coll[i].t < 0.3f) n++;
+    return n;
+}
+
 /* 0x5b2610 + 0x5af0e0 for one contact; 1 when an impulse was applied (the
    bodies were closing) */
 static int resolve(World *W, const Contact *k, CarCollHit *hit, CarCollWake wake, void *user)

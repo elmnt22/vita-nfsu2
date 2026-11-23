@@ -5087,6 +5087,18 @@ static float n2_player_tick(const N2Scene *scene, float carpos[3], float vel[2],
        player's car +0x3c -> +0x18 for its step (ResetDampenMode, hydraulics) */
     carcoll_world_time(1.0f / 60.0f * n2sim_time_scale());
     n2sim_set_body_collisions(g_n2, carcoll_body_collisions(g_n2));
+    n2sim_set_body_ground(g_n2, carcoll_body_world(g_n2));
+    n2sim_set_human(g_n2, 1, g_reset_blink > 0.0f);   /* car +0x14 -> +4 == 1; Car::IsBlinking */
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (#35): OPENUG2_SIM_ROLL="deg [lift]" tips the car over once, 600 ticks in */
+        static int t; const char *e = getenv("OPENUG2_SIM_ROLL");
+        float deg = 90.0f, lift = 1.0f;
+        if (e && ++t == 600 && sscanf(e, "%f %f", &deg, &lift) >= 1) {
+            n2sim_debug_roll(g_n2, deg, lift);
+            printf("sim: car rolled %.0f degrees%c", deg, 10);
+        }
+    }
+#endif
     {   /* test aid: OPENUG2_COLLTEST logs the player's live Collision count and dampen mode changes */
         static int on = -1, pc, pd;
         if (on < 0) on = getenv("OPENUG2_COLLTEST") != NULL;
@@ -12472,7 +12484,10 @@ static void rt_step_batch(RtStepBatch *b)
     static double sum[8], wall; static long cnt[8]; static int batches;
     int mv[AIRACE_MAX + RT_TMAX];
     for (int i = 0; i < b->n; i++) { int m = n2sim_mover(b->s[i]); mv[i] = m >= 0 && m < 8 ? m : 0; }
-    for (int i = 0; i < b->n; i++) n2sim_set_body_collisions(b->s[i], carcoll_body_collisions(b->s[i]));   /* car +0x3c -> +0x18 */
+    for (int i = 0; i < b->n; i++) {
+        n2sim_set_body_collisions(b->s[i], carcoll_body_collisions(b->s[i]));   /* car +0x3c -> +0x18 */
+        n2sim_set_body_ground(b->s[i], carcoll_body_world(b->s[i]));
+    }
     Uint64 t0 = SDL_GetPerformanceCounter();
     int n = b->n;
     /* hwlog25: a race tick's steps are ~0.5 ms of work (0.02 ms a traffic
@@ -25732,8 +25747,13 @@ int main(int argc, char **argv) {
             }
             float mph = fabsf(speed) * 60.0f * 2.237f;
             int early =g_rt.active && g_rt.start >= 0.0f && g_rt.t - g_rt.start < 3.0f;
-            if (rs && !rs_prev && race_state == 1 && !g_showroom && !g_rt.postrace && mph <= 60.0f && !early &&
-                rs_ticks >= 120 && ring_n) {
+            /* GitHub #35: the roof reset's request (car +0x96c, n2sim 0x5a5e20 port):
+               Car::Move 0x6012b0 calls Player::HandleReset for it without
+               IsAllowedToReset; none once the race is finished (IsFinishedRacing) */
+            int roof = g_n2 && n2sim_want_reset(g_n2) && !g_rt.pfinished;
+            if (roof) printf("reset: the car lies stuck (on its side / drive wheels off the ground)%c", 10);
+            if (((rs && !rs_prev && mph <= 60.0f && !early && rs_ticks >= 120) || roof) &&
+                race_state == 1 && !g_showroom && !g_rt.postrace && ring_n) {
                 float p[3], h, v = 0.0f;
                 const unsigned char *z = g_rt.rp ? racepath_zone(g_rt.rp, carpos, 4) : NULL;
                 const char *how;

@@ -399,6 +399,9 @@ struct N2Sim {
     double hit_time;                   /* carstate+0x3c -> +0x140, last crash */
     int   dampen;                      /* car +0x38 DampenMode: 0 normal, 1 crash, 2 collision */
     int   body_colls;                  /* car +0x3c -> +0x18: live Collisions (n2sim_set_body_collisions) */
+    int   body_ground;                 /* ... of them with the world (Collision::IsGroundInvolved) */
+    int   human, blinking;             /* car +0x14 -> +4 == 1 (a human player); Car::IsBlinking */
+    int   want_reset;                  /* car +0x96c (Car::PleaseResetMeLater 0x5ebf60) */
     float draft;                       /* car +0x4dc (0x5ebd80, World::DoTimestep) */
     int   nos_spray;                   /* a purge press since the last n2sim_nos_spray */
     int   dampen_on; float dampen_t;   /* car +0x54c: time on four wheels since */
@@ -1437,7 +1440,11 @@ static void force_pass(N2Sim *s)                                         /* 0x5b
 }
 
 /* ---- rest detection 0x5992b0 / 0x5a5e20 ----------------------------------- */
-static int rest_check_c(N2Sim *s, const int *contact, float thr, int gear)  /* 0x5992b0 */
+/* GitHub #35: the port also wanted all four wheels in contact here (not in
+   0x5992b0: its loop over the four is the hydraulic states). A car propped
+   on its body (on its side against a barrier or a wall) then never came to
+   rest, so the roof reset below never ran and it stayed up there. */
+static int rest_check_c(N2Sim *s, int prev, float thr, int gear)       /* 0x5992b0 */
 {
     Body *b = &s->b;
     /* never at rest while the hydraulics bounce (0x5ed290: any bounce > 0)
@@ -1445,20 +1452,36 @@ static int rest_check_c(N2Sim *s, const int *contact, float thr, int gear)  /* 0
     for (int i = 0; i < 4; i++) if (s->hyd_bounce[i] > 0) return 0;
     if (s->mover == N2_MOVER_PHYSICS)
         for (int i = 0; i < 4; i++) if (s->hyd_code[i] == 2 || s->hyd_code[i] == 3) return 0;
-    for (int i = 0; i < 4; i++) if (!contact[i]) return 0;
     if (thr <= 0.3f || gear == 1 || s->cs_wheels < 1) {
         float v = len3(b->v), w = len3(b->w);
+        /* Car::IsTouchingGround 0x5ed220: a wheel down, or a body collision
+           with the world; the last answer 2 also keeps it */
+        int touching = s->cs_wheels > 0 || s->body_ground > 0;
         if (v <= 0.7f && w <= 0.7f &&
             ((fabsf(b->R[2]) <= 0.15f && fabsf(b->R[6]) <= 0.15f) || s->cs_wheels < 1) &&
-            (s->cs_wheels > 0 || s->rest == 2))
+            !s->blinking && (touching || prev == 2))
             return v <= 0.25f && w <= 0.25f ? 2 : 1;
     }
     return 0;
 }
 static int rest_check(N2Sim *s)
 {
-    int c[4] = { s->wh[0].contact, s->wh[1].contact, s->wh[2].contact, s->wh[3].contact };
-    return rest_check_c(s, c, s->eff.throttle, s->d.gear);
+    return rest_check_c(s, s->rest, s->eff.throttle, s->d.gear);
+}
+/* MovementDousingAndRoofReset 0x5a5e20, fully at rest (2): the timer (mover
+   +0x68: the clock when it started, 0 off) runs while the car lies on its
+   side or roof (up z < 0.1, RigidBody +0x58) or, for a human player's car
+   (car +0x14 -> +4 == 1), while no drive wheel touches (AreDriveWheelsOffGround
+   0x5ed1b0); a second on, PleaseResetMeLater 0x5ebf60 (car +0x96c; Car::Move
+   0x6012b0 -> Player::HandleReset for a player). Upright, it stops. */
+static void roof_reset(N2Sim *s, float *timer)
+{
+    int drive_off = 1;
+    for (int i = 0; i < 4; i++)
+        if (s->cs_contact[i] && (i < 2 ? front_driven(&s->d) : rear_driven(&s->d))) drive_off = 0;
+    if (!(s->b.R[10] < 0.1f) && !(s->human && drive_off)) { *timer = 0; return; }
+    if (*timer == 0.0f) { *timer = (float)s->time; if (*timer == 0.0f) *timer = 1e-6f; return; }
+    if ((float)s->time - *timer > 1.0f) s->want_reset = 1;      /* 0x7a1a78 */
 }
 static int rest_apply(N2Sim *s)
 {
@@ -1475,6 +1498,7 @@ static int rest_apply(N2Sim *s)
     }
     memset(b->p, 0, 12); memset(b->L, 0, 12);
     if (s->cs_wheels > 0) for (int i = 0; i < 4; i++) s->wh[i].w = 0;
+    roof_reset(s, &s->rest_t);
     b->gravity = 0;
     return 1;
 }
@@ -1885,9 +1909,10 @@ static void mello_post_all(N2Sim *s) { body_post(&s->b); mello_post(s); }   /* 0
 static int mello_rest(N2Sim *s)                                          /* 0x5a5e20, no wheels */
 {
     Mello *m = &s->m; Body *b = &s->b;
-    int r = m->rest = rest_check_c(s, m->contact, m->thr, m->gear);
+    int r = m->rest = rest_check_c(s, m->rest, m->thr, m->gear);
     if (r == 2) {
         memset(b->p, 0, 12); memset(b->L, 0, 12);
+        roof_reset(s, &m->rest_t);
         b->gravity = 0;
         return 1;
     }
@@ -3369,6 +3394,14 @@ void n2sim_set_dampen(N2Sim *s, int mode)
 }
 int n2sim_dampen(const N2Sim *s) { return s ? s->dampen : 0; }
 void n2sim_set_body_collisions(N2Sim *s, int n) { if (s) s->body_colls = n; }
+void n2sim_set_body_ground(N2Sim *s, int n) { if (s) s->body_ground = n; }
+void n2sim_set_human(N2Sim *s, int human, int blinking) { if (s) { s->human = human; s->blinking = blinking; } }
+int n2sim_want_reset(N2Sim *s)
+{
+    if (!s || !s->want_reset) return 0;
+    s->want_reset = 0; s->rest_t = 0; s->m.rest_t = 0;
+    return 1;
+}
 int n2sim_drag(const N2Sim *s) { return s && s->drag; }
 
 /* 0x5ebc20: the draft car o gives s -- o at 1 m/s or more (car +0x430),
@@ -3730,6 +3763,22 @@ void n2sim_body_pose(N2Sim *s, const float pos[3], const float R[16], const floa
 {
     Body *b = &s->b;
     memcpy(b->pos, pos, 12); memcpy(b->R, R, 64); memcpy(b->p, p, 12);
+    body_refresh(b);
+}
+
+/* test aid (sim, #35): roll the body `deg` about its forward axis, lifted
+   `lift` m, at rest */
+void n2sim_debug_roll(N2Sim *s, float deg, float lift)
+{
+    Body *b = &s->b;
+    float a = deg * 3.14159265f / 180.0f, c = cosf(a), sn = sinf(a);
+    for (int k = 0; k < 3; k++) {
+        float y = b->R[4 + k], z = b->R[8 + k];
+        b->R[4 + k] = y * c + z * sn;
+        b->R[8 + k] = -y * sn + z * c;
+    }
+    b->pos[2] += lift;
+    memset(b->p, 0, 12); memset(b->L, 0, 12);
     body_refresh(b);
 }
 
