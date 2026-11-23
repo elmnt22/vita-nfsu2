@@ -50,8 +50,30 @@ typedef struct {
                                is one engine cycle, so it plays at length x rpm / cyc_k */
 } GinsuSweep;
 
+/* One GinsuSynthesis voice (SPEED2.EXE 0x466d30 HandlePacketRelease, GC
+ * 800b0908): the recording plays on at its own rate in 11 ms packets; the
+ * rpm's place in it (nominal) glides to its target in 6 packets
+ * (UpdateFrequency 0x467230, 60 ms from SetGinsuParams 0x473e60); when the
+ * playback drifts a whole engine cycle from nominal it jumps by whole cycles
+ * with a 0.5 ms crossfade, at most once per 11 ms (SetSynthData 0x467160). */
+typedef struct {
+    float buf[1024]; int n;  /* the packet being played (recording rate) */
+    double rd; float last;   /* read cursor in it; the previous packet's last sample */
+    long  play;              /* +0x2c playback position in the recording */
+    float nominal, target;   /* +0x30 / +0x34 positions for the rpm */
+    int   glide, hold;       /* +0x38 packets left to the target, +0x3c samples before a jump */
+    int   P, X, H;           /* +0x14 packet, +0x18 crossfade, +0x10 hold (samples) */
+} GinVoice;
+
 typedef struct {
     GinsuSweep accel_sweep, decel_sweep;
+    GinVoice v[2];          /* per-sweep synthesis voice (0 decel, 1 accel) */
+    float erpm_g, erpm_t;   /* the rpm on the slot scale: glided, and its target */
+    int   eglide, epk;      /* its glide (packets left, output samples into the packet) */
+    int   tick;             /* output samples into the 60 Hz SFXCTL update */
+    float avg[3]; int navg; /* SFXCTL_Engine's Average(3) of the sound rpm (1000..10000) */
+    int   redline, saw_up;  /* UpdateRedlining 0x46f610 state; UpdateRPM's dip direction (+0x120) */
+    float saw;              /* UpdateRPM 0x46f7d0's limiter dip, 0..200 (+0x124) */
     double play_cursor[2];  /* per-sweep cursor (accel, decel); double: a float's step at 131072+
                                samples is 1/64, a 2 % staircase on a 0.72 increment (GitHub #16) */
     int   grain_idx[2];     /* per-sweep grain (engine cycle) being played */

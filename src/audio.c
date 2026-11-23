@@ -337,6 +337,117 @@ static float gin_pos_at(const GinsuSweep *s, float rpm) {
            ((float)s->rpm_pos[i+1] - (float)s->rpm_pos[i]);
 }
 
+/* GinsuSynthData over the grain (engine cycle) table: SampleToCycle 0x466af0,
+   CycleToSample, CyclePeriod 0x4669d0 (central differences, interpolated) */
+static float gin_cyc(const GinsuSweep *s, double pos) {
+    int n = s->n_grain;
+    if (pos <= (double)s->grain[0]) return 0.0f;
+    if (pos >= (double)s->grain[n]) return (float)n;
+    int lo = 0, hi = n - 1;
+    while (lo < hi) { int m = (lo + hi + 1) / 2; if ((double)s->grain[m] <= pos) lo = m; else hi = m - 1; }
+    return (float)lo + (float)((pos - (double)s->grain[lo]) / (double)(s->grain[lo + 1] - s->grain[lo]));
+}
+static double gin_c2s(const GinsuSweep *s, float c) {
+    int n = s->n_grain;
+    if (c <= 0.0f) return (double)s->grain[0];
+    if (c >= (float)n) return (double)s->grain[n];
+    int j = (int)c;
+    return (double)s->grain[j] + (double)(c - (float)j) * (double)(s->grain[j + 1] - s->grain[j]);
+}
+static float gin_period(const GinsuSweep *s, float c) {
+    int n = s->n_grain; const uint32_t *g = s->grain;
+    if (n < 2) return n == 1 ? (float)(g[1] - g[0]) : 1.0f;
+    int j = (int)floorf(c);
+    float a, b;
+    if (j < 1) {
+        if (j < 0) { c = 0.0f; j = 0; }
+        a = (float)(g[1] - g[0]); b = (float)(g[2] - g[0]) * 0.5f;
+    } else if (j < n - 1) {
+        a = (float)(g[j + 1] - g[j - 1]) * 0.5f; b = (float)(g[j + 2] - g[j]) * 0.5f;
+    } else {
+        if (n <= j) c = (float)n;
+        j = n - 1;
+        a = (float)(g[n] - g[n - 2]) * 0.5f; b = (float)(g[n] - g[n - 1]);
+    }
+    float p = (b - a) * (c - (float)j) + a;
+    return p > 1.0f ? p : 1.0f;
+}
+static float gin_smp(const GinsuSweep *s, long i) {
+    if (i < 0) i = 0;
+    if (i >= (long)s->total_samples) i = (long)s->total_samples - 1;
+    return (float)s->samples[i] * (1.0f / 32768.0f);
+}
+static void gin_voice_init(const GinsuSweep *s, GinVoice *v) {   /* SetSynthData 0x467160 + StartSynthesis 0x4778c0 */
+    memset(v, 0, sizeof *v);
+    v->P = (int)lrintf((float)s->sample_rate * 0.011f);
+    v->H = v->P;
+    v->X = (int)lrintf((float)s->sample_rate * 0.0005f);
+    if (v->P + v->X > 1000) v->P = 1000 - v->X;
+    if (v->P < 8) v->P = 8;
+    v->play = (long)s->grain[0];
+    v->nominal = v->target = (float)s->grain[0];
+    v->glide = 1;
+}
+/* HandlePacketRelease 0x466d30: the next packet */
+static void gin_packet(const GinsuSweep *s, GinVoice *v) {
+    int P = v->P, X = v->X;
+    if (v->play < (long)s->grain[0] || v->play + P + X + 2 >= (long)s->total_samples)   /* (port: never off the data) */
+        v->play = (long)llrint(gin_c2s(s, gin_cyc(s, v->nominal)));
+    if (v->play + P + X + 2 >= (long)s->total_samples) v->play = (long)s->total_samples - P - X - 3;
+    if (v->play < 0) v->play = 0;
+    float cn = gin_cyc(s, v->nominal);
+    float step = (v->target - v->nominal) / (float)(v->glide > 0 ? v->glide : 1);
+    int jump = 0; float fr = 1.0f;
+    if (v->hold < P) {
+        float cp = gin_cyc(s, (double)v->play);
+        float d = step / gin_period(s, cn) - (float)P / gin_period(s, cp);   /* nominal's drift from the playback, cycles a packet */
+        float off = cn - cp, f4 = (float)v->hold / (float)P;
+        float o5 = f4 * d + off, o6 = d + off;
+        if (floorf(o5) == floorf(o6)) {          /* no whole cycle crossed: jump once far enough off */
+            if (ceilf(fabsf(d)) < fabsf(o5)) { jump = o5 >= 0.0f ? (int)floorf(o5) : (int)ceilf(o5); fr = f4; }
+        } else {                                  /* a whole cycle crossed in this packet: jump there */
+            jump = o5 >= o6 ? (int)floorf(o5) : (int)ceilf(o5);
+            fr = ((float)jump - off) / d;
+        }
+        if (!jump) fr = 1.0f;
+    }
+    int n1 = (int)lrintf((float)P * fr);
+    if (n1 < 0) n1 = 0; if (n1 > P) n1 = P;
+    int k = 0;
+    for (; k < n1; k++) v->buf[k] = gin_smp(s, v->play + k);
+    v->play += n1; v->hold -= n1; if (v->hold < 0) v->hold = 0;
+    if (jump) {
+        long np = (long)llrint(gin_c2s(s, gin_cyc(s, (double)v->play) + (float)jump));
+        for (int x = 0; x < X; x++) {             /* the 0.5 ms linear crossfade */
+            float t = (float)x / (float)X;
+            v->buf[k++] = gin_smp(s, v->play + x) * (1.0f - t) + gin_smp(s, np + x) * t;
+        }
+        v->play = np + X; v->hold = v->H - X;
+        int rest = P - k;
+        for (int x = 0; x < rest; x++) v->buf[k++] = gin_smp(s, v->play + x);
+        if (rest > 0) { v->play += rest; v->hold -= rest; }
+    }
+    v->n = k;
+    v->nominal = (float)lrintf(v->nominal + step);
+    if (v->glide > 1) v->glide--;
+}
+/* the voice's output: its packets read at `speed` recording samples per output sample */
+static float gin_voice_read(const GinsuSweep *s, GinVoice *v, double speed) {
+    for (int guard = 0; guard < 4; guard++) {
+        long i = (long)floor(v->rd);
+        if (i + 1 < v->n) {
+            float a = i < 0 ? v->last : v->buf[i], b = v->buf[i + 1];
+            float f = (float)(v->rd - (double)i);
+            v->rd += speed;
+            return a + (b - a) * f;
+        }
+        if (v->n > 0) { v->last = v->buf[v->n - 1]; v->rd -= (double)v->n; }
+        gin_packet(s, v);
+        if (v->n <= 1) break;
+    }
+    return 0.0f;
+}
+
 /* Per-car audio rows, from SPEED2.EXE: fn 0x459240 maps the car type (GLOBALB
  * car-table order) to a row; the table at 0x7f2230 holds 12-byte records
  * {engine slot, ?, turbo bank} at row*4 + upgrade level. Cars outside the
@@ -501,6 +612,7 @@ loaded:
         GinsuSweep *sw = a ? &g->accel_sweep : &g->decel_sweep;
         g->play_cursor[a] = (double)sw->grain[0];
         g->grain_idx[a] = 0;
+        gin_voice_init(sw, &g->v[a]);
         /* each grain is one engine cycle: its length x its recorded rpm is
            the sweep's constant (32 kHz: 120 s x 32000 = 3.84e6) */
         double k = 0.0; int nk = 0;
@@ -511,6 +623,8 @@ loaded:
         }
         sw->cyc_k = nk ? (float)(k / nk) : 120.0f * (float)sw->sample_rate;
     }
+    g->erpm_g = g->erpm_t = 0.0f; g->eglide = 1; g->epk = 0;
+    g->tick = 0; g->navg = 0; g->redline = 0; g->saw_up = 1; g->saw = 0.0f;
     g->has_gin_data = 1;
     return g->decel_is_alias ? 1 : 2;
 }
@@ -1759,16 +1873,18 @@ static void audio_mix_body(void *ud, Uint8 *stream, int len) {
         float w[3]; eng_band_weights(e->current_rpm, w);
         float eng = 0.0f;
         if (e->gin.has_gin_data) {
-            /* native Gnsu20 path (GitHub #16). Each grain of a sweep is one
-               engine cycle of the recording, so the voice plays whole cycles:
-               at every cycle end it continues with the cycle recorded at the
-               current rpm (GinsuSynthesis works in cycle space too,
-               HandlePacketRelease GC 800b0908), each read at length x rpm /
-               cyc_k so the pitch follows the rpm exactly whichever cycle
-               plays. The old way held a grain until the rpm was 6 % off,
-               then crossfaded to a grain started out of phase: a 1 % pitch
-               jump and a dip at every switch, a staircase on a pull.
-               Accel/decel sweeps crossfade by load. */
+            /* native Gnsu20 path (GitHub #16), as the game's GinsuSynthesis
+               (PC 0x466d30, GC HandlePacketRelease 800b0908): each sweep's
+               recording plays on at its own rate (its own cycles one after
+               another, not one cycle repeated), in 11 ms packets; where the rpm
+               sits in it glides there in 6 packets (UpdateFrequency, 60 ms);
+               when the playback is a whole engine cycle off it jumps by whole
+               cycles with a 0.5 ms crossfade. 11-20 played one recorded cycle
+               per engine cycle with no crossfade: the same cycle over and over
+               between rpm steps (the steps players still heard in 0.2.1). The
+               60 ms glide replaces the ~110 ms easing the rpm had here, which
+               smoothed the rev limiter's bounce away. Accel/decel sweeps
+               crossfade by load. */
             Ginsu20State *g = &e->gin;
             /* the rpm the sweeps play (0x47c3f8 -> ctl +0xf8): the engine
                rpm on the sound's 1000..10000 scale (SFXCTL_Physics 0x484c50:
@@ -1779,11 +1895,43 @@ static void audio_mix_body(void *ud, Uint8 *stream, int len) {
                high-rev note at idle. */
             float lo = e->rpm_lo, hi = e->rpm_hi;
             if (!(hi > lo + 1.0f)) { lo = ENG_IDLE_RPM; hi = ENG_REDLINE_RPM; }
-            float rf = (e->current_rpm - lo) / (hi - lo);
-            if (rf < 0.0f) rf = 0.0f; if (rf > 1.0f) rf = 1.0f;
             float s_lo = g->slot_lo, s_hi = g->slot_hi;
             if (!(s_hi > s_lo)) { s_lo = g->accel_sweep.rpm_min; s_hi = g->accel_sweep.rpm_max; }
-            float erpm = s_lo + rf * (s_hi - s_lo);
+            int retarget = 0; float et = g->erpm_t;
+            if (g->navg == 0 || ++g->tick >= 735) {   /* the game's sound update, 60 Hz */
+                g->tick = 0;
+                float rf = (target - lo) / (hi - lo);
+                if (rf < 0.0f) rf = 0.0f; if (rf > 1.0f) rf = 1.0f;
+                float rs = 1000.0f + rf * 9000.0f;   /* SFXCTL_Physics +0x48 */
+                float cur = rs;   /* (+0x128, GetRPM 0x45c530: this update's rpm before the dip) */
+                /* the rev limiter's bounce (GitHub #16): UpdateRedlining
+                   0x46f610 turns redlining on above 9800 (off below it), and
+                   UpdateRPM 0x46f7d0 then takes a dip off the rpm that runs
+                   0 -> 200 -> 0 in steps of 50 (0x468e30), one step per update;
+                   the rpm then goes through the 3-sample Average */
+                if (!g->redline) { if (cur > 9800.0f) { g->redline = 1; g->saw_up = 1; g->saw = 0.0f; } }
+                else if (cur < 9800.0f) g->redline = 0;
+                float rec = rs;
+                if (g->redline) {
+                    float tg = g->saw_up ? 200.0f : 0.0f;
+                    g->saw = g->saw + 50.0f < tg ? g->saw + 50.0f : g->saw - 50.0f > tg ? g->saw - 50.0f : tg;
+                    if (g->saw == tg) g->saw_up = !g->saw_up;
+                    rec = rs - g->saw;
+                }
+                if (!g->navg) { g->avg[0] = g->avg[1] = g->avg[2] = rec; g->navg = 1; }
+                else { g->avg[0] = g->avg[1]; g->avg[1] = g->avg[2]; g->avg[2] = rec; }
+                float rr = ((g->avg[0] + g->avg[1] + g->avg[2]) / 3.0f - 1000.0f) / 9000.0f;
+                if (rr < 0.0f) rr = 0.0f; if (rr > 1.0f) rr = 1.0f;
+                et = s_lo + rr * (s_hi - s_lo);
+                retarget = et != g->erpm_t;      /* a new rpm: UpdateFrequency(f, 60 ms) */
+                if (retarget) { g->erpm_t = et; g->eglide = 6; if (g->erpm_g <= 0.0f) g->erpm_g = et; }
+            }
+            if (++g->epk >= 485) {               /* the same glide on the rpm itself, 11 ms packets */
+                g->epk = 0;
+                g->erpm_g += (g->erpm_t - g->erpm_g) / (float)g->eglide;
+                if (g->eglide > 1) g->eglide--;
+            }
+            float erpm = g->erpm_g;
             float dmin = g->decel_sweep.rpm_min;
             float wdec = (erpm - 0.85f * dmin) / (0.15f * dmin);
             if (wdec < 0.0f) wdec = 0.0f; if (wdec > 1.0f) wdec = 1.0f;
@@ -1791,33 +1939,17 @@ static void audio_mix_body(void *ud, Uint8 *stream, int len) {
             float wd = (1.0f - e->current_load) * wdec;
             for (int a = 0; a < 2; a++) {
                 GinsuSweep *sw = a ? &g->accel_sweep : &g->decel_sweep;
+                GinVoice *v = &g->v[a];
+                if (retarget) {
+                    float st = et < sw->rpm_min ? sw->rpm_min : et > sw->rpm_max ? sw->rpm_max : et;
+                    v->target = gin_pos_at(sw, st); v->glide = 6;
+                }
                 if (!a && wd < 1e-4f) continue;   /* decel silent: skip its work */
                 float rate = (float)sw->sample_rate / 44100.0f;
-                float srpm = erpm < sw->rpm_min ? sw->rpm_min : erpm > sw->rpm_max ? sw->rpm_max : erpm;
-                /* below the sweep the lowest cycle plays lower (0x473e60:
+                /* below the sweep the lowest cycles play lower (0x473e60:
                    frequency = the data's minimum, pitch x rpm / minimum) */
-                float prpm = erpm < sw->rpm_min ? erpm : srpm;
-                int j = g->grain_idx[a];
-                if (j < 0 || j >= sw->n_grain) { j = 0; g->play_cursor[a] = (double)sw->grain[0]; }
-                if (g->play_cursor[a] < (double)sw->grain[j]) g->play_cursor[a] = (double)sw->grain[j];
-                uint32_t i0 = (uint32_t)g->play_cursor[a];
-                float fr = (float)(g->play_cursor[a] - (double)i0);
-                float s = (sw->samples[i0]*(1.0f-fr) + sw->samples[i0+1]*fr) / 32768.0f;
-                float len = (float)(sw->grain[j+1] - sw->grain[j]);
-                g->play_cursor[a] += (double)(rate * prpm * len / sw->cyc_k);
-                if (g->play_cursor[a] >= (double)sw->grain[j+1]) {   /* the cycle's end: the next one */
-                    float over = (float)(g->play_cursor[a] - (double)sw->grain[j+1]) / len;
-                    float pos = gin_pos_at(sw, srpm);
-                    int lo_g = 0, hi_g = sw->n_grain - 1;
-                    while (lo_g < hi_g) {
-                        int mid = (lo_g + hi_g) / 2;
-                        if (pos >= (double)sw->grain[mid+1]) lo_g = mid + 1; else hi_g = mid;
-                    }
-                    float nlen = (float)(sw->grain[lo_g+1] - sw->grain[lo_g]);
-                    if (over > 0.999f) over = 0.999f;
-                    g->play_cursor[a] = (double)sw->grain[lo_g] + (double)(over * nlen);
-                    g->grain_idx[a] = lo_g;
-                }
+                double speed = (double)rate * (erpm < sw->rpm_min && sw->rpm_min > 1.0f ? erpm / sw->rpm_min : 1.0f);
+                float s = gin_voice_read(sw, v, speed);
                 eng += s * (a ? wa : wd) * master;
             }
             eng *= 0.55f;   /* sweeps are recorded near full scale */
@@ -2026,9 +2158,9 @@ static void audio_mix_body(void *ud, Uint8 *stream, int len) {
     {   static int el = -1;   /* test aid: the engine voice per mix buffer */
         if (el < 0) el = getenv("OPENUG2_SIM_ENGLOG") != NULL;
         if (el && e->gin.has_gin_data)
-            printf("englog: target %.0f cur %.0f lo %.0f hi %.0f load %.2f grain %d/%d\n", (double)target,
+            printf("englog: snd %.0f red %d saw %.0f target %.0f cur %.0f lo %.0f hi %.0f load %.2f grain %d/%d\n", (double)e->gin.erpm_t, e->gin.redline, (double)e->gin.saw, (double)target,
                    (double)e->current_rpm, (double)e->rpm_lo, (double)e->rpm_hi, (double)e->current_load,
-                   e->gin.grain_idx[1], e->gin.grain_idx[0]);
+                   (int)gin_cyc(&e->gin.accel_sweep, (double)e->gin.v[1].play), (int)gin_cyc(&e->gin.decel_sweep, (double)e->gin.v[0].play));
     }
 #endif
 #if OPENUG2_REVERB
