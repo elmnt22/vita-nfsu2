@@ -40,7 +40,7 @@ CFLAGS=(-O2 -g -std=gnu99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-u
 # 2.7 -> 1.6%). The magic SDK symbols in sdl_vita.c are marked used/externally_visible,
 # or LTO drops sceUserMainThreadStackSize and main overflows the default stack at boot.
 LINKF=(); [ "${LTO:-0}" = 1 ] && CFLAGS+=(-flto)
-O3_FILES=" src/render.c src/world_instance.c src/world_tiles.c src/world_mesh.c src/acid.c src/aciddraw.c src/carfx.c src/nisdraw.c src/hud.c "
+O3_FILES=" src/render.c src/world_instance.c src/world_tiles.c src/world_mesh.c src/acid.c src/aciddraw.c src/carfx.c src/nisdraw.c src/hud.c src/rstream.c "
 # rebuild everything when the flags change
 FLAGSTAMP="$OUT/obj/.flags"
 FLAGSTR="${CFLAGS[*]} | O3:$O3_FILES"
@@ -50,7 +50,7 @@ if [ ! -f "$FLAGSTAMP" ] || [ "$(cat "$FLAGSTAMP")" != "$FLAGSTR" ]; then
 fi
 
 SRC="src/main.c src/render.c src/physics.c src/n2sim.c src/wcoll.c src/carcoll.c src/airacer.c src/perfparts.c src/airace.c src/racepath.c src/style.c src/ai.c src/audio.c src/resource.c src/world.c
-     src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/jumpcam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/profile.c src/pcsave.c src/garage_line.c src/vinyl.c src/partanim.c src/smokeable.c src/skyline.c src/worldanim.c src/career.c src/trophy.c src/movie.c src/mplay.c src/speech.c src/tuning.c src/replay.c src/rain.c src/reverb.c src/savenote.c src/beyond.c src/xpconv.c src/xproads.c src/xpcity.c src/canyon.c vita/sdl_vita.c"
+     src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c src/feng.c src/shop.c src/world_tiles.c src/carfx.c src/chasecam.c src/jumpcam.c src/nis.c src/nisdraw.c src/acid.c src/aciddraw.c src/carsfx.c src/eal3.c src/music.c src/options.c src/profile.c src/pcsave.c src/garage_line.c src/vinyl.c src/partanim.c src/smokeable.c src/skyline.c src/worldanim.c src/career.c src/trophy.c src/movie.c src/mplay.c src/speech.c src/tuning.c src/replay.c src/rain.c src/reverb.c src/savenote.c src/beyond.c src/xpconv.c src/xproads.c src/xpcity.c src/canyon.c src/rstream.c vita/sdl_vita.c"
 
 OBJS=()
 pids=()

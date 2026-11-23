@@ -117,4 +117,9 @@ int winst_test_collect_placements(const unsigned char *section_data,
                                   WInstStats *stats);
 #endif
 
+/* rstream.c: one solid's model-space meshes (see world_instance.c) */
+int winst_solid_meshes(const unsigned char *data, long begin, long end,
+                       const uint32_t *keys, int nkeys, N2Scene *out);
+void winst_solid_free(N2Scene *s);
+
 #endif

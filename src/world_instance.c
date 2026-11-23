@@ -543,6 +543,18 @@ static void winst_collect_model(WInstLibrary *library, const unsigned char *data
     }
 }
 
+/* Retail streamer spike (rstream.c): one solid (0x80134010 range) parsed
+ * exactly as a prototype is, into model-space meshes the caller owns
+ * (free with winst_solid_free). Returns the mesh count. */
+int winst_solid_meshes(const unsigned char *data, long begin, long end,
+                       const uint32_t *keys, int nkeys, N2Scene *out) {
+    WInstProto tmp; memset(&tmp, 0, sizeof tmp);
+    winst_collect_model(NULL, data, begin, end, keys, nkeys, &tmp);
+    *out = tmp.scene;
+    return out->count;
+}
+void winst_solid_free(N2Scene *s) { winst_free_scene(s); }
+
 /* Parse a prototype's geometry on first use. */
 static const N2Scene *winst_proto_load(const WInstLibrary *library, WInstProto *proto) {
     if (!proto->loaded) {

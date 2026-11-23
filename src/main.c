@@ -58,6 +58,7 @@
 #include "chasecam.h"
 #include "jumpcam.h"
 #include "skyline.h"
+#include "rstream.h"
 #include "beyond.h"
 #include "canyon.h"
 #include "xpcity.h"
@@ -27912,7 +27913,7 @@ int main(int argc, char **argv) {
                chosen: the density that leaves the FURTHEST vista vertex at
                VISTA_MINCONTRIB of its own colour, so the backdrop fades into
                the same horizon haze instead of being deleted by it. */
-        if (nvista && tier == 2 && g_dbg.show_track && !g_showroom && (passmode == 0 || passmode == 1)) {
+        if (nvista && tier == 2 && g_dbg.show_track && !g_showroom && (passmode == 0 || passmode == 1) && !rstream_active()) {
             const float VISTA_MINCONTRIB = 0.35f;
             float Pv[16], MVPv[16];
             mat_persp(cam_fovy, cam_aspect, znear, vista_far, Pv);
@@ -28395,7 +28396,7 @@ int main(int argc, char **argv) {
         Uint64 oc1 = SDL_GetPerformanceCounter();
         g_wd_oc[0] += oc1 - oc0;
         static long wv_frames, wv_async, wv_waited;   /* the visibility worker, logged with the cell cull */
-        if (g_dbg.show_track && (passmode == 0 || passmode == 1) && nbatch > 0) {
+        if (g_dbg.show_track && (passmode == 0 || passmode == 1) && nbatch > 0 && !rstream_active()) {
             /* the per-batch tests (wvis_classify) on a worker core while the
                opaque batches it has found so far are drawn here, in k order */
             static WVisJob wv; static int *wv_opq, wv_cap, wv_on = -1;
@@ -28532,10 +28533,28 @@ int main(int argc, char **argv) {
         (void)cur_refl;
         g_wd_oc[2] += SDL_GetPerformanceCounter() - oc2;
         #endif
+#ifdef __vita__
+        /* retail streamer spike (rstream.c, retailstream.txt): the city's
+           scenery straight from the STREAM sections, culled and LOD-picked
+           the retail way; the tile batches above are skipped meanwhile */
+        if (resident_args.trackname && rstream_track_ok(resident_args.trackname)) {
+            if (g_dbg.show_track && passmode == 0 && !g_showroom &&
+                rstream_start(resident_args.track_root, resident_args.trackname)) {
+                rstream_set_event(resident_args.scenery_event);
+                rstream_update(cam);
+                RsDrawCtx rc;
+                rc.rp = &rp; rc.MVP = MVP; rc.cam = cam; rc.look = look;
+                rc.hfov43 = 2.0f * atanf(tanf(0.5f * cam_fovy) / 0.75f);
+                rc.planes = (const float (*)[4])world_planes; rc.refl_ready = g_refl_ready;
+                g_dbg.drawn += rstream_draw(&rc);
+                lasttex = (GLuint)-1; lastmode = -1;
+            }
+        } else if (rstream_active()) rstream_stop();
+#endif
         /* the resident skyline (skyline.c): cells wholly past skyline_inner(),
            flat-coloured, pushed back a little in depth so a streamed stand-in
            of the same building wins where both draw */
-        if (g_dbg.show_track && passmode == 0 && tall_on && VITA_PROBE(2)) {
+        if (g_dbg.show_track && passmode == 0 && tall_on && VITA_PROBE(2) && !rstream_active()) {
             static int sky_logn; static long sky_drawn, sky_frames;
             if (resident_args.trackname) skyline_start(resident_args.trackname);
             skyline_pump();
