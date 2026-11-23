@@ -1967,9 +1967,23 @@ float career_star_rating(void)
    time NotifyDVDCoverElegible(n) -- the others locked again; the speech's
    +0x8895 = the highest locked requirement (0 none); CareerSpeech
    HandleShowcaseUnlock 0x5253f0 on each unlocked one. */
+/* GitHub #36 (port option, LiveArea Settings "Ignore Visual Rating",
+   novisrating.txt): the DVD covers' star requirement counts as met */
+int career_vr_ignored(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        FILE *f = fopen("ux0:data/NFSU2/novisrating.txt", "rb");
+        on = f != NULL;
+        if (f) fclose(f);
+        printf("ignore visual rating: %s\n", on ? "on (novisrating.txt)" : "off");
+    }
+    return on;
+}
 void career_recalc_dvd_unlocks(void)
 {
     float stars = career_star_rating();
+    if (career_vr_ignored()) stars = 1e9f;   /* #36 (the cover's pay keeps the real rating) */
     const unsigned char *best = NULL;
     for (int i = 0; i < career_nshowcases(); i++) {
         const unsigned char *sc = career_showcase(i);
@@ -1980,7 +1994,7 @@ void career_recalc_dvd_unlocks(void)
             if (!r) {
                 career_sms_dvd_cover((uint32_t)(int)need);
                 r = career_add_record(rd32(sc + 0x20));
-                printf("career: DVD %d unlocked (%.2f stars)\n", (int)need, stars);
+                printf("career: DVD %d unlocked (%.2f stars%s)\n", (int)need, career_star_rating(), career_vr_ignored() ? ", visual rating ignored" : "");
             }
             if (r) r->flag[CREC_ENTERED] = 2;
             career_speech_showcase_unlock(sc);                            /* CareerSpeech 0x5253f0 */

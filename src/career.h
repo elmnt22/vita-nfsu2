@@ -467,6 +467,7 @@ void career_sms_dvd_cover(uint32_t n);                        /* NotifyDVDCoverE
 const unsigned char *career_showcase_by_handle(uint32_t h);   /* FindShowcaseDataByHandle 801224d4 */
 int   career_showcase_enterable(const unsigned char *sc);     /* IsEnterable 8012b124 */
 void  career_showcase_unlock(const unsigned char *sc);        /* NotifyUnlockedShowcase 8012b0d8 */
+int   career_vr_ignored(void);   /* #36: novisrating.txt */
 float career_star_rating(void);                               /* GetCurrentPlayerStarRating 0x528410 */
 void  career_recalc_dvd_unlocks(void);                        /* RecalcDVDUnlocks 0x5331c0 */
 int   career_showcase_reward(const unsigned char *sc, int *star);   /* 0x541210: base + star, paid */
