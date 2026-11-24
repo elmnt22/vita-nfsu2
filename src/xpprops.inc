@@ -221,6 +221,31 @@ int xp_props(const char *raw_companion, const char *raw_stream, const char *out_
             uint32_t id = u32le(h), sz = u32le(h + 4);
             int want = pass == 0 ? (id == 0x34027u || id == 0x80134000u) : id == 0x80034100u;
             if (!want) { if (fseek(f, (long)sz, SEEK_CUR)) break; continue; }
+            if (id == 0x80134000u && !carbon) {
+                /* 11-24, MW: only each solid's header (0x134011, the first chunk of every
+                   0x80134010 there) -- not the 250 MB of models (a minute and a half on the Vita) */
+                long at = ftell(f), end = at + (long)sz;
+                while (rc == XP_OK && at + 8 <= end) {
+                    uint8_t ch[8];
+                    if (fseek(f, at, SEEK_SET) || fread(ch, 1, 8, f) != 8) { rc = XP_ERR_READ; break; }
+                    uint32_t cid = u32le(ch), csz = u32le(ch + 4);
+                    if (at + 8 + (long)csz > end) break;
+                    if (cid == 0x80134010u && csz >= 8) {
+                        uint8_t hh[8];
+                        if (fread(hh, 1, 8, f) != 8) { rc = XP_ERR_READ; break; }
+                        uint32_t hid = u32le(hh), hsz = u32le(hh + 4);
+                        if (hid == 0x134011u && 8 + (size_t)hsz <= csz) {
+                            if (8 + (size_t)hsz > bcap) { uint8_t *nb = realloc(buf, 8 + hsz); if (!nb) { rc = XP_ERR_MEMORY; break; } buf = nb; bcap = 8 + hsz; }
+                            memcpy(buf, hh, 8);
+                            if (fread(buf + 8, 1, hsz, f) != hsz) { rc = XP_ERR_READ; break; }
+                            if (solid_boxes(buf, 8 + hsz, &sb, &nsb, &sbcap)) { rc = XP_ERR_MEMORY; break; }
+                        }
+                    }
+                    at += 8 + (long)csz;
+                }
+                if (rc != XP_OK || fseek(f, end, SEEK_SET)) break;
+                continue;
+            }
             if (sz > bcap) { uint8_t *nb = realloc(buf, sz); if (!nb) { rc = XP_ERR_MEMORY; break; } buf = nb; bcap = sz; }
             if (fread(buf, 1, sz, f) != sz) { rc = XP_ERR_READ; break; }
             if (id == 0x80134000u) { if (solid_boxes(buf, sz, &sb, &nsb, &sbcap)) { rc = XP_ERR_MEMORY; break; } }

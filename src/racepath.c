@@ -801,15 +801,29 @@ static int build(RacePath *p, const unsigned char *evr)                 /* 0x5e5
 static RacePath *load(const char *path, int event, int reversed, int zones_only);
 RacePath *racepath_load(const char *path, int event, int reversed) { return load(path, event, reversed, 0); }
 RacePath *racepath_load_zones(const char *path) { return load(path, 0, 0, 1); }
+static RacePath *parse(unsigned char *d, long len, int event, int reversed, int zones_only);
+/* a Paths file's bytes already in memory (copied; xp_events checks its events before writing them) */
+RacePath *racepath_parse(const unsigned char *data, long len, int event, int reversed)
+{
+    unsigned char *d = len > 0 ? (unsigned char *)malloc((size_t)len) : NULL;
+    if (!d) return NULL;
+    memcpy(d, data, (size_t)len);
+    return parse(d, len, event, reversed, 0);
+}
 static RacePath *load(const char *path, int event, int reversed, int zones_only)
 {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
-    RacePath *p = (RacePath *)calloc(1, sizeof *p);
     unsigned char *d = len > 0 ? (unsigned char *)malloc((size_t)len) : NULL;
-    if (!p || !d || fread(d, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(d); free(p); return NULL; }
+    if (!d || fread(d, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(d); return NULL; }
     fclose(f);
+    return parse(d, len, event, reversed, zones_only);
+}
+static RacePath *parse(unsigned char *d, long len, int event, int reversed, int zones_only)
+{
+    RacePath *p = (RacePath *)calloc(1, sizeof *p);
+    if (!p) { free(d); return NULL; }
     p->file = d;
     p->reversed = reversed;
     const unsigned char *secs = NULL, *nodes = NULL, *evs = NULL;

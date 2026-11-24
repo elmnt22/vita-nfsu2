@@ -60,6 +60,11 @@ typedef struct { long races, events, circuits, sprints, drags, drifts, fallback,
    2 = routes without U-turns; event ids unchanged) */
 #define XP_EVENTS_VERSION 2
 int xp_events_current(const char *routes_dir);
+/* a millisecond clock for xp_events' step times (the game sets SDL_GetTicks; NULL: none) */
+extern unsigned (*xp_ticks)(void);
+/* runs fn(arg, 0..n-1) at once and returns when all are done (the game: SDL threads; NULL: one at a time) */
+extern void (*xp_parallel)(void (*fn)(void *arg, int worker), void *arg, int n);
+extern int xp_workers;   /* how many (the game sets 3 on the Vita) */
 int xp_events(const char *gameplay_bin, const char *raw_companion, const char *raw_stream,
               const char *out_dir, int game, const char *city, int first_id, XpEventStats *stats);
 

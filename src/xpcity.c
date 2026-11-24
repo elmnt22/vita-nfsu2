@@ -138,6 +138,20 @@ static void make_routes(int c, const char *troot)
 }
 /* the city's race events (xp_events): once, from the raw MW files (gameplay.bin, the
    companion, the stream's barrier walls); the Prep Tool sends them ready made */
+/* xp_events' route search on several cores (xp_parallel): fn(arg, 1..n-1) on threads, 0 here */
+typedef struct { void (*fn)(void *, int); void *arg; int wi; } XpPar;
+static int xp_par_thread(void *ud) { XpPar *p = (XpPar *)ud; p->fn(p->arg, p->wi); return 0; }
+static void xp_par_sdl(void (*fn)(void *, int), void *arg, int n)
+{
+    XpPar P[8]; SDL_Thread *t[8] = {0};
+    if (n > 8) n = 8;
+    for (int i = 1; i < n; i++) { P[i].fn = fn; P[i].arg = arg; P[i].wi = i; t[i] = SDL_CreateThread(xp_par_thread, "xpev", &P[i]); }
+    fn(arg, 0);
+    for (int i = 1; i < n; i++) {
+        if (t[i]) SDL_WaitThread(t[i], NULL);
+        else fn(arg, i);   /* no thread: that worker's share here (the jobs are taken from one counter) */
+    }
+}
 static void make_events(int c, const char *troot)
 {
     char dir[256], ev[300], gp[256], rawc[256], raws[256];
@@ -167,6 +181,8 @@ static void make_events(int c, const char *troot)
     if (g_window) vita_progress_screen(title, "BUILDING THE RACES", "ONE TIME ONLY", 0.0f);
     Uint32 t0 = SDL_GetTicks();
     XpEventStats st;
+    xp_ticks = SDL_GetTicks;   /* its step times in the log */
+    xp_parallel = xp_par_sdl; xp_workers = 3;   /* 11-24: the route search on the Vita's three cores */
     /* event ids: Rockport 7301 on, Palmont 7601 on (beyond.c takes 4000-7999) */
     int rc = xp_events(gp, rawc, raws, dir, k_city[c].game, k_city[c].name[0] == 'R' ? "Rockport" : "Palmont",
                        k_city[c].game == XP_GAME_CARBON ? 7601 : 7301, &st);

@@ -585,7 +585,7 @@ static int bar_walls(const char *stream, Bars *B)
             if (fread(buf, 1, s, f) != s) { ok = 0; break; }
             if (!carp_walls(buf, s, B, art, gen, ++g)) ok = 0;
             o += 8 + (long)s;
-        } else if (id & 0x80000000u) {
+        } else if ((id & 0x80000000u) && id != 0x80134000u && id != 0xb3300000u) {   /* 11-24: not into models / textures */
             if (sp == 32) { ok = 0; break; }
             st[sp].o = o + 8 + (long)s; st[sp].e = e; sp++;
             e = o + 8 + (long)s; o += 8;
@@ -700,23 +700,25 @@ static int he_less(const HE *x, const HE *y) { return x->d != y->d ? x->d < y->d
 static int heap_push(Heap *h, HE e)
 {
     if (h->n == h->cap) { int c = h->cap ? h->cap * 2 : 1024; HE *v = realloc(h->v, (size_t)c * sizeof *v); if (!v) return 0; h->v = v; h->cap = c; }
-    int i = h->n++;
-    while (i > 0) { int p = (i - 1) / 2; if (!he_less(&e, &h->v[p])) break; h->v[i] = h->v[p]; i = p; }
+    int i = h->n++;   /* 4-ary (11-24): fewer levels; the same pop order (he_less is a strict total order) */
+    while (i > 0) { int p = (i - 1) / 4; if (!he_less(&e, &h->v[p])) break; h->v[i] = h->v[p]; i = p; }
     h->v[i] = e; return 1;
 }
 static HE heap_pop(Heap *h)
 {
     HE top = h->v[0], e = h->v[--h->n]; int i = 0;
     for (;;) {
-        int c = 2 * i + 1; if (c >= h->n) break;
-        if (c + 1 < h->n && he_less(&h->v[c + 1], &h->v[c])) c++;
+        int c = 4 * i + 1; if (c >= h->n) break;
+        int ce = c + 4 < h->n ? c + 4 : h->n;
+        for (int q = c + 1; q < ce; q++) if (he_less(&h->v[q], &h->v[c])) c = q;
         if (!he_less(&h->v[c], &e)) break;
         h->v[i] = h->v[c]; i = c;
     }
     if (h->n) h->v[i] = e;
     return top;
 }
-typedef struct { const G *g; const Grid *grid; double *dist; int *prev; int *touched; int ntouched; unsigned char *W; Heap heap; NLs nl; int uturn; } ChainCtx;
+typedef struct { const G *g; const Grid *grid; double *dist; int *prev; int *touched; int ntouched; unsigned char *W; Heap heap; NLs nl; int uturn;
+                 double *u0, *u1; float *len; unsigned char *np2; } ChainCtx;   /* + lane lengths, >= 2 points (flat, for the search) */   /* each lane's first / last heading (dunit, made once: the same values) */
 static int nl_cmp(const void *x, const void *y) { const NL *a = x, *b = y; return (a->d > b->d) - (a->d < b->d); }
 /* the chain (lanes) into *out / *nout; 0 none, -1 out of memory. blk: stamp/tag, or NULL */
 static int chain(ChainCtx *C, const Race *r, const int *stamp, int tag, int **out, int *nout)
@@ -728,7 +730,7 @@ static int chain(ChainCtx *C, const Race *r, const int *stamp, int tag, int **ou
     for (int k = 0; k < n; k++) {
         if (!near_lanes(g, C->grid, r->wp[k], 25.0, NULL, &C->nl)) return -1;
         if (k && !C->nl.n) return 0;
-        for (int j = 0; j < C->nl.n; j++) C->W[(size_t)k * nl + C->nl.v[j].li] = 1;
+        for (int j = 0; j < C->nl.n; j++) C->W[(size_t)C->nl.v[j].li * n + k] = 1;   /* lane-major (11-24) */
     }
     double wd[2];
     { D3 a = r->wp[0], b = n > 1 ? r->wp[1] : r->wp[0]; wd[0] = b.x - a.x; wd[1] = b.y - a.y; }
@@ -742,7 +744,7 @@ static int chain(ChainCtx *C, const Race *r, const int *stamp, int tag, int **ou
     double best_d = -1; int *best = NULL, nbest = 0;
     for (int si = 0; si < nst; si++) {
         int s = starts[si], k0 = 0;
-        while (k0 + 1 < n && C->W[(size_t)(k0 + 1) * nl + s]) k0++;
+        while (k0 + 1 < n && C->W[(size_t)s * n + k0 + 1]) k0++;
         for (int i = 0; i < C->ntouched; i++) { C->dist[C->touched[i]] = 1e18; C->prev[C->touched[i]] = -1; }
         C->ntouched = 0; C->heap.n = 0;
         int st0 = s * n + k0, goal = -1;
@@ -759,17 +761,18 @@ static int chain(ChainCtx *C, const Race *r, const int *stamp, int tag, int **ou
                3-20 m between a road's two sides, or a teardrop of them, are no heading) */
             double ui[2] = { 0, 0 }, acc = 0; int hin = 0;
             for (int x = sa, step = 0; C->uturn && x >= 0 && step < 8 && !hin; x = C->prev[x], step++) {
-                const Lane *q = &g->l[x / n];
-                acc += q->len;
-                if (acc < 30.0 || q->pts.n < 2) continue;
-                dunit(lpt(g, x / n, q->pts.n - 2), lpt(g, x / n, q->pts.n - 1), ui); hin = 1;
+                acc += C->len[x / n];
+                if (acc < 30.0 || !C->np2[x / n]) continue;
+                ui[0] = C->u1[2 * (x / n)]; ui[1] = C->u1[2 * (x / n) + 1]; hin = 1;
             }
-            for (int j = 0; j < g->nsucc[e.a]; j++) {
-                int bl = g->succ[e.a][j], kk = e.k;
-                while (kk + 1 < n && C->W[(size_t)(kk + 1) * nl + bl]) kk++;
-                double nd = e.d + g->l[bl].len + (stamp && stamp[bl] == tag ? BLOCK : 0.0);
-                if (C->uturn && hin && g->l[bl].pts.n >= 2) {   /* turning round onto the road's other side: a U-turn */
-                    double uo[2]; dunit(lpt(g, bl, 0), lpt(g, bl, 1), uo);
+            const int *sc = g->succ[e.a]; int nsc = g->nsucc[e.a];
+            for (int j = 0; j < nsc; j++) {
+                int bl = sc[j], kk = e.k;
+                const unsigned char *wr = C->W + (size_t)bl * n;
+                while (kk + 1 < n && wr[kk + 1]) kk++;
+                double nd = e.d + C->len[bl] + (stamp && stamp[bl] == tag ? BLOCK : 0.0);
+                if (C->uturn && hin && C->np2[bl]) {   /* turning round onto the road's other side: a U-turn */
+                    const double *uo = C->u0 + 2 * bl;
                     if (ui[0] * uo[0] + ui[1] * uo[1] < UTURN_COS) nd += UTURN_COST;
                 }
                 int sb = bl * n + kk;
@@ -1141,29 +1144,25 @@ static int routes_bin(const DPolys *S, int closed, FILE *f)
 }
 
 /* ---- the whole set ---- */
-typedef struct { int id, type, closed, mode, len; size_t partlen; char start[96]; char *bars; float *pl; int npl; float tlim; char gates[1024]; char name[64]; float *mr; int nmr; } EvMeta;   /* pl: the route, x y every ~15 m */
-static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t *recs, const unsigned char *keep, int reread)
+typedef struct { int id, type, closed, mode, len; size_t partlen; uint8_t *part; char start[96]; char *bars; float *pl; int npl; float tlim; char gates[1024]; char name[64]; float *mr; int nmr; } EvMeta;   /* pl: the route, x y every ~15 m */
+/* each kept event's Paths file: its part, then every kept record (0x3414c) -- one open, two writes
+   (11-24: was a reopen + a write per record, ~24k small writes on the Vita's card) */
+static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t *recs, const unsigned char *keep)
 {
     int nk = 0; for (int i = 0; i < nm; i++) nk += keep[i];
-    uint8_t hd[8]; pu32(hd, 0x3414C); pu32(hd + 4, 0x110 * (uint32_t)nk);
+    size_t tn = 8 + 0x110 * (size_t)nk;
+    uint8_t *t = malloc(tn); if (!t) return 0;
+    pu32(t, 0x3414C); pu32(t + 4, 0x110 * (uint32_t)nk);
+    for (int j = 0, w = 0; j < nm; j++) if (keep[j]) memcpy(t + 8 + 0x110 * (size_t)w++, recs + 0x110 * (size_t)j, 0x110);
     for (int i = 0; i < nm; i++) {
         if (!keep[i]) continue;
         char p[600]; snprintf(p, sizeof p, "%s/Paths%d.bin", dir, m[i].id);
-        uint8_t *part = NULL;
-        if (reread) {
-            FILE *f = fopen(p, "rb"); if (!f) return 0;
-            part = malloc(m[i].partlen ? m[i].partlen : 1);
-            int got = part && fread(part, 1, m[i].partlen, f) == m[i].partlen;
-            fclose(f);
-            if (!got) { free(part); return 0; }
-        }
-        FILE *f = fopen(p, reread ? "wb" : "ab"); if (!f) { free(part); return 0; }
-        int ok = (!reread || fwrite(part, 1, m[i].partlen, f) == m[i].partlen) && fwrite(hd, 1, 8, f) == 8;
-        for (int j = 0; j < nm && ok; j++) if (keep[j]) ok = fwrite(recs + 0x110 * (size_t)j, 1, 0x110, f) == 0x110;
+        FILE *f = fopen(p, "wb"); if (!f) { free(t); return 0; }
+        int ok = fwrite(m[i].part, 1, m[i].partlen, f) == m[i].partlen && fwrite(t, 1, tn, f) == tn;
         if (fclose(f)) ok = 0;
-        free(part);
-        if (!ok) return 0;
+        if (!ok) { free(t); return 0; }
     }
+    free(t);
     return 1;
 }
 /* ---- Carbon's minimap route (11-19) ----
@@ -1488,9 +1487,107 @@ int xp_events_current(const char *routes_dir)
     if (f) { if (fscanf(f, "%d", &v) != 1) v = 0; fclose(f); }
     return v == XP_EVENTS_VERSION;
 }
+unsigned (*xp_ticks)(void);
+static unsigned ev_now(void) { return xp_ticks ? xp_ticks() : 0; }
+void (*xp_parallel)(void (*fn)(void *arg, int worker), void *arg, int n);
+int xp_workers = 1;
+/* 11-24: every race's lane chain first, on several cores (they share only read-only data:
+   the graph, grid, barriers, races); the event loop then takes them in order as before, so
+   the results are the same as one at a time */
+typedef struct { int x, nch, fb; int *ch; } ChainRes;
+/* 11-24: a barrier's blocked lanes (blocked_lanes over every group of the name), found once */
+typedef struct { const char *name; int *li; int n; } BarL;
+typedef struct { BarL *v; int n; } BarLs;
+static int barl_cmp(const void *x, const void *y) { return strcmp(((const BarL *)x)->name, ((const BarL *)y)->name); }
+static const BarL *barl_get(const BarLs *L, const char *name)
+{
+    if (*name == '*') name++;
+    BarL k = { name, NULL, 0 };
+    return L->n ? bsearch(&k, L->v, (size_t)L->n, sizeof *L->v, barl_cmp) : NULL;
+}
+static void barl_stamp(const BarLs *L, const char *name, int *stamp, int tag)
+{
+    const BarL *b = barl_get(L, name);
+    for (int i = 0; b && i < b->n; i++) stamp[b->li[i]] = tag;
+}
+static int barl_make(BarLs *L, const Race *R, int nr, const Bars *B, const G *g, const Grid *grid, int *stamp, int *tag, int *seen, int *seentag)
+{
+    int cap = 0; for (int i = 0; i < nr; i++) cap += R[i].nbar;
+    L->v = calloc((size_t)(cap ? cap : 1), sizeof *L->v); L->n = 0;
+    if (!L->v) return 0;
+    for (int i = 0; i < nr; i++) for (int b = 0; b < R[i].nbar; b++) {
+        const char *n = R[i].bar[b]; if (*n == '*') n++;
+        L->v[L->n++].name = n;
+    }
+    if (L->n) qsort(L->v, (size_t)L->n, sizeof *L->v, barl_cmp);
+    int w = 0;
+    for (int i = 0; i < L->n; i++) if (!w || strcmp(L->v[w - 1].name, L->v[i].name)) L->v[w++] = L->v[i];
+    L->n = w;
+    for (int i = 0; i < L->n; i++) {
+        int t = ++*tag, cnt = 0;
+        const BSeg *s; int ns;
+        for (int k = 0; bar_segs(B, L->v[i].name, &s, &ns, k); k++) blocked_lanes(g, grid, s, ns, stamp, t, seen, seentag);
+        for (int li = 0; li < g->n; li++) cnt += stamp[li] == t;
+        L->v[i].li = malloc((size_t)(cnt ? cnt : 1) * sizeof *L->v[i].li);
+        if (!L->v[i].li) return 0;
+        for (int li = 0; li < g->n; li++) if (stamp[li] == t) L->v[i].li[L->v[i].n++] = li;
+    }
+    return 1;
+}
+static void barl_free(BarLs *L) { for (int i = 0; L->v && i < L->n; i++) free(L->v[i].li); free(L->v); memset(L, 0, sizeof *L); }
+typedef struct { ChainCtx C; int *stamp, *seen; unsigned char *mark; int tag, seentag, ok; } EvWorker;
+typedef struct { const G *g; const Grid *grid; const BarLs *L; const Race *R; int nr; ChainRes *res; EvWorker *w; volatile int next; } EvJobs;
+static int ev_worker_init(EvWorker *w, const ChainCtx *base, int nl, int maxwp)
+{
+    memset(w, 0, sizeof *w);
+    w->C = *base;
+    w->C.ntouched = 0; memset(&w->C.heap, 0, sizeof w->C.heap); memset(&w->C.nl, 0, sizeof w->C.nl);
+    size_t ns = (size_t)nl * maxwp;
+    w->C.dist = malloc(ns * sizeof *w->C.dist); w->C.prev = malloc(ns * sizeof *w->C.prev);
+    w->C.touched = malloc(ns * sizeof *w->C.touched); w->C.W = malloc(ns ? ns : 1);
+    w->stamp = calloc((size_t)(nl ? nl : 1), sizeof *w->stamp); w->seen = calloc((size_t)(nl ? nl : 1), sizeof *w->seen);
+    w->mark = calloc((size_t)(nl ? nl : 1), 1);
+    if (!w->C.dist || !w->C.prev || !w->C.touched || !w->C.W || !w->stamp || !w->seen || !w->mark) return 0;
+    for (size_t i = 0; i < ns; i++) { w->C.dist[i] = 1e18; w->C.prev[i] = -1; }
+    return 1;
+}
+static void ev_worker_free(EvWorker *w)
+{
+    free(w->C.dist); free(w->C.prev); free(w->C.touched); free(w->C.W); free(w->C.heap.v); free(w->C.nl.v);
+    free(w->stamp); free(w->seen); free(w->mark);
+}
+static void ev_chains(void *arg, int wi)
+{
+    EvJobs *J = arg; EvWorker *w = &J->w[wi];
+    for (;;) {
+        int ri = __sync_fetch_and_add(&J->next, 1);
+        if (ri >= J->nr) break;
+        const Race *r = &J->R[ri]; ChainRes *o = &J->res[ri];
+        int rt = ++w->tag;
+        for (int b = 0; b < r->nbar; b++) barl_stamp(J->L, r->bar[b], w->stamp, rt);
+        /* WW2 11-22: which races exist (and so every event id after them) stays as the first
+           sets had it -- found without the U-turn cost; the route itself is the U-turn-free
+           one when that is whole too */
+        int *ch = NULL, nch = 0, fb = 0;
+        w->C.uturn = 0;
+        int x = route_chain(&w->C, r, w->stamp, rt, w->mark, &ch, &nch, &fb);
+        if (x > 0) {
+            int *ch2 = NULL, nch2 = 0, fb2 = 0;
+            w->C.uturn = 1;
+            int x2 = route_chain(&w->C, r, w->stamp, rt, w->mark, &ch2, &nch2, &fb2);
+            if (x2 < 0) { free(ch); ch = NULL; x = -1; }
+            else if (x2 > 0) { free(ch); ch = ch2; nch = nch2; fb = fb2; }
+        }
+        o->x = x; o->ch = ch; o->nch = nch; o->fb = fb;
+    }
+}
 int xp_events(const char *gameplay_bin, const char *raw_companion, const char *raw_stream,
               const char *out_dir, int game, const char *city, int first_id, XpEventStats *st)
 {
+    unsigned T[12] = {0}, tw = 0, tb = 0, tp = 0, tpb = 0, tq;
+    ChainRes *res = NULL; EvWorker *ew = NULL; int nw = 0;
+    BarLs BL = {0}; uint8_t *tbl = NULL;
+    T[0] = ev_now();
     XpEventStats dummy; if (!st) st = &dummy;
     memset(st, 0, sizeof *st);
     if (game != XP_GAME_MW && game != XP_GAME_CARBON) return XP_ERR_FORMAT;
@@ -1502,6 +1599,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (!read_races(gp, gn, &R, &nr, shops, &st->shops, game == XP_GAME_CARBON)) { free(gp); return XP_ERR_FORMAT; }
     free(gp);
     st->races = nr;
+    T[1] = ev_now();
     uint8_t *chunk = read_road_chunk(raw_companion, &clen, &rc);
     if (!chunk) { free_races(R, nr); return rc; }
     Rn rn; G g; memset(&g, 0, sizeof g);
@@ -1516,8 +1614,12 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (!rn_find(chunk, clen, &rn)) goto done;
     rc = XP_ERR_MEMORY;
     if (!build_graph(&rn, &g)) goto done;
+    T[2] = ev_now();
     rc = XP_ERR_OPEN_IN;
-    if (!bar_names(raw_companion, &B) || !bar_walls(raw_stream, &B)) goto done;
+    if (!bar_names(raw_companion, &B)) goto done;
+    T[3] = ev_now();
+    if (!bar_walls(raw_stream, &B)) goto done;
+    T[4] = ev_now();
     st->barrier_segs = B.ns;
     rc = XP_ERR_MEMORY;
     if (game == XP_GAME_CARBON && !mr_init(&mr, &rn, raw_companion, &mr_bars)) goto done;
@@ -1533,6 +1635,15 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     }
     int maxwp = 1; for (int i = 0; i < nr; i++) if (R[i].nwp > maxwp) maxwp = R[i].nwp;
     C.g = &g; C.grid = &grid;
+    C.u0 = malloc((size_t)(g.n ? g.n : 1) * 2 * sizeof *C.u0); C.u1 = malloc((size_t)(g.n ? g.n : 1) * 2 * sizeof *C.u1);
+    C.len = malloc((size_t)(g.n ? g.n : 1) * sizeof *C.len); C.np2 = malloc((size_t)(g.n ? g.n : 1));
+    if (!C.u0 || !C.u1 || !C.len || !C.np2) goto done;
+    for (int i = 0; i < g.n; i++) {
+        int np = g.l[i].pts.n;
+        C.len[i] = g.l[i].len; C.np2[i] = np >= 2;
+        C.u0[2 * i] = C.u0[2 * i + 1] = C.u1[2 * i] = C.u1[2 * i + 1] = 0;
+        if (np >= 2) { dunit(lpt(&g, i, 0), lpt(&g, i, 1), C.u0 + 2 * i); dunit(lpt(&g, i, np - 2), lpt(&g, i, np - 1), C.u1 + 2 * i); }
+    }
     C.dist = malloc((size_t)g.n * maxwp * sizeof *C.dist); C.prev = malloc((size_t)g.n * maxwp * sizeof *C.prev);
     C.touched = malloc((size_t)g.n * maxwp * sizeof *C.touched); C.W = malloc((size_t)g.n * maxwp);
     stamp = calloc((size_t)g.n, sizeof *stamp); seen = calloc((size_t)g.n, sizeof *seen); mark = calloc((size_t)g.n, 1);
@@ -1540,71 +1651,84 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (!C.dist || !C.prev || !C.touched || !C.W || !stamp || !seen || !mark || !meta || !recs) goto done;
     for (size_t i = 0; i < (size_t)g.n * maxwp; i++) { C.dist[i] = 1e18; C.prev[i] = -1; }
     qsort(R, (size_t)nr, sizeof *R, race_cmp);
+    if (!barl_make(&BL, R, nr, &B, &g, &grid, stamp, &tag, seen, &seentag)) goto done;
+    T[5] = ev_now();
+    {   /* every race's chain: worker 0 uses the buffers above, the others their own */
+        int want = xp_parallel && xp_workers > 1 ? (xp_workers > 8 ? 8 : xp_workers) : 1;
+        res = calloc((size_t)(nr ? nr : 1), sizeof *res); ew = calloc((size_t)want, sizeof *ew);
+        if (!res || !ew) goto done;
+        ew[0].C = C; ew[0].stamp = stamp; ew[0].seen = seen; ew[0].mark = mark; nw = 1;
+        while (nw < want && ev_worker_init(&ew[nw], &C, g.n, maxwp)) nw++;
+        if (nw < want && nw > 0 && want > 1) ev_worker_free(&ew[nw]);   /* the one that failed half way */
+        ew[0].tag = tag; ew[0].seentag = seentag;
+        EvJobs J = { &g, &grid, &BL, R, nr, res, ew, 0 };
+        if (nw > 1) xp_parallel(ev_chains, &J, nw); else ev_chains(&J, 0);
+        C = ew[0].C;   /* its grown heap / lane lists, freed below */
+        tag = ew[0].tag; seentag = ew[0].seentag;
+        for (int i = 0; i < nr; i++) if (res[i].x < 0) goto done;
+    }
+    T[10] = ev_now();
     for (int ri = 0; ri < nr; ri++) {
         Race *r = &R[ri];
         int rt = ++tag;
-        for (int b = 0; b < r->nbar; b++) {
-            const BSeg *s; int ns;
-            for (int w = 0; bar_segs(&B, r->bar[b], &s, &ns, w); w++) blocked_lanes(&g, &grid, s, ns, stamp, rt, seen, &seentag);
-        }
+        for (int b = 0; b < r->nbar; b++) barl_stamp(&BL, r->bar[b], stamp, rt);
         /* WW2 11-22: which races exist (and so every event id after them) stays as the first
            sets had it -- found without the U-turn cost; the route itself is the U-turn-free
            one when that is whole too */
-        int *ch = NULL, nch = 0, fb = 0, x;
-        C.uturn = 0;
-        x = route_chain(&C, r, stamp, rt, mark, &ch, &nch, &fb);
-        if (x < 0) goto done;
+        int *ch = res[ri].ch, nch = res[ri].nch, fb = res[ri].fb, x = res[ri].x;   /* ev_chains' */
+        res[ri].ch = NULL;
         if (!x) { st->skipped++; continue; }
-        {
-            int *ch2 = NULL, nch2 = 0, fb2 = 0;
-            C.uturn = 1;
-            int x2 = route_chain(&C, r, stamp, rt, mark, &ch2, &nch2, &fb2);
-            if (x2 < 0) { free(ch); goto done; }
-            if (x2 > 0) { free(ch); ch = ch2; nch = nch2; fb = fb2; }
-        }
         st->fallback += fb;
         int thru = 0; for (int i = 0; ch && i < nch; i++) thru += stamp[ch[i]] == rt;
         if (thru) st->through++;
         int closed = r->closed;
+        tq = ev_now();
         if (!recut(&g, ch, nch, closed, &g2) || !g2.n) { free(ch); if (!g2.n) { st->skipped++; continue; } goto done; }
         const DPoly **pc = malloc((size_t)g2.n * sizeof *pc);
         if (!pc) { free(ch); goto done; }
         for (int i = 0; i < g2.n; i++) pc[i] = &g2.v[i];
         int okp = section_polylines(pc, g2.n, closed, &S); free(pc);
         if (!okp) { free(ch); goto done; }
+        tp += ev_now() - tq;
         int ev = first_id + nm;
+        tq = ev_now();
         part.n = 0;
         uint8_t *rec = recs + 0x110 * (size_t)nm;
         x = paths_bin(&S, ev, closed, &part, rec);
         if (x <= 0) { free(ch); if (!x) goto done; st->skipped++; continue; }
+        tpb += ev_now() - tq;
         XPEV_TRACE(ev, r, &g, ch, nch, stamp, rt, &C);
         double L = 0; for (int s = 0; s < S.n; s++) L += poly_len(&S.v[s]);
         double l100 = pyround(L / 100); rec[5] = (uint8_t)(l100 > 255 ? 255 : l100);
-        char p[600]; snprintf(p, sizeof p, "%s/Paths%d.bin", out_dir, ev);
-        FILE *f = fopen(p, "wb");
-        if (!f) { free(ch); rc = XP_ERR_OPEN_OUT; goto done; }
-        int okw = fwrite(part.b, 1, part.n, f) == part.n; if (fclose(f)) okw = 0;
-        snprintf(p, sizeof p, "%s/Routes%dF.bin", out_dir, ev);
-        f = okw ? fopen(p, "wb") : NULL;
-        if (f) { okw = routes_bin(&S, closed, f); if (fclose(f)) okw = 0; } else okw = 0;
-        if (!okw) { free(ch); rc = XP_ERR_WRITE; goto done; }
+        char p[600];
+        tq = ev_now();
         EvMeta *m = &meta[nm];
+        m->part = malloc(part.n ? part.n : 1);   /* 11-24: its Paths file written once, with the records (write_allrec) */
+        if (!m->part) { free(ch); goto done; }
+        memcpy(m->part, part.b, part.n);
+        snprintf(p, sizeof p, "%s/Routes%dF.bin", out_dir, ev);
+        FILE *f = fopen(p, "wb");
+        int okw = f != NULL;
+        if (f) { okw = routes_bin(&S, closed, f); if (fclose(f)) okw = 0; }
+        if (!okw) { free(ch); rc = XP_ERR_WRITE; goto done; }
+        tw += ev_now() - tq;
         if (game == XP_GAME_CARBON && !mr_race(&mr, r, &m->mr, &m->nmr, &mr_fail)) { free(ch); rc = XP_ERR_MEMORY; goto done; }
         snprintf(m->name, sizeof m->name, "%s", r->name); m->id = ev; m->type = r->type; m->closed = r->closed; m->mode = r->mode; m->tlim = r->tlim; memcpy(m->gates, r->gates, sizeof m->gates); m->len = (int)pyround(L); m->partlen = part.n;
         /* a barrier the route still crosses (no way round it the format holds) stays off */
         size_t bl = 0; for (int b = 0; b < r->nbar; b++) bl += strlen(r->bar[b]) + 1;
         m->bars = malloc(bl + 1); if (!m->bars) { free(ch); goto done; }
         m->bars[0] = 0;
+        tq = ev_now();
         for (int b = 0; b < r->nbar; b++) {
             int bt = ++tag, hit = 0;
-            const BSeg *s; int ns;
-            for (int w = 0; bar_segs(&B, r->bar[b], &s, &ns, w); w++) blocked_lanes(&g, &grid, s, ns, stamp, bt, seen, &seentag);
+            barl_stamp(&BL, r->bar[b], stamp, bt);
             for (int i = 0; i < nch && !hit; i++) hit = stamp[ch[i]] == bt;
             if (hit) { st->barriers_off++; continue; }
             st->barriers_on++;
             if (m->bars[0]) strcat(m->bars, " ");
             strcat(m->bars, r->bar[b]);
         }
+        tb += ev_now() - tq;
         /* the start: the first point, heading to the first one 8 m on */
         D3 a = S.v[0].p[0], bq = S.v[0].n > 1 ? S.v[0].p[1] : S.v[1 < S.n ? 1 : 0].p[0]; int fnd = 0;
         for (int s = 0; s < S.n && !fnd; s++) for (int i = 0; i < S.v[s].n; i++) if (dd2(S.v[s].p[i], a) > 8) { bq = S.v[s].p[i]; fnd = 1; break; }
@@ -1626,28 +1750,43 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         free(ch);
     }
     nrecs = nm;
+    T[6] = ev_now();
     keep = malloc((size_t)(nm ? nm : 1));
     if (!keep) goto done;
     memset(keep, 1, (size_t)(nm ? nm : 1));
-    rc = XP_ERR_WRITE;
-    if (!write_allrec(out_dir, meta, nm, recs, keep, 0)) goto done;
-    /* the game's own route builder must take each one; drop those it refuses */
+    rc = XP_ERR_MEMORY;
+    /* the game's own route builder must take each one (its file as written: its part + every
+       record); drop those it refuses */
+    T[7] = ev_now();
     int bad = 0;
-    for (int i = 0; i < nm; i++) {
-        char p[600]; snprintf(p, sizeof p, "%s/Paths%d.bin", out_dir, meta[i].id);
-        RacePath *rp = racepath_load(p, meta[i].id, 0);
-        if (rp) { racepath_free(rp); continue; }
-        keep[i] = 0; bad++;
-        remove(p); snprintf(p, sizeof p, "%s/Routes%dF.bin", out_dir, meta[i].id); remove(p);
+    {
+        size_t big = 0; for (int i = 0; i < nm; i++) if (meta[i].partlen > big) big = meta[i].partlen;
+        size_t tn = 8 + 0x110 * (size_t)nm;
+        tbl = malloc(big + tn);
+        if (!tbl) goto done;
+        uint8_t *t = tbl + big;
+        pu32(t, 0x3414C); pu32(t + 4, 0x110 * (uint32_t)nm); memcpy(t + 8, recs, 0x110 * (size_t)nm);
+        for (int i = 0; i < nm; i++) {
+            uint8_t *fb2 = t - meta[i].partlen;   /* part right in front of the table */
+            memcpy(fb2, meta[i].part, meta[i].partlen);
+            RacePath *rp = racepath_parse(fb2, (long)(meta[i].partlen + tn), meta[i].id, 0);
+            if (rp) { racepath_free(rp); continue; }
+            keep[i] = 0; bad++;
+            char p[600]; snprintf(p, sizeof p, "%s/Paths%d.bin", out_dir, meta[i].id); remove(p);
+            snprintf(p, sizeof p, "%s/Routes%dF.bin", out_dir, meta[i].id); remove(p);
+        }
+        free(tbl); tbl = NULL;
     }
     st->dropped = bad;
+    T[8] = ev_now();
     if (bad) {
         /* the records shrink to the events kept */
         int w = 0;
-        for (int i = 0; i < nm; i++) if (keep[i]) { if (w != i) { memmove(recs + 0x110 * (size_t)w, recs + 0x110 * (size_t)i, 0x110); free(meta[w].bars); free(meta[w].pl); free(meta[w].mr); meta[w] = meta[i]; meta[i].bars = NULL; meta[i].pl = NULL; meta[i].mr = NULL; } w++; }
+        for (int i = 0; i < nm; i++) if (keep[i]) { if (w != i) { memmove(recs + 0x110 * (size_t)w, recs + 0x110 * (size_t)i, 0x110); free(meta[w].bars); free(meta[w].pl); free(meta[w].mr); free(meta[w].part); meta[w] = meta[i]; meta[i].bars = NULL; meta[i].pl = NULL; meta[i].mr = NULL; meta[i].part = NULL; } w++; }
         nm = w; memset(keep, 1, (size_t)(nm ? nm : 1));
-        if (!write_allrec(out_dir, meta, nm, recs, keep, 1)) goto done;
     }
+    rc = XP_ERR_WRITE;
+    if (!write_allrec(out_dir, meta, nm, recs, keep)) goto done;
     {
         char p[600]; snprintf(p, sizeof p, "%s/events.txt", out_dir);
         FILE *fe = fopen(p, "w"); snprintf(p, sizeof p, "%s/starts.txt", out_dir);
@@ -1720,12 +1859,22 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         }
         rc = okw ? XP_OK : XP_ERR_WRITE;
     }
+    T[9] = ev_now();
+    if (xp_ticks)
+        printf("xp_events: steps (ms): races %u, road net + graph %u, barrier names %u, barrier walls %u, setup %u, "
+               "chains %u (%d cores), events %u (lanes %u, paths %u, files %u, barriers %u), records %u, route check %u, the rest %u\n",
+               T[1] - T[0], T[2] - T[1], T[3] - T[2], T[4] - T[3], T[5] - T[4],
+               T[10] - T[5], nw, T[6] - T[10], tp, tpb, tw, tb, T[7] - T[6], T[8] - T[7], T[9] - T[8]);
 done:
     (void)nrecs;
-    if (meta) for (int i = 0; i < nr; i++) { free(meta[i].bars); free(meta[i].pl); free(meta[i].mr); }
+    if (meta) for (int i = 0; i < nr; i++) { free(meta[i].bars); free(meta[i].pl); free(meta[i].mr); free(meta[i].part); }
+    barl_free(&BL); free(tbl);
     if (mr.rn) mr_free(&mr);
     free(meta); free(recs); free(keep); free(mark); free(stamp); free(seen);
-    free(C.dist); free(C.prev); free(C.touched); free(C.W); free(C.heap.v); free(C.nl.v);
+    if (res) for (int i = 0; i < nr; i++) free(res[i].ch);
+    for (int i = 1; i < nw; i++) ev_worker_free(&ew[i]);
+    free(res); free(ew);
+    free(C.dist); free(C.prev); free(C.touched); free(C.W); free(C.heap.v); free(C.nl.v); free(C.u0); free(C.u1); free(C.len); free(C.np2);
     dps_free(&g2); dps_free(&S); free(part.b);
     free(grid.e); free(B.name); free(B.s);
     free_graph(&g); free(chunk); free_races(R, nr);

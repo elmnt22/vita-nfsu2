@@ -26,6 +26,7 @@ void      racepath_free(RacePath *p);
 /* free roam (race mode 0): the zones only, no route -- racepath_lap 0,
    locating does nothing; NULL without chunk 0x3414a */
 RacePath *racepath_load_zones(const char *paths_bin);
+RacePath *racepath_parse(const unsigned char *data, long len, int event, int reversed);   /* from memory (copied) */
 /* the next zone of `type` holding pos after `after` (NULL: the first), in
    file order -- the same as walking racepath_zone_next with that test */
 const unsigned char *racepath_zone_at(const RacePath *p, const float pos[2], int type, const unsigned char *after);
