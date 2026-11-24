@@ -108,14 +108,15 @@ typedef struct {
     int tex;                   /* slot in g_tex, -1 none */
     int page;                  /* build: the vertex page; GPU names after upload */
     unsigned char reflect, mat_exact, glow;
-    int nv;                    /* vertices (sizing) */
+    int nv, vb;                /* vertices, first vertex in its page */
 } RsMesh;
 
 struct RsSolid {
     uint32_t hash; int polys; float volume, density;
     int m0, nm;                /* meshes of the owning section */
     RsSec *sec;
-    RsSolid *next;             /* hash chain */
+    RsSolid *next;             /* hash chain (main thread) */
+    RsSolid *xnext;            /* the worker's X-section chain (bake) */
 };
 
 /* 0x34103 instance / 0x34104 tree node, parsed once on the worker (the raw
@@ -139,7 +140,21 @@ typedef struct {
     unsigned char *hide; unsigned hide_gen;    /* group/prop hidden per instance, by g_sel_gen */
     RsSolid *(*model)[3]; unsigned gen;         /* resolved per info, by g_gen */
     RsSec *sec;
+    /* world-space bake (worker): every instance whose models were in (its own
+       section or an X library) has its LOD A and B meshes copied, transformed,
+       into the section's bake pages in piece order, so the instances the
+       per-frame culls keep draw as a few merged index ranges */
+    unsigned char *bk;                         /* per instance: 1 baked */
+    RsSolid *(*bm)[2];                         /* per info: the baked LOD A / B models */
+    struct RsPiece *pc; int npc;
+    unsigned char *vis;                        /* per frame: 0, or the LOD drawn + 1 */
+    int touched;
 } RsScen;
+typedef struct RsPiece {
+    const RsMesh *src;         /* texture / mode / reflect / glow */
+    unsigned ioff, count;      /* index bytes offset, index count in the bake page */
+    unsigned short inst; unsigned char lod, page;
+} RsPiece;
 
 typedef struct { BatchedVertex *v; int nv, cv; uint16_t *ix; int ni, ci; GLuint vbo, ibo; } RsPage;
 
@@ -154,6 +169,9 @@ struct RsSec {
     RsMesh *mesh; int nmesh;
     RsSolid *sol; int nsol;
     RsScen *scen; int nscen;
+    RsPage *bpage; int nbpage; /* bake pages */
+    long bake_v;               /* baked vertices (stats) */
+    long unbaked;              /* instances left on the per-instance path */
     int *texs; int ntex;       /* g_tex slots this section's meshes use */
     Uint32 t_queued, t_built;
     long bytes_gpu;
@@ -206,6 +224,7 @@ static struct {
     SDL_Thread *thr; int quit;
     /* stats */
     long st_draws, st_inst, st_frames, st_cull[8], st_tex_up, st_sec_up, st_unload;
+    long st_binst, st_bruns, st_bpieces;
     /* decoded pixels waiting for the main thread's upload (state 2) */
     volatile long dec_bytes; volatile int ndec; long dec_peak; long st_dec_wait_ms;
     double st_up_ms, st_draw_ms, st_upd_ms;
@@ -491,7 +510,7 @@ static void rs_build_solid(RsBuild *B, long beg, long end) {
             p->ix[p->ni + t] = (uint16_t)(vb + (v >= 0 && v < m->nverts ? remap[v] : 0));
         }
         free(remap);
-        rm->b.index_count = m->nidx; rm->nv = used;
+        rm->b.index_count = m->nidx; rm->nv = used; rm->vb = vb;
         rm->b.texkey = m->texkey;
         rm->b.nmesh = 1;
         p->nv += used; p->ni += m->nidx;
@@ -584,6 +603,7 @@ static int rs_sec_visit(const unsigned char *d, uint32_t tag, long beg, long end
 
 static void rs_sec_free_cpu(RsSec *s) {
     for (int i = 0; i < s->npage; i++) { free(s->page[i].v); free(s->page[i].ix); s->page[i].v = NULL; s->page[i].ix = NULL; }
+    for (int i = 0; i < s->nbpage; i++) { free(s->bpage[i].v); free(s->bpage[i].ix); s->bpage[i].v = NULL; s->bpage[i].ix = NULL; }
 }
 static void rs_sec_free_all(RsSec *s) {
     rs_sec_free_cpu(s);
@@ -592,12 +612,18 @@ static void rs_sec_free_all(RsSec *s) {
         if (s->page[i].ibo) glDeleteBuffers(1, &s->page[i].ibo);
     }
     free(s->page); s->page = NULL; s->npage = 0;
+    for (int i = 0; i < s->nbpage; i++) {
+        if (s->bpage[i].vbo) glDeleteBuffers(1, &s->bpage[i].vbo);
+        if (s->bpage[i].ibo) glDeleteBuffers(1, &s->bpage[i].ibo);
+    }
+    free(s->bpage); s->bpage = NULL; s->nbpage = 0; s->bake_v = 0; s->unbaked = 0;
     free(s->mesh); s->mesh = NULL; s->nmesh = 0;
     free(s->sol); s->sol = NULL; s->nsol = 0;
     for (int i = 0; i < s->nscen; i++) {
         RsScen *c = &s->scen[i];
         free(c->info); free(c->inst); free(c->node); free(c->pre); free(c->model);
         free(c->in); free(c->nd); free(c->infR); free(c->hide);
+        free(c->bk); free(c->bm); free(c->pc); free(c->vis);
     }
     free(s->scen); s->scen = NULL; s->nscen = 0;
     free(s->texs); s->texs = NULL; s->ntex = 0;
@@ -616,6 +642,175 @@ static int rs_read_at(int fd, long off, unsigned char *d, long n) {
     }
     return 1;
 }
+/* ---------------------------------------------------------------- bake (worker) */
+/* X-library solids by hash, for the worker only (X sections never unload while
+   the streamer runs; the main thread's g_solhash is not safe to read here) */
+static RsSolid *g_xhash[4096];
+static uint32_t rs_xh(uint32_t h) { return (h * 2654435761u) >> 20; }   /* 12 bits */
+static void rs_xregister(RsSec *s) {
+    for (int i = 0; i < s->nsol; i++) {
+        RsSolid *so = &s->sol[i]; uint32_t b = rs_xh(so->hash);
+        so->xnext = g_xhash[b]; g_xhash[b] = so;
+    }
+}
+static int rs_hash_valid(uint32_t h) { return h && h != 0xbe43edbbu && h != 0x72923c81u; }
+typedef struct { RsSec *s; int *head, *next; } RsOwn;
+static RsSolid *rs_bfind(const RsOwn *o, uint32_t h) {
+    for (int i = o->head[h & 1023]; i >= 0; i = o->next[i]) if (o->s->sol[i].hash == h) return &o->s->sol[i];
+    for (RsSolid *so = g_xhash[rs_xh(h)]; so; so = so->xnext) if (so->hash == h) return so;
+    return NULL;
+}
+static int rs_piece_key(const RsMesh *m) { return m->tex >= 0 ? m->tex : -1 - (int)(m->b.texkey & 0x3fffffff); }
+static int rs_piece_cmp(const void *a, const void *b) {
+    const RsPiece *x = (const RsPiece *)a, *y = (const RsPiece *)b;
+    int kx = rs_piece_key(x->src), ky = rs_piece_key(y->src);
+    if (kx != ky) return kx < ky ? -1 : 1;
+    int fx = x->src->mat_exact | x->src->reflect << 1 | x->src->glow << 2, fy = y->src->mat_exact | y->src->reflect << 1 | y->src->glow << 2;
+    if (fx != fy) return fx - fy;
+    if (x->src->b.texkey != y->src->b.texkey) return x->src->b.texkey < y->src->b.texkey ? -1 : 1;
+    if (x->lod != y->lod) return x->lod - y->lod;
+    if (x->inst != y->inst) return x->inst - y->inst;
+    return x->src < y->src ? -1 : x->src > y->src;
+}
+/* same draw state: may share one draw call */
+static int rs_piece_same(const RsMesh *a, const RsMesh *b) {
+    return a == b || (a->tex == b->tex && a->b.texkey == b->b.texkey && a->mat_exact == b->mat_exact &&
+                      a->reflect == b->reflect && a->glow == b->glow);
+}
+static int rs_bpage_room(RsSec *s, int nv) {
+    RsPage *p = s->nbpage ? &s->bpage[s->nbpage - 1] : NULL;
+    if (p && p->nv + nv <= RS_MAXV && s->nbpage < 255) return s->nbpage - 1;
+    if (s->nbpage >= 255) return -1;
+    RsPage *np = (RsPage *)realloc(s->bpage, (size_t)(s->nbpage + 1) * sizeof *np);
+    if (!np) return -1;
+    s->bpage = np; memset(&np[s->nbpage], 0, sizeof *np);
+    return s->nbpage++;
+}
+static int rs_bake_piece(RsSec *s, RsPiece *pc, const RsPage *sp, const RsInst *in) {
+    const RsMesh *m = pc->src;
+    if (!sp->v || !sp->ix || m->nv <= 0 || m->vb + m->nv > sp->nv) return 0;
+    int pg = rs_bpage_room(s, m->nv);
+    if (pg < 0) return 0;
+    RsPage *p = &s->bpage[pg];
+    int ni = (int)m->b.index_count, i0 = (int)(m->b.ioff / 2);
+    if (p->nv + m->nv > p->cv) {
+        int c = p->cv ? p->cv : 8192; while (c < p->nv + m->nv) c *= 2;
+        if (c > RS_MAXV + 1) c = RS_MAXV + 1;
+        BatchedVertex *nv = (BatchedVertex *)realloc(p->v, (size_t)c * sizeof *nv);
+        if (!nv) return 0;
+        p->v = nv; p->cv = c;
+    }
+    if (p->ni + ni > p->ci) {
+        int c = p->ci ? p->ci : 16384; while (c < p->ni + ni) c *= 2;
+        uint16_t *nx = (uint16_t *)realloc(p->ix, (size_t)c * sizeof *nx);
+        if (!nx) return 0;
+        p->ix = nx; p->ci = c;
+    }
+    /* the instance matrix, as rs_draw_instance builds it (column-major) */
+    float M[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    if (!(in->flags & 0x100)) {
+        for (int row = 0; row < 3; row++)
+            for (int col = 0; col < 3; col++) M[row * 4 + col] = (float)in->rot[row * 3 + col] * (1.0f / 8192.0f);
+        M[12] = in->pos[0]; M[13] = in->pos[1]; M[14] = in->pos[2];
+    }
+    int vb = p->nv;
+    for (int v = 0; v < m->nv; v++) {
+        const BatchedVertex *a = &sp->v[m->vb + v]; BatchedVertex *o = &p->v[vb + v];
+        *o = *a;
+        float x = a->pos[0], y = a->pos[1], z = a->pos[2];
+        o->pos[0] = M[0]*x + M[4]*y + M[8]*z + M[12];
+        o->pos[1] = M[1]*x + M[5]*y + M[9]*z + M[13];
+        o->pos[2] = M[2]*x + M[6]*y + M[10]*z + M[14];
+#ifdef __vita__
+        float nx = a->normal[0] * (1.0f / 127.0f), ny = a->normal[1] * (1.0f / 127.0f), nz = a->normal[2] * (1.0f / 127.0f);
+#else
+        float nx = a->normal[0], ny = a->normal[1], nz = a->normal[2];
+#endif
+        float wx = M[0]*nx + M[4]*ny + M[8]*nz, wy = M[1]*nx + M[5]*ny + M[9]*nz, wz = M[2]*nx + M[6]*ny + M[10]*nz;
+        float l = sqrtf(wx*wx + wy*wy + wz*wz);
+        if (l > 1e-8f) { wx /= l; wy /= l; wz /= l; }   /* the shaders normalise vN */
+        BV_SET_NORMAL(o, wx, wy, wz);
+    }
+    for (int t = 0; t < ni; t++) {
+        int q = (int)sp->ix[i0 + t] - m->vb;
+        p->ix[p->ni + t] = (uint16_t)(vb + (q >= 0 && q < m->nv ? q : 0));
+    }
+    pc->page = (unsigned char)pg; pc->ioff = (unsigned)(p->ni * 2); pc->count = (unsigned)ni;
+    p->nv += m->nv; p->ni += ni;
+    s->bake_v += m->nv;
+    return 1;
+}
+/* the section's scenery, baked; returns the instances left unbaked */
+static long rs_bake(RsSec *s) {
+    long left = 0;
+    RsOwn O; O.s = s;
+    int head[1024]; O.head = head; for (int i = 0; i < 1024; i++) head[i] = -1;
+    O.next = (int *)malloc((size_t)(s->nsol ? s->nsol : 1) * sizeof(int));
+    if (!O.next) { for (int i = 0; i < s->nscen; i++) left += s->scen[i].ninst; return left; }
+    for (int i = 0; i < s->nsol; i++) { int b = (int)(s->sol[i].hash & 1023); O.next[i] = head[b]; head[b] = i; }
+    for (int c = 0; c < s->nscen; c++) {
+        RsScen *sc = &s->scen[c];
+        sc->bk = (unsigned char *)calloc((size_t)sc->ninst, 1);
+        sc->vis = (unsigned char *)calloc((size_t)sc->ninst, 1);
+        sc->bm = calloc((size_t)sc->ninfo, sizeof *sc->bm);
+        unsigned char *iok = (unsigned char *)malloc((size_t)sc->ninfo);
+        if (!sc->bk || !sc->vis || !sc->bm || !iok || sc->ninst > 65535) {
+            free(sc->bk); free(sc->vis); free(sc->bm); free(iok); sc->bk = sc->vis = NULL; sc->bm = NULL;
+            left += sc->ninst; continue;
+        }
+        long np = 0;
+        for (int k = 0; k < sc->ninfo; k++) {
+            int ok = 1;
+            for (int l = 0; l < 2; l++) {
+                uint32_t h = rd32(sc->info + k * 0x44 + 0x20 + l * 4);
+                sc->bm[k][l] = rs_hash_valid(h) ? rs_bfind(&O, h) : NULL;
+                /* a LOD B nobody has (22 in L4RA) draws nothing, as on the old path */
+                if (rs_hash_valid(h) && !sc->bm[k][l] && l == 0) ok = 0;
+            }
+            iok[k] = (unsigned char)ok;
+        }
+        for (int i = 0; i < sc->ninst; i++) {
+            int info = sc->in[i].info;
+            if (info < 0 || info >= sc->ninfo || !iok[info]) continue;
+            for (int l = 0; l < 2; l++) if (sc->bm[info][l]) np += sc->bm[info][l]->nm;
+        }
+        sc->pc = np ? (RsPiece *)malloc((size_t)np * sizeof *sc->pc) : NULL;
+        if (np && !sc->pc) { free(iok); left += sc->ninst; continue; }
+        long n = 0;
+        for (int i = 0; i < sc->ninst; i++) {
+            int info = sc->in[i].info;
+            if (info < 0 || info >= sc->ninfo || !iok[info]) continue;
+            for (int l = 0; l < 2; l++) {
+                const RsSolid *so = sc->bm[info][l];
+                for (int k = 0; so && k < so->nm; k++) {
+                    const RsMesh *m = &so->sec->mesh[so->m0 + k];
+                    if (m->nv <= 0 || m->b.index_count < 3) continue;
+                    RsPiece *pc = &sc->pc[n++]; pc->src = m; pc->inst = (unsigned short)i; pc->lod = (unsigned char)l;
+                }
+            }
+        }
+        qsort(sc->pc, (size_t)n, sizeof *sc->pc, rs_piece_cmp);
+        /* write in piece order; an instance whose piece failed stays unbaked */
+        long w = 0;
+        for (long q = 0; q < n; q++) {
+            RsPiece *pc = &sc->pc[q];
+            const RsSolid *so = sc->bm[sc->in[pc->inst].info][pc->lod];
+            if (!rs_bake_piece(s, pc, &so->sec->page[pc->src->page], &sc->in[pc->inst])) { sc->bk[pc->inst] = 2; continue; }
+            sc->pc[w++] = *pc;
+        }
+        sc->npc = (int)w;
+        for (int i = 0; i < sc->ninst; i++) {
+            int info = sc->in[i].info;
+            int ok = info >= 0 && info < sc->ninfo && iok[info] && sc->bk[i] != 2;
+            sc->bk[i] = (unsigned char)ok;
+            left += !ok;
+        }
+        free(iok);
+    }
+    free(O.next);
+    return left;
+}
+
 static void rs_build(RsSec *s, int fd) {
     Uint32 t0 = SDL_GetTicks();
     if (rs_letter(s->number) == 25) return;   /* Y: texture packs only; textures come by key from the pinned bundle */
@@ -628,6 +823,10 @@ static void rs_build(RsSec *s, int fd) {
     RsBuild B; memset(&B, 0, sizeof B); B.s = s; B.d = d; B.dlen = s->size;
     asset_chunks_walk(d, 0, s->size, rs_sec_visit, &B);
     free(d);
+    long unbaked = 0;
+    if (rs_letter(s->number) == 24) rs_xregister(s);   /* model library: before anyone bakes from it */
+    else if (s->nscen) unbaked = rs_bake(s);
+    s->unbaked = unbaked;
     /* the section's texture slots, distinct */
     int cap = s->nmesh ? s->nmesh : 1;
     s->texs = (int *)malloc((size_t)cap * sizeof *s->texs);
@@ -651,12 +850,13 @@ static void rs_build(RsSec *s, int fd) {
         rs_tex_decode(t);
     }
     Uint32 t2 = SDL_GetTicks();
-    { long nv = 0, ni = 0; for (int i = 0; i < s->nmesh; i++) { nv += s->mesh[i].nv; ni += s->mesh[i].b.index_count; }
-      if (rs_letter(s->number) == 24) printf("rstream: %s geometry %ld vertices %ld indices\n", s->name, nv, ni); }
+    long mv = 0; for (int i = 0; i < s->nmesh; i++) mv += s->mesh[i].nv;
     static int logn;
     if (logn++ < 400)
-        printf("rstream: built %s (%ld KB): read %u ms, parse+tex %u ms, %d solids %d meshes %d scenery, %d pages, %d textures\n",
-               s->name, s->size / 1024, (unsigned)(t1 - t0), (unsigned)(t2 - t1), s->nsol, s->nmesh, s->nscen, s->npage, s->ntex);
+        printf("rstream: built %s (%ld KB): read %u ms, parse+tex+bake %u ms, %d solids %d meshes (%ld vertices) %d scenery, %d pages, %d textures, "
+               "baked %ld vertices in %d pages, %ld instances unbaked\n",
+               s->name, s->size / 1024, (unsigned)(t1 - t0), (unsigned)(t2 - t1), s->nsol, s->nmesh, mv, s->nscen, s->npage, s->ntex,
+               s->bake_v, s->nbpage, unbaked);
 }
 
 static int rs_worker(void *arg) {
@@ -720,7 +920,11 @@ static RsSolid *rs_solid(uint32_t hash) {
 static int rs_activate(RsSec *s) {
     for (int k = 0; k < s->ntex; k++) { int st = g_tex[s->texs[k]].state; if (st != 3 && st != 4) return 0; }
     long bytes = 0;
-    for (int i = 0; i < s->npage; i++) {
+    /* model pages go to the GPU only for instances left unbaked: an X library
+       and a fully baked section draw from the bake pages alone (the X CPU copy
+       stays for later bakes) */
+    int models = rs_letter(s->number) != 24 && s->unbaked > 0;
+    for (int i = 0; i < s->npage && models; i++) {
         RsPage *p = &s->page[i];
         if (!p->nv || !p->ni) continue;
         glGenBuffers(1, &p->vbo); glGenBuffers(1, &p->ibo);
@@ -730,8 +934,19 @@ static int rs_activate(RsSec *s) {
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)p->ni * 2, p->ix, GL_STATIC_DRAW);
         bytes += (long)p->nv * (long)sizeof(BatchedVertex) + (long)p->ni * 2;
     }
+    for (int i = 0; i < s->nbpage; i++) {
+        RsPage *p = &s->bpage[i];
+        if (!p->nv || !p->ni) continue;
+        glGenBuffers(1, &p->vbo); glGenBuffers(1, &p->ibo);
+        glBindBuffer(GL_ARRAY_BUFFER, p->vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)p->nv * (GLsizeiptr)sizeof(BatchedVertex), p->v, GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p->ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)p->ni * 2, p->ix, GL_STATIC_DRAW);
+        bytes += (long)p->nv * (long)sizeof(BatchedVertex) + (long)p->ni * 2;
+    }
     glBindBuffer(GL_ARRAY_BUFFER, 0); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    rs_sec_free_cpu(s);
+    /* an X library keeps its CPU vertices: later sections bake from them */
+    if (rs_letter(s->number) != 24) rs_sec_free_cpu(s);
     for (int i = 0; i < s->nmesh; i++) {
         RsMesh *m = &s->mesh[i];
         m->b.vbo = s->page[m->page].vbo; m->b.ibo = s->page[m->page].ibo;
@@ -834,7 +1049,7 @@ void rstream_stop(void) {
     }
     memset(g_tex, 0, sizeof g_tex);
     g.dec_bytes = 0; g.ndec = 0;
-    memset(g_solhash, 0, sizeof g_solhash); memset(g_hdr, 0, sizeof g_hdr);
+    memset(g_solhash, 0, sizeof g_solhash); memset(g_hdr, 0, sizeof g_hdr); memset(g_xhash, 0, sizeof g_xhash);
     rs_free_tables();
     g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0;
     printf("rstream: stopped\n");
@@ -1020,7 +1235,9 @@ static void rs_xbox(const float M[16], const float lo[3], const float hi[3], flo
 typedef struct { const RsSolid *s; int mtx; int state; } RsRec;   /* mtx: -1 identity, else index */
 #define RS_MAXREC 6000
 static RsRec g_rec[RS_MAXREC]; static float g_mtx[RS_MAXREC][16]; static int g_nrec, g_nmtx;
-typedef struct { int rec, mesh; unsigned char row; } RsDef;
+/* a deferred draw: one instanced mesh (mtx = its matrix) or one merged bake run (mtx -1) */
+typedef struct { const RsMesh *m; GLuint vbo, ibo; unsigned ioff, count; int mtx; unsigned char row; } RsDef;
+static RsScen *g_touched[512]; static int g_ntouched;
 #define RS_MAXDEF 8192
 static RsDef g_def[4][RS_MAXDEF]; static int g_ndef[4];   /* 0 reflect, 1 cutout, 2 blend/add, 3 glow */
 
@@ -1067,6 +1284,23 @@ static void rs_draw_instance(RsCull *K, RsScen *sc, int ii, int state) {
     }
     if (pixels < 17) { g.st_cull[3]++; return; }   /* < 2, then the main view's 17 */
     /* 5 LOD */
+    if (sc->bk && sc->bk[ii]) {   /* baked: mark it; the bake runs draw it */
+        const RsSolid *a = sc->bm[info][0], *b = sc->bm[info][1];
+        float fb = 0.0f;
+        if (a) {
+            if (a->polys < 40) fb = 4.0f;
+            else if (a->volume > 0.0f) fb = (float)pixels / (a->density > 6.0f ? a->density : 6.0f);
+        }
+        int lod = fb >= 4.0f ? 0 : 1;
+        if (!(lod ? b : a)) return;
+        if (!sc->touched) {
+            if (g_ntouched >= 512) { g.st_cull[5]++; return; }
+            g_touched[g_ntouched++] = sc; sc->touched = 1;
+        }
+        sc->vis[ii] = (unsigned char)(lod + 1);
+        g.st_binst++;
+        return;
+    }
     if (sc->gen != g_gen) {
         for (int k = 0; k < sc->ninfo; k++)
             for (int m = 0; m < 3; m++) sc->model[k][m] = rs_solid(rd32(sc->info + k * 0x44 + 0x20 + m * 4));
@@ -1145,6 +1379,9 @@ static void rs_set_mtx(const RsDrawCtx *c, int mtx) {
     }
     g_lastmtx = mtx;
 }
+static void rs_def_batch(const RsDef *d, N2Batch *b) {
+    *b = d->m->b; b->vbo = d->vbo; b->ibo = d->ibo; b->ioff = d->ioff; b->index_count = d->count;
+}
 static int rs_mesh_visible(const RsDrawCtx *c, const RsRec *r, const RsMesh *m) {
     if (r->state == 2) return 1;
     float lo[3], hi[3];
@@ -1175,7 +1412,7 @@ int rstream_draw(const RsDrawCtx *c) {
        is left out: the port decides group members by its own selection above,
        as the tile build does (world_scenery.h) */
     K.cull = 0x02 | 0x08;
-    g_nrec = g_nmtx = 0; g_ndef[0] = g_ndef[1] = g_ndef[2] = g_ndef[3] = 0;
+    g_nrec = g_nmtx = 0; g_ndef[0] = g_ndef[1] = g_ndef[2] = g_ndef[3] = 0; g_ntouched = 0;
     /* WhatSectionsShouldWeDraw */
     int zone = rs_find_zone(c->cam[0], c->cam[1]);
     static RsScen *list[160]; int nl = 0;
@@ -1217,7 +1454,8 @@ int rstream_draw(const RsDrawCtx *c) {
 #endif
             if (q >= 0) {
                 if (g_ndef[q] < RS_MAXDEF) {
-                    RsDef *d = &g_def[q][g_ndef[q]++]; d->rec = r; d->mesh = so->m0 + k;
+                    RsDef *d = &g_def[q][g_ndef[q]++]; d->m = m; d->vbo = m->b.vbo; d->ibo = m->b.ibo;
+                    d->ioff = m->b.ioff; d->count = m->b.index_count; d->mtx = R->mtx;
                     d->row = q == 2 && m->tex >= 0 ? g_tex[m->tex].order : 0;
                 }
                 continue;
@@ -1244,12 +1482,52 @@ int rstream_draw(const RsDrawCtx *c) {
             draw_batch(&m->b); draws++; g_st_ident += R->mtx < 0;
         }
     }
+    /* baked runs: consecutive visible pieces of one draw state in one page are
+       one index range */
+    for (int t = 0; t < g_ntouched; t++) {
+        RsScen *sc = g_touched[t];
+        const RsPiece *run = NULL; unsigned rcount = 0;
+        for (int q = 0; q <= sc->npc; q++) {
+            const RsPiece *pc = q < sc->npc ? &sc->pc[q] : NULL;
+            int on = pc && sc->vis[pc->inst] == pc->lod + 1;
+            if (on) g.st_bpieces++;
+            if (run && on && pc->page == run->page && pc->ioff == run->ioff + rcount * 2 && rs_piece_same(pc->src, run->src)) {
+                rcount += pc->count; continue;
+            }
+            if (run) {   /* flush */
+                const RsMesh *m = run->src; const RsPage *bp = &sc->sec->bpage[run->page];
+                if (bp->vbo) {
+                    unsigned char md = rs_mesh_mode(m);
+                    int cq = m->glow ? 3 : md == N2_DRAW_BLEND || md == N2_DRAW_ADD ? 2 : md == N2_DRAW_CUTOUT ? 1 : m->reflect && c->refl_ready ? 0 : -1;
+#ifdef OPENUG2_SIM_PRE_H
+                    static int hq = -9; if (hq == -9) { const char *e = getenv("OPENUG2_RS_HIDEQ"); hq = e && *e ? atoi(e) : -5; }
+                    if (hq == cq) cq = -9;
+#endif
+                    if (cq >= 0) {
+                        if (g_ndef[cq] < RS_MAXDEF) {
+                            RsDef *d = &g_def[cq][g_ndef[cq]++]; d->m = m; d->vbo = bp->vbo; d->ibo = bp->ibo;
+                            d->ioff = run->ioff; d->count = rcount; d->mtx = -1;
+                            d->row = cq == 2 && m->tex >= 0 ? g_tex[m->tex].order : 0;
+                        }
+                    } else if (cq == -1) {
+                        N2Batch b = m->b; b.vbo = bp->vbo; b.ibo = bp->ibo; b.ioff = run->ioff; b.index_count = rcount;
+                        rs_set_mtx(c, -1); rs_bind_tex(c, m, &b);
+                        draw_batch(&b); draws++; g_st_ident++;
+                    }
+                    g.st_bruns++;
+                }
+                run = NULL;
+            }
+            if (on) { run = pc; rcount = pc->count; }
+        }
+        memset(sc->vis, 0, (size_t)sc->ninst); sc->touched = 0;
+    }
     /* worldreflect (row 0, effect 2) */
     if (g_ndef[0]) {
         vita_set_reflect(1);
         for (int q = 0; q < g_ndef[0]; q++) {
-            const RsDef *d = &g_def[0][q]; const RsRec *R = &g_rec[d->rec]; RsMesh *m = &R->s->sec->mesh[d->mesh];
-            rs_set_mtx(c, R->mtx); rs_bind_tex(c, m, &m->b); draw_batch(&m->b); draws++;
+            const RsDef *d = &g_def[0][q]; N2Batch b; rs_def_batch(d, &b);
+            rs_set_mtx(c, d->mtx); rs_bind_tex(c, d->m, &b); draw_batch(&b); draws++;
         }
         vita_set_reflect(0);
     }
@@ -1257,8 +1535,8 @@ int rstream_draw(const RsDrawCtx *c) {
     if (g_ndef[1]) {
         glUniform1f(c->rp->uAlphaTest, 1.0f);
         for (int q = 0; q < g_ndef[1]; q++) {
-            const RsDef *d = &g_def[1][q]; const RsRec *R = &g_rec[d->rec]; RsMesh *m = &R->s->sec->mesh[d->mesh];
-            rs_set_mtx(c, R->mtx); rs_bind_tex(c, m, &m->b); draw_batch(&m->b); draws++;
+            const RsDef *d = &g_def[1][q]; N2Batch b; rs_def_batch(d, &b);
+            rs_set_mtx(c, d->mtx); rs_bind_tex(c, d->m, &b); draw_batch(&b); draws++;
         }
         glUniform1f(c->rp->uAlphaTest, 0.0f);
     }
@@ -1271,10 +1549,10 @@ int rstream_draw(const RsDrawCtx *c) {
             for (int q = 0; q < g_ndef[2]; q++) {
                 const RsDef *d = &g_def[2][q];
                 if (d->row != row) continue;
-                const RsRec *R = &g_rec[d->rec]; RsMesh *m = &R->s->sec->mesh[d->mesh];
-                int add = rs_mesh_mode(m) == N2_DRAW_ADD;
+                int add = rs_mesh_mode(d->m) == N2_DRAW_ADD;
                 if (add != lastadd) { glBlendFunc(GL_SRC_ALPHA, add ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA); lastadd = add; }
-                rs_set_mtx(c, R->mtx); rs_bind_tex(c, m, &m->b); draw_batch(&m->b); draws++;
+                N2Batch b; rs_def_batch(d, &b);
+                rs_set_mtx(c, d->mtx); rs_bind_tex(c, d->m, &b); draw_batch(&b); draws++;
             }
         glUniform1f(c->rp->uTextureAlpha, 0.0f);
         glDepthMask(GL_TRUE); glDisable(GL_BLEND);
@@ -1287,13 +1565,13 @@ int rstream_draw(const RsDrawCtx *c) {
         glUniform3f(c->rp->uFogColor, 0, 0, 0);
         glDepthMask(GL_FALSE); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
         for (int q = 0; q < g_ndef[3]; q++) {
-            const RsDef *d = &g_def[3][q]; const RsRec *R = &g_rec[d->rec]; RsMesh *m = &R->s->sec->mesh[d->mesh];
-            rs_set_mtx(c, R->mtx);
-            rs_bind_tex(c, m, &m->b);
-            GLuint t = m->b.tex;
+            const RsDef *d = &g_def[3][q]; N2Batch b; rs_def_batch(d, &b);
+            rs_set_mtx(c, d->mtx);
+            rs_bind_tex(c, d->m, &b);
+            GLuint t = b.tex;
             glUniform1f(c->rp->uUnlit, t ? 0 : 1); glUniform1f(c->rp->uEmissiveTex, t ? 1 : 0);
             glUniform3f(c->rp->uColor, 1, t ? 1 : .85f, t ? 1 : .5f);
-            draw_batch(&m->b); draws++;
+            draw_batch(&b); draws++;
         }
         glUniform3fv(c->rp->uFogColor, 1, fog);
         glUniform1f(c->rp->uEmissiveTex, 0); glUniform1f(c->rp->uUnlit, 0);
@@ -1317,23 +1595,16 @@ int rstream_draw(const RsDrawCtx *c) {
             gpu += s->bytes_gpu;
         }
         int ntex = 0; for (int i = 0; i < RS_TEXCAP; i++) ntex += g_tex[i].state == 3;
-        {   /* sizing: world-space copies of the visible list's instances (LOD A) */
-            static int said; long bake = 0, own = 0, xi = 0, ni = 0;
-            for (int i = 0; i < nl && said < 12; i++) {
-                RsScen *sc = list[i];
-                if (sc->gen != g_gen) continue;
-                for (int k = 0; k < sc->ninst; k++) {
-                    int info = rd16(sc->inst + k * 0x40 + 0x18);
-                    if (info < 0 || info >= sc->ninfo) continue;
-                    const RsSolid *so = sc->model[info][0]; if (!so) continue;
-                    long nv = 0; for (int q = 0; q < so->nm; q++) nv += so->sec->mesh[so->m0 + q].nv;
-                    bake += nv; ni++; if (so->sec != sc->sec) xi++;
-                }
-            }
-            for (int i = 0; i < g.nsec; i++) if (g.sec[i].state == 4) for (int q = 0; q < g.sec[i].nmesh; q++) own += g.sec[i].mesh[q].nv;
-            if (said++ < 12) printf("rstream sizing: visible list %ld instances (%ld use another section's model), baked LOD A %ld KB vs resident model vertices %ld KB\n",
-                                    ni, xi, bake * (long)sizeof(BatchedVertex) / 1024, own * (long)sizeof(BatchedVertex) / 1024);
+        long bakev = 0, unb = 0, xcpu = 0;
+        for (int i = 0; i < g.nsec; i++) {
+            const RsSec *s = &g.sec[i];
+            if (s->state != 4) continue;
+            bakev += s->bake_v; unb += s->unbaked;
+            if (rs_letter(s->number) == 24) for (int k = 0; k < s->npage; k++) xcpu += (long)s->page[k].nv * (long)sizeof(BatchedVertex) + (long)s->page[k].ni * 2;
         }
+        printf("rstream bake: %.0f baked instances/frame drawn as %.0f runs (%.0f pieces) | %ld KB baked vertices resident, %ld instances unbaked, X library CPU copy %ld KB\n",
+               g.st_binst / F, g.st_bruns / F, g.st_bpieces / F, bakev * (long)sizeof(BatchedVertex) / 1024, unb, xcpu / 1024);
+        g.st_binst = g.st_bruns = g.st_bpieces = 0;
         printf("rstream: zone %d (pred %d) | %.0f draws %.0f instances/frame, scenery %d hdrs | draw %.2f ms (cull %.2f) update %.2f ms (uploads %.2f) "
                "| culled/frame: groups %.0f props %.0f precull %.0f excl %.0f frustum %.0f pixels %.0f model-missing %.0f full %.0f "
                "| switches/frame: matrix %.0f texture %.0f, identity draws %.0f | sections: wanted %d active %d built %d queued %d, wanted-not-in %d, unloads %ld | GPU %ld KB, textures %d (+%ld)\n",
