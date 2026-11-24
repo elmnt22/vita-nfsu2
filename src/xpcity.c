@@ -24,8 +24,19 @@
 
 void vita_mark(const char *fmt, ...);
 void vita_fast_clocks(void);
-void vita_progress_screen(const char *title, const char *line1, const char *line2, float frac);
-void vita_progress_screen_done(void);
+void (*xpcity_screen)(const char *line1, const char *line2, const char *line3);
+void (*xpcity_screen_done)(void);
+static int g_drew;   /* the loading screen shows this city's lines (put back at the end) */
+static void city_screen(const char *l1, const char *l2, const char *l3)
+{
+    if (!xpcity_screen) return;
+    xpcity_screen(l1, l2, l3); g_drew = 1;
+}
+static void city_screen_done(void)
+{
+    if (g_drew && xpcity_screen_done) xpcity_screen_done();
+    g_drew = 0;
+}
 
 #define XP_RAW_ROOT "ux0:data/NFSU2/expansion"
 #define XP_SWITCH   XP_RAW_ROOT "/enable.txt"   /* the switch: the cities need it AND their files */
@@ -64,8 +75,6 @@ int xpcity_fixed_focus(const char *track, float xy[2]) {
 const char *xpcity_region(const char *track) { int c = city_of(track); return c >= 0 ? k_city[c].bun + 6 : NULL; }
 
 static char g_bar_region[16] = "";   /* the race barriers' region (read below); "" = read again */
-static int g_window;
-int xpcity_window_made(void) { return g_window; }
 
 static struct { volatile long long done, total; volatile int finished, rc; const char *in, *out; int game; } g_job;
 static int job_progress(void *ud, long long done, long long total) {
@@ -209,33 +218,40 @@ static void make_props(int c, const char *troot)
               "%ld too big, %ld no model, %ld bad)", out, rc == XP_OK ? "made" : "FAILED", (SDL_GetTicks() - t0) / 1000.0,
               st.mw, st.props, st.infos, st.packs, st.other_kind, st.too_big, st.no_model, st.bad);
 }
-/* 11-24: the first boot's steps under one progress bar (the "Optimizing World Data" art):
-   each step on a worker while this thread draws; a..b is the step's share of the bar (the
-   Vita's times, hwlog96: reading 22 s, map 2, road net 10, races 90, props 41) and
-   xp_frac how far it is. No time left shown (not always right, user 11-24). */
+/* 11-24: the first boot's steps on the game's loading screen, with how far along they are
+   all together: each step on a worker while this thread draws; a..b is the step's share
+   (the Vita's times, hwlog96: reading 22 s, map 2, road net 10, races 90, props 41) and
+   xp_frac how far it is. No time left shown (not always right, user 11-24). A step that
+   is done already (every later boot) shows nothing. */
 typedef struct { void (*fn)(int, const char *); int c; const char *troot; volatile int done; } PrepJob;
 static int prep_thread(void *ud) { PrepJob *j = (PrepJob *)ud; j->fn(j->c, j->troot); j->done = 1; return 0; }
+static const char *g_prep_city = "";
 static void prep_bar(const char *line, float frac)
 {
-    char b[64]; snprintf(b, sizeof b, "%d%%  -  ONE TIME ONLY", (int)(frac * 100.0f));
-    vita_progress_screen("OPTIMIZING WORLD DATA", line, b, frac);
+    char a[64], b[64];
+    snprintf(a, sizeof a, "PREPARING %s", g_prep_city);
+    snprintf(b, sizeof b, "%d%%  -  ONE TIME ONLY", (int)(frac * 100.0f));
+    city_screen(a, line, b);
 }
 static void prep_step(void (*fn)(int, const char *), int c, const char *troot, const char *line, float a, float b, int live)
 {
-    if (!g_window) { fn(c, troot); return; }
+    if (!xpcity_screen) { fn(c, troot); return; }
     static PrepJob j;
     j.fn = fn; j.c = c; j.troot = troot; j.done = 0;
     xp_frac = 0.0f;
-    prep_bar(line, a);
+    g_prep_city = k_city[c].name;
     SDL_Thread *t = SDL_CreateThread(prep_thread, "xpprep", &j);
     if (!t) { fn(c, troot); return; }
+    Uint32 t0 = SDL_GetTicks();
     while (!j.done) {
-        float f = live ? xp_frac : 0.0f; if (f < 0) f = 0; if (f > 1) f = 1;
-        prep_bar(line, a + (b - a) * f);
+        if (g_drew || SDL_GetTicks() - t0 > 300) {   /* not for a step with nothing to do */
+            float f = live ? xp_frac : 0.0f; if (f < 0) f = 0; if (f > 1) f = 1;
+            prep_bar(line, a + (b - a) * f);
+        }
         SDL_Delay(100);
     }
     SDL_WaitThread(t, NULL);
-    prep_bar(line, b);
+    if (g_drew) prep_bar(line, b);
 }
 static void prep_rest(int c, const char *troot)
 {
@@ -582,24 +598,21 @@ static int lean_prepare(int c, const char *troot)
         }
     }
     if (xp_file_size(outc) > 0 && xp_file_size(lean) > 0 && lean_marker_ok(mark, raw_size)) {
-        prep_rest(c, troot);   /* each made already, or a newer version (no window: no bar) */
+        prep_rest(c, troot);   /* each made already, or a newer version */
+        city_screen_done();
         return 1;
     }
     if (g_failed[c]) { vita_mark("xpcity: %s failed to prepare this session; not again until a restart", k_city[c].name); return 0; }
     vita_mark("xpcity: preparing %s for the retail streamer from %s (%lld bytes)", k_city[c].name, raw, raw_size);
     remove(mark);
     snprintf(p, sizeof p, XP_CACHE "/%s.XPL.idx", k_city[c].bun); remove(p);
-    if (!g_window) {
-        vita_fast_clocks();
-        SDL_Window *w = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
-        SDL_GL_CreateContext(w);
-        g_window = 1;
-    }
+    g_prep_city = k_city[c].name;
     memset((void *)&g_job, 0, sizeof g_job);
     g_job.in = raw; g_job.out = lean; g_job.game = k_city[c].game; g_job_lean = 1;
     SDL_Thread *t = SDL_CreateThread(job_thread, "xpcity", NULL);
     Uint32 t0 = SDL_GetTicks();
     char title[64]; snprintf(title, sizeof title, "PREPARING %s", k_city[c].name);
+    prep_bar("READING THE CITY", 0.0f);
     while (t && !g_job.finished) {
         float frac = g_job.total > 0 ? (float)g_job.done / (float)g_job.total : 0.0f;
         prep_bar("READING THE CITY", 0.13f * frac);
@@ -620,12 +633,12 @@ static int lean_prepare(int c, const char *troot)
         remove(mark);
         g_failed[c] = 1; g_known[c] = 0;
         Uint32 e0 = SDL_GetTicks();
-        while (SDL_GetTicks() - e0 < 5000) {
-            vita_progress_screen(title, "COULD NOT PREPARE THE CITY", "SEE THE LOG. BACK TO BAYVIEW.", 0.0f);
+        while (xpcity_screen && SDL_GetTicks() - e0 < 5000) {
+            city_screen(title, "COULD NOT PREPARE THE CITY", "SEE THE LOG. BACK TO BAYVIEW.");
             SDL_Delay(100);
         }
     }
-    vita_progress_screen_done();
+    city_screen_done();
     return ok;
 }
 
@@ -643,7 +656,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     long long raw_size = xp_file_size(raw);
     int have = xp_file_size(out) > 0 && xp_file_size(outc) > 0;
     /* sent from the PC tool (no raw files here), or translated before from these raw files */
-    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { prep_rest(c, troot); return 1; }
+    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { prep_rest(c, troot); city_screen_done(); return 1; }
     if (raw_size <= 0 || xp_file_size(rawc) <= 0) {
         vita_mark("xpcity: %s is not installed (no translated city, no raw files in " XP_RAW_ROOT "/%s)",
                   k_city[c].name, k_city[c].dir);
@@ -669,12 +682,6 @@ int xpcity_prepare(const char *troot, const char *track) {
         snprintf(q, sizeof q, "%s/%s.SEA", troot, k_city[c].companion); remove(q);
         for (int a = 0; a < 8; a++) { snprintf(q, sizeof q, "%s/%s_A%d.MAP", troot, k_city[c].companion, a); remove(q); }
     }
-    if (!g_window) {   /* graphics up early: the world load's own screens come later */
-        vita_fast_clocks();
-        SDL_Window *w = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
-        SDL_GL_CreateContext(w);
-        g_window = 1;
-    }
     memset((void *)&g_job, 0, sizeof g_job);
     g_job.in = raw; g_job.out = out; g_job.game = k_city[c].game;
     SDL_Thread *t = SDL_CreateThread(job_thread, "xpcity", NULL);
@@ -682,11 +689,8 @@ int xpcity_prepare(const char *troot, const char *track) {
     char title[64]; snprintf(title, sizeof title, "PREPARING %s", k_city[c].name);
     while (t && !g_job.finished) {
         float frac = g_job.total > 0 ? (float)g_job.done / (float)g_job.total : 0.0f;
-        char a[96]; Uint32 ms = SDL_GetTicks() - t0;
-        if (frac > 0.05f) snprintf(a, sizeof a, "%d%%  -  ABOUT %d MIN LEFT", (int)(frac * 100.0f),
-                                   (int)(ms / frac * (1.0f - frac) / 60000.0f + 0.999f));
-        else snprintf(a, sizeof a, "%d%%  -  ONE TIME ONLY", (int)(frac * 100.0f));
-        vita_progress_screen(title, "TRANSLATING THE CITY", a, frac);
+        char a[96]; snprintf(a, sizeof a, "%d%%  -  ONE TIME ONLY", (int)(frac * 100.0f));
+        city_screen(title, "TRANSLATING THE CITY", a);
         SDL_Delay(100);
     }
     if (t) SDL_WaitThread(t, NULL);
@@ -698,12 +702,12 @@ int xpcity_prepare(const char *troot, const char *track) {
         remove(mark);
         g_failed[c] = 1; g_known[c] = 0;   /* XF3: the picker stops offering it; no rerun on every pick */
         Uint32 e0 = SDL_GetTicks();
-        while (SDL_GetTicks() - e0 < 5000) {
-            vita_progress_screen(title, "COULD NOT TRANSLATE THE CITY", "SEE THE LOG. BACK TO BAYVIEW.", 0.0f);
+        while (xpcity_screen && SDL_GetTicks() - e0 < 5000) {
+            city_screen(title, "COULD NOT TRANSLATE THE CITY", "SEE THE LOG. BACK TO BAYVIEW.");
             SDL_Delay(100);
         }
     }
-    vita_progress_screen_done();
+    city_screen_done();
     return ok;
 }
 

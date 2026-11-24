@@ -107,7 +107,7 @@ done < <(find "$ROOT/vita/sce_sys" -type f)
 python "$ROOT/tools/lsc_png.py" || echo "lsc_png failed: drawn controller used"
 # controls loading screen logo: img/uga_load_logo.png -> assets/ug_load_logo.raw
 python "$ROOT/tools/ugl_png.py" || echo "ugl_png failed: game logo used"
-# app assets (app0:assets/...): the tile conversion screen background
+# app assets (app0:assets/...)
 while IFS= read -r f; do
     PACK+=(-a "$f=assets/${f#"$ROOT/vita/assets/"}")
 done < <(find "$ROOT/vita/assets" -type f)

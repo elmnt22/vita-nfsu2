@@ -23,8 +23,11 @@ int xpcity_stream_path(const char *track, char *out, size_t n);
 int xpcity_coll_path(const char *troot, const char *track, char *out, size_t n);
 /* the lean file's night lamp flare packs (kept; NULL none) */
 unsigned char *xpcity_lamps(const char *troot, const char *track, long *len);
-/* xpcity_prepare opened the window already (the boot must not open another) */
-int xpcity_window_made(void);
+/* 11-24: the city's first-boot steps show on the game's own loading screen: main.c sets
+   these (three lines in place of "LOADING", then back); called on the main thread about
+   every 100 ms while a step runs on a worker, so it also beats the freeze watchdog */
+extern void (*xpcity_screen)(const char *line1, const char *line2, const char *line3);
+extern void (*xpcity_screen_done)(void);
 /* the city's minimap file (BMAP) once xpcity_prepare found or made it, else NULL */
 const char *xpcity_map(const char *track);
 /* the map holding (x, y): the city's, or an area apart from it (<map>_A<k>.MAP); NULL as xpcity_map */

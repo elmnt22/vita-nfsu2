@@ -2198,9 +2198,8 @@ void SDL_WaitThread(SDL_Thread *t, int *status) {
     free(t);
 }
 
-/* ---- one-off progress screen (before the engine's renderer exists) --------
-   Used by the world tile conversion, which runs before the world and its
-   shaders load: rectangles and a 5x7 pixel font made of scissored clears. */
+/* ---- rectangles and a 5x7 pixel font made of scissored clears (the Settings
+   screen, before the engine's renderer exists) ------------------------------ */
 static void ps_rect(int x, int y, int w, int h, float r, float g, float b) {
     glScissor(x, g_disp_h - y - h, w, h);   /* top-left coordinates */
     glClearColor(r, g, b, 1.0f);
@@ -2208,73 +2207,6 @@ static void ps_rect(int x, int y, int w, int h, float r, float g, float b) {
 }
 #include "ps_font.inc"
 
-/* Background art (app0:assets/optimizing.raw, 720x408 RGB565, made from
-   the user's own artwork; its title is part of the picture). */
-static GLuint g_ps_bg; static int g_ps_bg_tried;
-static void ps_background(int W, int H) {
-    if (!g_ps_bg_tried) {
-        g_ps_bg_tried = 1;
-        size_t n = 720u * 408u * 2u;
-        unsigned char *px = malloc(n);
-        SceUID fd = sceIoOpen("app0:assets/optimizing.raw", SCE_O_RDONLY, 0);
-        if (px && fd >= 0 && sceIoRead(fd, px, (SceSize)n) == (int)n) {
-            glGenTextures(1, &g_ps_bg);
-            glBindTexture(GL_TEXTURE_2D, g_ps_bg);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 720, 408, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, px);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        } else printf("progress screen: no background art (%d)\n", fd);
-        if (fd >= 0) sceIoClose(fd);
-        free(px);
-    }
-    if (!g_ps_bg) { ps_rect(0, 0, W, H, 0.02f, 0.03f, 0.06f); return; }
-    /* fixed-function quad: the engine's shaders do not exist yet */
-    glDisable(GL_SCISSOR_TEST);
-    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrthof(0, 1, 1, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_ps_bg);
-    glColor4f(1, 1, 1, 1);
-    glBegin(GL_TRIANGLE_STRIP);
-    glTexCoord2f(0, 0); glVertex3f(0, 0, 0);
-    glTexCoord2f(1, 0); glVertex3f(1, 0, 0);
-    glTexCoord2f(0, 1); glVertex3f(0, 1, 0);
-    glTexCoord2f(1, 1); glVertex3f(1, 1, 0);
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
-    glEnable(GL_SCISSOR_TEST);
-}
-static void ps_text_shadow(const char *s, int x, int y, int px, float r, float g, float b) {
-    ps_text(s, x + px, y + px, px, 0.0f, 0.0f, 0.0f);
-    ps_text(s, x, y, px, r, g, b);
-}
-/* Called once the conversion is over: the texture is not needed again. */
-void vita_progress_screen_done(void) {
-    if (g_ps_bg) { glDeleteTextures(1, &g_ps_bg); g_ps_bg = 0; }
-}
-
-/* Draws one frame: background, a progress bar at `frac` (0..1) and two lines.
-   `title` is drawn only when there is no background art (the art has it). */
-void vita_progress_screen(const char *title, const char *line1, const char *line2, float frac) {
-    int W = g_disp_w, H = g_disp_h;
-    glDisable(GL_DEPTH_TEST);
-    glEnable(GL_SCISSOR_TEST);
-    ps_rect(0, 0, W, H, 0.0f, 0.0f, 0.0f);
-    ps_background(W, H);
-    int sp = W >= 900 ? 3 : 2;
-    if (!g_ps_bg && title)
-        ps_text(title, (W - ps_text_width(title, sp + 1)) / 2, H * 150 / 544, sp + 1, 0.95f, 0.75f, 0.20f);
-    /* under the art's title (y 237 of 544) */
-    int bw = W * 2 / 3, bx = (W - bw) / 2, by = H * 290 / 544, bh = H * 14 / 544;
-    if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-    ps_rect(bx - 2, by - 2, bw + 4, bh + 4, 0.55f, 0.85f, 0.95f);
-    ps_rect(bx, by, bw, bh, 0.02f, 0.05f, 0.08f);
-    ps_rect(bx, by, (int)(bw * frac), bh, 0.25f, 0.85f, 1.0f);
-    if (line1) ps_text_shadow(line1, (W - ps_text_width(line1, sp)) / 2, by + bh + H * 22 / 544, sp, 0.92f, 0.97f, 1.0f);
-    if (line2) ps_text_shadow(line2, (W - ps_text_width(line2, sp)) / 2, by + bh + H * 50 / 544, sp, 0.70f, 0.82f, 0.90f);
-    glDisable(GL_SCISSOR_TEST);
-    vglSwapBuffers(GL_FALSE);
-}
 /* Full clocks before SDL_Init has run (the tile conversion starts earlier). */
 void vita_fast_clocks(void) {
     scePowerSetArmClockFrequency(444);
@@ -2366,8 +2298,7 @@ static int bs_rmtree(const char *dir) {
         if (!strcmp(e.d_name, ".") || !strcmp(e.d_name, "..")) continue;
         snprintf(path, sizeof path, "%s/%s", dir, e.d_name);
         if (SCE_S_ISDIR(e.d_stat.st_mode)) n += bs_rmtree(path);
-        else if (sceIoRemove(path) >= 0 && (++n & 63) == 0)
-            vita_progress_screen(NULL, "DELETING CACHES", NULL, 0.5f);
+        else if (sceIoRemove(path) >= 0) n++;
     }
     sceIoDclose(d);
     sceIoRmdir(dir);

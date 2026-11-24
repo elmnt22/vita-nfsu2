@@ -192,6 +192,37 @@ static void ls_pump(void) {
     }
 #endif
 }
+/* 11-24: an expansion city's first-boot steps (xpcity.c) on the game's own loading screen:
+   three lines in place of "LOADING" (the user 11-24: no separate screen of its own); the
+   steps run on workers and this is called every ~100 ms, so the freeze watchdog hears
+   from the main thread (hwlog97: a 90 s race step in a track switch tripped it) */
+static void xp_ls_screen(const char *l1, const char *l2, const char *l3) {
+#ifdef __vita__
+    extern volatile unsigned vita_wd_beat;
+    vita_wd_beat++;
+#endif
+    Shop *fe = g_boot_fe ? g_boot_fe : g_ls_fe;
+    if (!fe) return;
+    shop_loading_text3(fe, l1, l2, l3);
+    fe_frame(fe);
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): the lines in the log; OPENUG2_XP_SHOT=1 shoots xpls_<n> every 4 s */
+        static Uint32 last; static int n;
+        Uint32 now = SDL_GetTicks();
+        if (now - last >= 1000) printf("xp loading screen: %s | %s | %s\n", l1, l2, l3);
+        if (getenv("OPENUG2_XP_SHOT") && now - last >= 1000 && (n++ % 4) == 0) {
+            void sim_shot_named(const char *); char nm[24];
+            snprintf(nm, sizeof nm, "xpls_%d", n / 4); sim_shot_named(nm);
+        }
+        if (now - last >= 1000) last = now;
+    }
+#endif
+}
+static void xp_ls_screen_done(void) {
+    Shop *fe = g_boot_fe ? g_boot_fe : g_ls_fe;
+    if (fe) shop_loading_text(fe, NULL, NULL);   /* back to "LOADING" */
+}
+static int g_boot_window;   /* the boot opened the window (early, for a city's first-boot steps) */
 /* the boot world load, off the main thread so the loading screen animates */
 static struct { World *w; const char *root, *track; const WLoadOptions *opt; int world2, nm; volatile int done; } g_wl;
 static int world_load_thread(void *a) {
@@ -16657,6 +16688,17 @@ int main(int argc, char **argv) {
 #ifdef __vita__
     /* Rockport / Palmont: their world stream translated into UG2's format, on the
        first boot into the city when the Expansion Prep Tool did not (xpcity.c) */
+    xpcity_screen = xp_ls_screen; xpcity_screen_done = xp_ls_screen_done;
+    if (xpcity_is_city(trackname)) {   /* its first-boot steps show on the game's loading screen: up now */
+        extern void vita_fast_clocks(void);
+        vita_fast_clocks();
+        SDL_Window *pw = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
+        SDL_GL_CreateContext(pw);
+        g_boot_window = 1;
+        FILE *nf = fopen("ux0:data/NFSU2/nofrontend.txt", "r");
+        if (nf) fclose(nf);
+        else if ((g_boot_fe = shop_open_loading(dataroot)) != NULL) { shop_loading(g_boot_fe); boot_frame(); }
+    }
     if (xpcity_is_city(trackname) && !xpcity_prepare(troot, trackname)) {
         vita_mark("venue boot: %s could not be prepared -- the city instead", trackname);
         trackname = "STREAML4RA"; g_in_venue = 0; g_boot_ev = 0;
@@ -17242,7 +17284,7 @@ int main(int argc, char **argv) {
     {   /* graphics up before the world loads: the loading screens need them */
         extern void vita_fast_clocks(void);
         vita_fast_clocks();
-        if (!xpcity_window_made()) {   /* an expansion city's translation opened it already */
+        if (!g_boot_window) {   /* an expansion city's boot opened it already */
             SDL_Window *pw = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
             SDL_GL_CreateContext(pw);
         }
@@ -17250,7 +17292,7 @@ int main(int argc, char **argv) {
     {   /* the game's loading screen, unless the front end is skipped */
         FILE *nf = fopen("ux0:data/NFSU2/nofrontend.txt", "r");
         if (nf) fclose(nf);
-        else if ((g_boot_fe = shop_open_loading(dataroot)) != NULL) {   /* the menus open while the world loads */
+        else if (!g_boot_fe && (g_boot_fe = shop_open_loading(dataroot)) != NULL) {   /* the menus open while the world loads */
             shop_loading(g_boot_fe);
             boot_frame();
         }
@@ -17289,7 +17331,6 @@ int main(int argc, char **argv) {
                 conv[nconv] = trackname; conv_name[nconv++] = "THIS TRACK";
             }
             if (nconv) {
-                extern void vita_progress_screen(const char *, const char *, const char *, float);
                 extern void world_instance_library_release(void);
                 extern void world_instance_cache_flush(void);
                 vita_mark("tiles: %d track(s) to convert", nconv);
@@ -17321,17 +17362,13 @@ int main(int argc, char **argv) {
                             shop_loading_text3(g_boot_fe, a, b, c);
                             boot_frame();
                             SDL_Delay(30);
-                        } else {
-                            vita_progress_screen(a, b, c, frac);
-                            SDL_Delay(100);
-                        }
+                        } else SDL_Delay(100);   /* (nofrontend.txt: nothing drawn) */
                     }
                     if (tt) SDL_WaitThread(tt, NULL);
                     vita_mark("tiles: %s %s", conv[q], tprog.ok ? "converted" : "FAILED");
                 }
                 rstream_stop();   /* its worker reads the pinned bundle */
                 res_unpin(); world_instance_library_release(); world_instance_cache_flush();
-                extern void vita_progress_screen_done(void); vita_progress_screen_done();
                 if (g_boot_fe) shop_loading_text(g_boot_fe, NULL, NULL);   /* back to "LOADING" */
                 tiles_relaunch = 1;
             }
@@ -17342,7 +17379,6 @@ int main(int argc, char **argv) {
                (a file open costs ~100-270 ms on the card), once, here with
                the card to itself */
             if (world_tiles_migrate_needed()) {
-                extern void vita_progress_screen(const char *, const char *, const char *, float);
                 static WTileProgress pprog;
                 memset((void *)&pprog, 0, sizeof pprog);
                 vita_mark("tiles: packing loose tile files");
@@ -17366,15 +17402,11 @@ int main(int argc, char **argv) {
                         shop_loading_text3(g_boot_fe, a, b, c);
                         boot_frame();
                         SDL_Delay(30);
-                    } else {
-                        vita_progress_screen(a, b, c, frac);
-                        SDL_Delay(100);
-                    }
+                    } else SDL_Delay(100);
                 }
                 if (pt) SDL_WaitThread(pt, NULL);
                 else world_tiles_migrate_sync(&pprog);
                 vita_mark("tiles: packing done");
-                extern void vita_progress_screen_done(void); vita_progress_screen_done();
                 if (g_boot_fe) shop_loading_text(g_boot_fe, NULL, NULL);
                 tiles_relaunch = 1;
             }
@@ -21552,6 +21584,7 @@ int main(int argc, char **argv) {
             world_tiles_trim(0);
             /* an expansion city: its translation / minimap / events / props as at a venue boot (port; the
                world picker and the career trips switch into it) */
+            if (xpcity_is_city(next_track)) loading_screen(dataroot);   /* its first-boot steps show on it */
             if (xpcity_is_city(next_track) && !xpcity_prepare(troot, next_track)) {
                 vita_mark("track switch: %s could not be prepared -- the city instead", next_track);
                 next_track = "STREAML4RA"; next_ev = 0;

@@ -329,30 +329,11 @@ int vita_copy_passed(unsigned mark) { (void)mark; return 1; }
 void vita_copy_wait(void) {}
 void vita_copy_stats(unsigned long long *us, unsigned long long *bytes) { *us = 0; *bytes = 0; }
 
-/* ---- progress screen (the tile conversion before the renderer exists) ----- */
+/* ---- the window; rectangles for the Settings screen ------------------------ */
 static SDL_Window *g_win;
 static void ps_rect(int x, int y, int w, int h, float r, float g, float b) {
     glScissor(x, SIM_H - y - h, w, h); glClearColor(r, g, b, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
 }
-void vita_progress_screen_done(void) {}
-void vita_progress_screen(const char *title, const char *line1, const char *line2, float frac) {
-    static Uint32 last;
-    Uint32 now = SDL_GetTicks();
-    if (now - last < 100 && frac < 1.0f) return;
-    last = now;
-    printf("progress: %s | %s | %s | %.0f%%\n", title ? title : "", line1 ? line1 : "", line2 ? line2 : "", frac * 100);
-    glDisable(GL_DEPTH_TEST); glEnable(GL_SCISSOR_TEST);
-    ps_rect(0, 0, SIM_W, SIM_H, 0.02f, 0.03f, 0.06f);
-    if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-    int bw = SIM_W * 2 / 3, bx = (SIM_W - bw) / 2, by = SIM_H * 290 / 544, bh = SIM_H * 14 / 544;
-    ps_rect(bx - 2, by - 2, bw + 4, bh + 4, 0.55f, 0.85f, 0.95f);
-    ps_rect(bx, by, bw, bh, 0.02f, 0.05f, 0.08f);
-    ps_rect(bx, by, (int)(bw * frac), bh, 0.25f, 0.85f, 1.0f);
-    glDisable(GL_SCISSOR_TEST);
-    SDL_GL_SwapWindow(g_win);
-    SDL_PumpEvents();
-}
-
 /* ---- input: the pad, from the keyboard or the script ------------------------- */
 enum { P_CROSS = 1 << 0, P_CIRCLE = 1 << 1, P_SQUARE = 1 << 2, P_TRIANGLE = 1 << 3, P_L = 1 << 4,
        P_R = 1 << 5, P_UP = 1 << 6, P_DOWN = 1 << 7, P_LEFT = 1 << 8, P_RIGHT = 1 << 9,
