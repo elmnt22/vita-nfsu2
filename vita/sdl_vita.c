@@ -2015,7 +2015,11 @@ SDL_Thread *SDL_CreateThread(SDL_ThreadFunction fn, const char *name, void *data
     /* 11-24: the expansion's first-boot steps (xpcity.c) on the render core -- it only draws a
        progress bar then, and their own route-search workers take the other two */
     int core0 = name && !strcmp(name, "xpprep");
-    t->uid = sceKernelCreateThread(name ? name : "worker", thread_entry, 0x10000100,
+    /* ...and at the lowest priority, with their route-search workers: the Vita does not share
+       a core between threads of one priority, so at the default one they kept the main
+       loop (the loading screen) and the music off the CPU for 46 s (hwlog98) */
+    int low = name && (!strcmp(name, "xpprep") || !strcmp(name, "xpev") || !strcmp(name, "xpcity"));
+    t->uid = sceKernelCreateThread(name ? name : "worker", thread_entry, low ? 191 : 0x10000100,
                                    (big_stack ? 8 : 2) * 1024 * 1024, 0,
                                    core0 ? SCE_KERNEL_CPU_MASK_USER_0 : SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);
     if (t->uid < 0) { printf("thread \"%s\" could not start: 0x%08X (out of kernel memory?)\n", name ? name : "worker", (unsigned)t->uid); free(t); return NULL; }

@@ -11234,7 +11234,8 @@ static float loading_text_shift(Shop *s, const FengPackage *pk, int p) {
     int fi = s->font_of[p][o->res];
     if (fi < 0 || !s->font[fi].ok) return 0.0f;
     const FengFont *f = &s->font[fi].f;
-    float grow = (feng_text_width(f, s->ls_line1) - feng_text_width(f, o->text)) * o->size[0];
+    const char *row = s->ls_line3[0] ? s->ls_line2 : s->ls_line1;   /* the line on the circles' row */
+    float grow = (feng_text_width(f, row) - feng_text_width(f, o->text)) * o->size[0];
     /* "LOADING" is right-justified (Sj 6) with the circles after its right
        edge: a longer line grows to the left and the circles stay put */
     if (o->just & FENG_JUST_RIGHT) return 0.0f;
@@ -11462,17 +11463,21 @@ static void draw_package(Shop *s, const DC *dc, int p, const Texts *t, int show_
                 continue;
             }
             if (o->hash == 0xa96c3902u && s->ls_line1[0]) {           /* "LOADING" */
+                /* three lines (a one-time prep): the middle one, the step, on the
+                   circles' row (user 11-24), the first above it */
+                float up = s->ls_line3[0] ? -22.0f : 0.0f;
+                s->text_dy = up;
                 text(s, dc, p, i, s->ls_line1, c);
                 if (s->ls_line2[0]) {
                     float c2[4] = { c[0], c[1], c[2], c[3] * 0.85f };
-                    s->text_dy = 22.0f;
+                    s->text_dy = up + 22.0f;
                     text(s, dc, p, i, s->ls_line2, c2);
                     if (s->ls_line3[0]) {
-                        s->text_dy = 44.0f;
+                        s->text_dy = up + 44.0f;
                         text(s, dc, p, i, s->ls_line3, c2);
                     }
-                    s->text_dy = 0.0f;
                 }
+                s->text_dy = 0.0f;
                 continue;
             }
         }
