@@ -284,7 +284,10 @@ static void conv_insts(Buf *o, const uint8_t *d, size_t sz)
         uint8_t u[0x40];
         memcpy(u, r, 24);                 /* bbox */
         memcpy(u + 24, r + 62, 2);        /* scenery info number */
-        memset(u + 26, 0, 2);             /* UG2 instance flags (MW exclude flags differ) */
+        /* UG2 instance flags: only MW's 0x0002, not in the player's view -- the same bit as UG2's.
+           ~95% of those are the road-reflection copies 16-27 m under a drawn twin (an overhead
+           sign at road level in a tunnel, user 11-24); MW's other exclude bits differ */
+        u[26] = r[24] & 0x02; u[27] = 0;
         int32_t pc = (int16_t)(r[28] | r[29] << 8); memcpy(u + 28, &pc, 4);   /* preculler index */
         memcpy(u + 32, r + 32, 30);       /* position + packed rotation */
         memset(u + 62, 0, 2);

@@ -1611,6 +1611,37 @@ static void rs_draw_instance(RsCull *K, RsScen *sc, int ii, int state) {
     int info = in->info;
     unsigned flags = in->flags;
     if (info < 0 || info >= sc->ninfo) return;
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_RS_PT="x y z r" lists (once each) the instances whose box comes within r of the point */
+        static int pt_on = -1; static float P[4]; static int seen[64][2], nseen;
+        if (pt_on < 0) { const char *e = getenv("OPENUG2_RS_PT"); pt_on = e && sscanf(e, "%f %f %f %f", &P[0], &P[1], &P[2], &P[3]) == 4; }
+        if (pt_on && !K->aux && P[0] > in->lo[0] - P[3] && P[0] < in->hi[0] + P[3] && P[1] > in->lo[1] - P[3] && P[1] < in->hi[1] + P[3]
+            && P[2] > in->lo[2] - P[3] && P[2] < in->hi[2] + P[3]) {
+            int k = 0; while (k < nseen && !(seen[k][0] == sc->number && seen[k][1] == ii)) k++;
+            if (k == nseen && nseen < 64) {
+                seen[nseen][0] = sc->number; seen[nseen][1] = ii; nseen++;
+                const RsSolid *a = sc->bk && sc->bk[ii] ? sc->bm[info][0] : NULL, *b = sc->bk && sc->bk[ii] ? sc->bm[info][1] : NULL;
+                printf("rs pt: %s inst %d info %d flags %04x hide %d baked %d box %.1f %.1f %.1f .. %.1f %.1f %.1f pos %.1f %.1f %.1f R %.1f"
+                       " rot %d %d %d | %d %d %d | %d %d %d solids %08x %08x\n",
+                       sc->sec->name, ii, info, flags, sc->hide[ii], sc->bk ? sc->bk[ii] : -1,
+                       in->lo[0], in->lo[1], in->lo[2], in->hi[0], in->hi[1], in->hi[2], in->pos[0], in->pos[1], in->pos[2], sc->infR[info],
+                       in->rot[0], in->rot[1], in->rot[2], in->rot[3], in->rot[4], in->rot[5], in->rot[6], in->rot[7], in->rot[8],
+                       a ? a->hash : 0, b ? b->hash : 0);
+                if (g.wgt_ok) for (size_t o = 0; o < g.wgt.override_count; o++) {
+                    const unsigned char *r = g.wgt.overrides + 8 * o;
+                    if (wg_u16(r) != sc->number || wg_u16(r + 2) != ii) continue;
+                    printf("rs pt:   override %u flags %04x groups:", (unsigned)o, wg_u16(r + 4));
+                    for (size_t p = 0; p < g.wgt.group_bytes;) {
+                        const unsigned char *gp = g.wgt.groups + p; uint32_t refs = wg_u32(gp + 48);
+                        for (uint32_t j = 0; j < refs; j++) if (wg_u16(gp + 52 + 2 * (size_t)j) == o) printf(" %.40s", (const char *)gp + 8);
+                        p += (size_t)((52ULL + 2ULL * refs + 3) & ~3ULL);
+                    }
+                    printf("\n");
+                }
+            }
+        }
+    }
+#endif
     /* 1 precull */
     if (K->cell >= 0 && in->pre >= 0 && (sc->pre[in->pre * 0x80 + (K->cell >> 3)] >> (K->cell & 7) & 1)) { g.st_cull[0]++; return; }
     /* scenery groups / props (the port's rules, not the 0x10 exclusion bit) */
