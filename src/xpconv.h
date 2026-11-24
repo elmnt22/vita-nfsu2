@@ -2,6 +2,16 @@
    Shared by the Expansion Prep Tool (PC) and the game's on-device conversion. */
 #ifndef XPCONV_H
 #define XPCONV_H
+/* 11-24: the translators' files -- reads unbuffered (one system call a read, however big: the
+   Vita's stdio read through a small buffer, ~1 KB a call, and walked the stream at a crawl),
+   writes through a 256 KB buffer (many small records) */
+#include <stdio.h>
+static inline FILE *xp_fopen(const char *path, const char *mode)
+{
+    FILE *f = fopen(path, mode);
+    if (f) { if (mode[0] == 'r') setvbuf(f, NULL, _IONBF, 0); else setvbuf(f, NULL, _IOFBF, 1 << 18); }
+    return f;
+}
 /* bumped whenever the translated output changes: an older marker = translate again */
 /* the oldest translation each game still takes (V4 11-22: 12 changed only the Rockport relight) */
 #define XP_MIN_MW     12

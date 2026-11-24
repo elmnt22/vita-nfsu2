@@ -487,7 +487,7 @@ out:
 
 static uint8_t *read_road_chunk(const char *bun_path, size_t *clen_out, int *rc_out)
 {
-    FILE *f = fopen(bun_path, "rb"); if (!f) { *rc_out = XP_ERR_OPEN_IN; return NULL; }
+    FILE *f = xp_fopen(bun_path, "rb"); if (!f) { *rc_out = XP_ERR_OPEN_IN; return NULL; }
     uint8_t *chunk = NULL; size_t clen = 0; int rc = XP_ERR_FORMAT;
     for (;;) {   /* the top-level 0x3b800 chunk, read alone */
         uint8_t h[8];
@@ -528,7 +528,7 @@ int xp_routes(const char *bun_path, const char *out_path, int game, XpRoadStats 
             for (int i = 0; i < g.n && okp; i++) { simplify(&g.l[i].pts, &g.l[i].simp); okp = g.l[i].simp.n >= 2; }
             st->lanes = g.n;
             for (int i = 0; i < g.n; i++) if (!g.nsucc[i]) st->dead++;
-            FILE *w = okp ? fopen(out_path, "wb") : NULL;
+            FILE *w = okp ? xp_fopen(out_path, "wb") : NULL;
             if (!okp) rc = XP_ERR_FORMAT;
             else if (!w) rc = XP_ERR_OPEN_OUT;
             else {

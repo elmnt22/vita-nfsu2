@@ -207,7 +207,7 @@ int xp_props(const char *raw_companion, const char *raw_stream, const char *out_
     int nk = (int)(sizeof k_kinds / sizeof *k_kinds);
     uint32_t kh[sizeof k_kinds / sizeof *k_kinds];
     for (int k = 0; k < nk; k++) kh[k] = vlt_hash((const uint8_t *)k_kinds[k].kind, strlen(k_kinds[k].kind));
-    FILE *f = fopen(raw_stream, "rb");
+    FILE *f = xp_fopen(raw_stream, "rb");
     if (!f) { free(pl); return XP_ERR_OPEN_IN; }
     XpSp *sp = NULL; int nsp = 0, cap = 0, rc = XP_OK;
     SolidBox *sb = NULL; size_t nsb = 0, sbcap = 0;
@@ -398,7 +398,7 @@ int xp_props(const char *raw_companion, const char *raw_stream, const char *out_
     }
     free(sp); free(inf);
     if (rc == XP_OK) {
-        FILE *w = fopen(out_path, "wb");
+        FILE *w = xp_fopen(out_path, "wb");
         if (!w) rc = XP_ERR_OPEN_OUT;
         else {
             int ok = fwrite(o.b, 1, o.n, w) == o.n;

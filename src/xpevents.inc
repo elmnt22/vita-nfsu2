@@ -50,7 +50,7 @@ static void pf32(uint8_t *p, double v) { float f = (float)v; uint32_t u; memcpy(
 /* a whole top-level chunk of a BUN (id), or NULL */
 static uint8_t *read_top(const char *path, uint32_t want, size_t *len)
 {
-    FILE *f = fopen(path, "rb"); if (!f) return NULL;
+    FILE *f = xp_fopen(path, "rb"); if (!f) return NULL;
     uint8_t *out = NULL; *len = 0;
     for (;;) {
         uint8_t h[8];
@@ -68,7 +68,7 @@ static uint8_t *read_top(const char *path, uint32_t want, size_t *len)
 }
 static uint8_t *read_all(const char *path, size_t *len)
 {
-    FILE *f = fopen(path, "rb"); if (!f) return NULL;
+    FILE *f = xp_fopen(path, "rb"); if (!f) return NULL;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     uint8_t *b = n > 0 ? malloc((size_t)n) : NULL;
     if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
@@ -462,7 +462,7 @@ static void write_shops(const PosE *pos, int npos, const char *path, long *nshop
         { "menu_gate_customshop/zone_customshop_%d/respawn", -1 },
     };
     static const int cycle[4] = { 3, 1, 2, 5 };
-    FILE *f = fopen(path, "w");
+    FILE *f = xp_fopen(path, "w");
     if (!f) return;
     int nshop = 0, ok = 1;
     for (int g = 0; g < 3; g++)
@@ -568,7 +568,7 @@ static int carp_walls(const uint8_t *c, size_t s, Bars *B, uint32_t *art, uint32
 /* every CARP 0x3b801 chunk of the stream, read one at a time (the stream is 500 MB) */
 static int bar_walls(const char *stream, Bars *B)
 {
-    FILE *f = fopen(stream, "rb"); if (!f) return 0;
+    FILE *f = xp_fopen(stream, "rb"); if (!f) return 0;
     fseek(f, 0, SEEK_END); long len = ftell(f);
     uint32_t *art = calloc(65536, 4), *gen = calloc(65536, 4), g = 0;
     struct { long o, e; } st[32]; int sp = 0, ok = art && gen && len > 0;
@@ -1157,7 +1157,7 @@ static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t 
     for (int i = 0; i < nm; i++) {
         if (!keep[i]) continue;
         char p[600]; snprintf(p, sizeof p, "%s/Paths%d.bin", dir, m[i].id);
-        FILE *f = fopen(p, "wb"); if (!f) { free(t); return 0; }
+        FILE *f = xp_fopen(p, "wb"); if (!f) { free(t); return 0; }
         int ok = fwrite(m[i].part, 1, m[i].partlen, f) == m[i].partlen && fwrite(t, 1, tn, f) == tn;
         if (fclose(f)) ok = 0;
         if (!ok) { free(t); return 0; }
@@ -1190,7 +1190,7 @@ typedef struct {
 } Mr;
 static uint8_t *read_nested(const char *path, uint32_t want, size_t *len)
 {
-    FILE *f = fopen(path, "rb"); if (!f) return NULL;
+    FILE *f = xp_fopen(path, "rb"); if (!f) return NULL;
     fseek(f, 0, SEEK_END); long e = ftell(f), o = 0;
     struct { long o, e; } st[32]; int sp = 0;
     uint8_t *out = NULL; *len = 0;
@@ -1483,7 +1483,7 @@ static int mr_race(Mr *m, const Race *rc, float **out, int *nout, long *nfail)
 int xp_events_current(const char *routes_dir)
 {
     char p[600]; snprintf(p, sizeof p, "%s/evver.txt", routes_dir);
-    FILE *f = fopen(p, "r"); int v = 0;
+    FILE *f = xp_fopen(p, "r"); int v = 0;
     if (f) { if (fscanf(f, "%d", &v) != 1) v = 0; fclose(f); }
     return v == XP_EVENTS_VERSION;
 }
@@ -1707,7 +1707,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         if (!m->part) { free(ch); goto done; }
         memcpy(m->part, part.b, part.n);
         snprintf(p, sizeof p, "%s/Routes%dF.bin", out_dir, ev);
-        FILE *f = fopen(p, "wb");
+        FILE *f = xp_fopen(p, "wb");
         int okw = f != NULL;
         if (f) { okw = routes_bin(&S, closed, f); if (fclose(f)) okw = 0; }
         if (!okw) { free(ch); rc = XP_ERR_WRITE; goto done; }
@@ -1789,12 +1789,12 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (!write_allrec(out_dir, meta, nm, recs, keep)) goto done;
     {
         char p[600]; snprintf(p, sizeof p, "%s/events.txt", out_dir);
-        FILE *fe = fopen(p, "w"); snprintf(p, sizeof p, "%s/starts.txt", out_dir);
-        FILE *fs = fopen(p, "w"); snprintf(p, sizeof p, "%s/barriers.txt", out_dir);
-        FILE *fb = fopen(p, "w"); snprintf(p, sizeof p, "%s/modes.txt", out_dir);
-        FILE *fmo = fopen(p, "w"); snprintf(p, sizeof p, "%s/gates.txt", out_dir);
-        FILE *fg = fopen(p, "w"); snprintf(p, sizeof p, "%s/names.txt", out_dir);
-        FILE *fn = fopen(p, "w");   /* the game's own race names (MW 1.2.3: its MINI_MAP_1_2_3.BIN race map) */
+        FILE *fe = xp_fopen(p, "w"); snprintf(p, sizeof p, "%s/starts.txt", out_dir);
+        FILE *fs = xp_fopen(p, "w"); snprintf(p, sizeof p, "%s/barriers.txt", out_dir);
+        FILE *fb = xp_fopen(p, "w"); snprintf(p, sizeof p, "%s/modes.txt", out_dir);
+        FILE *fmo = xp_fopen(p, "w"); snprintf(p, sizeof p, "%s/gates.txt", out_dir);
+        FILE *fg = xp_fopen(p, "w"); snprintf(p, sizeof p, "%s/names.txt", out_dir);
+        FILE *fn = xp_fopen(p, "w");   /* the game's own race names (MW 1.2.3: its MINI_MAP_1_2_3.BIN race map) */
         int okw = fe && fs && fb && fmo && fg && fn, cnt[6 * XM_NMODES] = {0};
         for (int i = 0; i < nm && okw; i++) {
             const char *label = meta[i].mode ? k_mode_label[meta[i].mode] :
@@ -1816,7 +1816,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
             else if (meta[i].type == RT_DRIFT) st->drifts++; else st->drags++;
         }
         snprintf(p, sizeof p, "%s/trackpoly.bin", out_dir);   /* "XTPL" n, then per event: id, closed, count, x y ... */
-        FILE *ft = fopen(p, "wb");
+        FILE *ft = xp_fopen(p, "wb");
         if (!ft) okw = 0;
         else {
             uint32_t hd[2] = { 0x4c505458u, (uint32_t)nm };
@@ -1829,7 +1829,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         }
         if (okw) {   /* "XMMR" n, then per event: id, count, x y ... (Carbon's minimap route, mr_race; MW: none, its race maps hold theirs) */
             snprintf(p, sizeof p, "%s/mmroute.bin", out_dir);
-            FILE *fr = fopen(p, "wb"); long tot = 0;
+            FILE *fr = xp_fopen(p, "wb"); long tot = 0;
             if (!fr) okw = 0;
             else {
                 int nwr = 0; for (int i = 0; i < nm; i++) nwr += meta[i].nmr > 1;
@@ -1853,7 +1853,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         if (fn && fclose(fn)) okw = 0;
         if (okw) {   /* last: the set is whole at this version */
             char vp[600]; snprintf(vp, sizeof vp, "%s/evver.txt", out_dir);
-            FILE *fv = fopen(vp, "w");
+            FILE *fv = xp_fopen(vp, "w");
             okw = fv && fprintf(fv, "%d%c", XP_EVENTS_VERSION, 10) > 0;
             if (fv && fclose(fv)) okw = 0;
         }

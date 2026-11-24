@@ -799,8 +799,8 @@ int xp_lean(const char *in_path, const char *out_path, int game, XpProgress prog
 {
     xp_setup(game);
     memset(&st, 0, sizeof st); g_oom = 0;
-    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
-    FILE *w = fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }
+    FILE *f = xp_fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    FILE *w = xp_fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }
     fseek(f, 0, SEEK_END);
 #ifdef _WIN32
     long long total = _ftelli64(f);
@@ -859,8 +859,8 @@ int xp_convert(const char *in_path, const char *out_path, int game,
 {
     xp_setup(game);
     memset(&st, 0, sizeof st); g_oom = 0; g_tpk_tex = g_tpk_alpha = 0;
-    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
-    FILE *w = fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }
+    FILE *f = xp_fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    FILE *w = xp_fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }
     fseek(f, 0, SEEK_END);
 #ifdef _WIN32
     long long total = _ftelli64(f);
@@ -1045,7 +1045,7 @@ static int sea_mask_write(const char *map_path)
     char path[1100]; snprintf(path, sizeof path, "%s", map_path);
     char *dot = strrchr(path, '.'); if (dot && !strchr(dot, '/')) strcpy(dot, ".SEA"); else strcat(path, ".SEA");
     int rc = XP_OK;
-    FILE *o = fopen(path, "wb");
+    FILE *o = xp_fopen(path, "wb");
     if (!o) rc = XP_ERR_OPEN_OUT;
     else {
         uint32_t hd[3] = { 0, (uint32_t)W, (uint32_t)H }; memcpy(hd, "SEAM", 4);
@@ -1070,7 +1070,7 @@ static int mm_carbon_write(const char *path, uint8_t *img, int W, float ax, floa
     for (size_t i = 0; i < g_mmn; i++) if (is_road_key(g_mm[i].key)) mm_fill(img, W, g_mm[i].xy, x0, y0, px, road);
     const float zoom = 1.5f * size / 5633.0f;   /* Bayview's radar reach (TRACKMAP4000: 5633 m, 1.5) */
     printf("xp_minimap carbon: %s: %zu ground triangles (%zu road), %.0f m from (%.0f, %.0f), %d px\n", path, g_mmn, nr, size, x0, y0, W);
-    FILE *o = fopen(path, "wb");
+    FILE *o = xp_fopen(path, "wb");
     if (!o) return XP_ERR_OPEN_OUT;
     uint32_t hd[3] = { 0, (uint32_t)W, (uint32_t)W }; memcpy(hd, "BMAP", 4);
     float fl[4] = { x0, y0, size, zoom };
@@ -1080,7 +1080,7 @@ static int mm_carbon_write(const char *path, uint8_t *img, int W, float ax, floa
 }
 static int minimap_carbon(const char *in_path, const char *out_path)
 {
-    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    FILE *f = xp_fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
     g_mmn = 0; g_mm_on = 1; g_oom = 0;
     uint8_t *chunk = NULL; size_t cap = 0; int rc = XP_OK;
     Buf scratch = {0};
@@ -1199,7 +1199,7 @@ int xp_minimap(const char *in_path, const char *out_path, int game)
     if (game != XP_GAME_MW) return XP_ERR_FORMAT;
     const float x0 = -1222.4f, y0 = 5063.4f, size = 6656.0f;
     const float zoom = 1.5f * 6656.0f / 5633.0f;              /* Bayview's radar reach (TRACKMAP4000: 5633 m, 1.5) */
-    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    FILE *f = xp_fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     uint8_t *d = n > 0 ? malloc((size_t)n) : NULL;
     if (!d || fread(d, 1, (size_t)n, f) != (size_t)n) { free(d); fclose(f); return d ? XP_ERR_READ : XP_ERR_MEMORY; }
@@ -1254,7 +1254,7 @@ int xp_minimap(const char *in_path, const char *out_path, int game)
     int rc = XP_OK;
     if (tiles != 64) rc = XP_ERR_FORMAT;
     else {
-        FILE *o = fopen(out_path, "wb");
+        FILE *o = xp_fopen(out_path, "wb");
         if (!o) rc = XP_ERR_OPEN_OUT;
         else {
             uint32_t hd[3] = { 0, (uint32_t)W, (uint32_t)W }; memcpy(hd, "BMAP", 4);
@@ -1269,7 +1269,7 @@ int xp_minimap(const char *in_path, const char *out_path, int game)
 
 long long xp_file_size(const char *path)
 {
-    FILE *f = fopen(path, "rb"); if (!f) return -1;
+    FILE *f = xp_fopen(path, "rb"); if (!f) return -1;
     fseek(f, 0, SEEK_END);
 #ifdef _WIN32
     long long n = _ftelli64(f);
@@ -1281,7 +1281,7 @@ long long xp_file_size(const char *path)
 }
 int xp_marker_write(const char *marker_path, int game, long long source_size)
 {
-    FILE *f = fopen(marker_path, "w"); if (!f) return 0;
+    FILE *f = xp_fopen(marker_path, "w"); if (!f) return 0;
     int ok = fprintf(f, "xpconv %d %d %lld\n", XP_VERSION, game, source_size) > 0;
     return fclose(f) == 0 && ok;
 }
@@ -1295,7 +1295,7 @@ int xp_marker_text_ok(const char *text, int game, long long source_size)
 }
 int xp_marker_ok(const char *marker_path, int game, long long source_size)
 {
-    FILE *f = fopen(marker_path, "r"); if (!f) return 0;
+    FILE *f = xp_fopen(marker_path, "r"); if (!f) return 0;
     int v = 0, g = 0; long long n = -1;
     int got = fscanf(f, "xpconv %d %d %lld", &v, &g, &n);
     fclose(f);
@@ -1363,7 +1363,7 @@ static void put_sections_carbon(Buf *o, const uint8_t *p, uint32_t n)
 int xp_companion(const char *in_path, const char *out_path, int game)
 {
     if (game != XP_GAME_MW && game != XP_GAME_CARBON) return XP_ERR_FORMAT;
-    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    FILE *f = xp_fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     uint8_t *d = n > 0 ? malloc((size_t)n) : NULL;
     if (!d || fread(d, 1, (size_t)n, f) != (size_t)n) { free(d); fclose(f); return d ? XP_ERR_READ : XP_ERR_MEMORY; }
@@ -1434,7 +1434,7 @@ int xp_companion(const char *in_path, const char *out_path, int game)
     free(d);
     if (g_oom) { free(o.p); return XP_ERR_MEMORY; }
     if (rc != XP_OK) { free(o.p); return rc; }
-    FILE *w = fopen(out_path, "wb");
+    FILE *w = xp_fopen(out_path, "wb");
     if (!w) { free(o.p); return XP_ERR_OPEN_OUT; }
     int ok = fwrite(o.p, 1, o.n, w) == o.n;
     ok &= fclose(w) == 0;
