@@ -2,12 +2,12 @@
    Shared by the Expansion Prep Tool (PC) and the game's on-device conversion. */
 #ifndef XPCONV_H
 #define XPCONV_H
-/* 11-24: the translators' files -- writes through a 256 KB buffer (many small records) */
+/* the translators' files (one place to tune their stdio) */
 #include <stdio.h>
 static inline FILE *xp_fopen(const char *path, const char *mode)
 {
     FILE *f = fopen(path, mode);
-    if (f && mode[0] != 'r') setvbuf(f, NULL, _IOFBF, 1 << 18);   /* reads: stdio's own (unbuffered was one byte a call on the Vita: hwlog94) */
+    /* 11-24: no setvbuf here -- an unbuffered read and a 256 KB write buffer both hung the Vita (hwlog94/95) */
     return f;
 }
 /* bumped whenever the translated output changes: an older marker = translate again */
