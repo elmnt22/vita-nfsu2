@@ -177,9 +177,7 @@ static void make_events(int c, const char *troot)
     }
     if (have) remove(ev);   /* WW2: an older set -- made again (a failed run leaves none, as before) */
     mkdir(dir, 0777);
-    char title[64]; snprintf(title, sizeof title, "PREPARING %s", k_city[c].name);
-    if (g_window) vita_progress_screen(title, "BUILDING THE RACES", "ONE TIME ONLY", 0.0f);
-    Uint32 t0 = SDL_GetTicks();
+    Uint32 t0 = SDL_GetTicks();   /* (the bar: prep_step) */
     XpEventStats st;
     xp_ticks = SDL_GetTicks;   /* its step times in the log */
     xp_parallel = xp_par_sdl; xp_workers = 3;   /* 11-24: the route search on the Vita's three cores */
@@ -191,7 +189,6 @@ static void make_events(int c, const char *troot)
     vita_mark("xpcity: race events %s: %s in %.1f s (%ld MW races -> %ld events: %ld circuits %ld sprints %ld drags, %ld skipped, "
               "%ld dropped; barriers %ld on %ld off)", dir, rc == XP_OK ? "made" : "FAILED", (SDL_GetTicks() - t0) / 1000.0,
               st.races, st.events, st.circuits, st.sprints, st.drags, st.skipped, st.dropped, st.barriers_on, st.barriers_off);
-    if (g_window) vita_progress_screen_done();
 }
 /* the city's smackable props -> TRACKS/XPSMK<companion>.BUN (xpprops.inc), from the raw files */
 static void make_props(int c, const char *troot)
@@ -205,15 +202,47 @@ static void make_props(int c, const char *troot)
         vita_mark("xpcity: no props for %s (no raw %s / %s)", k_city[c].name, k_city[c].companion, k_city[c].bun);
         return;
     }
-    char title[64]; snprintf(title, sizeof title, "PREPARING %s", k_city[c].name);
-    if (g_window) vita_progress_screen(title, "PLACING THE PROPS", "ONE TIME ONLY", 0.0f);
-    Uint32 t0 = SDL_GetTicks();
+    Uint32 t0 = SDL_GetTicks();   /* (the bar: prep_step) */
     XpPropStats st;
     int rc = xp_props(rawc, raws, out, k_city[c].game, &st);
     vita_mark("xpcity: props %s: %s in %.1f s (%ld MW smackables -> %ld props, %ld infos, %ld packs; scenery: %ld other kinds, "
               "%ld too big, %ld no model, %ld bad)", out, rc == XP_OK ? "made" : "FAILED", (SDL_GetTicks() - t0) / 1000.0,
               st.mw, st.props, st.infos, st.packs, st.other_kind, st.too_big, st.no_model, st.bad);
-    if (g_window) vita_progress_screen_done();
+}
+/* 11-24: the first boot's steps under one progress bar (the "Optimizing World Data" art):
+   each step on a worker while this thread draws; a..b is the step's share of the bar (the
+   Vita's times, hwlog96: reading 22 s, map 2, road net 10, races 90, props 41) and
+   xp_frac how far it is. No time left shown (not always right, user 11-24). */
+typedef struct { void (*fn)(int, const char *); int c; const char *troot; volatile int done; } PrepJob;
+static int prep_thread(void *ud) { PrepJob *j = (PrepJob *)ud; j->fn(j->c, j->troot); j->done = 1; return 0; }
+static void prep_bar(const char *line, float frac)
+{
+    char b[64]; snprintf(b, sizeof b, "%d%%  -  ONE TIME ONLY", (int)(frac * 100.0f));
+    vita_progress_screen("OPTIMIZING WORLD DATA", line, b, frac);
+}
+static void prep_step(void (*fn)(int, const char *), int c, const char *troot, const char *line, float a, float b, int live)
+{
+    if (!g_window) { fn(c, troot); return; }
+    static PrepJob j;
+    j.fn = fn; j.c = c; j.troot = troot; j.done = 0;
+    xp_frac = 0.0f;
+    prep_bar(line, a);
+    SDL_Thread *t = SDL_CreateThread(prep_thread, "xpprep", &j);
+    if (!t) { fn(c, troot); return; }
+    while (!j.done) {
+        float f = live ? xp_frac : 0.0f; if (f < 0) f = 0; if (f > 1) f = 1;
+        prep_bar(line, a + (b - a) * f);
+        SDL_Delay(100);
+    }
+    SDL_WaitThread(t, NULL);
+    prep_bar(line, b);
+}
+static void prep_rest(int c, const char *troot)
+{
+    prep_step(make_map, c, troot, "DRAWING THE MAP", 0.13f, 0.145f, 0);
+    prep_step(make_routes, c, troot, "BUILDING THE ROADS", 0.145f, 0.21f, 0);
+    prep_step(make_events, c, troot, "BUILDING THE RACES", 0.21f, 0.755f, 1);
+    prep_step(make_props, c, troot, "PLACING THE PROPS", 0.755f, 1.0f, 1);
 }
 const char *xpcity_map(const char *track)
 {
@@ -553,7 +582,7 @@ static int lean_prepare(int c, const char *troot)
         }
     }
     if (xp_file_size(outc) > 0 && xp_file_size(lean) > 0 && lean_marker_ok(mark, raw_size)) {
-        make_map(c, troot); make_routes(c, troot); make_events(c, troot); make_props(c, troot);
+        prep_rest(c, troot);   /* each made already, or a newer version (no window: no bar) */
         return 1;
     }
     if (g_failed[c]) { vita_mark("xpcity: %s failed to prepare this session; not again until a restart", k_city[c].name); return 0; }
@@ -573,8 +602,7 @@ static int lean_prepare(int c, const char *troot)
     char title[64]; snprintf(title, sizeof title, "PREPARING %s", k_city[c].name);
     while (t && !g_job.finished) {
         float frac = g_job.total > 0 ? (float)g_job.done / (float)g_job.total : 0.0f;
-        char a[96]; snprintf(a, sizeof a, "%d%%  -  ONE TIME ONLY", (int)(frac * 100.0f));
-        vita_progress_screen(title, "READING THE CITY", a, frac);
+        prep_bar("READING THE CITY", 0.13f * frac);
         SDL_Delay(100);
     }
     if (t) SDL_WaitThread(t, NULL);
@@ -586,7 +614,7 @@ static int lean_prepare(int c, const char *troot)
         ok = m && fprintf(m, "xplean %d %d %lld\n", XP_LEAN_VERSION, k_city[c].game, raw_size) > 0;
         if (m && fclose(m)) ok = 0;
     }
-    if (ok) { make_map(c, troot); make_routes(c, troot); make_events(c, troot); make_props(c, troot); }
+    if (ok) prep_rest(c, troot);
     vita_mark("xpcity: %s %s in %.1f s", k_city[c].name, ok ? "prepared" : "FAILED", (SDL_GetTicks() - t0) / 1000.0);
     if (!ok) {
         remove(mark);
@@ -615,7 +643,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     long long raw_size = xp_file_size(raw);
     int have = xp_file_size(out) > 0 && xp_file_size(outc) > 0;
     /* sent from the PC tool (no raw files here), or translated before from these raw files */
-    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { make_map(c, troot); make_routes(c, troot); make_events(c, troot); make_props(c, troot); return 1; }
+    if (have && xp_marker_ok(mark, k_city[c].game, raw_size)) { prep_rest(c, troot); return 1; }
     if (raw_size <= 0 || xp_file_size(rawc) <= 0) {
         vita_mark("xpcity: %s is not installed (no translated city, no raw files in " XP_RAW_ROOT "/%s)",
                   k_city[c].name, k_city[c].dir);
@@ -664,7 +692,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     if (t) SDL_WaitThread(t, NULL);
     else job_thread(NULL);
     int ok = g_job.rc == XP_OK && xp_companion(rawc, outc, k_city[c].game) == XP_OK && xp_marker_write(mark, k_city[c].game, raw_size);
-    if (ok) { make_map(c, troot); make_routes(c, troot); make_events(c, troot); make_props(c, troot); }
+    if (ok) prep_rest(c, troot);
     vita_mark("xpcity: %s %s in %.1f s", k_city[c].name, ok ? "translated" : "FAILED", (SDL_GetTicks() - t0) / 1000.0);
     if (!ok) {
         remove(mark);

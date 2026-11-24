@@ -2012,9 +2012,12 @@ SDL_Thread *SDL_CreateThread(SDL_ThreadFunction fn, const char *name, void *data
        it run on any core other than the render thread's. */
     /* the boot world load ran on the 8 MB main stack before it moved here */
     int big_stack = name && !strcmp(name, "world-load");
+    /* 11-24: the expansion's first-boot steps (xpcity.c) on the render core -- it only draws a
+       progress bar then, and their own route-search workers take the other two */
+    int core0 = name && !strcmp(name, "xpprep");
     t->uid = sceKernelCreateThread(name ? name : "worker", thread_entry, 0x10000100,
                                    (big_stack ? 8 : 2) * 1024 * 1024, 0,
-                                   SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);
+                                   core0 ? SCE_KERNEL_CPU_MASK_USER_0 : SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2, NULL);
     if (t->uid < 0) { printf("thread \"%s\" could not start: 0x%08X (out of kernel memory?)\n", name ? name : "worker", (unsigned)t->uid); free(t); return NULL; }
     /* (Codex CR7) a thread that was created but never started used to come back as
        a live SDL_Thread: its caller then waited forever for work nobody did */

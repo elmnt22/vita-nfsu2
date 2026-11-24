@@ -209,6 +209,8 @@ int xp_props(const char *raw_companion, const char *raw_stream, const char *out_
     for (int k = 0; k < nk; k++) kh[k] = vlt_hash((const uint8_t *)k_kinds[k].kind, strlen(k_kinds[k].kind));
     FILE *f = xp_fopen(raw_stream, "rb");
     if (!f) { free(pl); return XP_ERR_OPEN_IN; }
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); if (fsz <= 0) fsz = 1;
+    xp_frac = 0.0f;
     XpSp *sp = NULL; int nsp = 0, cap = 0, rc = XP_OK;
     SolidBox *sb = NULL; size_t nsb = 0, sbcap = 0;
     uint8_t *buf = NULL; size_t bcap = 0;
@@ -217,6 +219,7 @@ int xp_props(const char *raw_companion, const char *raw_stream, const char *out_
         fseek(f, 0, SEEK_SET);
         for (;;) {
             uint8_t h[8];
+            xp_frac = 0.5f * (float)pass + 0.5f * (float)ftell(f) / (float)fsz;   /* the first-boot bar */
             if (fread(h, 1, 8, f) != 8) break;
             uint32_t id = u32le(h), sz = u32le(h + 4);
             int want = pass == 0 ? (id == 0x34027u || id == 0x80134000u) : id == 0x80034100u;
@@ -227,6 +230,7 @@ int xp_props(const char *raw_companion, const char *raw_stream, const char *out_
                 long at = ftell(f), end = at + (long)sz;
                 while (rc == XP_OK && at + 8 <= end) {
                     uint8_t ch[8];
+                    xp_frac = 0.5f * (float)at / (float)fsz;
                     if (fseek(f, at, SEEK_SET) || fread(ch, 1, 8, f) != 8) { rc = XP_ERR_READ; break; }
                     uint32_t cid = u32le(ch), csz = u32le(ch + 4);
                     if (at + 8 + (long)csz > end) break;

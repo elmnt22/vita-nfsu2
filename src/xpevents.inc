@@ -1491,6 +1491,7 @@ unsigned (*xp_ticks)(void);
 static unsigned ev_now(void) { return xp_ticks ? xp_ticks() : 0; }
 void (*xp_parallel)(void (*fn)(void *arg, int worker), void *arg, int n);
 int xp_workers = 1;
+volatile float xp_frac;
 /* 11-24: every race's lane chain first, on several cores (they share only read-only data:
    the graph, grid, barriers, races); the event loop then takes them in order as before, so
    the results are the same as one at a time */
@@ -1562,6 +1563,7 @@ static void ev_chains(void *arg, int wi)
     for (;;) {
         int ri = __sync_fetch_and_add(&J->next, 1);
         if (ri >= J->nr) break;
+        xp_frac = 0.19f + 0.50f * (float)ri / (float)(J->nr ? J->nr : 1);
         const Race *r = &J->R[ri]; ChainRes *o = &J->res[ri];
         int rt = ++w->tag;
         for (int b = 0; b < r->nbar; b++) barl_stamp(J->L, r->bar[b], w->stamp, rt);
@@ -1587,7 +1589,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     unsigned T[12] = {0}, tw = 0, tb = 0, tp = 0, tpb = 0, tq;
     ChainRes *res = NULL; EvWorker *ew = NULL; int nw = 0;
     BarLs BL = {0}; uint8_t *tbl = NULL;
-    T[0] = ev_now();
+    T[0] = ev_now(); xp_frac = 0.0f;
     XpEventStats dummy; if (!st) st = &dummy;
     memset(st, 0, sizeof *st);
     if (game != XP_GAME_MW && game != XP_GAME_CARBON) return XP_ERR_FORMAT;
@@ -1619,7 +1621,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (!bar_names(raw_companion, &B)) goto done;
     T[3] = ev_now();
     if (!bar_walls(raw_stream, &B)) goto done;
-    T[4] = ev_now();
+    T[4] = ev_now(); xp_frac = 0.15f;   /* the bar: the share of the Vita's time (hwlog96) */
     st->barrier_segs = B.ns;
     rc = XP_ERR_MEMORY;
     if (game == XP_GAME_CARBON && !mr_init(&mr, &rn, raw_companion, &mr_bars)) goto done;
@@ -1652,7 +1654,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     for (size_t i = 0; i < (size_t)g.n * maxwp; i++) { C.dist[i] = 1e18; C.prev[i] = -1; }
     qsort(R, (size_t)nr, sizeof *R, race_cmp);
     if (!barl_make(&BL, R, nr, &B, &g, &grid, stamp, &tag, seen, &seentag)) goto done;
-    T[5] = ev_now();
+    T[5] = ev_now(); xp_frac = 0.19f;
     {   /* every race's chain: worker 0 uses the buffers above, the others their own */
         int want = xp_parallel && xp_workers > 1 ? (xp_workers > 8 ? 8 : xp_workers) : 1;
         res = calloc((size_t)(nr ? nr : 1), sizeof *res); ew = calloc((size_t)want, sizeof *ew);
@@ -1667,8 +1669,9 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         tag = ew[0].tag; seentag = ew[0].seentag;
         for (int i = 0; i < nr; i++) if (res[i].x < 0) goto done;
     }
-    T[10] = ev_now();
+    T[10] = ev_now(); xp_frac = 0.69f;
     for (int ri = 0; ri < nr; ri++) {
+        xp_frac = 0.69f + 0.13f * (float)ri / (float)(nr ? nr : 1);
         Race *r = &R[ri];
         int rt = ++tag;
         for (int b = 0; b < r->nbar; b++) barl_stamp(&BL, r->bar[b], stamp, rt);
@@ -1750,7 +1753,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         free(ch);
     }
     nrecs = nm;
-    T[6] = ev_now();
+    T[6] = ev_now(); xp_frac = 0.82f;
     keep = malloc((size_t)(nm ? nm : 1));
     if (!keep) goto done;
     memset(keep, 1, (size_t)(nm ? nm : 1));
@@ -1778,7 +1781,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         free(tbl); tbl = NULL;
     }
     st->dropped = bad;
-    T[8] = ev_now();
+    T[8] = ev_now(); xp_frac = 0.84f;
     if (bad) {
         /* the records shrink to the events kept */
         int w = 0;
@@ -1859,7 +1862,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         }
         rc = okw ? XP_OK : XP_ERR_WRITE;
     }
-    T[9] = ev_now();
+    T[9] = ev_now(); xp_frac = 1.0f;
     if (xp_ticks)
         printf("xp_events: steps (ms): races %u, road net + graph %u, barrier names %u, barrier walls %u, setup %u, "
                "chains %u (%d cores), events %u (lanes %u, paths %u, files %u, barriers %u), records %u, route check %u, the rest %u\n",
