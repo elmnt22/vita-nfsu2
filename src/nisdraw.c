@@ -352,14 +352,19 @@ int nisdraw_draw(NisDraw *d, const Nis *n, const float V[16], const float PV[16]
                 o[7] = x[3] * m[2] + x[4] * m[6] + x[5] * m[10];
             }
         }
-        bind_stream(d, d->scratch, (int)((o - d->scratch) / 8));
+        /* one upload per slice, each drawn from its own start: GXM keeps an
+           attribute's byte offset in 16 bits (SceGxmVertexAttribute.offset),
+           so a slice past 2048 vertices into one shared stream (32-byte
+           vertices) read from a wrapped offset -- the torn pre-race
+           characters (Vita only; desktop GL has no such limit) */
         for (int j = 0, first = 0; j < s->nsub; first += s->sub[j].nv, j++) {
             const NdSub *u = &s->sub[j];
             glUniform4fv(d->uDMin, 1, u->dmin);
             glUniform4fv(d->uDRange, 1, u->drange);
             glUniform1f(d->uCut, u->cut ? 1.0f : 0.0f);
             glBindTexture(GL_TEXTURE_2D, u->tex);
-            stream_at(first);
+            bind_stream(d, d->scratch + 8 * (size_t)first, u->nv);
+            stream_at(0);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, u->ibo);
             glDrawElements(GL_TRIANGLES, u->ni, GL_UNSIGNED_SHORT, 0);
         }
