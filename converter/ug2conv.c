@@ -62,10 +62,13 @@ const char *conv_shop_file(void);
 int conv_shop_done(void);
 int conv_shop(void);
 
-static const struct { const char *bun, *name; } k_tracks[] = {
-    { "STREAML4RA", "The City" },        { "STREAML4RB", "Drag Strips 1" },
-    { "STREAML4RC", "Drift Venues" },    { "STREAML4RD", "Drag Strips 2" },
-    { "STREAML4RF", "Street X Tracks" }, { "STREAML4RG", "URL Tracks" } };
+/* lean: the game streams it straight from the game data (rstream.c, on by
+   default since 11-24) -- no tiles, no compact copy; only its stripped
+   bundle + start are made here (the game would make them on first use) */
+static const struct { const char *bun, *name; int lean; } k_tracks[] = {
+    { "STREAML4RA", "The City", 1 },        { "STREAML4RB", "Drag Strips 1", 0 },
+    { "STREAML4RC", "Drift Venues", 0 },    { "STREAML4RD", "Drag Strips 2", 0 },
+    { "STREAML4RF", "Street X Tracks", 0 }, { "STREAML4RG", "URL Tracks", 0 } };
 #define NTRACKS ((int)(sizeof k_tracks / sizeof *k_tracks))
 #define TRACKS_ROOT "ux0:data/NFSU2/TRACKS"   /* the game folder's TRACKS (conv_platform.c) */
 #define VITA_CACHE  "ux0:/data/NFSU2/cache"   /* on the Vita, as its FTP servers name it */
@@ -267,6 +270,7 @@ static int track_present(const char *game, int t) {
     return file_exists(p);
 }
 static int track_done(int t) {
+    if (k_tracks[t].lean) return conv_track_extras_done(k_tracks[t].bun);
     char p[MAX_PATH + 64]; compact_path(p, sizeof p, t);
     return world_tiles_ready(k_tracks[t].bun) && file_exists(p);
 }
@@ -335,6 +339,18 @@ static void convert_all(void) {
     for (int i = 0; i < n && ok; i++) {
         int t = todo[i];
         g_job.cur = i; g_job.ncur = t;
+        if (k_tracks[t].lean) {   /* no tiles: its stripped bundle + start only */
+            DWORD t0 = GetTickCount();
+            res_unpin(); world_instance_library_release(); world_instance_cache_flush();
+            conv_track_extras(TRACKS_ROOT, k_tracks[t].bun);
+            world_instance_library_release(); world_instance_cache_flush();
+            char cp[MAX_PATH + 64]; compact_path(cp, sizeof cp, t);
+            DeleteFileA(cp);   /* the full pin's compact copy: the Vita does not use it */
+            ok = track_done(t);
+            printf("converter: %s %s in %.1f s (streamed from the game data, no tiles)\n", k_tracks[t].name,
+                   ok ? "prepared" : "FAILED", (GetTickCount() - t0) / 1000.0);
+            continue;
+        }
         /* as the Vita's boot does: one pinned bundle at a time, and nothing
            keyed to the previous one */
         res_unpin(); world_instance_library_release(); world_instance_cache_flush();
@@ -485,6 +501,11 @@ static int send_list(SendFile *f, int cap, const char *game) {
     for (int i = n; i < cap; i++) f[i].game = 0;
     for (int t = 0; t < NTRACKS && n + 5 <= cap; t++) {
         if (!track_done(t)) continue;
+        if (k_tracks[t].lean) {   /* streamed: its stripped bundle and start only */
+            snprintf(name, sizeof name, "%s.BUN.compact.strip", k_tracks[t].bun); n = send_add(f, n, name);
+            snprintf(name, sizeof name, "%s.focus", k_tracks[t].bun + 6); n = send_add(f, n, name);
+            continue;
+        }
         compact_path(f[n].local, sizeof f[n].local, t);
         snprintf(f[n].remote, sizeof f[n].remote, VITA_CACHE "/%s.BUN.compact", k_tracks[t].bun); n++;
         snprintf(name, sizeof name, "%s.BUN.compact.strip", k_tracks[t].bun); n = send_add(f, n, name);
@@ -735,6 +756,7 @@ static void vita_state(HINTERNET c, VitaState *v) {
     remote_dirs_reset();   /* the listings from before the send are stale */
     v->tiles = 0;
     for (int k = 0; k < NTRACKS; k++) {
+        if (k_tracks[k].lean) { v->tiles++; continue; }   /* streamed: nothing to optimize */
         snprintf(r, sizeof r, VITA_CACHE "/tiles/%s_v%d.idx", k_tracks[k].bun, WTILE_VERSION);
         if (remote_size(c, r) > 0) v->tiles++;
     }

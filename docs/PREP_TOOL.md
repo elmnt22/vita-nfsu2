@@ -49,13 +49,17 @@ and the v1.2 patch didn't change the data files, so this is only a note.
 
 ## 3. Convert
 
-Click **Convert**. All six track sets are converted:
+Click **Convert**. The five event track sets are converted:
 
-- The City
 - Drag Strips 1 and 2
 - Drift Venues
 - Street X Tracks
 - URL Tracks
+
+The City itself needs no conversion any more: the game streams it straight
+from the game files, the way the original does. The tool only prepares its
+small start-up file. When the game starts, it deletes the old converted city
+files from your Vita (they are no longer used).
 
 It also prebuilds the cars' parts lists and the shop screens, which the
 Vita would otherwise build the first time you open them.
@@ -107,7 +111,7 @@ already sent are skipped.
 Copy the game folders (see the [README](../README.md#2-copy-the-game-data))
 and the **`cache`** folder from the output folder into
 **`ux0:data/NFSU2/`**, so you get for example
-`ux0:data/NFSU2/cache/tiles/STREAML4RA_v6.idx`.
+`ux0:data/NFSU2/cache/tiles/STREAML4RG_v7.idx`.
 
 ### Checking it worked
 

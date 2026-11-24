@@ -41,8 +41,10 @@ folder and writes what the Vita would write to `ux0:data/NFSU2/cache`:
 - `cache/shop_vNN.bin` -- the shop screens and art (`src/shop.c`
   `shop_build_cache`)
 
-for STREAML4RA (city), L4RB/L4RD (drag), L4RC (drift), L4RF (Street X),
-L4RG (URL). The output is byte-identical to the simulator's own boot
+for L4RB/L4RD (drag), L4RC (drift), L4RF (Street X), L4RG (URL). Since
+11-24 the city (STREAML4RA, `lean` in k_tracks) is not converted: the game
+streams it with the retail streamer (src/rstream.c); the tool only writes its
+.BUN.compact.strip + L4RA.focus and sends those. The output is byte-identical to the simulator's own boot
 conversion (checked 2026-10-18; mesh counts match the Vita's logs; strip,
 focus, mods and shop files checked identical to the simulator's 2026-10-25).
 World detail is set to low, as the Vita's default.
