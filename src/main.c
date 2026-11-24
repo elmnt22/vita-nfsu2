@@ -21526,7 +21526,9 @@ int main(int argc, char **argv) {
             world_tiles_reset();
             skyline_reset();
             world_texture_cache_clear();
-            rstream_stop();   /* its worker reads the pinned bundle (hwlog86 crash) */
+            /* its worker reads the pinned bundle (hwlog86 crash): stopped, its
+               model library and textures kept when the city comes back */
+            rstream_park_for(next_track);
             res_unpin();
             world_instance_library_release();
             world_instance_cache_flush();
@@ -21737,6 +21739,7 @@ int main(int argc, char **argv) {
                 printf("rstream: spawn area %s in %u ms (%d left)\n", ok ? "ready" : "NOT ready",
                        (unsigned)(SDL_GetTicks() - p0), left);
             }
+            if (!rstream_active()) rstream_stop();   /* a park nobody resumed: freed */
             hud_free(&sw_ls);
             kit_globalb_release();
             vita_mark("track switch: %s ready in %u ms, %d meshes, %d events, spawn (%.0f, %.0f, %.1f)",

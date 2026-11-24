@@ -19,6 +19,9 @@ int  rstream_active(void);
 /* main thread: start (or keep) streaming for a track; stop on another */
 int  rstream_start(const char *track_root, const char *trackname);
 void rstream_stop(void);
+/* before a reload unpins the bundle: keeps the model library and textures
+   when the next track is the same stream (else rstream_stop) */
+void rstream_park_for(const char *next_track);
 /* the scenery-group set: resident_args.scenery_event (cheap when unchanged) */
 void rstream_set_event(int event);
 

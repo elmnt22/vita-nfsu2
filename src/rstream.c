@@ -1048,8 +1048,34 @@ static void rs_free_tables(void) {
     free(g.common); g.common = NULL; g.commonlen = 0;
     free(g.loc4); g.loc4 = NULL; g.loc4len = 0;
 }
+/* parked: the worker stopped and the pinned bundle let go, but the X model
+   library, every uploaded texture and the tables kept for a restart on the
+   same stream (a same-city reload: X0 took ~5 s again on HW, hwlog88) */
+static int g_parked;
+void rstream_park_for(const char *next_track) {
+    if (!g.active || !rstream_track_ok(next_track)) { rstream_stop(); return; }
+    if (g.thr) {
+        rs_lock(&g_mx); g.quit = 1; rs_unlock(&g_mx);
+        SDL_WaitThread(g.thr, NULL); g.thr = NULL;
+    }
+    int keep = 0;
+    for (int i = 0; i < g.nsec; i++) {
+        RsSec *s = &g.sec[i]; int L = rs_letter(s->number);
+        s->wanted = 0;
+        if (L == 24 || L == 25) { keep += s->state == 3 || s->state == 4; continue; }
+        if (s->state) rs_unload(s);
+    }
+    free(g.tpk.blk); memset(&g.tpk, 0, sizeof g.tpk);
+    g.pin = NULL; g.pinlen = 0;   /* borrowed: the caller unpins it next */
+    int ntex = 0; for (int i = 0; i < RS_TEXCAP; i++) ntex += g_tex[i].state == 3;
+    g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0;
+    g_parked = 1;
+    printf("rstream: parked for the reload (%d library sections, %d textures, %ld KB kept)\n",
+           keep, ntex, g.tex_gpu / 1024);
+}
 void rstream_stop(void) {
-    if (!g.active && !g.thr) return;
+    if (!g.active && !g.thr && !g_parked) return;
+    g_parked = 0;
     if (g.thr) {
         rs_lock(&g_mx); g.quit = 1; rs_unlock(&g_mx);
         SDL_WaitThread(g.thr, NULL); g.thr = NULL;
@@ -1090,6 +1116,21 @@ int rstream_start(const char *track_root, const char *trackname) {
     const char *b = rs_base(trackname);
     snprintf(stream, sizeof stream, "%s/%s%s", track_root, b, strstr(b, ".BUN") ? "" : ".BUN");
     if (g.active && !strcmp(stream, g.stream)) return 1;
+    if (g_parked && !strcmp(stream, g.stream)) {   /* the same stream again: the kept library */
+        Uint32 u0 = SDL_GetTicks();
+        g.pin = res_bundle(g.stream, &g.pinlen);
+        g.pin_gen = res_pin_gen();
+        if (g.pin) g.tpk = n2_tpk_open(g.pin, g.pinlen);
+        g.quit = 0;
+        g.thr = SDL_CreateThread(rs_worker, "rstream", NULL);
+        if (!g.thr) { printf("rstream: no worker thread\n"); rstream_stop(); return 0; }
+        g_parked = 0;
+        g.active = 1;
+        g.cold = 1; g.cold_t0 = 0;
+        g.st_t0 = SDL_GetTicks();
+        printf("rstream: resumed from park (%u ms)\n", (unsigned)(SDL_GetTicks() - u0));
+        return 1;
+    }
     rstream_stop();
     snprintf(g.troot, sizeof g.troot, "%s", track_root);
     snprintf(g.stream, sizeof g.stream, "%s", stream);
@@ -1676,6 +1717,7 @@ int rstream_active(void) { return 0; }
 int rstream_start(const char *r, const char *t) { (void)r; (void)t; return 0; }
 void rstream_set_event(int e) { (void)e; }
 void rstream_stop(void) {}
+void rstream_park_for(const char *t) { (void)t; }
 void rstream_update(const float cam[3]) { (void)cam; }
 int rstream_draw(const RsDrawCtx *c) { (void)c; return 0; }
 int rstream_area_ready(int *left) { if (left) *left = 0; return 1; }
