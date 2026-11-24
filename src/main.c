@@ -17273,7 +17273,10 @@ int main(int argc, char **argv) {
             const char *conv[8], *conv_name[8]; int nconv = 0, boot_listed = 0, tiles_relaunch = 0;
             for (int q = 0; q < (int)(sizeof k_tile_tracks / sizeof *k_tile_tracks); q++) {
                 if (!strcmp(k_tile_tracks[q][0], trackname)) boot_listed = 1;
-                if (world_lean_track(k_tile_tracks[q][0])) continue;   /* the retail streamer draws it from the game data */
+                if (world_lean_track(k_tile_tracks[q][0])) {   /* the retail streamer draws it from the game data */
+                    world_tiles_drop_track(k_tile_tracks[q][0]);
+                    continue;
+                }
                 char bp[1024]; snprintf(bp, sizeof bp, "%s/%s.BUN", troot, k_tile_tracks[q][0]);
                 FILE *bf = fopen(bp, "rb");
                 if (!bf) continue;

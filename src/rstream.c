@@ -61,9 +61,12 @@ int rstream_enabled(void) {
         if (f) { size_t n = fread(opt, 1, sizeof opt - 1, f); opt[n] = 0; fclose(f); }
         const char *e = getenv("OPENUG2_RSTREAM");
         if (e && !*opt) snprintf(opt, sizeof opt, "%s", e);
-        g_rs_on = f || e ? 1 : 0;
+        /* on by default (11-24): the city draws from the game data, no tile
+           cache. retailstream.txt "off" (or "tiles") goes back to the tiles
+           (they are converted again on the next boot) */
+        g_rs_on = !(strstr(opt, "off") || strstr(opt, "tiles") || (e && !strcmp(e, "0")));
         g_rs_precull_always = strstr(opt, "precull") != NULL;
-        printf("rstream: retail streamer %s%s\n", g_rs_on ? "ON (retailstream.txt)" : "off",
+        printf("rstream: retail streamer %s%s\n", g_rs_on ? "ON" : "off (retailstream.txt)",
                g_rs_on && g_rs_precull_always ? ", precull at every speed" : "");
     }
     return g_rs_on;
@@ -371,8 +374,19 @@ static long rs_tex_bytes(const N2Tex *t) {
     long px = (long)t->w * (long)t->h;
     return (t->rgb ? px * 3 : 0) + (t->alpha ? px : 0) + (t->dxt ? t->dxtlen : 0);
 }
-/* worker: decode one queued key from the pinned bundle */
+/* worker (and the main thread once for a sky texture): decode one queued key
+   from the pinned bundle. n2_tpk_keep_dxt / n2_tpk_skip_pixels are this
+   file's statics, read more than once inside n2_tpk_decode: two decodes at
+   once flipped them under each other and the DXT1 path wrote through a NULL
+   rgb buffer (hwlog89_lean_R data abort in n2_dxt1). One decode at a time. */
+static RsLock g_decmx;
+static void rs_tex_decode_one(int slot);
 static void rs_tex_decode(int slot) {
+    rs_lock(&g_decmx);
+    rs_tex_decode_one(slot);
+    rs_unlock(&g_decmx);
+}
+static void rs_tex_decode_one(int slot) {
     RsTex *e = &g_tex[slot];
     N2Tex t; memset(&t, 0, sizeof t);
     if (g.pin && res_pin_gen() != g.pin_gen) {   /* stale pin: leave it queued, the main thread stops us */

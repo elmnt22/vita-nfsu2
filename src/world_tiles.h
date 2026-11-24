@@ -77,6 +77,7 @@ void world_tiles_preload(const char *track, float x, float y);
    assembly starts it, calling it earlier is harmless. */
 void world_tiles_migrate_start(void);
 void world_tiles_drop_old_versions(void);   /* older WTILE_VERSION sets, once the current one is complete */
+void world_tiles_drop_track(const char *track);   /* a streamer track: its tiles + compact copy off the card */
 /* Boot: pack every track's loose tile files on the calling thread, progress
  * in p (cells = tiles copied + files removed); needed = any loose file left;
  * track = the one being packed now (for the screen). */
