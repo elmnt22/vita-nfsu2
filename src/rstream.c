@@ -210,6 +210,8 @@ static struct {
     WGSelection sel; int sel_on, sel_key[3];
     /* textures */
     unsigned char *pin; long pinlen; N2Tpk tpk;
+    unsigned pin_gen;          /* res_pin_gen() when g.pin was taken: the pin is borrowed,
+                                  a re-pin frees it (hwlog86: worker read a freed copy) */
     uint32_t *keys; int nkeys;
     /* the tile builder's other texture sources, in its key order (world_instance.c
        library: bundle, LOC4DYNTEX, InGameCommon, regional ads): a material slot is
@@ -368,6 +370,10 @@ static long rs_tex_bytes(const N2Tex *t) {
 static void rs_tex_decode(int slot) {
     RsTex *e = &g_tex[slot];
     N2Tex t; memset(&t, 0, sizeof t);
+    if (g.pin && res_pin_gen() != g.pin_gen) {   /* stale pin: leave it queued, the main thread stops us */
+        rs_lock(&g_mx); e->state = 1; rs_unlock(&g_mx);
+        return;
+    }
     int dxt = render_world_dxt_enabled();
     n2_tpk_keep_dxt = dxt; n2_tpk_skip_pixels = dxt;
     int ok = g.pin && n2_tpk_decode(g.pin, g.pinlen, g.tpk, e->key, &t);
@@ -1095,6 +1101,7 @@ int rstream_start(const char *track_root, const char *trackname) {
     g.sel_on = 0; g.sel_key[0] = g.sel_key[1] = g.sel_key[2] = -99999;
     if (!g.nsec || !g.nbnd) { printf("rstream: %s: %d sections, %d zones -- not used\n", g.comp, g.nsec, g.nbnd); rs_free_tables(); return 0; }
     g.pin = res_bundle(g.stream, &g.pinlen);
+    g.pin_gen = res_pin_gen();
     if (g.pin) {
         g.tpk = n2_tpk_open(g.pin, g.pinlen);
         g.keys = (uint32_t *)malloc(16384 * sizeof *g.keys);
@@ -1136,6 +1143,11 @@ int rstream_start(const char *track_root, const char *trackname) {
 
 /* ---------------------------------------------------------------- per frame (main) */
 void rstream_update(const float cam[3]) {
+    if (g.active && g.pin && res_pin_gen() != g.pin_gen) {
+        printf("rstream: the pinned bundle changed under the streamer -- restarting\n");
+        rstream_stop();
+        return;
+    }
     if (!g.active) return;
     Uint64 f = SDL_GetPerformanceFrequency(), t0 = SDL_GetPerformanceCounter();
     Uint32 now = SDL_GetTicks();

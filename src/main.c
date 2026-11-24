@@ -17291,6 +17291,7 @@ int main(int argc, char **argv) {
                 for (int q = 0; q < nconv; q++) {
                     /* the previous bundle (the boot's focus pin, or the last
                        conversion's) and everything keyed to it */
+                    rstream_stop();   /* its worker reads the pinned bundle */
                     res_unpin(); world_instance_library_release(); world_instance_cache_flush();
                     static WTileProgress tprog;
                     static struct { const char *root, *track; } targs;
@@ -17323,6 +17324,7 @@ int main(int argc, char **argv) {
                     if (tt) SDL_WaitThread(tt, NULL);
                     vita_mark("tiles: %s %s", conv[q], tprog.ok ? "converted" : "FAILED");
                 }
+                rstream_stop();   /* its worker reads the pinned bundle */
                 res_unpin(); world_instance_library_release(); world_instance_cache_flush();
                 extern void vita_progress_screen_done(void); vita_progress_screen_done();
                 if (g_boot_fe) shop_loading_text(g_boot_fe, NULL, NULL);   /* back to "LOADING" */
@@ -21468,6 +21470,13 @@ int main(int argc, char **argv) {
            bundle -- then the new track's first area is built round its
            authored focus exactly as the boot builds it, and the frame state
            is pointed at it the way a streaming swap points it. */
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_SIM_SWITCH_AT=<s> switches to the city once, as the
+               career free roam start does (the hwlog86 unpin-under-the-streamer path) */
+            static int sw_done; const char *e = getenv("OPENUG2_SIM_SWITCH_AT");
+            if (e && *e && !sw_done && SDL_GetTicks() > (Uint32)(atof(e) * 1000.0)) { sw_done = 1; venue_go(NULL, 0); }
+        }
+#endif
         if (g_switch_track && world2) {
             const char *next_track = g_switch_track;
             int next_ev = g_switch_ev;
@@ -21517,6 +21526,7 @@ int main(int argc, char **argv) {
             world_tiles_reset();
             skyline_reset();
             world_texture_cache_clear();
+            rstream_stop();   /* its worker reads the pinned bundle (hwlog86 crash) */
             res_unpin();
             world_instance_library_release();
             world_instance_cache_flush();
