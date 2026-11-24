@@ -21722,6 +21722,21 @@ int main(int argc, char **argv) {
             race_state = 1; garage_race = -1;
             race_start_pending = race_place_pending = 0;
             g_boot_ev = next_ev;
+            if (rstream_track_ok(trackname) && g_dbg.show_track &&
+                rstream_start(resident_args.track_root, trackname)) {
+                /* the streamer draws the city: its spawn area in before the first
+                   frame (hwlog87: the car stood ~5 s in an empty world while X0 built) */
+                Uint32 p0 = SDL_GetTicks(), pf = 0; int left = 0, ok;
+                rstream_set_event(resident_args.scenery_event);
+                for (;;) {
+                    rstream_update(carpos);
+                    if ((ok = rstream_area_ready(&left)) || SDL_GetTicks() - p0 > 20000) break;
+                    if (SDL_GetTicks() - pf >= 33) { switch_frame(sw_ls, &rp, &quad); pf = SDL_GetTicks(); }
+                    else SDL_Delay(2);
+                }
+                printf("rstream: spawn area %s in %u ms (%d left)\n", ok ? "ready" : "NOT ready",
+                       (unsigned)(SDL_GetTicks() - p0), left);
+            }
             hud_free(&sw_ls);
             kit_globalb_release();
             vita_mark("track switch: %s ready in %u ms, %d meshes, %d events, spawn (%.0f, %.0f, %.1f)",
@@ -24452,7 +24467,9 @@ int main(int argc, char **argv) {
         if (race_place_pending && race_state == 0 && active_resident &&
             active_scenery_event == resident_args.scenery_event &&
             hypotf(carpos[0]-active_resident->center[0], carpos[1]-active_resident->center[1]) <
-                active_resident->radius - 50.0f) {
+                active_resident->radius - 50.0f &&
+            (!rstream_active() || (rstream_update(carpos), rstream_area_ready(NULL)) ||   /* the streamer's start area too */
+             (g_race_ask_ms && SDL_GetTicks() - g_race_ask_ms > 20000))) {
             hitch_mark("race.wait");
             if (!race_place_on_grid(&world, &scene, carpos, &heading))
                 printf("garage: no ground under the grid; starting where the car stands\n");
@@ -25461,6 +25478,7 @@ int main(int argc, char **argv) {
                 vel[0] = vel[1] = 0; speed = 0;
                 g_n2_live = 0; cam_snap = 1;
                 post_hold = 1; ft_hold = 1;
+                rstream_rewarm();   /* the loading screen until the streamer has the spot */
             }
         }
         if (post_hold) {   /* the post-race marker: stood there once the resident covers it */
@@ -25469,7 +25487,7 @@ int main(int argc, char **argv) {
             else if (!ft_hold && !rp_hold && (!g_rt.active || !g_rt.post_done)) post_hold = 0;
             else if (active_resident && hypotf(post_hold_pos[0] - active_resident->center[0],
                                                post_hold_pos[1] - active_resident->center[1]) <
-                                            active_resident->radius - 50.0f) {
+                                            active_resident->radius - 50.0f && !rstream_cold()) {
                 post_hold = 0;
                 float z = post_hold_pos[2];
                 int put_found = 0;
@@ -25505,6 +25523,7 @@ int main(int argc, char **argv) {
                     printf("fast travel: no collision ground at (%.0f %.0f %.1f) or its road, back to (%.0f %.0f %.1f)\n",
                            post_hold_pos[0], post_hold_pos[1], post_hold_pos[2], g_ft_from[0], g_ft_from[1], g_ft_from[2]);
                     g_ft_back = 1; post_hold = 1;
+                    rstream_rewarm();
                     memcpy(post_hold_pos, g_ft_from, sizeof post_hold_pos);
                     memcpy(carpos, g_ft_from, 3 * sizeof(float)); heading = g_ft_from[3];
                     vel[0] = vel[1] = 0; speed = 0; g_n2_live = 0;
@@ -26003,6 +26022,7 @@ int main(int argc, char **argv) {
                     memcpy(post_hold_pos, carpos, 3 * sizeof(float)); post_hold_pos[3] = heading;
                     vel[0] = vel[1] = 0; speed = 0; g_n2_live = 0; cam_snap = 1;
                     post_hold = 1; ft_hold = 0; rp_hold = 1;
+                    rstream_rewarm();
                     printf("replay: exit to (%.0f, %.0f), outside the area in (centre %.0f, %.0f): held until it streams in\n",
                            carpos[0], carpos[1], active_resident->center[0], active_resident->center[1]);
                 }
@@ -32057,8 +32077,9 @@ int main(int argc, char **argv) {
                    screen; its own menu sounds play (GitHub #10: the engine went on
                    behind it after a race) */
                 static int ls_mute;
-                int up = g_restart_ls && ((race_state == 3 && (race_start_pending || g_qr_pending || g_career_go || g_switch_track))
-                                          || (race_state == 0 && race_place_pending));
+                int up = (g_restart_ls && ((race_state == 3 && (race_start_pending || g_qr_pending || g_career_go || g_switch_track))
+                                           || (race_state == 0 && race_place_pending)))
+                         || (rstream_cold() && g_ls_fe && !g_showroom);
                 if (up != ls_mute) { audio_pause_game(up ? 1 : g_pause.on); ls_mute = up; }
             }
             if (g_restart_ls) {                  /* RCSTATE LOADING after a Restart */
@@ -32074,6 +32095,20 @@ int main(int argc, char **argv) {
                     shop_draw(g_ls_fe, &rp, &quad, W, H);
                     ls_drew("main loop"); g_ls_frame = 1;
                 } else { g_restart_ls = 0; g_ls_drawn = 0; }
+            }
+            if (!g_ls_frame && rstream_cold() && !g_showroom && (g_ls_fe || loading_screen(dataroot))) {
+                /* the streamer's first area is not in yet (a boot or front-end
+                   start): the loading screen, not the car in an empty city
+                   (hwlog87 screenshot) */
+                static Uint32 cl_last;
+                Uint32 cl_now = SDL_GetTicks();
+                float dt = cl_last ? (float)(cl_now - cl_last) / 1000.0f : 0.0f;
+                cl_last = cl_now;
+                glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                shop_update(g_ls_fe, dt < 0.0f ? 0.0f : dt > 0.1f ? 0.1f : dt);
+                shop_draw(g_ls_fe, &rp, &quad, W, H);
+                ls_drew("streamer area"); g_ls_frame = 1;
             }
             {   /* the EA Trax chyron, under the menus */
                 static Uint32 cy_last;

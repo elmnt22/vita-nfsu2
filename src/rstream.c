@@ -210,6 +210,10 @@ static struct {
     WGSelection sel; int sel_on, sel_key[3];
     /* textures */
     unsigned char *pin; long pinlen; N2Tpk tpk;
+    int cold;                  /* started, its first area not in yet (rstream_cold) */
+    Uint32 cold_t0, cold_last; /* the cold wait's start, restarted after a gap in the updates:
+                                  a front-end boot draws the world one frame, then the menus
+                                  run without it (sim: given up at once after them) */
     unsigned pin_gen;          /* res_pin_gen() when g.pin was taken: the pin is borrowed,
                                   a re-pin frees it (hwlog86: worker read a freed copy) */
     uint32_t *keys; int nkeys;
@@ -229,6 +233,7 @@ static struct {
     long st_binst, st_bruns, st_bpieces;
     /* decoded pixels waiting for the main thread's upload (state 2) */
     volatile long dec_bytes; volatile int ndec; long dec_peak; long st_dec_wait_ms;
+    long tex_gpu;              /* uploaded texture bytes (decoded size: DXT exact, RGB(A) close) */
     double st_up_ms, st_draw_ms, st_upd_ms;
     Uint32 st_t0;
 } g;
@@ -417,6 +422,7 @@ static void rs_tex_upload(Uint64 deadline) {
         free(e->t.rgb); free(e->t.alpha); free(e->t.dxt); memset(&e->t, 0, sizeof e->t);
         rs_lock(&g_mx);
         e->tex = id; e->state = id ? 3 : 4;
+        if (id) g.tex_gpu += nb;
         g.dec_bytes -= nb; g.ndec--;
         rs_unlock(&g_mx);
         g.st_tex_up++;
@@ -1054,7 +1060,7 @@ void rstream_stop(void) {
         free(g_tex[i].t.rgb); free(g_tex[i].t.alpha); free(g_tex[i].t.dxt);
     }
     memset(g_tex, 0, sizeof g_tex);
-    g.dec_bytes = 0; g.ndec = 0;
+    g.dec_bytes = 0; g.ndec = 0; g.tex_gpu = 0;
     memset(g_solhash, 0, sizeof g_solhash); memset(g_hdr, 0, sizeof g_hdr); memset(g_xhash, 0, sizeof g_xhash);
     rs_free_tables();
     g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0;
@@ -1137,6 +1143,7 @@ int rstream_start(const char *track_root, const char *trackname) {
     g.thr = SDL_CreateThread(rs_worker, "rstream", NULL);
     if (!g.thr) { printf("rstream: no worker thread\n"); rs_free_tables(); return 0; }
     g.active = 1;
+    g.cold = 1; g.cold_t0 = 0;
     g.st_t0 = SDL_GetTicks();
     return 1;
 }
@@ -1208,7 +1215,38 @@ void rstream_update(const float cam[3]) {
             if (a0 >= deadline) { over = 1; break; }
             if (rs_activate(s)) g.st_up_ms += (double)(SDL_GetPerformanceCounter() - a0) * 1000.0 / (double)f;
         }
+    if (g.cold) {
+        int left = 0;
+        if (!g.cold_t0 || now - g.cold_last > 1000) g.cold_t0 = now ? now : 1;
+        g.cold_last = now;
+        if (rstream_area_ready(&left) || now - g.cold_t0 > 20000) {
+            printf("rstream: first area %s %u ms after its first frame (%d left)\n",
+                   left ? "given up" : "in", (unsigned)(now - g.cold_t0), left);
+            g.cold = 0;
+        }
+    }
     g.st_upd_ms += (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)f;
+}
+
+/* the loading screen's wait (retail holds it until the TrackStreamer has
+   the start area in): every wanted section on the GPU and no texture still
+   queued or decoded -- 1 also when not streaming or outside every zone */
+int rstream_cold(void) { return g.active && g.cold; }
+void rstream_rewarm(void) { if (g.active) { g.cold = 1; g.cold_t0 = 0; } }
+
+int rstream_area_ready(int *left) {
+    int n = 0;
+    if (left) *left = 0;
+    if (!g.active) return 1;
+    if (!g.have_pos) { if (left) *left = -1; return 0; }
+    if (!g.zone) return 1;
+    rs_lock(&g_mx);
+    for (int i = 0; i < g.nsec; i++) if (g.sec[i].wanted && g.sec[i].state != 4) n++;
+    if (g.ndec) n++;
+    for (int i = 0; i < RS_TEXCAP && !n; i++) if (g_tex[i].state == 1) n++;
+    rs_unlock(&g_mx);
+    if (left) *left = n;
+    return n == 0;
 }
 
 /* ---------------------------------------------------------------- draw */
@@ -1619,10 +1657,10 @@ int rstream_draw(const RsDrawCtx *c) {
         g.st_binst = g.st_bruns = g.st_bpieces = 0;
         printf("rstream: zone %d (pred %d) | %.0f draws %.0f instances/frame, scenery %d hdrs | draw %.2f ms (cull %.2f) update %.2f ms (uploads %.2f) "
                "| culled/frame: groups %.0f props %.0f precull %.0f excl %.0f frustum %.0f pixels %.0f model-missing %.0f full %.0f "
-               "| switches/frame: matrix %.0f texture %.0f, identity draws %.0f | sections: wanted %d active %d built %d queued %d, wanted-not-in %d, unloads %ld | GPU %ld KB, textures %d (+%ld)\n",
+               "| switches/frame: matrix %.0f texture %.0f, identity draws %.0f | sections: wanted %d active %d built %d queued %d, wanted-not-in %d, unloads %ld | GPU %ld KB, textures %d (+%ld, %ld KB)\n",
                g.zone, g.pzone, g.st_draws / F, g.st_inst / F, nl, g.st_draw_ms / F, cull_ms / F, g.st_upd_ms / F, g.st_up_ms / F,
                g.st_cull[7] / F, g.st_cull[6] / F, g.st_cull[0] / F, g.st_cull[1] / F, g.st_cull[2] / F, g.st_cull[3] / F, g.st_cull[4] / F, g.st_cull[5] / F, g_st_mtxsw / F, g_st_texsw / F, g_st_ident / F,
-               nwant, nact, nbuilt, nq, nmiss, g.st_unload, gpu / 1024, ntex, g.st_tex_up);
+               nwant, nact, nbuilt, nq, nmiss, g.st_unload, gpu / 1024, ntex, g.st_tex_up, g.tex_gpu / 1024);
         g.st_draws = g.st_inst = g.st_frames = 0; memset(g.st_cull, 0, sizeof g.st_cull);
         printf("rstream: decoded backlog %ld KB now, %ld KB peak, worker waited %ld ms\n",
                g.dec_bytes / 1024, g.dec_peak / 1024, g.st_dec_wait_ms);
@@ -1640,4 +1678,7 @@ void rstream_set_event(int e) { (void)e; }
 void rstream_stop(void) {}
 void rstream_update(const float cam[3]) { (void)cam; }
 int rstream_draw(const RsDrawCtx *c) { (void)c; return 0; }
+int rstream_area_ready(int *left) { if (left) *left = 0; return 1; }
+int rstream_cold(void) { return 0; }
+void rstream_rewarm(void) {}
 #endif

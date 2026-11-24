@@ -34,6 +34,14 @@ typedef struct {
 
 /* main thread, once per frame before drawing: zones, wanted list, uploads */
 void rstream_update(const float cam[3]);
+/* 1 once the area round the last rstream_update position is drawable (or
+   nothing streams); *left = sections/texture work still to come */
+int  rstream_area_ready(int *left);
+/* 1 from a fresh start until its first area is in (20 s at most): the
+   loading screen stays over the world meanwhile */
+int  rstream_cold(void);
+/* a jump (fast travel, a replay's exit): cold again until the new area is in */
+void rstream_rewarm(void);
 /* main view scenery; returns draws issued. Leaves uMVP = MVP, uModel = I,
    alpha test off, blend off, depth write on. */
 int  rstream_draw(const RsDrawCtx *c);
