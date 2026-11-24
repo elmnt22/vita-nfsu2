@@ -39,6 +39,9 @@ typedef struct {
  * has none. */
 WColl *wcoll_load(const char *stream_bun, const char *track_bun);
 void   wcoll_free(WColl *w);
+/* (port) one loaded copy per city, shared by the frame and the lean resident
+ * builds (worker threads): a reference to give back with wcoll_free. */
+WColl *wcoll_shared(const char *stream_bun, const char *track_bun);
 void   wcoll_cache_thread(void);   /* the thread whose gathers use the polygon cache (main) */
 int    wcoll_pack_count(const WColl *w);
 
@@ -81,6 +84,11 @@ typedef struct {
  * live pack, as the body's own collider does). Returns the count. */
 int wcoll_gather(WColl *w, WCollCtx *c, const float pos[3], const float mn[2],
                  const float mx[2], WCollPoly *out, int max);
+
+/* (port) every polygon in the xy box [mn, mx] over all packs, each once, the
+ * barrier groups' left out; cb returns 0 to stop. Any thread. Returns the count. */
+int wcoll_area_polys(const WColl *w, const float mn[2], const float mx[2],
+                     int (*cb)(void *u, const WCollPoly *p), void *u);
 
 /* Retail surface table 0x800ee0 (29 entries, stride 0x98). */
 #define WCOLL_NSURF 29

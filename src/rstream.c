@@ -441,6 +441,95 @@ static int rs_page_room(RsSec *s, int nv) {
     return s->npage++;
 }
 
+/* ---------------------------------------------------------------- sky
+   SKYDOME (solid be43edbb: the dome and its cap) is in the X library and
+   placed by a scenery instance (Z0 in L4RA), but the retail scenery draw
+   never draws it (rs_hash_valid): it is the sky pass's. The tile build kept
+   it in its track-wide tile; here it is kept aside at the build and placed
+   once on the main thread (rstream_sky). */
+#define RS_SKYMAX 4
+typedef struct { uint32_t solid, texkey; int nv, ni; float *v; unsigned char *col; uint16_t *ix; } RsSkySrc;
+static RsSkySrc g_skysrc[RS_SKYMAX]; static int g_nskysrc;   /* worker writes under g_mx */
+static N2Batch g_skyb[RS_SKYMAX]; static int g_nskyb, g_sky_slot[RS_SKYMAX];
+static int g_sky_state;   /* 0 not placed, 1 placed (batches made), 2 no instance found yet */
+static void rs_sky_keep(uint32_t solid, const N2Mesh *m) {
+    if (m->nverts <= 0 || m->nidx < 3 || m->nverts > RS_MAXV) return;
+    rs_lock(&g_mx);
+    int dup = 0;
+    for (int i = 0; i < g_nskysrc; i++) dup |= g_skysrc[i].solid == solid && g_skysrc[i].texkey == m->texkey;
+    if (!dup && g_nskysrc < RS_SKYMAX) {
+        RsSkySrc *k = &g_skysrc[g_nskysrc];
+        k->v = (float *)malloc((size_t)m->nverts * 5 * sizeof(float));
+        k->col = m->vcol ? (unsigned char *)malloc((size_t)m->nverts * 4) : NULL;
+        k->ix = (uint16_t *)malloc((size_t)m->nidx * sizeof(uint16_t));
+        if (k->v && k->ix && (!m->vcol || k->col)) {
+            memcpy(k->v, m->verts, (size_t)m->nverts * 5 * sizeof(float));
+            if (k->col) memcpy(k->col, m->vcol, (size_t)m->nverts * 4);
+            for (int t = 0; t < m->nidx; t++)
+                k->ix[t] = (uint16_t)(m->idx[t] >= 0 && m->idx[t] < m->nverts ? m->idx[t] : 0);
+            k->solid = solid; k->texkey = m->texkey; k->nv = m->nverts; k->ni = m->nidx;
+            g_nskysrc++;
+        } else { free(k->v); free(k->col); free(k->ix); memset(k, 0, sizeof *k); }
+    }
+    rs_unlock(&g_mx);
+}
+/* the smokeable props' models (a few dozen solids), kept as CPU meshes: the
+   lean resident has no tile cache to take them from, and smokeable.c draws,
+   hits and smashes them from the resident scene (role 3) */
+typedef struct { uint32_t solid; N2Mesh m; } RsProp;
+static RsProp *g_prop; static int g_nprop, g_cprop;
+static volatile int g_prop_gen;
+int rstream_prop_gen(void) { return g_prop_gen; }
+static void rs_prop_keep(uint32_t solid, const N2Mesh *m) {
+    if (m->nverts <= 0 || m->nidx < 3 || !smk_is_model(solid)) return;
+    N2Mesh c = *m;
+    c.shared_geometry = NULL; c.authored_normals = 0;
+    c.verts = (float *)malloc((size_t)m->nverts * 5 * sizeof(float));
+    c.idx = (uint16_t *)malloc((size_t)m->nidx * sizeof(uint16_t));
+    c.vcol = m->vcol ? (unsigned char *)malloc((size_t)m->nverts * 4) : NULL;
+    if (!c.verts || !c.idx || (m->vcol && !c.vcol)) { free(c.verts); free(c.idx); free(c.vcol); return; }
+    memcpy(c.verts, m->verts, (size_t)m->nverts * 5 * sizeof(float));
+    memcpy(c.idx, m->idx, (size_t)m->nidx * sizeof(uint16_t));
+    if (c.vcol) memcpy(c.vcol, m->vcol, (size_t)m->nverts * 4);
+    rs_lock(&g_mx);
+    int dup = 0;   /* a re-read section: the same solid again */
+    for (int i = 0; i < g_nprop && !dup; i++)
+        dup = g_prop[i].solid == solid && g_prop[i].m.texkey == m->texkey &&
+              g_prop[i].m.nverts == m->nverts && g_prop[i].m.nidx == m->nidx;
+    if (!dup && g_nprop == g_cprop) {
+        int cap = g_cprop ? g_cprop * 2 : 64;
+        RsProp *n = (RsProp *)realloc(g_prop, (size_t)cap * sizeof *n);
+        if (n) { g_prop = n; g_cprop = cap; }
+    }
+    if (!dup && g_nprop < g_cprop) { g_prop[g_nprop].solid = solid; g_prop[g_nprop].m = c; g_nprop++; g_prop_gen++; c.verts = NULL; c.idx = NULL; c.vcol = NULL; }
+    rs_unlock(&g_mx);
+    free(c.verts); free(c.idx); free(c.vcol);
+}
+static void rs_prop_free(void) {
+    rs_lock(&g_mx);
+    for (int i = 0; i < g_nprop; i++) { free(g_prop[i].m.verts); free(g_prop[i].m.idx); free(g_prop[i].m.vcol); }
+    free(g_prop); g_prop = NULL; g_nprop = g_cprop = 0;
+    rs_unlock(&g_mx);
+}
+int rstream_prop_place(uint32_t model, const float M[16], N2Scene *dst) {
+    int n = 0;
+    rs_lock(&g_mx);
+    for (int i = 0; i < g_nprop; i++)
+        if (g_prop[i].solid == model && winst_place_mesh(dst, &g_prop[i].m, M, g_prop[i].m.aname, NULL)) n++;
+    rs_unlock(&g_mx);
+    return n;
+}
+static void rs_sky_free(int sources) {
+    for (int i = 0; i < g_nskyb; i++) {
+        if (g_skyb[i].vbo) glDeleteBuffers(1, &g_skyb[i].vbo);
+        if (g_skyb[i].ibo) glDeleteBuffers(1, &g_skyb[i].ibo);
+    }
+    memset(g_skyb, 0, sizeof g_skyb); g_nskyb = 0; g_sky_state = 0;
+    if (!sources) return;
+    for (int i = 0; i < g_nskysrc; i++) { free(g_skysrc[i].v); free(g_skysrc[i].col); free(g_skysrc[i].ix); }
+    memset(g_skysrc, 0, sizeof g_skysrc); g_nskysrc = 0;
+}
+
 static void rs_build_solid(RsBuild *B, long beg, long end) {
     RsSec *s = B->s;
     N2Leaf h[2]; int nh = 0;
@@ -464,7 +553,9 @@ static void rs_build_solid(RsBuild *B, long beg, long end) {
     so->m0 = s->nmesh; so->sec = s;
     for (int i = 0; i < sc.count; i++) {
         const N2Mesh *m = &sc.meshes[i];
-        if (m->nverts <= 0 || m->nidx < 3 || m->nverts > RS_MAXV || m->cat == N2_SKY) continue;
+        if (m->cat == N2_SKY) { rs_sky_keep(so->hash, m); continue; }
+        rs_prop_keep(so->hash, m);
+        if (m->nverts <= 0 || m->nidx < 3 || m->nverts > RS_MAXV) continue;
         /* a material piece carries its solid's whole vertex pool (n2_add_pair
            takes an index sub-range): keep only the vertices its indices use
            (X0: 973k vertices for 468k indices before this) */
@@ -1089,10 +1180,100 @@ void rstream_stop(void) {
     g.dec_bytes = 0; g.ndec = 0; g.tex_gpu = 0;
     memset(g_solhash, 0, sizeof g_solhash); memset(g_hdr, 0, sizeof g_hdr); memset(g_xhash, 0, sizeof g_xhash);
     rs_free_tables();
+    rs_sky_free(1);
+    rs_prop_free();
     g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0;
     printf("rstream: stopped\n");
 }
 int rstream_active(void) { return g.active; }
+
+/* the sky batches, world space, texture keys for the sky profile (the tile
+   build's n2_sky_remap_key); 0 until the dome's library and its instance are in */
+N2Batch *rstream_sky(int profile, int *count) {
+    *count = 0;
+    if (!g.active) return NULL;
+    static int last_profile = -999;
+    if (g_sky_state == 1 && profile != last_profile) rs_sky_free(0);
+    if (g_sky_state != 1) {
+        static Uint32 last_try;
+        if (g_sky_state == 2 && SDL_GetTicks() - last_try < 500) return NULL;
+        last_try = SDL_GetTicks();
+        rs_lock(&g_mx); int nsrc = g_nskysrc; rs_unlock(&g_mx);
+        if (!nsrc) { g_sky_state = 2; return NULL; }
+        /* the instance placing the dome solid, in any built section */
+        const RsInst *in = NULL;
+        for (int i = 0; i < g.nsec && !in; i++) {
+            RsSec *s = &g.sec[i];
+            if (s->state < 3) continue;
+            for (int c = 0; c < s->nscen && !in; c++) {
+                RsScen *sc = &s->scen[c];
+                for (int k = 0; k < sc->ninst && !in; k++) {
+                    int inf = sc->in[k].info;
+                    if (inf < 0 || inf >= sc->ninfo) continue;
+                    uint32_t h = rd32(sc->info + inf * 0x44 + 0x20);
+                    for (int q = 0; q < nsrc && !in; q++) if (g_skysrc[q].solid == h) in = &sc->in[k];
+                }
+            }
+        }
+        if (!in) { g_sky_state = 2; return NULL; }
+        float M[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        if (!(in->flags & 0x100)) {
+            for (int row = 0; row < 3; row++)
+                for (int col = 0; col < 3; col++) M[row * 4 + col] = (float)in->rot[row * 3 + col] * (1.0f / 8192.0f);
+            M[12] = in->pos[0]; M[13] = in->pos[1]; M[14] = in->pos[2];
+        }
+        for (int q = 0; q < nsrc && g_nskyb < RS_SKYMAX; q++) {
+            const RsSkySrc *k = &g_skysrc[q];
+            BatchedVertex *bv = (BatchedVertex *)malloc((size_t)k->nv * sizeof *bv);
+            if (!bv) continue;
+            N2Batch *b = &g_skyb[g_nskyb]; memset(b, 0, sizeof *b);
+            for (int c = 0; c < 3; c++) { b->bbox_min[c] = 1e30f; b->bbox_max[c] = -1e30f; }
+            for (int v = 0; v < k->nv; v++) {
+                const float *p = k->v + v * 5; BatchedVertex *o = &bv[v];
+                float x = p[0], y = p[1], z = p[2];
+                o->pos[0] = M[0]*x + M[4]*y + M[8]*z + M[12];
+                o->pos[1] = M[1]*x + M[5]*y + M[9]*z + M[13];
+                o->pos[2] = M[2]*x + M[6]*y + M[10]*z + M[14];
+                o->uv[0] = p[3]; o->uv[1] = p[4];
+                BV_SET_NORMAL(o, 0.0f, 0.0f, 1.0f);
+                if (k->col) memcpy(o->col, k->col + v * 4, 4);
+                else o->col[0] = o->col[1] = o->col[2] = o->col[3] = 255;
+                for (int c = 0; c < 3; c++) {
+                    if (o->pos[c] < b->bbox_min[c]) b->bbox_min[c] = o->pos[c];
+                    if (o->pos[c] > b->bbox_max[c]) b->bbox_max[c] = o->pos[c];
+                }
+            }
+            glGenBuffers(1, &b->vbo); glGenBuffers(1, &b->ibo);
+            glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)k->nv * sizeof *bv), bv, GL_STATIC_DRAW);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)((size_t)k->ni * sizeof(uint16_t)), k->ix, GL_STATIC_DRAW);
+            free(bv);
+            b->index_count = k->ni; b->nmesh = 1;
+            b->texkey = n2_sky_remap_key(profile, k->texkey);
+            rs_lock(&g_mx);
+            int slot = rs_tex_slot(b->texkey, 1);
+            int go = slot >= 0 && g_tex[slot].state == 1;
+            if (go) g_tex[slot].state = 5;
+            rs_unlock(&g_mx);
+            if (go) rs_tex_decode(slot);   /* once: the upload below (or the next frame's) binds it */
+            g_sky_slot[g_nskyb++] = slot;
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, 0); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        g_sky_state = 1; last_profile = profile;
+        printf("rstream: sky placed at (%.0f %.0f %.0f): %d batch(es) for profile %d\n",
+               M[12], M[13], M[14], g_nskyb, profile);
+    }
+    int n = 0;
+    for (int i = 0; i < g_nskyb; i++) {
+        int t = g_sky_slot[i];
+        g_skyb[i].tex = t >= 0 && g_tex[t].state == 3 ? g_tex[t].tex : 0;
+        n += g_skyb[i].tex != 0;
+    }
+    if (!n) { rs_tex_upload(SDL_GetPerformanceCounter() + SDL_GetPerformanceFrequency() / 500); return NULL; }
+    *count = g_nskyb;
+    return g_skyb;
+}
 
 /* the scenery set (resident_args.scenery_event: -1 free roam, > 0 a race's
    event, 0 unfiltered) -- the selection world_instance.c builds for the tiles */
@@ -1335,6 +1516,7 @@ static RsDef g_def[4][RS_MAXDEF]; static int g_ndef[4];   /* 0 reflect, 1 cutout
 typedef struct {
     const RsDrawCtx *c; float H; int cell; unsigned cull;
     float dir[3];
+    int aux;
 } RsCull;
 
 /* groups + smackable props, per instance, once per selection (bsearches) */
@@ -1357,6 +1539,13 @@ static void rs_draw_instance(RsCull *K, RsScen *sc, int ii, int state) {
     if (K->cell >= 0 && in->pre >= 0 && (sc->pre[in->pre * 0x80 + (K->cell >> 3)] >> (K->cell & 7) & 1)) { g.st_cull[0]++; return; }
     /* scenery groups / props (the port's rules, not the 0x10 exclusion bit) */
     if (sc->hide[ii]) { g.st_cull[sc->hide[ii] == 1 ? 7 : 6]++; return; }
+    if (K->aux) {   /* an auxiliary view: near, and standing up where asked */
+        const RsDrawCtx *c = K->c;
+        if (in->hi[2] < c->minz || in->hi[2] - in->lo[2] < c->minh) return;
+        float dx = c->cam[0] < in->lo[0] ? in->lo[0] - c->cam[0] : c->cam[0] > in->hi[0] ? c->cam[0] - in->hi[0] : 0.0f;
+        float dy = c->cam[1] < in->lo[1] ? in->lo[1] - c->cam[1] : c->cam[1] > in->hi[1] ? c->cam[1] - in->hi[1] : 0.0f;
+        if (dx * dx + dy * dy > c->reach * c->reach) return;
+    }
     /* 2 view exclusion */
     if (((flags & 0xff) ^ 0x60) & K->cull) { g.st_cull[1]++; return; }
     /* 3 frustum */
@@ -1492,8 +1681,13 @@ int rstream_draw(const RsDrawCtx *c) {
     Uint64 f = SDL_GetPerformanceFrequency(), t0 = SDL_GetPerformanceCounter();
     RsCull K; memset(&K, 0, sizeof K);
     K.c = c;
+    const int aux = c->aux;
+    long aux_cull[8], aux_b[3];   /* an aux view leaves the main view's stats alone */
+    if (aux) { memcpy(aux_cull, g.st_cull, sizeof aux_cull); aux_b[0] = g.st_binst; aux_b[1] = g.st_bruns; aux_b[2] = g.st_bpieces; }
+    K.aux = aux;
     float th = tanf(c->hfov43 * 0.5f);
     K.H = th != 0.0f ? 256.0f / th : 10.0f;
+    if (aux && c->pix > 0.0f) K.H *= c->pix;
     float ll = sqrtf(c->look[0]*c->look[0] + c->look[1]*c->look[1] + c->look[2]*c->look[2]);
     for (int i = 0; i < 3; i++) K.dir[i] = ll > 1e-6f ? c->look[i] / ll : 0.0f;
     /* precull mode 3: only at camera speed >= 17.88 m/s */
@@ -1530,6 +1724,7 @@ int rstream_draw(const RsDrawCtx *c) {
             if (!m->b.vbo || !rs_mesh_visible(c, R, m)) continue;
             unsigned char md = rs_mesh_mode(m);
             int q = m->glow ? 3 : md == N2_DRAW_BLEND || md == N2_DRAW_ADD ? 2 : md == N2_DRAW_CUTOUT ? 1 : m->reflect && c->refl_ready ? 0 : -1;
+            if (aux && (q == 1 || draws >= c->max_draws)) continue;
 #ifdef OPENUG2_SIM_PRE_H
             {   /* test aid (simulator): OPENUG2_RS_HIDEQ=<q> hides a class (-1 opaque, 0 reflect, 1 cutout, 2 blend, 3 glow) */
                 static int hq = -9; if (hq == -9) { const char *e = getenv("OPENUG2_RS_HIDEQ"); hq = e && *e ? atoi(e) : -5; }
@@ -1590,6 +1785,7 @@ int rstream_draw(const RsDrawCtx *c) {
                 if (bp->vbo) {
                     unsigned char md = rs_mesh_mode(m);
                     int cq = m->glow ? 3 : md == N2_DRAW_BLEND || md == N2_DRAW_ADD ? 2 : md == N2_DRAW_CUTOUT ? 1 : m->reflect && c->refl_ready ? 0 : -1;
+                    if (aux && (cq == 1 || draws >= c->max_draws)) cq = -9;
 #ifdef OPENUG2_SIM_PRE_H
                     static int hq = -9; if (hq == -9) { const char *e = getenv("OPENUG2_RS_HIDEQ"); hq = e && *e ? atoi(e) : -5; }
                     if (hq == cq) cq = -9;
@@ -1670,6 +1866,11 @@ int rstream_draw(const RsDrawCtx *c) {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
     rs_set_mtx(c, -1);
+    if (aux) {
+        memcpy(g.st_cull, aux_cull, sizeof aux_cull);
+        g.st_binst = aux_b[0]; g.st_bruns = aux_b[1]; g.st_bpieces = aux_b[2];
+        return draws;
+    }
     Uint64 t2 = SDL_GetPerformanceCounter();
 
     /* stats, every 600 frames */
@@ -1714,6 +1915,9 @@ int rstream_draw(const RsDrawCtx *c) {
 int rstream_enabled(void) { return 0; }
 int rstream_track_ok(const char *t) { (void)t; return 0; }
 int rstream_active(void) { return 0; }
+N2Batch *rstream_sky(int p, int *n) { (void)p; *n = 0; return NULL; }
+int rstream_prop_place(uint32_t m, const float M[16], N2Scene *d) { (void)m; (void)M; (void)d; return 0; }
+int rstream_prop_gen(void) { return 0; }
 int rstream_start(const char *r, const char *t) { (void)r; (void)t; return 0; }
 void rstream_set_event(int e) { (void)e; }
 void rstream_stop(void) {}

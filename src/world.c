@@ -17,6 +17,10 @@
 #include "resource.h"
 #include "beyond.h"
 #include "xpcity.h"
+#include "wcoll.h"
+#include "rstream.h"
+#include "smokeable.h"
+#include "SDL.h"
 
 #ifdef __vita__
 void vita_mark(const char *fmt, ...);
@@ -26,6 +30,8 @@ void vita_mark(const char *fmt, ...);
 #endif
 
 static void grid_build(World *w);
+static int world_lean_scene(N2Scene *sc, const char *troot, const char *track, float x, float y, float r);
+static int g_lean_missing, g_lean_gen;   /* the last world_lean_scene's (build worker) */
 static void nav_build_adj(World *w);
 
 static void world_scene_free(N2Scene *scene) {
@@ -310,7 +316,8 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
 #ifdef __vita__
         /* decide on world tiles BEFORE taking the pinned bundle: switching
            them on strips (reallocates) it */
-        if (nreg == 1) (void)world_tiles_enabled(regs[r]);
+        if (nreg == 1 && world_lean_track(regs[r])) res_pin_strip();   /* textures, lights, grass only */
+        else if (nreg == 1) (void)world_tiles_enabled(regs[r]);
         if (beyond_is_track(regs[r])) {   /* the World Expansion has no bundle: tiles only (hwlog80: a failed open per build) */
             g->data = NULL; g->len = 0; g->pinned = 0;
             g->mesh0 = g->mesh1 = w->neighborhood.scene.count;
@@ -458,6 +465,20 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         }
         int built = 0;
 #ifdef __vita__
+        if (nreg == 1 && world_lean_track(regs[0])) {   /* the streamer draws it: collision only */
+            if (!world_lean_scene(&w->neighborhood.scene, troot, regs[0], options->focus_x, options->focus_y,
+                                  options->view_radius)) {
+                world_scene_free(&w->neighborhood.scene);
+                w->neighborhood.load_failed = 1;
+                world_instance_lend_bundle(NULL, NULL, 0);
+                return 0;
+            }
+            snprintf(w->neighborhood.inst_stats.bundle, sizeof w->neighborhood.inst_stats.bundle, "%s", regs[0]);
+            w->neighborhood.lean = 1;
+            w->neighborhood.lean_props_missing = g_lean_missing;
+            w->neighborhood.lean_prop_gen = g_lean_gen;
+            built = 1;
+        } else
         /* prebuilt tiles: read and share instead of placing */
         if (nreg == 1 && world_tiles_enabled(regs[0])) {
             built = world_tiles_assemble(&w->neighborhood.scene, &w->neighborhood.vista, troot, regs[0],
@@ -589,6 +610,118 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         w->neighborhood.radius = options->view_radius;
     }
     return nm;
+}
+
+/* ---- the lean resident (no tile cache) ----
+   With the retail streamer drawing a city (rstream.c), the resident world is
+   no longer a copy of the city's meshes: its scene is the retail collision
+   (wcoll.c, the game's own ground and walls) as never-drawn meshes, for the
+   port's ground queries (spawn, car shadows, race grid, area checks, walls),
+   in 64 m tiles. */
+int world_lean_track(const char *track) {
+#ifdef __vita__
+    return track && rstream_track_ok(track);
+#else
+    (void)track; return 0;
+#endif
+}
+typedef struct { N2Scene *sc; int key[4096][4]; int nkey; long polys, walls, tris, props, prop_meshes, prop_missing; int full; } WLean;
+static int wl_mesh(WLean *L, int tx, int ty, int cat) {
+    for (int i = L->nkey - 1; i >= 0; i--)
+        if (L->key[i][0] == tx && L->key[i][1] == ty && L->key[i][2] == cat &&
+            L->sc->meshes[L->key[i][3]].nidx < 3 * 8000) return L->key[i][3];
+    if (L->nkey >= 4096) return -1;
+    if (L->sc->count == L->sc->cap) {
+        int c = L->sc->cap ? L->sc->cap * 2 : 256;
+        N2Mesh *n = (N2Mesh *)realloc(L->sc->meshes, (size_t)c * sizeof *n);
+        if (!n) return -1;
+        L->sc->meshes = n; L->sc->cap = c;
+    }
+    int mi = L->sc->count++;
+    N2Mesh *m = &L->sc->meshes[mi]; memset(m, 0, sizeof *m);
+    m->cat = cat; m->world_role = 4;   /* collision only, never drawn */
+    snprintf(m->sname, sizeof m->sname, "WCOLL_%d_%d", tx, ty);
+    for (int c = 0; c < 3; c++) { m->world_bounds[c] = 1e30f; m->world_bounds[c + 3] = -1e30f; }
+    L->key[L->nkey][0] = tx; L->key[L->nkey][1] = ty; L->key[L->nkey][2] = cat; L->key[L->nkey][3] = mi;
+    L->nkey++;
+    return mi;
+}
+static int wl_poly(void *u, const WCollPoly *p) {
+    WLean *L = (WLean *)u;
+    if (p->flags & 4) return 1;            /* a +-2048 m vertical sheet: no height to give */
+    int cat;
+    if (p->n[2] >= 0.5f || p->n[2] <= -0.5f) {
+        int s = p->surface;   /* DIRT GRAVEL PUDDLE DEEP_WATER GRASS: terrain (road wins a tie) */
+        cat = (s == 8 || s == 9 || s == 13 || s == 14 || s == 15) ? N2_TERRAIN : N2_ROAD;
+    } else { cat = N2_OTHER; L->walls++; }
+    float cx = 0, cy = 0;
+    for (int i = 0; i < p->nv; i++) { cx += p->v[i][0]; cy += p->v[i][1]; }
+    cx /= (float)p->nv; cy /= (float)p->nv;
+    int mi = wl_mesh(L, (int)floorf(cx / 64.0f), (int)floorf(cy / 64.0f), cat);
+    if (mi < 0) { L->full = 1; return 0; }
+    N2Mesh *m = &L->sc->meshes[mi];
+    int nv = m->nverts, ni = m->nidx, add = p->nv == 4 ? 6 : 3;
+    float *v = (float *)realloc(m->verts, (size_t)(nv + p->nv) * 5 * sizeof(float));
+    if (!v) { L->full = 1; return 0; }
+    m->verts = v;
+    uint16_t *ix = (uint16_t *)realloc(m->idx, (size_t)(ni + add) * sizeof(uint16_t));
+    if (!ix) { L->full = 1; return 0; }
+    m->idx = ix;
+    for (int i = 0; i < p->nv; i++) {
+        float *o = v + (size_t)(nv + i) * 5;
+        o[0] = p->v[i][0]; o[1] = p->v[i][1]; o[2] = p->v[i][2]; o[3] = o[4] = 0.0f;
+        for (int c = 0; c < 3; c++) {
+            if (o[c] < m->world_bounds[c]) m->world_bounds[c] = o[c];
+            if (o[c] > m->world_bounds[c + 3]) m->world_bounds[c + 3] = o[c];
+        }
+    }
+    ix[ni++] = (uint16_t)nv; ix[ni++] = (uint16_t)(nv + 1); ix[ni++] = (uint16_t)(nv + 2);
+    if (p->nv == 4) { ix[ni++] = (uint16_t)nv; ix[ni++] = (uint16_t)(nv + 2); ix[ni++] = (uint16_t)(nv + 3); }
+    m->nverts = nv + p->nv; m->nidx = ni; m->world_bounds_valid = 1;
+    L->polys++; L->tris += add / 3;
+    return 1;
+}
+/* a smokeable spawner's prop: its model's meshes at its matrix, kept by
+   scenery id for smokeable.c (the tile builds' role 3) */
+static int wl_prop(void *u, unsigned section, unsigned instance, uint32_t model, const float M[16]) {
+    WLean *L = (WLean *)u;
+    int m0 = L->sc->count;
+    int n = rstream_prop_place(model, M, L->sc);
+    if (!n) { L->prop_missing++; return 1; }
+    for (int i = m0; i < L->sc->count; i++) {
+        N2Mesh *m = &L->sc->meshes[i];
+        m->world_role = 3; m->scen_has = 1;
+        m->scen_region = (uint16_t)section; m->scen_index = (uint16_t)instance;
+    }
+    L->props++; L->prop_meshes += n;
+    return 1;
+}
+/* the never-drawn collision scene of the box around (x, y); 0 = no collision data */
+static int world_lean_scene(N2Scene *sc, const char *troot, const char *track, float x, float y, float r) {
+    const char *b = strrchr(track, '/'); b = b ? b + 1 : track;
+    const char *stem = !strncmp(b, "STREAM", 6) ? b + 6 : b;
+    char sp[1100], tp[1100];
+    snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, stem);
+    snprintf(tp, sizeof tp, "%s/%s.BUN", troot, stem);
+    WColl *wc = wcoll_shared(sp, tp);
+    if (!wc) { printf("lean resident: no collision for %s\n", track); return 0; }
+    WLean *L = (WLean *)calloc(1, sizeof *L);
+    if (!L) { wcoll_free(wc); return 0; }
+    L->sc = sc;
+    float mn[2] = { x - r, y - r }, mx[2] = { x + r, y + r };
+    Uint32 t0 = SDL_GetTicks();
+    wcoll_area_polys(wc, mn, mx, wl_poly, L);
+    wcoll_free(wc);
+    int ok = !L->full;
+    g_lean_gen = rstream_prop_gen();   /* before placing: a model kept meanwhile still rebuilds */
+    if (ok) smk_spawners_box(mn, mx, wl_prop, L);   /* the smokeable props (role 3) */
+    g_lean_missing = (int)L->prop_missing;
+    printf("lean resident: %ld collision polygons (%ld walls, %ld triangles) in %d meshes around (%.0f %.0f) r %.0f, "
+           "%ld props (%ld meshes, %ld models missing), %u ms%s\n",
+           L->polys, L->walls, L->tris, sc->count, x, y, r, L->props, L->prop_meshes, L->prop_missing,
+           (unsigned)(SDL_GetTicks() - t0), ok ? "" : " -- OUT OF ROOM");
+    free(L);
+    return ok;
 }
 
 int world_neighborhood_load(WorldNeighborhood *neighborhood,

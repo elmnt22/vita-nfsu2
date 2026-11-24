@@ -118,6 +118,8 @@ struct WColl {
        every pack under the point: a 128 m grid of pack lists */
     float gx0, gy0; int gw, gh;
     int *gstart, *glist;
+    int refs;                    /* (port) wcoll_shared: the frame's user + the lean resident builds */
+    char path[1100];
 };
 
 static uint32_t rd32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -417,9 +419,34 @@ static inline uintptr_t pc_self(void) {
 static uintptr_t g_pc_tid;
 void wcoll_cache_thread(void) { g_pc_tid = pc_self(); }
 
+static volatile int g_sh_lock;
+static WColl *g_shared;          /* the last city wcoll_shared loaded (holds one reference) */
+static void sh_lock(void) { while (__sync_lock_test_and_set(&g_sh_lock, 1)) SDL_Delay(0); }
+static void sh_unlock(void) { __sync_lock_release(&g_sh_lock); }
+static void wcoll_destroy(WColl *w);
+WColl *wcoll_shared(const char *stream_bun, const char *track_bun)
+{
+    sh_lock();
+    if (g_shared && !strcmp(g_shared->path, stream_bun)) { g_shared->refs++; sh_unlock(); return g_shared; }
+    if (g_shared && --g_shared->refs <= 0) wcoll_destroy(g_shared);
+    g_shared = wcoll_load(stream_bun, track_bun);
+    if (g_shared) { snprintf(g_shared->path, sizeof g_shared->path, "%s", stream_bun); g_shared->refs = 2; }
+    WColl *w = g_shared;
+    sh_unlock();
+    return w;
+}
 void wcoll_free(WColl *w)
 {
     if (!w) return;
+    sh_lock();
+    int gone = w->refs <= 1;
+    if (!gone) w->refs--;
+    else if (w == g_shared) g_shared = NULL;
+    sh_unlock();
+    if (gone) wcoll_destroy(w);
+}
+static void wcoll_destroy(WColl *w)
+{
     for (int i = 0; i < (1 << PC_BITS); i++) if (g_pc[i].w == w) g_pc[i].w = NULL;
     for (int i = 0; i < w->npacks; i++) free(w->packs[i].data);
     for (int i = 0; i < w->nbnd; i++) free(w->bnd[i].xy);
@@ -430,6 +457,72 @@ void wcoll_free(WColl *w)
 }
 
 int wcoll_pack_count(const WColl *w) { return w ? w->npacks : 0; }
+
+/* (port) every polygon of every pack in an xy box, each once (the x20.. pack
+   copies and overlapping packs share polygons), barrier-group polygons left
+   out. Read-only, any thread: the lean resident's never-drawn ground. */
+static void poly_expand(const Pack *k, const unsigned char *q, WCollPoly *o);
+int wcoll_area_polys(const WColl *w, const float mn[2], const float mx[2],
+                     int (*cb)(void *u, const WCollPoly *p), void *u)
+{
+    if (!w || !cb) return 0;
+    int cap = 1 << 16, n = 0, seen = 0;
+    uint64_t *set = (uint64_t *)calloc((size_t)cap, sizeof *set);
+    if (!set) return 0;
+    for (int pk = 0; pk < w->npacks; pk++) {
+        const Pack *k = &w->packs[pk];
+        if (k->x0 > mx[0] || k->y0 > mx[1] || k->x0 + 32.0f * k->W < mn[0] || k->y0 + 32.0f * k->H < mn[1]) continue;
+        int x0 = (int)floorf((mn[0] - k->x0) / 32.0f), x1 = (int)floorf((mx[0] - k->x0) / 32.0f);
+        int y0 = (int)floorf((mn[1] - k->y0) / 32.0f), y1 = (int)floorf((mx[1] - k->y0) / 32.0f);
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+        if (x1 > k->W - 1) x1 = k->W - 1; if (y1 > k->H - 1) y1 = k->H - 1;
+        for (int iy = y0; iy <= y1; iy++)
+            for (int ix = x0; ix <= x1; ix++) {
+                const unsigned char *cell = k->cells + 4 * (k->W * iy + ix);
+                int e0 = rd16(cell), e1 = e0 + rd16(cell + 2);
+                if (e1 > k->nlist) e1 = k->nlist;
+                for (int e = e0; e < e1; e++) {
+                    int pi = rd16(k->list + 4 * e + 0);
+                    if (pi >= k->npoly) continue;
+                    const unsigned char *q = k->poly + 32 * pi;
+                    if (q[0]) continue;                      /* a barrier group's */
+                    /* once: FNV-1a of the record and its pack origin */
+                    uint64_t h = 1469598103934665603ull;
+                    for (int b = 0; b < 32; b++) { h ^= q[b]; h *= 1099511628211ull; }
+                    float org[2] = { k->ox, k->oy };
+                    const unsigned char *ob = (const unsigned char *)org;
+                    for (int b = 0; b < 8; b++) { h ^= ob[b]; h *= 1099511628211ull; }
+                    if (!h) h = 1;
+                    if ((seen + 1) * 2 > cap) {
+                        int nc = cap * 2; uint64_t *ns = (uint64_t *)calloc((size_t)nc, sizeof *ns);
+                        if (!ns) { free(set); return n; }
+                        for (int i = 0; i < cap; i++) if (set[i]) {
+                            uint32_t s2 = (uint32_t)(set[i] >> 20) & (uint32_t)(nc - 1);
+                            while (ns[s2]) s2 = (s2 + 1) & (uint32_t)(nc - 1);
+                            ns[s2] = set[i];
+                        }
+                        free(set); set = ns; cap = nc;
+                    }
+                    uint32_t s = (uint32_t)(h >> 20) & (uint32_t)(cap - 1);
+                    int dup = 0;
+                    while (set[s]) { if (set[s] == h) { dup = 1; break; } s = (s + 1) & (uint32_t)(cap - 1); }
+                    if (dup) continue;
+                    set[s] = h; seen++;
+                    WCollPoly o; poly_expand(k, q, &o); o.id = (pk << 16) | pi;
+                    float bx0 = o.v[0][0], bx1 = bx0, by0 = o.v[0][1], by1 = by0;
+                    for (int i = 1; i < o.nv; i++) {
+                        if (o.v[i][0] < bx0) bx0 = o.v[i][0]; if (o.v[i][0] > bx1) bx1 = o.v[i][0];
+                        if (o.v[i][1] < by0) by0 = o.v[i][1]; if (o.v[i][1] > by1) by1 = o.v[i][1];
+                    }
+                    if (bx1 < mn[0] || by1 < mn[1] || bx0 > mx[0] || by0 > mx[1]) continue;
+                    n++;
+                    if (!cb(u, &o)) { free(set); return n; }
+                }
+            }
+    }
+    free(set);
+    return n;
+}
 
 void wcoll_ctx_init(WCollCtx *c)
 {

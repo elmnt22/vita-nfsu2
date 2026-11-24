@@ -36,6 +36,14 @@ void smk_free(void);
 /* Is this scenery instance (section, index) a smokeable's? Read-only after
    smk_load: safe from the world build worker. */
 int  smk_is_prop(unsigned section, unsigned instance);
+/* Is this solid hash a spawner's model? (the retail streamer keeps those
+   models' meshes for the lean resident). Read-only after smk_load. */
+int  smk_is_model(uint32_t model);
+/* Every spawner whose position lies in the xy box: cb(section, instance,
+   model, world matrix); cb returns 0 to stop. Read-only after smk_load. */
+int  smk_spawners_box(const float mn[2], const float mx[2],
+                      int (*cb)(void *u, unsigned section, unsigned instance,
+                                uint32_t model, const float M[16]), void *u);
 
 /* World::World -> SpawnSmokeables 0x5b4220: every spawner enabled again,
    every live prop gone (a new world: a race start or end, a track load). */

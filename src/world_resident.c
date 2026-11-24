@@ -853,7 +853,7 @@ static int resident_resources_step(WorldResidentResources *resources,
             resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
             return 0;
         }
-        if (resources->ordinary_count <= 0 || !resources->ordinary) goto fail;
+        if ((resources->ordinary_count <= 0 || !resources->ordinary) && !neighborhood->lean) goto fail;
         hitch_mark("fin.batch_upload");
         VMARK("  resident: %d world batches uploaded", resources->ordinary_count);
         hitch_mark("fin.vmark_batches");
@@ -905,7 +905,7 @@ static int resident_resources_step(WorldResidentResources *resources,
     hitch_mark("fin.vista");
 
     resources->debug_batches = (WorldMeshBatch *)calloc(
-        (size_t)resources->ordinary_count, sizeof *resources->debug_batches);
+        (size_t)(resources->ordinary_count ? resources->ordinary_count : 1), sizeof *resources->debug_batches);
     if (!resources->debug_batches) goto fail;
     for (int i = 0; i < resources->ordinary_count; i++) {
         resources->debug_batches[i].vbo = resources->ordinary[i].vbo;

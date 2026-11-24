@@ -145,6 +145,26 @@ static int spawner_of(unsigned section, unsigned instance)
     return -1;
 }
 int smk_is_prop(unsigned section, unsigned instance) { return spawner_of(section, instance) >= 0; }
+int smk_is_model(uint32_t model)
+{
+    if (!model) return 0;
+    for (int i = 0; i < g_nsp; i++) if (g_sp[i].model == model) return 1;
+    return 0;
+}
+int smk_spawners_box(const float mn[2], const float mx[2],
+                     int (*cb)(void *u, unsigned section, unsigned instance,
+                               uint32_t model, const float M[16]), void *u)
+{
+    int n = 0;
+    for (int i = 0; i < g_nsp; i++) {
+        const SmkSpawner *S = &g_sp[i];
+        float x = S->M[12], y = S->M[13];
+        if (x < mn[0] || x > mx[0] || y < mn[1] || y > mx[1]) continue;
+        n++;
+        if (!cb(u, S->section, S->instance, S->model, S->M)) break;
+    }
+    return n;
+}
 
 static void orthonormalise(float *m)                   /* the pack's first load (+0xe) */
 {

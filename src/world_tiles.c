@@ -992,6 +992,9 @@ static int g_wt_off_file;   /* notileload.txt: no preload either */
 int world_tiles_enabled(const char *track) {
 #ifdef __vita__
     if (g_wt_converting) return 0;
+    {   extern int world_lean_track(const char *);
+        if (world_lean_track(track)) return 0;   /* the retail streamer's city: no tiles */
+    }
     if (g_wt_enabled < 0) {
         FILE *off = fopen("ux0:data/NFSU2/notileload.txt", "r");
         if (off) { fclose(off); g_wt_off_file = 1; }

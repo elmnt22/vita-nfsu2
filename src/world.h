@@ -93,6 +93,9 @@ typedef struct {
     WInstStats inst_stats;
     float center[2], radius;
     int load_failed;                /* (Codex CR10) a 0-mesh load was a failure (read / memory / abort), not open water */
+    int lean;                       /* the scene is the never-drawn retail collision (world_lean_track): no draw batches */
+    int lean_props_missing;         /* lean: spawners in the box whose model the streamer had not kept yet */
+    int lean_prop_gen;              /* lean: rstream_prop_gen() when it was built */
     int *cat_idx; int cat_nsky, cat_nglow, cat_count;   /* (CR13) scene meshes: sky ones, then glow ones (worker-made; cat_count = scene.count then) */
 } WorldNeighborhood;
 
@@ -221,6 +224,9 @@ extern void (*world_region_hook)(const unsigned char *data, long len, int r, int
 int world_load_ex(World *w, const char *troot, const char *trackname,
                   const WLoadOptions *options);
 
+/* the retail streamer draws this track: its resident world is the never-drawn
+   retail collision, no tile cache (world.c, "the lean resident") */
+int world_lean_track(const char *track);
 int world_neighborhood_load(WorldNeighborhood *neighborhood,
                             const char *troot, const char *trackname,
                             const WLoadOptions *options);

@@ -212,6 +212,7 @@ static long pin_tpk(int fd, long off, uint32_t size, unsigned char *out, long cu
     return w;
 }
 
+static int g_pin_strip_req;   /* (defined below) */
 /* Two passes over the top-level chunk list: size, then copy. */
 static long pin_build(int fd, long flen, unsigned char *out, ResPixStub *stub, int *nstub) {
     long off = 0, cur = 0;
@@ -222,6 +223,10 @@ static long pin_build(int fd, long flen, unsigned char *out, ResPixStub *stub, i
         uint32_t cid = pin_u32(h), cs = pin_u32(h + 4);
         if ((unsigned long)cs > (unsigned long)(flen - off - 8)) return -1;   /* no signed wrap / zero-step loop */
         long next = off + 8 + (long)cs;
+        if (g_pin_strip_req && (cid == 0x80134000u || cid == 0x80034100u || cid == 0x80034130u)) {
+            off = next;   /* stripped (pin_strip): models and scenery are not wanted */
+            continue;
+        }
         if (cid == 0) {
             /* padding: shrink to the size that keeps the next chunk at its
                original offset modulo 128 */
@@ -388,8 +393,10 @@ unsigned char *res_bundle(const char *path, long *len) {
     g_pin_flen = flen; g_pin_gen++;
     printf("bundle pinned: %s %ld MB -> %ld MB in memory (%d pixel blocks on demand)\n",
            path, flen >> 20, size >> 20, nstub);
-    pin_cache_save(cpath, flen, PIN_MAGIC);   /* the full copy: a later conversion needs it */
-    if (g_pin_strip_req) pin_strip();
+    if (g_pin_strip_req) {   /* built stripped: its own cache only */
+        char spath[1110]; snprintf(spath, sizeof spath, "%s.strip", cpath);
+        pin_cache_save(spath, flen, PIN_STRIP_MAGIC);
+    } else pin_cache_save(cpath, flen, PIN_MAGIC);   /* the full copy: a later conversion needs it */
     *len = g_pin.len;
     return g_pin.data;
 }

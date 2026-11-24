@@ -17273,6 +17273,7 @@ int main(int argc, char **argv) {
             const char *conv[8], *conv_name[8]; int nconv = 0, boot_listed = 0, tiles_relaunch = 0;
             for (int q = 0; q < (int)(sizeof k_tile_tracks / sizeof *k_tile_tracks); q++) {
                 if (!strcmp(k_tile_tracks[q][0], trackname)) boot_listed = 1;
+                if (world_lean_track(k_tile_tracks[q][0])) continue;   /* the retail streamer draws it from the game data */
                 char bp[1024]; snprintf(bp, sizeof bp, "%s/%s.BUN", troot, k_tile_tracks[q][0]);
                 FILE *bf = fopen(bp, "rb");
                 if (!bf) continue;
@@ -17280,7 +17281,7 @@ int main(int argc, char **argv) {
                 if (world_tiles_ready(k_tile_tracks[q][0])) continue;
                 conv[nconv] = k_tile_tracks[q][0]; conv_name[nconv++] = k_tile_tracks[q][1];
             }
-            if (!boot_listed && !world_tiles_ready(trackname)) {
+            if (!boot_listed && !world_lean_track(trackname) && !world_tiles_ready(trackname)) {
                 conv[nconv] = trackname; conv_name[nconv++] = "THIS TRACK";
             }
             if (nconv) {
@@ -17422,7 +17423,7 @@ int main(int argc, char **argv) {
         char sp[1100], tp[1100];
         snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, stem);
         snprintf(tp, sizeof tp, "%s/%s.BUN", troot, stem);
-        g_wcoll = wcoll_load(sp, tp);
+        g_wcoll = wcoll_shared(sp, tp);   /* the lean resident build may have loaded it already */
         wcoll_ctx_init(&g_wcc);
         /* the track's particle definitions (0x35021 in L4RA.BUN: the shops'
            XEE_EVENT_* markers, XE_IP_NUCLEAR_PLANT) and its sections' world
@@ -21618,7 +21619,7 @@ int main(int argc, char **argv) {
                 char sp[1100], tp[1100];
                 snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, nstem);
                 snprintf(tp, sizeof tp, "%s/%s.BUN", troot, nstem);
-                g_wcoll = sw_beyond ? NULL : wcoll_load(sp, tp);   /* Beyond: ground + walls from its tiles */
+                g_wcoll = sw_beyond ? NULL : wcoll_shared(sp, tp);   /* Beyond: ground + walls from its tiles */
                 vita_mark("  switch: collision loaded (%u ms in)", SDL_GetTicks() - sw_t0);
                 ls_pump();   /* the loading screen keeps moving between the steps */
                 wcoll_ctx_init(&g_wcc);
@@ -23426,6 +23427,23 @@ int main(int argc, char **argv) {
             if (!resident_wanted) {
                 resident_wanted = 1;
                 target[0] = scenery_target[0]; target[1] = scenery_target[1];
+            }
+        }
+        /* a lean resident built before the streamer kept its props' models
+           (the first build of a session comes before X0): build the same
+           area once more now that they are there */
+        /* held every frame until the rebuild is active (a one-frame want
+           would see the finished build discarded as an obsolete target) */
+        if (resident_enabled && !resident_wanted &&
+            active_resident->world.lean && active_resident->world.lean_props_missing > 0 &&
+            active_resident->world.lean_prop_gen != rstream_prop_gen()) {
+            static unsigned long props_logged_gen = (unsigned long)-1;
+            resident_wanted = 1;
+            target[0] = active_resident->center[0]; target[1] = active_resident->center[1];
+            if (props_logged_gen != active_resident->generation) {
+                props_logged_gen = active_resident->generation;
+                printf("lean resident: %d props had no model yet; rebuilding (%.0f, %.0f)\n",
+                       active_resident->world.lean_props_missing, target[0], target[1]);
             }
         }
         /* A finished or finishing resident whose centre is nearer the car than
@@ -27310,6 +27328,19 @@ int main(int argc, char **argv) {
                         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                         rdraws += rblend;
                     }
+#ifdef __vita__
+                    if (rstream_active() && active_resident && active_resident->world.lean) {
+                        /* the retail streamer's scenery (the lean resident has no world batches) */
+                        RsDrawCtx ac; memset(&ac, 0, sizeof ac);
+                        ac.rp = &rp; ac.MVP = MVPr; ac.cam = view_cam; ac.look = look;
+                        ac.hfov43 = 2.0f * atanf(tanf(0.5f * cam_fovy) / 0.75f);
+                        ac.planes = (const float (*)[4])rplanes;
+                        ac.aux = 1; ac.reach = rreach; ac.minz = h + 1.5f; ac.minh = 1.0f;
+                        ac.pix = 0.5f; ac.max_draws = rlite ? 150 : 300;
+                        rdraws += rstream_draw(&ac);
+                        glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPr); render_model(&rp, NULL);
+                    }
+#endif
                     if (nglow) render_world_glows(&rp, glowbatch, nglow, MVPr);
                     if (g_acid_ok) {   /* the reflection view's flares (flareType 2), the camera unmirrored */
                         rdraws += pf_refl_flares(V, MVP, 0.5f * (float)H / tanf(0.5f * cam_fovy),
@@ -27698,6 +27729,19 @@ int main(int argc, char **argv) {
                         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                         edraws += eblend;
                     }
+#ifdef __vita__
+                    if (rstream_active() && active_resident && active_resident->world.lean) {
+                        RsDrawCtx ac; memset(&ac, 0, sizeof ac);
+                        float flook[3] = { -Ve[2], -Ve[6], -Ve[10] };   /* the face's forward */
+                        ac.rp = &rp; ac.MVP = MVPe; ac.cam = eye; ac.look = flook;
+                        ac.hfov43 = 1.5707963f;
+                        ac.planes = (const float (*)[4])eplanes;
+                        ac.aux = 1; ac.reach = 120.0f; ac.minz = -1e30f; ac.minh = 0.0f;
+                        ac.pix = 0.25f; ac.max_draws = 120;
+                        edraws += rstream_draw(&ac);
+                        glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPe); render_model(&rp, NULL);
+                    }
+#endif
                     if (nglow) render_world_glows(&rp, glowbatch, nglow, MVPe);
                     if (g_acid_ok) {   /* the cube face's flares (flareType 1, 0x5cadd0); GUESS: the face view's
                                           +0xc taken as retail's 128 px 90-degree face (64), the port's faces are 64 px */
@@ -27782,6 +27826,16 @@ int main(int argc, char **argv) {
            then overwrites it normally. Missing textures leave the fog clear
            colour as the conservative fallback. */
         static int nosky_t = -1; if (nosky_t < 0) nosky_t = getenv("OPENUG2_NOSKY") != NULL;   /* test aid */
+#ifdef __vita__
+        {   /* the retail streamer's sky (rstream_sky): the dome from the game's
+               own sections, when the resident world has none (no tile cache) */
+            static N2Batch *rs_sky_ptr;
+            int nrs = 0;
+            N2Batch *rsb = rstream_active() ? rstream_sky(sky_profile, &nrs) : NULL;
+            if (nrs && (!nsky || skybatch == rs_sky_ptr)) { skybatch = rs_sky_ptr = rsb; nsky = nrs; }
+            else if (!nrs && rs_sky_ptr && skybatch == rs_sky_ptr) { skybatch = NULL; nsky = 0; }
+        }
+#endif
         if (nsky && !nosky_t && (passmode == 0 || passmode == 3 || passbatch >= 0) && VITA_PROBE(1)) {   /* M78/M79 */
 #ifdef __vita__
             vita_use_lite(1);   /* the dome covers most of the screen: cheap FS */
@@ -28575,7 +28629,7 @@ int main(int argc, char **argv) {
                 rstream_start(resident_args.track_root, resident_args.trackname)) {
                 rstream_set_event(resident_args.scenery_event);
                 rstream_update(cam);
-                RsDrawCtx rc;
+                RsDrawCtx rc; memset(&rc, 0, sizeof rc);
                 rc.rp = &rp; rc.MVP = MVP; rc.cam = cam; rc.look = look;
                 rc.hfov43 = 2.0f * atanf(tanf(0.5f * cam_fovy) / 0.75f);
                 rc.planes = (const float (*)[4])world_planes; rc.refl_ready = g_refl_ready;
