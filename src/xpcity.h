@@ -13,6 +13,16 @@ const char *xpcity_region(const char *track);   /* its routes region (L2RA ...):
    translated here from ux0:data/NFSU2/expansion/<game>/TRACKS behind a progress
    screen). 1 = ready (or not a city), 0 = not installed / failed. */
 int xpcity_prepare(const char *troot, const char *track);
+/* 11-24: a city the retail streamer draws from its raw files (Rockport, when the raw
+   MW files are there and the streamer is on): no translated stream, no tiles */
+int xpcity_lean(const char *track);
+int xpcity_lean_game(const char *track);   /* its XP_GAME_*, 0 not lean */
+/* its raw stream (the streamer reads it, the bundle pin takes its textures) */
+int xpcity_stream_path(const char *track, char *out, size_t n);
+/* the collision the game reads for it: TRACKS/STREAMxxx.XPL (xp_lean) */
+int xpcity_coll_path(const char *troot, const char *track, char *out, size_t n);
+/* the lean file's night lamp flare packs (kept; NULL none) */
+unsigned char *xpcity_lamps(const char *troot, const char *track, long *len);
 /* xpcity_prepare opened the window already (the boot must not open another) */
 int xpcity_window_made(void);
 /* the city's minimap file (BMAP) once xpcity_prepare found or made it, else NULL */

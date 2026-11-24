@@ -48,8 +48,10 @@ static void need(Buf *b, size_t k) {
     if (b->n + k <= b->cap) return;
     size_t c = b->cap ? b->cap : 1 << 20;
     while (c < b->n + k) c *= 2;
-    b->p = realloc(b->p, c); if (!b->p) { fprintf(stderr, "out of memory\n"); exit(1); }
-    b->cap = c;
+    /* out of memory: g_oom (every put checks it), never exit -- the retail
+       streamer's worker translates sections in the game (xp_section) */
+    uint8_t *np = realloc(b->p, c); if (!np) { g_oom = 1; return; }
+    b->p = np; b->cap = c;
 }
 static void put(Buf *b, const void *d, size_t k) { need(b, k); if (g_oom) return; memcpy(b->p + b->n, d, k); b->n += k; }
 static void put32(Buf *b, uint32_t v) { put(b, &v, 4); }
@@ -247,6 +249,9 @@ static void conv_infos(Buf *o, const uint8_t *d, size_t sz)
     close_chunk(o, c);
 }
 static int g_game;
+/* xp_section (the retail streamer's in-game translation): models and scenery only,
+   MW's scenery tree renamed to UG2's id, no precull, no generated lamps */
+static int g_secmode;
 /* Carbon instance (0x60 B): +0 bmin, +0xc flags, +0x10 bmax, +0x1c s16 preculler, +0x20 position,
    +0x2c float 3x3 (scale included), +0x50 key, +0x54 scenery info number */
 static void conv_insts_carbon(Buf *o, const uint8_t *d, size_t sz)
@@ -729,6 +734,15 @@ static void walk(Buf *o, const uint8_t *p, size_t n)
 }
 static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const uint8_t *raw)
 {
+    if (g_secmode && g_game == XP_GAME_MW && (id == 0x34104 || id == 0x34105 || id == 0x34106 || id == 0x34107)) {
+        /* MW scenery: 0x34105 = the tree nodes (UG2's 0x34104 layout, 0x24 B), 0x34107 its
+           precull rows (0x80 B, but MW's cell grid is not known: left out, as no precull),
+           0x34106 s16 pairs (not used) */
+        if (id != 0x34105) return;
+        size_t at = o->n; put(o, raw, 8 + sz);
+        if (!g_oom) { uint32_t u = 0x34104; memcpy(o->p + at, &u, 4); }
+        return;
+    }
     if (id == 0x80134010) conv_object(o, d, sz);
     else if (id == 0x34102) conv_infos(o, d, sz);
     else if (id == 0x34103) conv_insts(o, d, sz);
@@ -736,7 +750,105 @@ static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const u
     else if (id == 0xb3300000 && g_game == XP_GAME_CARBON) conv_tpk_carbon(o, d, sz);
     else if (is_walked(id)) { size_t c = open_chunk(o, id); walk(o, d, sz); close_chunk(o, c); }
     else put(o, raw, 8 + sz);
-    if (id == 0x80034100 && g_relight) lamp_pack(o, d, sz);   /* after its section */
+    if (id == 0x80034100 && g_relight && !g_secmode) lamp_pack(o, d, sz);   /* after its section */
+}
+static void xp_setup(int game)
+{
+    g_relight = game == XP_GAME_MW;   /* Carbon is a night city already */
+    g_game = game;
+    if (game == XP_GAME_MW) { g_grec = 0x68; g_gvo = 0x3c; g_gto = 0x40; }
+    else { g_grec = 0x90; g_gvo = 0x40; g_gto = 0x60; }
+}
+
+/* One stream section (the retail streamer, rstream.c): its top-level chunks in, the
+   models (0x80134000) and scenery (0x80034100) in UG2's format out, aligned from the
+   start of the output (a new malloc block). Everything else is left out: textures
+   come from the pinned raw stream, collision from the lean file (xp_lean). One
+   thread at a time (this file's statics). */
+int xp_section(const uint8_t *in, size_t n, int game, uint8_t **out, size_t *outn)
+{
+    xp_setup(game);
+    memset(&st, 0, sizeof st); g_oom = 0;
+    Buf o = {0};
+    g_secmode = 1;
+    for (size_t q = 0; q + 8 <= n; ) {
+        uint32_t id = rd32(in + q), sz = rd32(in + q + 4);
+        if (q + 8 + (size_t)sz > n) { st.bad++; break; }
+        if (id == 0x80134000 || id == 0x80034100) {
+            size_t want = q % 0x80, have = (size_t)(o.n % 0x80);
+            if (want != have) {
+                size_t k = (want - have + 0x80) % 0x80; if (k < 8) k += 0x80;
+                put32(&o, 0); put32(&o, (uint32_t)(k - 8)); putz(&o, k - 8);
+            }
+            conv_chunk(&o, id, in + q + 8, sz, in + q);
+        }
+        if (g_oom) break;
+        q += 8 + sz;
+    }
+    g_secmode = 0;
+    free(g_cp); g_cp = NULL; g_ncp = g_cpcap = 0;
+    if (g_oom) { free(o.p); *out = NULL; *outn = 0; return XP_ERR_MEMORY; }
+    *out = o.p; *outn = o.n;
+    return XP_OK;
+}
+
+/* The lean file (STREAMxxx.XPL) for a city the retail streamer draws from its raw
+   stream: only the collision packs (the CARP packs translated, as xp_convert) and
+   the generated night lamp flares (0x80135100), read from the raw stream once. */
+int xp_lean(const char *in_path, const char *out_path, int game, XpProgress progress, void *ud, XpStats *out_stats)
+{
+    xp_setup(game);
+    memset(&st, 0, sizeof st); g_oom = 0;
+    FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
+    FILE *w = fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }
+    fseek(f, 0, SEEK_END);
+#ifdef _WIN32
+    long long total = _ftelli64(f);
+#else
+    long long total = ftell(f);
+#endif
+    fseek(f, 0, SEEK_SET);
+    Buf o = {0}; uint8_t *chunk = NULL; size_t chunk_cap = 0;
+    long long in_at = 0; int rc = XP_OK, nprog = 0;
+    while (in_at + 8 <= total) {
+        uint8_t h[8];
+#ifdef _WIN32
+        if (_fseeki64(f, in_at, SEEK_SET) != 0) { rc = XP_ERR_READ; break; }
+#else
+        if (fseek(f, (long)in_at, SEEK_SET) != 0) { rc = XP_ERR_READ; break; }
+#endif
+        if (fread(h, 1, 8, f) != 8) { rc = XP_ERR_READ; break; }
+        uint32_t id = rd32(h), sz = rd32(h + 4);
+        if (in_at + 8 + (long long)sz > total) { rc = XP_ERR_FORMAT; break; }
+        int want_carp = id == 0x3b801, want_lamps = id == 0x80034100 && g_relight;
+        if (want_carp || want_lamps) {
+            if (8 + (size_t)sz > chunk_cap) {
+                uint8_t *nc = realloc(chunk, 8 + (size_t)sz); if (!nc) { rc = XP_ERR_MEMORY; break; }
+                chunk = nc; chunk_cap = 8 + (size_t)sz;
+            }
+            memcpy(chunk, h, 8);
+            if (fread(chunk + 8, 1, sz, f) != sz) { rc = XP_ERR_READ; break; }
+            size_t want = (size_t)(in_at % 0x80), have = (size_t)((o.base + o.n) % 0x80);
+            if (want != have) {
+                size_t k = (want - have + 0x80) % 0x80; if (k < 8) k += 0x80;
+                put32(&o, 0); put32(&o, (uint32_t)(k - 8)); putz(&o, k - 8);
+            }
+            if (want_carp) conv_carp(&o, chunk + 8, sz, chunk);
+            else lamp_pack(&o, chunk + 8, sz);
+            if (g_oom) { rc = XP_ERR_MEMORY; break; }
+            if (o.n && fwrite(o.p, 1, o.n, w) != o.n) { rc = XP_ERR_WRITE; break; }
+            o.base += o.n; o.n = 0;
+        }
+        in_at += 8 + (long long)sz;
+        if (progress && (++nprog & 15) == 0 && progress(ud, in_at, total)) { rc = XP_ERR_CANCELLED; break; }
+    }
+    st.in_bytes = total; st.out_bytes = o.base;
+    free(g_cp); g_cp = NULL; g_ncp = g_cpcap = 0;
+    free(o.p); free(chunk); fclose(f);
+    if (fclose(w) && rc == XP_OK) rc = XP_ERR_WRITE;
+    if (rc != XP_OK) remove(out_path);
+    if (out_stats) *out_stats = st;
+    return rc;
 }
 
 /* One top-level chunk in memory at a time (MW's largest 7.8 MB, Carbon's 13.8 MB),
@@ -745,10 +857,7 @@ static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const u
 int xp_convert(const char *in_path, const char *out_path, int game,
                XpProgress progress, void *ud, XpStats *out_stats)
 {
-    g_relight = game == XP_GAME_MW;   /* Carbon is a night city already */
-    g_game = game;
-    if (game == XP_GAME_MW) { g_grec = 0x68; g_gvo = 0x3c; g_gto = 0x40; }
-    else { g_grec = 0x90; g_gvo = 0x40; g_gto = 0x60; }
+    xp_setup(game);
     memset(&st, 0, sizeof st); g_oom = 0; g_tpk_tex = g_tpk_alpha = 0;
     FILE *f = fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
     FILE *w = fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }

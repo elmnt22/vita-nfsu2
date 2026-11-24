@@ -36,6 +36,8 @@
 #include "nfsu2.h"
 #include "smokeable.h"
 #include "world_scenery.h"
+#include "xpcity.h"
+#include "xpconv.h"
 #include "SDL.h"
 #include <math.h>
 #include <stdio.h>
@@ -78,7 +80,8 @@ static const char *rs_base(const char *t) {
 int rstream_track_ok(const char *trackname) {
     if (!trackname || !rstream_enabled()) return 0;
     const char *b = rs_base(trackname);
-    return !strncmp(b, "STREAML4RA", 10);   /* the base city only, for the spike */
+    /* the base city, and Rockport from its raw MW files (11-24, xpcity_lean) */
+    return !strncmp(b, "STREAML4RA", 10) || xpcity_lean(b);
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -201,6 +204,7 @@ typedef struct {
 static struct {
     char troot[512], stream[640], comp[640];
     int active;
+    int xp;                    /* XP_GAME_MW: a raw MW stream (sections translated as read, xp_section) */
     RsSec *sec; int nsec;
     short secof[RS_NUM];       /* number -> g.sec index, -1 */
     RsBound *bnd; int nbnd;    /* drivable boundaries (move-to-front order) */
@@ -255,19 +259,21 @@ static int rs_comp_visit(const unsigned char *d, uint32_t tag, long beg, long en
     (void)ctx;
     long len = end - beg; const unsigned char *p = d + beg;
     if (tag == 0x00034110u) {
-        int n; const unsigned char *r = rs_records(p, len, 0x50, &n);
+        /* MW (0x5c B): one more size word at +0x20, the rest 4 bytes on */
+        const int st = g.xp ? 0x5c : 0x50, sh = g.xp ? 4 : 0;
+        int n; const unsigned char *r = rs_records(p, len, st, &n);
         if (!r) { printf("rstream: section table size %ld not records\n", len); return 0; }
         g.sec = (RsSec *)calloc((size_t)n, sizeof *g.sec);
         if (!g.sec) return 0;
         for (int i = 0; i < n; i++) {
-            const unsigned char *q = r + i * 0x50;
+            const unsigned char *q = r + i * st;
             RsSec *s = &g.sec[g.nsec];
             s->number = rd16(q + 8);
             if (s->number <= 0 || s->number >= RS_NUM || rd32(q + 0x10) != 1) continue;
             memcpy(s->name, q, 7); s->name[7] = 0;
             s->off = (long)rd32(q + 0x14); s->size = (long)rd32(q + 0x18);
-            s->base_prio = (int)rd32(q + 0x20);
-            s->cx = rdf(q + 0x24); s->cy = rdf(q + 0x28); s->rad = rdf(q + 0x2c);
+            s->base_prio = (int)rd32(q + 0x20 + sh);
+            s->cx = rdf(q + 0x24 + sh); s->cy = rdf(q + 0x28 + sh); s->rad = rdf(q + 0x2c + sh);
             g.secof[s->number] = (short)g.nsec;
             g.nsec++;
         }
@@ -285,7 +291,7 @@ static int rs_comp_visit(const unsigned char *d, uint32_t tag, long beg, long en
         int cap = 512; g.bnd = (RsBound *)calloc((size_t)cap, sizeof *g.bnd);
         while (g.bnd && q + 0x24 <= len) {
             int num = rd16(p + q + 8), np = rd16(p + q + 0xa);
-            if (np < 0 || np > 64 || q + 0x24 + 8L * np > len) break;
+            if (np < 0 || np > 1024 || q + 0x24 + 8L * np > len) break;   /* MW: up to 260 points */
             int L = num / 100, n = num % 100;
             if (L >= 1 && L <= 20 && n >= 1 && n < (g.lod_offset ? g.lod_offset : 20) && g.nbnd < cap) {
                 RsBound *b = &g.bnd[g.nbnd];
@@ -296,6 +302,27 @@ static int rs_comp_visit(const unsigned char *d, uint32_t tag, long beg, long en
                 if (b->pts) { memcpy(b->pts, p + q + 0x24, (size_t)np * 8); g.nbnd++; }
             }
             q += 0x24 + 8L * np;
+        }
+        return 0;
+    }
+    if (tag == 0x00034153u && g.xp) {
+        /* MW: variable records, +0xc s16 section, +0xe u8 count, +0xf u8 capacity,
+           +0x12 the list, each padded to 4 bytes (wcoll.c's xp reader) */
+        long q = 0; while (q < len && p[q] == 0x11) q++;
+        q &= ~3L;
+        while (q + 0x12 <= len) {
+            int num = rd16(p + q + 0xc), cnt = p[q + 0xe], cap = p[q + 0xf];
+            long step = (0x12 + 2L * cap + 3) & ~3L;
+            if (cnt > cap || q + 0x12 + 2L * cnt > len) break;
+            if (num > 0 && num < RS_NUM && cnt <= 72 && !g.drv[num]) {
+                RsDriv *dv = (RsDriv *)calloc(1, sizeof *dv);
+                if (dv) {
+                    dv->number = num; dv->n = cnt;
+                    for (int k = 0; k < cnt; k++) dv->v[k] = rd16(p + q + 0x12 + 2 * k);
+                    g.drv[num] = dv;
+                }
+            }
+            q += step;
         }
         return 0;
     }
@@ -397,12 +424,15 @@ static void rs_tex_decode_one(int slot) {
     n2_tpk_keep_dxt = dxt; n2_tpk_skip_pixels = dxt;
     int ok = g.pin && n2_tpk_decode(g.pin, g.pinlen, g.tpk, e->key, &t);
     n2_tpk_skip_pixels = 0;
+    int src = 0;
     if (!ok) {   /* the other sources, as world_texture_decode: whole pixels, no DXT plan */
         n2_tpk_keep_dxt = 0;
-        if (g.loc4 && (ok = n2_load_car_tex_by_key(g.loc4, g.loc4len, e->key, &t)))
+        if (g.loc4 && (ok = n2_load_car_tex_by_key(g.loc4, g.loc4len, e->key, &t))) {
             t.order = t.usage = t.blend = t.wz = 0;   /* LOC4's opaque world policy (world.c) */
-        if (!ok && g.common) ok = n2_tpk_decode(g.common, g.commonlen, g.commontpk, e->key, &t);
-        if (!ok && g.ads) ok = n2_tpk_decode(g.ads, g.adslen, g.adstpk, e->key, &t);
+            src = 1;
+        }
+        if (!ok && g.common && (ok = n2_tpk_decode(g.common, g.commonlen, g.commontpk, e->key, &t))) src = 2;
+        if (!ok && g.ads && (ok = n2_tpk_decode(g.ads, g.adslen, g.adstpk, e->key, &t))) src = 3;
         if (ok && t.rgb) render_prehalve_tex(&t);
         goto done;
     }
@@ -415,6 +445,21 @@ static void rs_tex_decode_one(int slot) {
     }
 done:
     n2_tpk_keep_dxt = 0;
+#ifdef OPENUG2_SIM_PRE_H
+    {   /* test aid (simulator): OPENUG2_RS_TEXDUMP=<key hex> logs that texture's decode */
+        const char *e2 = getenv("OPENUG2_RS_TEXDUMP");
+        if (e2 && (uint32_t)strtoul(e2, NULL, 16) == e->key) {
+            long sum = 0, n = 0;
+            static const unsigned char z8[8];
+            long l1o = (long)(t.w / 4) * (t.h / 4) * (t.dxtfmt == 1 ? 8 : 16);   /* level 1 (the base level is never read) */
+            const unsigned char *L1 = t.dxt && t.dxtlen >= l1o + 8 ? t.dxt + l1o : z8;
+            if (t.rgb) for (long i = 0; i < (long)t.w * t.h * 3; i += 97) { sum += t.rgb[i]; n++; }
+            printf("rstream texdump %08x: src %d ok %d %dx%d dxt %p fmt %d rgb %p (mean %ld) bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                   e->key, src, ok, t.w, t.h, (void *)t.dxt, t.dxtfmt, (void *)t.rgb, n ? sum / n : -1,
+                   L1[0], L1[1], L1[2], L1[3], L1[4], L1[5], L1[6], L1[7]);
+        }
+    }
+#endif
     rs_lock(&g_mx);
     if (ok) {
         e->t = t; e->mode = rs_tex_mode(&t); e->order = t.order; e->state = 2;
@@ -936,9 +981,22 @@ static void rs_build(RsSec *s, int fd) {
     if (!rs_read_at(fd, s->off, d, s->size)) {
         printf("rstream: read failed for %s\n", s->name); free(d); return;
     }
+    long dlen = s->size;
+    Uint32 tx = 0;
+    if (g.xp) {   /* a raw MW section: its models + scenery in UG2's format (xpconv.c) */
+        Uint32 x0 = SDL_GetTicks();
+        unsigned char *u = NULL; size_t un = 0;
+        int rc = xp_section(d, (size_t)s->size, g.xp, &u, &un);
+        free(d);
+        if (rc != XP_OK) { free(u); printf("rstream: %s: translation failed (rc %d)\n", s->name, rc); return; }
+        if (!u) u = (unsigned char *)calloc(1, 8), un = 0;   /* no models or scenery (textures only): an empty section */
+        if (!u) { printf("rstream: %s: no memory\n", s->name); return; }
+        d = u; dlen = (long)un;
+        tx = SDL_GetTicks() - x0;
+    }
     Uint32 t1 = SDL_GetTicks();
-    RsBuild B; memset(&B, 0, sizeof B); B.s = s; B.d = d; B.dlen = s->size;
-    asset_chunks_walk(d, 0, s->size, rs_sec_visit, &B);
+    RsBuild B; memset(&B, 0, sizeof B); B.s = s; B.d = d; B.dlen = dlen;
+    asset_chunks_walk(d, 0, dlen, rs_sec_visit, &B);
     free(d);
     long unbaked = 0;
     if (rs_letter(s->number) == 24) rs_xregister(s);   /* model library: before anyone bakes from it */
@@ -970,10 +1028,11 @@ static void rs_build(RsSec *s, int fd) {
     long mv = 0; for (int i = 0; i < s->nmesh; i++) mv += s->mesh[i].nv;
     static int logn;
     if (logn++ < 400)
-        printf("rstream: built %s (%ld KB): read %u ms, parse+tex+bake %u ms, %d solids %d meshes (%ld vertices) %d scenery, %d pages, %d textures, "
+        printf("rstream: built %s (%ld KB): read %u ms%s, parse+tex+bake %u ms, %d solids %d meshes (%ld vertices) %d scenery, %d pages, %d textures, "
                "baked %ld vertices in %d pages, %ld instances unbaked\n",
-               s->name, s->size / 1024, (unsigned)(t1 - t0), (unsigned)(t2 - t1), s->nsol, s->nmesh, mv, s->nscen, s->npage, s->ntex,
+               s->name, s->size / 1024, (unsigned)(t1 - t0 - tx), g.xp ? (tx ? " + translate" : "") : "", (unsigned)(t2 - t1), s->nsol, s->nmesh, mv, s->nscen, s->npage, s->ntex,
                s->bake_v, s->nbpage, unbaked);
+    if (g.xp && logn <= 400) printf("rstream:   (%s translated in %u ms)\n", s->name, (unsigned)tx);
 }
 
 static int rs_worker(void *arg) {
@@ -1310,6 +1369,8 @@ int rstream_start(const char *track_root, const char *trackname) {
     char stream[640];
     const char *b = rs_base(trackname);
     snprintf(stream, sizeof stream, "%s/%s%s", track_root, b, strstr(b, ".BUN") ? "" : ".BUN");
+    int xp = xpcity_lean_game(b);
+    if (xp) xpcity_stream_path(b, stream, sizeof stream);   /* the raw MW stream; its companion: the translated one in track_root */
     if (g.active && !strcmp(stream, g.stream)) return 1;
     if (g_parked && !strcmp(stream, g.stream)) {   /* the same stream again: the kept library */
         Uint32 u0 = SDL_GetTicks();
@@ -1327,6 +1388,7 @@ int rstream_start(const char *track_root, const char *trackname) {
         return 1;
     }
     rstream_stop();
+    g.xp = xp;
     snprintf(g.troot, sizeof g.troot, "%s", track_root);
     snprintf(g.stream, sizeof g.stream, "%s", stream);
     char stem[64]; snprintf(stem, sizeof stem, "%s", b + 6);
@@ -1803,6 +1865,14 @@ int rstream_draw(const RsDrawCtx *c) {
 #ifdef OPENUG2_SIM_PRE_H
                     static int hq = -9; if (hq == -9) { const char *e = getenv("OPENUG2_RS_HIDEQ"); hq = e && *e ? atoi(e) : -5; }
                     if (hq == cq) cq = -9;
+                    /* OPENUG2_RS_HIDEK=<lo>:<hi> (hex) hides baked pieces whose texture key is lo <= key < hi */
+                    static uint32_t klo = 1, khi = 0;
+                    if (klo == 1 && khi == 0) { const char *e = getenv("OPENUG2_RS_HIDEK"); klo = 0; if (e && *e) { klo = (uint32_t)strtoul(e, NULL, 16); const char *c2 = strchr(e, ':'); khi = c2 ? (uint32_t)strtoul(c2 + 1, NULL, 16) : 0; } }
+                    if (khi && m->b.texkey >= klo && m->b.texkey < khi) {
+                        static int kn; if (kn++ < 40) printf("rstream hidek: %s key %08x tex %d state %d mode %d count %u\n", sc->sec->name, m->b.texkey,
+                                                            m->tex, m->tex >= 0 ? g_tex[m->tex].state : -1, md, rcount);
+                        cq = -9;
+                    }
 #endif
                     if (cq >= 0) {
                         if (g_ndef[cq] < RS_MAXDEF) {

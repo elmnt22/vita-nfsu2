@@ -223,7 +223,7 @@ static long pin_build(int fd, long flen, unsigned char *out, ResPixStub *stub, i
         uint32_t cid = pin_u32(h), cs = pin_u32(h + 4);
         if ((unsigned long)cs > (unsigned long)(flen - off - 8)) return -1;   /* no signed wrap / zero-step loop */
         long next = off + 8 + (long)cs;
-        if (g_pin_strip_req && (cid == 0x80134000u || cid == 0x80034100u || cid == 0x80034130u)) {
+        if (g_pin_strip_req && (cid == 0x80134000u || cid == 0x80034100u || cid == 0x80034130u || cid == 0x3b801u)) {
             off = next;   /* stripped (pin_strip): models and scenery are not wanted */
             continue;
         }
@@ -317,7 +317,7 @@ static void pin_strip(void) {
     for (long p = 0; p + 8 <= len; ) {
         uint32_t m = pin_u32(d + p), sz = pin_u32(d + p + 4);
         if ((unsigned long)sz > (unsigned long)(len - p - 8)) { keep += len - p; break; }
-        if (m != 0x80134000u && m != 0x80034100u && m != 0x80034130u) keep += 8 + (long)sz;
+        if (m != 0x80134000u && m != 0x80034100u && m != 0x80034130u && m != 0x3b801u) keep += 8 + (long)sz;
         p += 8 + (long)sz;
     }
     if (keep >= len) return;
@@ -327,7 +327,7 @@ static void pin_strip(void) {
     for (long p = 0; p + 8 <= len; ) {
         uint32_t m = pin_u32(d + p), sz = pin_u32(d + p + 4);
         long end = (unsigned long)sz > (unsigned long)(len - p - 8) ? len : p + 8 + (long)sz;
-        int drop = m == 0x80134000u || m == 0x80034100u || m == 0x80034130u;
+        int drop = m == 0x80134000u || m == 0x80034100u || m == 0x80034130u || m == 0x3b801u;   /* + MW collision (raw streamed Rockport) */
         /* stubs are in buffer order: move the ones inside this chunk along */
         while (si < g_pin.nstub && g_pin.stub[si].coff < end) {
             if (!drop && g_pin.stub[si].coff >= p) {

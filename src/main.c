@@ -17211,6 +17211,7 @@ int main(int argc, char **argv) {
         int n = ev ? sscanf(ev, "%f %f %f", &world2_spawn_xy[0], &world2_spawn_xy[1], &hd) : 0;
         if (n == 3) { world2_heading_deg = hd; world2_heading_set = 1; }   /* (degrees) */
         if (n >= 2) printf("sim: spawn (%.1f, %.1f)\n", world2_spawn_xy[0], world2_spawn_xy[1]);
+        if (n >= 2 && getenv("OPENUG2_SIM_EXACT")) world2_spawn_set = 1;   /* as --spawn X,Y: no nearest-road search */
     }
 #endif
     /* First open-world chunk: wide enough to include the neighboring airport/
@@ -17426,6 +17427,7 @@ int main(int argc, char **argv) {
         char sp[1100], tp[1100];
         snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, stem);
         snprintf(tp, sizeof tp, "%s/%s.BUN", troot, stem);
+        xpcity_coll_path(troot, trackname, sp, sizeof sp);   /* Rockport streamed: its lean file (xp_lean) */
         g_wcoll = wcoll_shared(sp, tp);   /* the lean resident build may have loaded it already */
         wcoll_ctx_init(&g_wcc);
         /* the track's particle definitions (0x35021 in L4RA.BUN: the shops'
@@ -18816,7 +18818,7 @@ int main(int argc, char **argv) {
                 for (int m = 0; m < scene.count; m++) {
                     const N2Mesh *me = &scene.meshes[m];
                     if (!me->verts || !me->idx) continue;
-                    for (int t = 0; t + 2 < me->nidx; t += 3) {
+                    for (int t = 0, nhit = 0; t + 2 < me->nidx && nhit < 12; t += 3) {
                         const float *a = me->verts + me->idx[t]*5, *b = me->verts + me->idx[t+1]*5, *c = me->verts + me->idx[t+2]*5;
                         float d1 = (b[0]-a[0])*(qy-a[1]) - (b[1]-a[1])*(qx-a[0]);
                         float d2 = (c[0]-b[0])*(qy-b[1]) - (c[1]-b[1])*(qx-b[0]);
@@ -18824,7 +18826,7 @@ int main(int argc, char **argv) {
                         if ((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0)) continue;
                         printf("XYDUMP mesh %d cat %d role %d z %.1f %.1f %.1f tris %d (%.31s / %.27s)\n", m, me->cat,
                                me->world_role, a[2], b[2], c[2], me->nidx / 3, me->sname, me->aname);
-                        break;
+                        nhit++;   /* every layer (a few) */
                     }
                 }
             }
@@ -21479,6 +21481,17 @@ int main(int argc, char **argv) {
                career free roam start does (the hwlog86 unpin-under-the-streamer path) */
             static int sw_done; const char *e = getenv("OPENUG2_SIM_SWITCH_AT");
             if (e && *e && !sw_done && SDL_GetTicks() > (Uint32)(atof(e) * 1000.0)) { sw_done = 1; venue_go(NULL, 0); }
+            /* OPENUG2_SIM_SWITCHES="<s>:<track>,<s>:<track>,..." (track "-" = the city): a switch at each */
+            static int sw_next; const char *L = getenv("OPENUG2_SIM_SWITCHES");
+            for (int k = 0; L && *L; k++) {
+                char tk[32] = ""; float at = 0.0f;
+                if (sscanf(L, "%f:%31[^,]", &at, tk) != 2) break;
+                if (k == sw_next) {
+                    if (SDL_GetTicks() > (Uint32)(at * 1000.0f) && !g_switch_track) { sw_next++; venue_go(strcmp(tk, "-") ? tk : NULL, 0); }
+                    break;
+                }
+                L = strchr(L, ','); if (L) L++;
+            }
         }
 #endif
         if (g_switch_track && world2) {
@@ -21622,6 +21635,7 @@ int main(int argc, char **argv) {
                 char sp[1100], tp[1100];
                 snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, nstem);
                 snprintf(tp, sizeof tp, "%s/%s.BUN", troot, nstem);
+                xpcity_coll_path(troot, next_track, sp, sizeof sp);   /* Rockport streamed: its lean file */
                 g_wcoll = sw_beyond ? NULL : wcoll_shared(sp, tp);   /* Beyond: ground + walls from its tiles */
                 vita_mark("  switch: collision loaded (%u ms in)", SDL_GetTicks() - sw_t0);
                 ls_pump();   /* the loading screen keeps moving between the steps */

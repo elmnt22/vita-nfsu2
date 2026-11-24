@@ -20,6 +20,7 @@
 #include "skyline.h"
 #include "beyond.h"
 #include "world_tiles.h"
+#include "rstream.h"
 
 void vita_mark(const char *fmt, ...);
 void vita_fast_clocks(void);
@@ -70,9 +71,17 @@ static struct { volatile long long done, total; volatile int finished, rc; const
 static int job_progress(void *ud, long long done, long long total) {
     (void)ud; g_job.done = done; g_job.total = total; return 0;
 }
+static int g_job_lean;
 static int job_thread(void *ud) {
     (void)ud;
     XpStats st;
+    if (g_job_lean) {
+        g_job.rc = xp_lean(g_job.in, g_job.out, g_job.game, job_progress, NULL, &st);
+        vita_mark("xpcity: lean file %s rc %d: %.1f MB read, %.1f MB written, %ld collision packs (%ld polygons), %ld lamp flares",
+                  g_job.out, g_job.rc, st.in_bytes / 1048576.0, st.out_bytes / 1048576.0, st.cpacks, st.cpolys, st.lights);
+        g_job.finished = 1;
+        return 0;
+    }
     g_job.rc = xp_convert(g_job.in, g_job.out, g_job.game, job_progress, NULL, &st);
     vita_mark("xpcity: translated %s rc %d: %.1f -> %.1f MB, %ld solids, %ld bad, %ld instances",
               g_job.in, g_job.rc, st.in_bytes / 1048576.0, st.out_bytes / 1048576.0, st.solids, st.bad, st.insts);
@@ -433,10 +442,154 @@ keep:
 
 static int g_failed[NCITY];   /* XF3: a translation that failed this session */
 static int g_known[NCITY], g_ok[NCITY];   /* xpcity_installed: the files do not change while the game runs */
+/* ---- the retail streamer's way (11-24): no translated stream, no tiles ----
+   Rockport is drawn by the retail streamer (rstream.c) straight from the raw MW
+   stream, each section translated as it loads (xp_section). What stays on the
+   card: the translated companion (TRACKS/L2RA.BUN, 1.4 MB, its tables + UG2
+   scenery groups) and STREAML2RA.XPL (collision packs + night lamp flares, xp_lean),
+   both made once from the raw files. Palmont: the translated stream + tiles still. */
+static int g_lean_known[NCITY], g_lean_on[NCITY];
+static int lean_city(int c)
+{
+    if (!g_lean_known[c]) {
+        char a[256], b[256];
+        snprintf(a, sizeof a, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
+        snprintf(b, sizeof b, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
+        g_lean_on[c] = k_city[c].game == XP_GAME_MW && xpcity_enabled() && rstream_enabled() &&
+                       xp_file_size(a) > 0 && xp_file_size(b) > 0;
+        g_lean_known[c] = 1;
+        printf("xpcity: %s %s%c", k_city[c].name, g_lean_on[c] ? "streams from its raw files (retail streamer, no tiles)"
+                                                             : "uses its translated stream + tiles", 10);
+    }
+    return g_lean_on[c];
+}
+int xpcity_lean(const char *track) { int c = city_of(track); return c >= 0 && lean_city(c); }
+int xpcity_lean_game(const char *track) { int c = city_of(track); return c >= 0 && lean_city(c) ? k_city[c].game : 0; }
+int xpcity_stream_path(const char *track, char *out, size_t n)
+{
+    int c = city_of(track);
+    if (c < 0 || !lean_city(c)) return 0;
+    snprintf(out, n, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
+    return 1;
+}
+int xpcity_coll_path(const char *troot, const char *track, char *out, size_t n)
+{
+    int c = city_of(track);
+    if (c < 0 || !lean_city(c)) return 0;
+    snprintf(out, n, "%s/%s.XPL", troot, k_city[c].bun);
+    return 1;
+}
+/* the lean file's night lamp flare packs (0x80135100), read once per city */
+unsigned char *xpcity_lamps(const char *troot, const char *track, long *len)
+{
+    static unsigned char *buf; static long blen; static char have[300];
+    *len = 0;
+    char p[300];
+    if (!xpcity_coll_path(troot, track, p, sizeof p)) return NULL;
+    if (strcmp(have, p)) {
+        free(buf); buf = NULL; blen = 0; snprintf(have, sizeof have, "%s", p);
+        FILE *f = fopen(p, "rb");
+        long cap = 0; unsigned char h[8];
+        while (f && fread(h, 1, 8, f) == 8) {
+            uint32_t id, sz; memcpy(&id, h, 4); memcpy(&sz, h + 4, 4);
+            if (id != 0x80135100u) { if (fseek(f, (long)sz, SEEK_CUR)) break; continue; }
+            if (blen + 8 + (long)sz > cap) {
+                long nc = cap ? cap * 2 : 256 << 10; while (nc < blen + 8 + (long)sz) nc *= 2;
+                unsigned char *nb = realloc(buf, (size_t)nc); if (!nb) break;
+                buf = nb; cap = nc;
+            }
+            memcpy(buf + blen, h, 8);
+            if (fread(buf + blen + 8, 1, sz, f) != sz) break;
+            blen += 8 + (long)sz;
+        }
+        if (f) fclose(f);
+    }
+    *len = blen;
+    return buf;
+}
+static int lean_marker_ok(const char *mark, long long raw_size)
+{
+    FILE *f = fopen(mark, "r"); if (!f) return 0;
+    int v = 0, g = 0; long long s = -1;
+    int ok = fscanf(f, "xplean %d %d %lld", &v, &g, &s) == 3 && v == XP_LEAN_VERSION && s == raw_size;
+    fclose(f);
+    return ok;
+}
+static int lean_prepare(int c, const char *troot)
+{
+    char raw[256], rawc[256], outc[1024], lean[1024], mark[1024], p[1100];
+    snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
+    snprintf(rawc, sizeof rawc, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
+    snprintf(outc, sizeof outc, "%s/%s.BUN", troot, k_city[c].companion);
+    snprintf(lean, sizeof lean, "%s/%s.XPL", troot, k_city[c].bun);
+    snprintf(mark, sizeof mark, "%s/%s.lean", troot, k_city[c].bun);
+    long long raw_size = xp_file_size(raw);
+    {   /* the old translated stream, its tiles and caches: not used any more (keeptiles.txt keeps them) */
+        FILE *k = fopen("ux0:data/NFSU2/keeptiles.txt", "rb");
+        if (k) fclose(k);
+        else {
+            snprintf(p, sizeof p, "%s/%s.BUN", troot, k_city[c].bun);
+            if (xp_file_size(p) > 0) { remove(p); vita_mark("xpcity: old translated stream %s deleted", p); }
+            snprintf(p, sizeof p, "%s/%s.xp", troot, k_city[c].bun); remove(p);
+            snprintf(p, sizeof p, XP_CACHE "/%s.BUN.idx", k_city[c].bun); remove(p);
+            skyline_forget(k_city[c].bun);
+            world_tiles_drop_track(k_city[c].bun);
+        }
+    }
+    if (xp_file_size(outc) > 0 && xp_file_size(lean) > 0 && lean_marker_ok(mark, raw_size)) {
+        make_map(c, troot); make_routes(c, troot); make_events(c, troot); make_props(c, troot);
+        return 1;
+    }
+    if (g_failed[c]) { vita_mark("xpcity: %s failed to prepare this session; not again until a restart", k_city[c].name); return 0; }
+    vita_mark("xpcity: preparing %s for the retail streamer from %s (%lld bytes)", k_city[c].name, raw, raw_size);
+    remove(mark);
+    snprintf(p, sizeof p, XP_CACHE "/%s.XPL.idx", k_city[c].bun); remove(p);
+    if (!g_window) {
+        vita_fast_clocks();
+        SDL_Window *w = SDL_CreateWindow("OpenUG2", 0, 0, 960, 544, SDL_WINDOW_OPENGL);
+        SDL_GL_CreateContext(w);
+        g_window = 1;
+    }
+    memset((void *)&g_job, 0, sizeof g_job);
+    g_job.in = raw; g_job.out = lean; g_job.game = k_city[c].game; g_job_lean = 1;
+    SDL_Thread *t = SDL_CreateThread(job_thread, "xpcity", NULL);
+    Uint32 t0 = SDL_GetTicks();
+    char title[64]; snprintf(title, sizeof title, "PREPARING %s", k_city[c].name);
+    while (t && !g_job.finished) {
+        float frac = g_job.total > 0 ? (float)g_job.done / (float)g_job.total : 0.0f;
+        char a[96]; snprintf(a, sizeof a, "%d%%  -  ONE TIME ONLY", (int)(frac * 100.0f));
+        vita_progress_screen(title, "READING THE CITY", a, frac);
+        SDL_Delay(100);
+    }
+    if (t) SDL_WaitThread(t, NULL);
+    else job_thread(NULL);
+    g_job_lean = 0;
+    int ok = g_job.rc == XP_OK && xp_companion(rawc, outc, k_city[c].game) == XP_OK;
+    if (ok) {
+        FILE *m = fopen(mark, "w");
+        ok = m && fprintf(m, "xplean %d %d %lld\n", XP_LEAN_VERSION, k_city[c].game, raw_size) > 0;
+        if (m && fclose(m)) ok = 0;
+    }
+    if (ok) { make_map(c, troot); make_routes(c, troot); make_events(c, troot); make_props(c, troot); }
+    vita_mark("xpcity: %s %s in %.1f s", k_city[c].name, ok ? "prepared" : "FAILED", (SDL_GetTicks() - t0) / 1000.0);
+    if (!ok) {
+        remove(mark);
+        g_failed[c] = 1; g_known[c] = 0;
+        Uint32 e0 = SDL_GetTicks();
+        while (SDL_GetTicks() - e0 < 5000) {
+            vita_progress_screen(title, "COULD NOT PREPARE THE CITY", "SEE THE LOG. BACK TO BAYVIEW.", 0.0f);
+            SDL_Delay(100);
+        }
+    }
+    vita_progress_screen_done();
+    return ok;
+}
+
 int xpcity_prepare(const char *troot, const char *track) {
     int c = city_of(track);
     if (c < 0) return 1;
     if (!xpcity_enabled()) { vita_mark("xpcity: %s asked for without " XP_SWITCH, k_city[c].name); return 0; }
+    if (lean_city(c)) return lean_prepare(c, troot);
     char raw[256], rawc[256], out[1024], outc[1024], mark[1024];
     snprintf(raw, sizeof raw, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
     snprintf(rawc, sizeof rawc, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);

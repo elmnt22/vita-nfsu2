@@ -313,6 +313,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         WRegion *g = &w->neighborhood.rgn[r];
         snprintf(g->name, sizeof g->name, "%s", regs[r]);
         char trackp[1024]; snprintf(trackp, sizeof trackp, "%s/%s.BUN", troot, regs[r]);
+        if (nreg == 1) xpcity_stream_path(regs[r], trackp, sizeof trackp);   /* Rockport streamed: its raw MW stream (textures) */
 #ifdef __vita__
         /* decide on world tiles BEFORE taking the pinned bundle: switching
            them on strips (reallocates) it */
@@ -333,6 +334,10 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
         if (!g->data) { fprintf(stderr, "cannot read %s\n", trackp); w->neighborhood.load_failed = 1; continue; }
         VMARK("  region %s in memory (%ld MB)", regs[r], g->len >> 20);
         if (world_region_hook) world_region_hook(g->data, g->len, r, nreg);
+        if (world_region_hook && xpcity_lean(regs[r])) {   /* the streamed city's generated night lamps (xp_lean) */
+            long ln = 0; unsigned char *lb = xpcity_lamps(troot, regs[r], &ln);
+            if (lb && ln > 8) world_region_hook(lb, ln, r + 1, nreg);
+        }
 #ifdef __vita__
         /* The pinned bundle never changes, so its light list (a whole-bundle
            scan plus an O(n^2) de-duplication) is built once and copied. */
@@ -703,6 +708,7 @@ static int world_lean_scene(N2Scene *sc, const char *troot, const char *track, f
     char sp[1100], tp[1100];
     snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, stem);
     snprintf(tp, sizeof tp, "%s/%s.BUN", troot, stem);
+    xpcity_coll_path(troot, b, sp, sizeof sp);   /* Rockport streamed: its lean file's collision */
     WColl *wc = wcoll_shared(sp, tp);
     if (!wc) { printf("lean resident: no collision for %s\n", track); return 0; }
     WLean *L = (WLean *)calloc(1, sizeof *L);
