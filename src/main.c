@@ -12627,6 +12627,26 @@ static void rt_step_batch(RtStepBatch *b)
         memset(sum, 0, sizeof sum); memset(cnt, 0, sizeof cnt); wall = 0; batches = 0;
     }
 }
+/* 0x59fb70 (crash response, GC 801ac03c), per contact pair from
+   Collision::AddImpulse 0x5a9620 -- car pairs AND car/wall pairs, a wall
+   being a pair body of type 3 (IsWallInvolved 0x5a0160): in a drag race a
+   racer's car (race entry) is totalled (+0x964) by an impulse of 30 t m/s or
+   more (capped at 40), or when it lies upside down (up.z < -0.5).
+   me = carcoll index (g_rt.n = the player). */
+static void rt_drag_crash(int me, float j, const char *what) {
+    if (me < 0 || me > g_rt.n) return;
+    int k = me == g_rt.n ? 0 : me + 1;
+    N2State ms;
+    n2sim_state(me == g_rt.n ? g_n2 : g_rt.car[me].s, &ms);
+    if (j > 40.0f) j = 40.0f;                                   /* 0x7a1858 */
+    if (!(30.0f <= j || ms.rot[8] < -0.5f)) return;             /* 0x7a186c / 0x787b5c */
+    AcidSlot *as = me == g_rt.n ? &g_acid_p : &g_acid_o[me];   /* visible damage on too */
+    if (as->c) acid_damage_visible(as->c, 1);
+    if (!g_rt.totalled[k]) {
+        g_rt.totalled[k] = 1;
+        printf("race: %s totalled (%s, impulse %.1f, up %.2f)%c", k ? g_rt.opp[k - 1].name : "player", what, j, ms.rot[8], 10);
+    }
+}
 static int rt_tick(int racing, float player_half_len, float player_half_wid)
 {
     const float dt = 1.0f / 60.0f;      /* the physics step: n2sim_step scales it itself */
@@ -13136,19 +13156,7 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
             /* 0x59fb70 (crash response): in a drag race a racer's car
                (race entry) is totalled (+0x964) by an impulse of 30 t m/s
                or more, or when it lies upside down (up.z < -0.5) */
-            if (g_rt.drag && me <= g_rt.n) {
-                int k = me == g_rt.n ? 0 : me + 1;
-                N2State ms;
-                n2sim_state(me == g_rt.n ? g_n2 : g_rt.car[me].s, &ms);
-                if (30.0f <= j || ms.rot[8] < -0.5f) {   /* 0x59fb70 (GC 801ac03c): visible damage on too */
-                    AcidSlot *as = me == g_rt.n ? &g_acid_p : &g_acid_o[me];
-                    if (as->c) acid_damage_visible(as->c, 1);
-                }
-                if (!g_rt.totalled[k] && (30.0f <= j || ms.rot[8] < -0.5f)) {    /* 0x7a186c / 0x787b5c */
-                    g_rt.totalled[k] = 1;
-                    printf("race: %s totalled (impulse %.1f, up %.2f)%c", k ? g_rt.opp[k - 1].name : "player", j, ms.rot[8], 10);
-                }
-            }
+            if (g_rt.drag && me <= g_rt.n) rt_drag_crash(me, j, "car");
         }
     }
     /* the polygon contacts in the same pair lists (0x5a0160 reads them):
@@ -13160,11 +13168,13 @@ static int rt_tick(int racing, float player_half_len, float player_half_wid)
         if (!r) continue;
         float j = sqrtf(h[i].impulse[0] * h[i].impulse[0] + h[i].impulse[1] * h[i].impulse[1] + h[i].impulse[2] * h[i].impulse[2]);
         airacer_contact(r, -2 - h[i].poly, 0, 0, h[i].point, j, fabsf(h[i].poly_nz) < 0.1f);
+        if (g_rt.drag && a < g_rt.n) rt_drag_crash(a, j, "wall");   /* a wall is a pair body too (type 3) */
     }
     {
         AiRacer *pr = g_rt.pdrag ? g_rt.pdrag : g_rt.pdrv;
         for (int i = 0; pr && player_n2 && i < g_n2_nwhit; i++)
             airacer_contact(pr, -2 - g_n2_whit[i].poly, 0, 0, g_n2_whit[i].pt, g_n2_whit[i].j, fabsf(g_n2_whit[i].nz) < 0.1f);
+        for (int i = 0; g_rt.drag && player_n2 && i < g_n2_nwhit; i++) rt_drag_crash(g_rt.n, g_n2_whit[i].j, "wall");
         g_n2_nwhit = 0;
     }
     for (int k = 0; k < g_rt.n && !g_rt.field_gone; k++) n2sim_state(g_rt.car[k].s, &g_rt.car[k].st);
