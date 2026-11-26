@@ -290,33 +290,55 @@ Carbon's pursuit knockout events.
 
 ### Setting it up
 
-No PC tool is needed: the game streams both cities straight from the
-original files. Copy these files from your PC install to the memory card,
-keeping the folders:
+Nothing is converted: the game streams both cities straight from the
+original files. You only have to get those files onto the memory card. Pick
+one of the two ways below; both end with the same files in the same place.
 
-| City | From your PC install | To the Vita |
-|---|---|---|
-| Rockport | `TRACKS\STREAML2RA.BUN`, `TRACKS\L2RA.BUN`, `TRACKS\L2RA\MINI_MAP.BIN`, `GLOBAL\gameplay.bin` (Most Wanted) | `ux0:data/NFSU2/expansion/mw/` |
-| Palmont | `TRACKS\STREAML5RA.BUN`, `TRACKS\L5RA.BUN`, `GLOBAL\gameplay.bin` (Carbon) | `ux0:data/NFSU2/expansion/carbon/` |
+#### Option A: copy the files yourself (no PC tool)
 
-For example, Rockport's stream ends up at
-`ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN`. The two `.BUN` files of
-a city are required. Without Rockport's `MINI_MAP.BIN` it has no minimap,
-and without `gameplay.bin` a city has no race events.
+1. Connect the Vita: in VitaShell press **START** and pick **USB** (or press
+   **SELECT** for FTP).
+2. Copy these files from your PC install to the memory card, keeping the
+   folders:
 
-That's all. The game finds the files by itself and turns the World
-Expansion on. In the game, pick **Quick Race → Free Run**; it asks which
-city you want. The first trip into each city takes a few minutes longer
-while the game prepares its roads, collision and events (shown in % on the
-loading screen); later trips load normally.
+   | City | From your PC install | To the Vita |
+   |---|---|---|
+   | Rockport | `TRACKS\STREAML2RA.BUN`, `TRACKS\L2RA.BUN`, `TRACKS\L2RA\MINI_MAP.BIN`, `GLOBAL\gameplay.bin` (Most Wanted) | `ux0:data/NFSU2/expansion/mw/` |
+   | Palmont | `TRACKS\STREAML5RA.BUN`, `TRACKS\L5RA.BUN`, `GLOBAL\gameplay.bin` (Carbon) | `ux0:data/NFSU2/expansion/carbon/` |
+
+   For example, Rockport's stream ends up at
+   `ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN`. The two `.BUN` files
+   of a city are required. Without Rockport's `MINI_MAP.BIN` it has no
+   minimap, and without `gameplay.bin` a city has no race events.
+
+#### Option B: with the Prep Tool
+
+1. In the [Prep Tool](#nfsu2-vita-prep-tool-pc), under **Optional: World
+   Expansion**, pick your Most Wanted and/or Carbon folder (the one with
+   `TRACKS` in it). Installed copies are found by themselves. Leave a box
+   empty to skip that city. Each city shows **Ready to send** when its files
+   are there.
+2. **Convert** (or **Check Game Files**) also checks those games' files
+   against the originals.
+3. **Send to Vita** or **Copy to Memory Card...** with **World Expansion
+   too** ticked. It copies the same files as Option A into the same
+   folders, and skips files already there.
+
+#### Then, on the Vita
+
+The game finds the files by itself and turns the World Expansion on. Pick
+**Quick Race → Free Run**; it asks which city you want. The first trip into
+each city takes a few minutes longer while the game prepares its roads,
+collision and events (shown in % on the loading screen); later trips load
+normally.
 
 To hide the cities again, untick **Rockport and Palmont** under **World
 Expansion** in [Settings](#settings). Your Underground 2 career is untouched
 either way.
 
-Older releases converted the cities with the Prep Tool. That is no longer
-needed: the converted city files from it are deleted on the first boot to
-free the space, and the raw files above are used instead.
+Older releases converted the cities on the PC. That is no longer needed:
+those converted files are deleted on the first boot to free the space, and
+the original files above are used instead.
 
 ### Good to know
 

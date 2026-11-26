@@ -1423,7 +1423,7 @@ static void paint_all(HDC dc, int cw, int chh) {
     /* the cards */
     card(g, dc, 0, L"1.  Your Need for Speed Underground 2 Folder", L"Pick the folder NFSU2 is installed in.", 0);
     card(g, dc, 1, L"Optional:  World Expansion — Rockport and Palmont",
-         L"Own Need for Speed Most Wanted (2005) or Carbon? Drive its city in Free Run too.", 0);
+         L"Own Most Wanted (2005) or Carbon? Their files are sent as they are, nothing converted.", 0);
     card(g, dc, 2, L"2.  Convert", L"Prepares the world data for the Vita. Your game files are only read, never changed.", 0);
     card(g, dc, 3, L"3.  Put It on Your Vita", L"Send the converted files to your PS Vita, over Wi-Fi or USB.", 0);
     card(g, dc, 4, L"Optional:  Bring Your PC Career",
@@ -1492,7 +1492,7 @@ static void paint_all(HDC dc, int cw, int chh) {
         SelectObject(dc, op); DeleteObject(p);
         glyph_at(dc, g_glyph, RGB(40, 52, 70), CL + 222, y + 58, 30, 36, 0xE823);   /* clock */
         text_at(dc, g_bold, RGB(16, 30, 54), CL + 260, y + 58, 220, 18, L"About 2 minutes", DT_SINGLELINE);
-        text_at(dc, g_small, RGB(72, 84, 102), CL + 260, y + 77, 230, 18, L"(longer with the World Expansion)", DT_SINGLELINE);
+        text_at(dc, g_small, RGB(72, 84, 102), CL + 260, y + 77, 230, 18, L"(+ a file check for the World Expansion)", DT_SINGLELINE);
         static const wchar_t *dt[4] = { L"", L"Working…", L"✔ Done!", L"✖ Failed" };
         COLORREF dc2 = g_done_state == 2 ? RGB(22, 140, 60) : g_done_state == 3 ? RGB(200, 30, 30) : RGB(110, 118, 130);
         text_at(dc, g_bold, dc2, CL + 400, y + 102, CR - CL - 400, 22, dt[g_done_state], DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
