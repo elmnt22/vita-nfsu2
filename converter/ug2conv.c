@@ -3,10 +3,10 @@
  * Gets a player's NFSU2 PC install ready for the Vita:
  *  - checks the game files against the v1.2 data the port is tested with
  *    (game_manifest.inc: names, sizes, CRC32s -- tools/gen_prep_manifest.py)
- *  - converts every track's world into prebuilt tiles: the Vita's one-time
- *    first boot step ("OPTIMIZING WORLD DATA", 15-20+ minutes on the console),
- *    run here with the game's own world_tiles.c and resource.c, built 32-bit
- *    like the Vita, plus the other first-use caches (conv_extras.c)
+ *  - prebuilds the small caches the game makes on first use (conv_extras.c:
+ *    each track's start + stripped bundle, the cars' parts lists, the shop):
+ *    a second, part of Send / Copy (11-25: every track streams from the game
+ *    data, so no world conversion; the tile path is only for k_tracks.lean 0)
  *  - sends the game files the Vita needs (only those: the manifest leaves out
  *    Support / Uninstall / #JIMBO and files the port never opens) and the
  *    cache to the Vita over FTP (VitaShell or vitacompanion, port 1337), or
@@ -20,10 +20,10 @@
  *    with the rest, as they are (the game streams them; nothing converted).
  *
  *   NFSU2VitaPrep.exe --cli GAME OUT [MW|- [CARBON|-]]
- *                                              check + convert without the window
+ *                                              check + prepare the caches without the window
  *                                              (+ checks the World Expansion in MW / CARBON)
  *   NFSU2VitaPrep.exe --send IP OUT [GAME|- [MW|- [CARBON|-]]]
- *                                              send OUT's cache (+ GAME's, MW's, CARBON's files) to the Vita
+ *                                              prepare (with GAME) + send OUT's cache and GAME's, MW's, CARBON's files
  *   NFSU2VitaPrep.exe --copy DEST OUT [GAME|- [MW|- [CARBON|-]]]
  *                                              the same into DEST (ux0's root, or any folder)
  *   NFSU2VitaPrep.exe --import-save SAVE GAME OUT
@@ -289,6 +289,8 @@ static struct {
     int gui;           /* the window: ask before converting a folder that failed the check */
     volatile int checking;
     volatile int in_xp;   /* on the World Expansion (conv_xp.c), after the tracks */
+    int no_xp;            /* the World Expansion is not being sent: its check is skipped */
+    int chain;            /* part of Send / Copy: the send follows, no result of its own */
     XppJob xp;
 } g_job;
 static HWND g_wnd;
@@ -296,7 +298,7 @@ static HWND g_wnd;
 void conv_fatal(const char *what) {
     printf("converter: unexpected call to %s -- stopping\n", what);
     fflush(stdout);
-    char m[256]; snprintf(m, sizeof m, "The conversion reached code it does not support (%s).\n"
+    char m[256]; snprintf(m, sizeof m, "The preparation reached code it does not support (%s).\n"
                           "Please report this. Nothing was copied to your Vita.", what);
     MessageBoxA(NULL, m, TOOL_NAME, MB_ICONERROR);
     ExitProcess(3);
@@ -318,7 +320,7 @@ static void convert_all(void) {
     printf("%s\n", g_chk.msg);
     if (!good && g_job.gui) {
         char q[2200];
-        snprintf(q, sizeof q, "%s\n\nConvert anyway?", g_chk.msg);
+        snprintf(q, sizeof q, "%s\n\nSend anyway?", g_chk.msg);
         if (MessageBoxA(g_wnd, q, TOOL_NAME, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
             snprintf(g_job.msg, sizeof g_job.msg, "Stopped: some game files are missing or changed (see Check game files).");
             printf("converter: %s\n", g_job.msg); fflush(stdout);
@@ -329,7 +331,7 @@ static void convert_all(void) {
     int todo[NTRACKS], n = 0, missing = 0;
     for (int t = 0; t < NTRACKS; t++) {
         if (!track_present(g_job.game, t)) { printf("%s: no %s.BUN, skipped\n", k_tracks[t].name, k_tracks[t].bun); missing++; continue; }
-        if (track_done(t)) { printf("%s: already converted\n", k_tracks[t].name); continue; }
+        if (track_done(t)) { printf("%s: already prepared\n", k_tracks[t].name); continue; }
         todo[n++] = t;
     }
     g_job.todo = n;
@@ -390,21 +392,20 @@ static void convert_all(void) {
     g_job.extra[0] = 0;
     if (!extras_ok) printf("converter: some first-use caches failed (the Vita builds those itself)\n");
     unsigned secs = (GetTickCount() - g_job.start) / 1000;
-    if (!ok) snprintf(g_job.msg, sizeof g_job.msg, "Conversion failed on %s. See convert_log.txt in the output folder.",
+    if (!ok) snprintf(g_job.msg, sizeof g_job.msg, "Preparing %s failed. See convert_log.txt in the output folder.",
                       k_tracks[g_job.ncur].name);
     else if (!track_done(0)) { ok = 0; snprintf(g_job.msg, sizeof g_job.msg, "This folder has no city (TRACKS\\STREAML4RA.BUN)."); }
-    else if (n) snprintf(g_job.msg, sizeof g_job.msg, "Done: %d track%s converted in %u:%02u%s. Now send it to your Vita.",
-                         n, n == 1 ? "" : "s", secs / 60, secs % 60, missing ? " (some tracks were missing)" : "");
-    else snprintf(g_job.msg, sizeof g_job.msg, "Everything is already converted. Now send it to your Vita.");
+    else snprintf(g_job.msg, sizeof g_job.msg, "Ready to send (%d track%s prepared in %u:%02u%s).",
+                  n, n == 1 ? "" : "s", secs / 60, secs % 60, missing ? ", some tracks were missing" : "");
     printf("converter: %s\n", g_job.msg);
     /* then the World Expansion cities whose game folders are picked */
-    if (ok && xpp_any_dir()) {
+    if (ok && xpp_any_dir() && !g_job.no_xp) {
         g_job.in_xp = 1;
         int xok = xpp_convert(&g_job.xp, g_job.gui, g_wnd);
         conv_set_folders(g_job.game, g_out);
         g_job.in_xp = 0;
         char m[sizeof g_job.msg];
-        if (xok) snprintf(m, sizeof m, "Done: %s Now send it to your Vita.", g_job.xp.msg);
+        if (xok) snprintf(m, sizeof m, "Ready to send. %s", g_job.xp.msg);
         else snprintf(m, sizeof m, "Underground 2 is ready, but: %s", g_job.xp.msg);
         snprintf(g_job.msg, sizeof g_job.msg, "%s", m);
         printf("converter: %s\n", g_job.msg);
@@ -415,7 +416,7 @@ static void convert_all(void) {
     g_job.done = 1;
     g_job.busy = 0;
 }
-static DWORD WINAPI convert_thread(LPVOID a) { (void)a; convert_all(); return 0; }
+static void send_all(void);
 
 /* ---- sending to the Vita over FTP (worker thread) ------------------------- */
 typedef struct { char local[MAX_PATH + 160], remote[256]; long long size, mtime; int game; } SendFile;
@@ -866,20 +867,30 @@ static void send_all(void) {
         if (ok) snprintf(g_send.msg, sizeof g_send.msg, "%s %.0f MB%s%s. Start NFS Underground 2%s.%s%s",
                          to_dir ? "Copied" : "Sent", moved / 1048576.0,
                          to_dir ? "" : " to the Vita", skip,
-                         track_done(0) ? " -- it skips \"Optimizing world data\"" : "",
+                         "",
                          g_kept_profiles ? "\n\nYour profile already on the Vita was kept (not replaced by the "
                                            "PC import). To replace it, import the PC save again, then send." : "",
                          g_send.xp_sent ? "\n\nTo drive Rockport and Palmont: pick the city in Free Run. The first "
                                           "trip into each city takes a few minutes longer while the game prepares it." : "");
         if (ok) { vita_state(c, &vnow); vita_report(&vwas, &vnow, g_send.msg, sizeof g_send.msg); }
-    } else snprintf(g_send.msg, sizeof g_send.msg, "Nothing to send yet: convert first, or tick \"Game files too\".");
+    } else snprintf(g_send.msg, sizeof g_send.msg, "Nothing to send: pick your game folder and tick \"Game files too\".");
     if (c) InternetCloseHandle(c);
     if (net) InternetCloseHandle(net);
     g_send.ok = ok;
     g_send.done = 1;
     g_send.busy = 0;
 }
-static DWORD WINAPI send_thread(LPVOID a) { (void)a; send_all(); return 0; }
+/* Send / Copy: the game files checked and the small caches made first (a second;
+   skipped when there is no game folder), then the send */
+static DWORD WINAPI send_thread(LPVOID a) {
+    (void)a;
+    if (g_job.chain) {
+        convert_all();
+        if (!g_job.ok) { g_send.busy = 0; return 0; }   /* the job's result says why */
+    }
+    send_all();
+    return 0;
+}
 
 /* ---- settings ------------------------------------------------------------- */
 #define REG_KEY "Software\\NFSU2Vita\\PrepTool"
@@ -899,7 +910,7 @@ static void setting_put(const char *name, const char *v) {
 /* ---- the window ----------------------------------------------------------- */
 enum { ID_GAME = 100, ID_BROWSE, ID_CONVERT, ID_PROGRESS, ID_STATUS, ID_IP, ID_SEND, ID_OPEN, ID_TIMER, ID_IMPORT,
        ID_CHECK, ID_GAMEFILES, ID_COPY, ID_XPDIR0, ID_XPDIR1, ID_XPBROWSE0, ID_XPBROWSE1, ID_XPSTATUS, ID_XPFILES };
-static HWND g_game_ed, g_browse, g_convert, g_bar, g_ip_ed, g_send_btn, g_open, g_import,
+static HWND g_game_ed, g_browse, g_bar, g_ip_ed, g_send_btn, g_open, g_import,
             g_check, g_gamefiles, g_copy;
 static HWND g_xp_ed[XPP_NCITY], g_xp_browse[XPP_NCITY], g_xpfiles;   /* the World Expansion */
 static HFONT g_font, g_bold, g_title, g_small, g_head, g_sub, g_btnf, g_btnbig, g_glyph, g_glyph_s, g_glyph_l;
@@ -975,11 +986,12 @@ static int text_w(HDC dc, HFONT f, const wchar_t *s) {   /* in pixels */
     SIZE z; SelectObject(dc, f); GetTextExtentPoint32W(dc, s, (int)wcslen(s), &z); return z.cx;
 }
 
-/* the layout: the header, then five cards */
+/* the layout: the header, then four cards (11-25: no Convert card, Send does it) */
 enum { CW = 600, CX0 = 16, CX1 = 584, CL = 80, CR = 564 };
 enum { HDR_H = 112 };
-static const int k_card_y[5] = { 112, 252, 420, 578, 788 }, k_card_h[5] = { 132, 160, 150, 202, 72 };
-#define CLIENT_H (788 + 72 + 14)
+static const int k_card_y[4] = { 112, 252, 420, 688 }, k_card_h[4] = { 132, 160, 260, 72 };
+#define CLIENT_H (688 + 72 + 14)
+#define BAR_Y (CY(2) + 210)   /* the progress bar, the result beside it, the status line under it */
 #define CY(i) (k_card_y[i])
 
 static HWND g_wnd_focus_ed;   /* the edit box with the keyboard: its frame turns blue */
@@ -1008,14 +1020,14 @@ static void inval(int x, int y, int w, int h) {
 static char g_status_txt[600];
 static void set_status(const char *s) {
     snprintf(g_status_txt, sizeof g_status_txt, "%s", s);
-    inval(CL, CY(2) + 122, CR - CL, 20);
+    inval(CL, BAR_Y + 14, CR - CL, 20);
 }
 /* the result label beside the progress bar: 0 blank, 1 working, 2 done, 3 failed */
 static int g_done_state;
 static void set_done(int st) {
     if (st == g_done_state) return;
     g_done_state = st;
-    inval(CL + 400, CY(2) + 100, CR - CL - 400, 24);
+    inval(CL + 400, BAR_Y - 8, CR - CL - 400, 24);
     if (st >= 2 && GetForegroundWindow() != g_wnd) {   /* a long job ended: flash the taskbar button */
         FLASHWINFO fw = { sizeof fw, g_wnd, FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0 };
         FlashWindowEx(&fw);
@@ -1023,7 +1035,7 @@ static void set_done(int st) {
 }
 static void ui_idle(void) {
     int busy = g_job.busy || g_send.busy || g_chk.busy;
-    EnableWindow(g_convert, !busy); EnableWindow(g_browse, !busy); EnableWindow(g_game_ed, !busy);
+    EnableWindow(g_browse, !busy); EnableWindow(g_game_ed, !busy);
     EnableWindow(g_check, !busy);
     EnableWindow(g_send_btn, !busy); EnableWindow(g_copy, !busy); EnableWindow(g_ip_ed, !busy);
     EnableWindow(g_gamefiles, !busy);
@@ -1045,7 +1057,7 @@ static void xp_status_update(void) {
     inval(CL, CY(1) + 118, CR - CL, 30);
 }
 /* the line beside Check Game Files: 0 no folder, 1 found, 2 checked OK, 3 check failed,
-   4 not the game's folder, 5 converted */
+   4 not the game's folder, 5 prepared */
 static int g_game_st, g_chk_res;   /* g_chk_res: 0 not checked, 1 OK, 2 problems */
 static void game_state_update(void) {
     char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
@@ -1084,21 +1096,9 @@ static int xp_read_dirs(int warn) {
 }
 static void ui_initial_status(void) {
     char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
-    if (track_done(0)) {
-        int n = 0; for (int t = 0; t < NTRACKS; t++) n += track_done(t);
-        char m[400]; snprintf(m, sizeof m, "%d of %d tracks already converted. Convert finishes the rest; "
-                              "Send copies them to the Vita.", n, NTRACKS);
-        for (int c = 0; c < XPP_NCITY; c++) {   /* V5: the cities too */
-            char d[MAX_PATH]; GetWindowTextA(g_xp_ed[c], d, sizeof d);
-            int done = xpp_city_done(c);
-            if (!done && !d[0]) continue;
-            size_t k = strlen(m);
-            snprintf(m + k, sizeof m - k, " %s %s.", xpp_city_name(c), done ? "ready to send" : "files not right");
-        }
-        set_status(m);
-        SendMessageA(g_bar, PBM_SETPOS, n == NTRACKS ? 1000 : 0, 0);
-    } else if (!game[0]) set_status("Pick your Need for Speed Underground 2 folder, then press Convert.");
-    else set_status("Ready. Press Convert -- it checks your game files, then converts (about 2 minutes).");
+    SendMessageA(g_bar, PBM_SETPOS, 0, 0);
+    if (!game[0]) set_status("Pick your Need for Speed Underground 2 folder, then send it to your Vita.");
+    else set_status("Ready. Sending checks your game files first; files already on the Vita are skipped.");
 }
 
 static void on_browse(void) {
@@ -1139,48 +1139,38 @@ static void on_xp_browse(int c) {
     CoTaskMemFree(id);
     xp_status_update();
 }
-static void on_convert(void) {
-    char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
-    if (!game_dir_fix(game, sizeof game)) {
-        MessageBoxA(g_wnd, "Pick your Need for Speed Underground 2 folder first (it has a TRACKS folder in it).",
-                    TOOL_NAME, MB_ICONWARNING);
-        return;
-    }
-    if (!xp_read_dirs(1)) return;
-    SetWindowTextA(g_game_ed, game);
-    setting_put("GameDir", game);
-    memset(&g_job, 0, sizeof g_job);
-    snprintf(g_job.game, sizeof g_job.game, "%s", game);
-    g_job.gui = 1;
-    g_job.busy = 1;
-    SendMessageA(g_bar, PBM_SETPOS, 0, 0);
-    set_status("Starting...");
-    ui_idle();
-    HANDLE h = CreateThread(NULL, 16 << 20, convert_thread, NULL, 0, NULL);
-    if (h) CloseHandle(h); else { g_job.busy = 0; set_status("Could not start the conversion."); ui_idle(); }
-}
 /* Send to Vita (FTP) and Copy to memory card (a folder) start the same job */
 static void start_send(const char *ip, const char *dest) {
     int with_game = SendMessageA(g_gamefiles, BM_GETCHECK, 0, 0) == BST_CHECKED;
     setting_put("GameFiles", with_game ? "1" : "0");
     char game[MAX_PATH]; GetWindowTextA(g_game_ed, game, sizeof game);
-    if (with_game && !game_dir_fix(game, sizeof game)) {
+    int have_game = game_dir_fix(game, sizeof game);
+    if (with_game && !have_game) {
         MessageBoxA(g_wnd, "Pick your Need for Speed Underground 2 folder first (step 1), or untick "
-                    "\"Game files too\" to send only the converted data.", TOOL_NAME, MB_ICONWARNING);
+                    "\"Game files too\" to send only an imported save.", TOOL_NAME, MB_ICONWARNING);
         return;
     }
+    if (!xp_read_dirs(1)) return;
     memset(&g_send, 0, sizeof g_send);
     if (ip) snprintf(g_send.ip, sizeof g_send.ip, "%s", ip);
     if (dest) snprintf(g_send.dest, sizeof g_send.dest, "%s", dest);
     if (with_game) snprintf(g_send.game, sizeof g_send.game, "%s", game);
     g_send.xp = SendMessageA(g_xpfiles, BM_GETCHECK, 0, 0) == BST_CHECKED;
     setting_put("XpFiles", g_send.xp ? "1" : "0");
+    memset(&g_job, 0, sizeof g_job);
+    if (have_game) {   /* checked + the caches made first (send_thread) */
+        SetWindowTextA(g_game_ed, game);
+        setting_put("GameDir", game);
+        snprintf(g_job.game, sizeof g_job.game, "%s", game);
+        g_job.gui = 1; g_job.chain = 1; g_job.no_xp = !g_send.xp;
+        g_job.busy = 1;
+    }
     g_send.busy = 1;
     SendMessageA(g_bar, PBM_SETPOS, 0, 0);
-    set_status(dest ? "Copying..." : "Connecting to the Vita...");
+    set_status(have_game ? "Starting..." : dest ? "Copying..." : "Connecting to the Vita...");
     ui_idle();
-    HANDLE h = CreateThread(NULL, 0, send_thread, NULL, 0, NULL);
-    if (h) CloseHandle(h); else { g_send.busy = 0; ui_idle(); }
+    HANDLE h = CreateThread(NULL, 16 << 20, send_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h); else { g_send.busy = 0; g_job.busy = 0; ui_idle(); }
 }
 static void on_send(void) {
     char ip[64]; GetWindowTextA(g_ip_ed, ip, sizeof ip);
@@ -1215,7 +1205,7 @@ static void on_copy(void) {
     dest_fix(p);
     start_send(NULL, p);
 }
-/* Check game files: the same check Convert runs first, on its own */
+/* Check game files: the same check Send runs first, on its own */
 static DWORD WINAPI check_thread(LPVOID a) {
     int ok = check_game((const char *)a);
     if (xpp_any_dir()) {
@@ -1321,11 +1311,16 @@ static void on_timer(void) {
         float all = (g_job.cur + f) / (float)g_job.todo;
         SendMessageA(g_bar, PBM_SETPOS, (WPARAM)(all * 1000.0f), 0);
         unsigned secs = (GetTickCount() - g_job.start) / 1000;
-        snprintf(m, sizeof m, "Converting %d of %d: %s  -  %d%%      (%u:%02u)", g_job.cur + 1, g_job.todo,
+        snprintf(m, sizeof m, "Preparing %d of %d: %s  -  %d%%      (%u:%02u)", g_job.cur + 1, g_job.todo,
                  k_tracks[g_job.ncur].name, (int)(f * 100.0f), secs / 60, secs % 60);
         set_status(m);
     } else if (g_job.busy && g_job.extra[0]) {
         set_status(g_job.extra);
+    } else if (g_job.done && g_job.chain && g_job.ok) {   /* prepared: the send goes on */
+        g_job.done = 0;
+        xp_status_update();
+        game_state_update();
+        set_status(g_send.dest[0] ? "Copying..." : "Connecting to the Vita...");
     } else if (g_job.done) {
         g_job.done = 0;
         if (g_job.ok) SendMessageA(g_bar, PBM_SETPOS, 1000, 0);
@@ -1343,6 +1338,8 @@ static void on_timer(void) {
         set_status(m);
     } else if (g_send.done) {
         g_send.done = 0;
+        xp_status_update();
+        game_state_update();
         set_status(g_send.ok && g_send.vita_line[0] ? g_send.vita_line : g_send.msg);   /* V2 */
         set_done(g_send.ok ? 2 : 3);
         ui_idle();
@@ -1367,21 +1364,18 @@ static void build_ui(void) {
     SendMessageW(g_xp_ed[1], EM_SETCUEBANNER, FALSE, (LPARAM)L"Need for Speed Carbon folder (optional)");
     SendMessageW(g_game_ed, EM_SETCUEBANNER, FALSE, (LPARAM)L"Pick your Need for Speed Underground 2 folder");
 
-    y = CY(2);   /* 2. Convert */
-    g_convert = mk("BUTTON", "Convert", BS_OWNERDRAW, CL, y + 56, 190, 40, ID_CONVERT, g_btnbig);
-    g_bar = mk(PROGRESS_CLASSA, "", 0, CL, y + 108, 392, 10, ID_PROGRESS, g_font);
-    SendMessageA(g_bar, PBM_SETRANGE32, 0, 1000);
-
-    y = CY(3);   /* 3. Put it on your Vita */
+    y = CY(2);   /* 2. Put it on your Vita */
     g_gamefiles = mk("BUTTON", "Game files too (1.7 GB the first time, then skipped)",
                      BS_AUTOCHECKBOX, CL, y + 56, 316, 22, ID_GAMEFILES, g_font);
     g_xpfiles = mk("BUTTON", "World Expansion too", BS_AUTOCHECKBOX, CL + 326, y + 56, 158, 22, ID_XPFILES, g_font);
     g_ip_ed = mk_edit(CL + 104, y + 90, 196, 30, ID_IP);
-    g_send_btn = mk("BUTTON", "Send to Vita", BS_OWNERDRAW, CL + 312, y + 90, CR - CL - 312, 30, ID_SEND, g_btnf);
+    g_send_btn = mk("BUTTON", "Send to Vita", BS_OWNERDRAW, CL + 312, y + 88, CR - CL - 312, 34, ID_SEND, g_btnbig);
     g_copy = mk("BUTTON", "Copy to Memory Card...", BS_OWNERDRAW, 36, y + 152, 180, 32, ID_COPY, g_btnf);
     g_open = mk("BUTTON", "Open Output Folder", BS_OWNERDRAW, 412, y + 152, 152, 32, ID_OPEN, g_btnf);
+    g_bar = mk(PROGRESS_CLASSA, "", 0, CL, BAR_Y, 392, 10, ID_PROGRESS, g_font);
+    SendMessageA(g_bar, PBM_SETRANGE32, 0, 1000);
 
-    y = CY(4);   /* bring your PC career */
+    y = CY(3);   /* bring your PC career */
     g_import = mk("BUTTON", "Import PC Save...", BS_OWNERDRAW, CR - 160, y + 20, 160, 32, ID_IMPORT, g_btnf);
 }
 
@@ -1417,31 +1411,29 @@ static void paint_all(HDC dc, int cw, int chh) {
     gp_circle(g, 600, 40, 220, ARGB(60, 214, 230, 252));
     text_at(dc, g_title, RGB(14, 28, 52), CX0 + 8, 20, 540, 36, L"NFSU2 Vita Prep Tool", DT_SINGLELINE);
     text_at(dc, g_sub, RGB(56, 70, 92), CX0 + 8, 58, 540, 40,
-            L"Gets your NFSU2 PC files ready for the Vita: checks them, does the Vita’s one-time "
-            L"“Optimizing world data” step here, and puts everything on the Vita.", DT_WORDBREAK);
+            L"Puts your NFSU2 PC files on the Vita: checks them, then sends them over Wi-Fi or "
+            L"USB. Optional: you can also copy them by hand (see the README).", DT_WORDBREAK);
 
     /* the cards */
     card(g, dc, 0, L"1.  Your Need for Speed Underground 2 Folder", L"Pick the folder NFSU2 is installed in.", 0);
     card(g, dc, 1, L"Optional:  World Expansion — Rockport and Palmont",
          L"Own Most Wanted (2005) or Carbon? Their files are sent as they are, nothing converted.", 0);
-    card(g, dc, 2, L"2.  Convert", L"Prepares the world data for the Vita. Your game files are only read, never changed.", 0);
-    card(g, dc, 3, L"3.  Put It on Your Vita", L"Send the converted files to your PS Vita, over Wi-Fi or USB.", 0);
-    card(g, dc, 4, L"Optional:  Bring Your PC Career",
+    card(g, dc, 2, L"2.  Put It on Your Vita",
+         L"Checks your game files, then sends them to your PS Vita over Wi-Fi or USB.", 0);
+    card(g, dc, 3, L"Optional:  Bring Your PC Career",
          L"Import a PC save to continue your progress on the Vita (career, cars, options, high scores).", CR - 172 - CL);
 
     /* card icons */
     glyph_at(dc, g_glyph, RGB(47, 123, 224), CX0 + 14, CY(0) + 12, 40, 36, 0xE8B7);   /* folder */
     glyph_at(dc, g_glyph, RGB(123, 97, 255), CX0 + 14, CY(1) + 12, 40, 36, 0xEA86);   /* puzzle piece */
-    gp_circle(g, CX0 + 34, CY(2) + 30, 32, ARGB(255, 37, 110, 230));                  /* play */
-    glyph_at(dc, g_glyph_s, RGB(255, 255, 255), CX0 + 21, CY(2) + 16, 30, 28, 0xF5B0);
     {   /* a handheld */
-        int x = CX0 + 17, y = CY(3) + 20;
+        int x = CX0 + 17, y = CY(2) + 20;
         gp_box(g, x, y, 34, 20, 7, 0, ARGB(255, 37, 110, 230), 2.2f);
         gp_box(g, x + 10, y + 5, 14, 10, 2, ARGB(255, 37, 110, 230), 0, 0);
         gp_circle(g, x + 5.5f, y + 10, 3.5f, ARGB(255, 37, 110, 230));
         gp_circle(g, x + 28.5f, y + 10, 3.5f, ARGB(255, 37, 110, 230));
     }
-    glyph_at(dc, g_glyph, RGB(37, 110, 230), CX0 + 14, CY(4) + 18, 40, 36, 0xE7FC);   /* gamepad */
+    glyph_at(dc, g_glyph, RGB(37, 110, 230), CX0 + 14, CY(3) + 18, 40, 36, 0xE7FC);   /* gamepad */
 
     /* the edit frames */
     for (int i = 0; i < g_nframes; i++) {
@@ -1453,9 +1445,9 @@ static void paint_all(HDC dc, int cw, int chh) {
 
     /* card 1: the game folder's state */
     {
-        static const wchar_t *t[6] = { L"Pick your NFSU2 folder.", L"Game files found — ready to convert.",
-                                       L"Game files OK — ready to convert.", L"Some game files are missing or changed.",
-                                       L"That folder has no TRACKS folder.", L"Converted — ready to send." };
+        static const wchar_t *t[6] = { L"Pick your NFSU2 folder.", L"Game files found — ready to send.",
+                                       L"Game files OK — ready to send.", L"Some game files are missing or changed.",
+                                       L"That folder has no TRACKS folder.", L"Game files found — ready to send." };
         int st = g_game_st, y = CY(0) + 105, x = CL + 156;
         if (st == 1 || st == 2 || st == 5) icon_check(g, dc, x + 9, y, 18, RGB(34, 160, 80));
         else if (st == 0) gp_circle(g, (float)x + 9, (float)y, 8, ARGB(255, 150, 160, 175));
@@ -1484,24 +1476,17 @@ static void paint_all(HDC dc, int cw, int chh) {
             x += w + 10;
         }
     }
-    /* card 3: the time note, the result, the status line */
+    /* card 3: the IP label and hint, the USB note, the output folder's caption, then
+       the result and the status line around the progress bar */
     {
-        int y = CY(2);
-        HPEN p = CreatePen(PS_SOLID, 1, RGB(214, 221, 231)); HGDIOBJ op = SelectObject(dc, p);
-        MoveToEx(dc, S(CL + 208), S(y + 62), NULL); LineTo(dc, S(CL + 208), S(y + 92));
-        SelectObject(dc, op); DeleteObject(p);
-        glyph_at(dc, g_glyph, RGB(40, 52, 70), CL + 222, y + 58, 30, 36, 0xE823);   /* clock */
-        text_at(dc, g_bold, RGB(16, 30, 54), CL + 260, y + 58, 220, 18, L"About 2 minutes", DT_SINGLELINE);
-        text_at(dc, g_small, RGB(72, 84, 102), CL + 260, y + 77, 230, 18, L"(+ a file check for the World Expansion)", DT_SINGLELINE);
         static const wchar_t *dt[4] = { L"", L"Working…", L"✔ Done!", L"✖ Failed" };
         COLORREF dc2 = g_done_state == 2 ? RGB(22, 140, 60) : g_done_state == 3 ? RGB(200, 30, 30) : RGB(110, 118, 130);
-        text_at(dc, g_bold, dc2, CL + 400, y + 102, CR - CL - 400, 22, dt[g_done_state], DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+        text_at(dc, g_bold, dc2, CL + 400, BAR_Y - 6, CR - CL - 400, 22, dt[g_done_state], DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
         wchar_t w[600]; MultiByteToWideChar(CP_ACP, 0, g_status_txt, -1, w, 600);
-        text_at(dc, g_small, RGB(72, 84, 102), CL, y + 124, CR - CL, 18, w, DT_SINGLELINE | DT_END_ELLIPSIS);
+        text_at(dc, g_small, RGB(72, 84, 102), CL, BAR_Y + 16, CR - CL, 18, w, DT_SINGLELINE | DT_END_ELLIPSIS);
     }
-    /* card 4: the IP label and hint, the USB note, the output folder's caption */
     {
-        int y = CY(3);
+        int y = CY(2);
         text_at(dc, g_font, RGB(40, 52, 70), CL, y + 90, 104, 30, L"Vita IP address:", DT_SINGLELINE | DT_VCENTER);
         text_at(dc, g_small, RGB(96, 106, 122), CL, y + 124, CR - CL, 18,
                 L"VitaShell shows the IP when you press SELECT. Close NFS Underground 2 on the Vita first.",
@@ -1511,13 +1496,13 @@ static void paint_all(HDC dc, int cw, int chh) {
         HPEN p = CreatePen(PS_SOLID, 1, RGB(214, 221, 231)); HGDIOBJ op = SelectObject(dc, p);
         MoveToEx(dc, S(404), S(y + 152), NULL); LineTo(dc, S(404), S(y + 184));
         SelectObject(dc, op); DeleteObject(p);
-        text_at(dc, g_small, RGB(96, 106, 122), 412, y + 186, CR - 412, 16, L"Converted data and logs",
+        text_at(dc, g_small, RGB(96, 106, 122), 412, y + 186, CR - 412, 16, L"Caches, saves and logs",
                 DT_SINGLELINE | DT_CENTER);
     }
     if (g) GdipDeleteGraphics(g);
 }
 
-/* the owner-drawn buttons: rounded, a glyph before the text; Convert is the blue one */
+/* the owner-drawn buttons: rounded, a glyph before the text; Send to Vita is the blue one */
 static wchar_t btn_glyph(int id) {
     switch (id) {
     case ID_BROWSE: case ID_XPBROWSE0: case ID_XPBROWSE1: return 0xE8B7;
@@ -1525,13 +1510,12 @@ static wchar_t btn_glyph(int id) {
     case ID_COPY: return 0xE7F1;
     case ID_OPEN: return 0xE838;
     case ID_IMPORT: return 0xE898;
-    case ID_CONVERT: return 0xF5B0;
     }
     return 0;
 }
 static void draw_button(const DRAWITEMSTRUCT *d) {
     HDC dc = d->hDC; RECT r = d->rcItem;
-    int primary = d->CtlID == ID_CONVERT;
+    int primary = d->CtlID == ID_SEND;
     int dis = (d->itemState & ODS_DISABLED) != 0, down = (d->itemState & ODS_SELECTED) != 0;
     FillRect(dc, &r, g_white);
     void *g = gp_begin(dc);
@@ -1569,7 +1553,6 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_BROWSE: on_browse(); g_chk_res = 0; game_state_update(); return 0;
-        case ID_CONVERT: on_convert(); return 0;
         case ID_SEND: on_send(); return 0;
         case ID_COPY: on_copy(); return 0;
         case ID_CHECK: on_check(); return 0;
@@ -1611,8 +1594,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CLOSE:
         if ((g_job.busy || g_send.busy || g_chk.busy) &&
-            MessageBoxA(h, g_job.busy ? "The conversion is still running. Quit anyway? (The track in progress "
-                                        "starts over next time.)"
+            MessageBoxA(h, g_job.busy ? "Still checking and preparing. Quit anyway?"
                                       : g_chk.busy ? "Still checking the game files. Quit anyway?"
                                       : "Still sending to the Vita. Quit anyway? (Send again later: files already "
                                         "there are skipped.)",
@@ -1702,6 +1684,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
         conv_set_folders("", g_out);
         xpp_set_out(g_out);
         g_send.xp = 1;   /* the World Expansion: the picked games' files */
+        if (g_send.game[0]) {   /* checked + the caches made first, as the window's Send */
+            CreateDirectoryA(g_out, NULL);
+            snprintf(g_job.game, sizeof g_job.game, "%s", g_send.game);
+            convert_all();
+            if (!g_job.ok) { fprintf(stderr, "%s\n", g_job.msg); return 1; }
+        }
         send_all();
         fprintf(stderr, "%s\n", g_send.msg);
         return g_send.ok ? 0 : 1;

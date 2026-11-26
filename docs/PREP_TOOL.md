@@ -19,9 +19,10 @@ Underground 2 ready for the Vita:
 `NFSU2VitaPrep.exe` is on the [Releases](https://github.com/elmnt22/vita-nfsu2/releases)
 page. It's a single file with nothing to install (Windows 10 / 11).
 
-Use the Prep Tool from the **same release** as your VPK. When the game's
-data format changes, the Vita ignores cache files from an older tool and
-converts on its own again.
+The Prep Tool is optional: you can copy the game folders by hand instead
+(see the [README](../README.md#2-copy-the-game-data)). Use it from the
+**same release** as your VPK. When a cache format changes, the Vita ignores
+cache files from an older tool and makes them itself.
 
 ## 1. Pick your game folder
 
@@ -33,41 +34,36 @@ contains `TRACKS`). A copy of the game folders works too.
 
 **Check game files** compares each of the 1,202 files the Vita needs with
 the original game, by size and checksum. It takes a few seconds and only
-reads your files. **Convert** runs the same check first.
+reads your files. **Send to Vita** and **Copy to memory card** run the same
+check first.
 
 - **All files match:** you're good to go.
 - **Missing files:** the Vita needs them. Reinstall the game or copy the
   folders again.
 - **Changed files:** a mod, a different release or a damaged copy. These
-  may crash or look wrong on the Vita. You can still convert and send
-  anyway.
+  may crash or look wrong on the Vita. You can still send them anyway.
 
 It also tells you if `SPEED2.EXE` is v1.2. The Vita doesn't use the EXE,
 and the v1.2 patch didn't change the data files, so this is only a note.
 
-## 3. Convert
+## 3. Put it on the Vita
 
-Click **Convert**. It checks your game files, then prepares each track's
-small start-up file: the City, Drag Strips 1 and 2, Drift Venues, Street X
-Tracks and URL Tracks. Nothing is converted any more: the game streams every
-track straight from the game files, the way the original does. When the
-game starts, it deletes old converted track files from your Vita (they are
-no longer used).
+Nothing is converted: the game streams every track straight from the game
+files, the way the original does. When the game starts, it deletes old
+converted track files from your Vita (they are no longer used).
 
-It also prebuilds the cars' parts lists and the shop screens, which the
-Vita would otherwise build the first time you open them.
+Sending checks your game files, then makes a few small caches (about 25 MB,
+a second): each track's start-up file and the cars' parts lists and shop
+screens, which the Vita would otherwise build the first time you open them.
+They go to a folder called **`NFSU2 Vita Prep`** next to the tool, or in
+your Documents folder if that's not writable (**Open output folder** shows
+it), and are sent with the rest.
 
-The result (about **25 MB**) goes to a folder called
-**`NFSU2 Vita Prep`** next to the tool, or in your Documents folder if
-that's not writable. **Open output folder** shows it.
-
-## 4. Put it on the Vita
-
-**Game files too** sends the game files along with the converted data.
+**Game files too** sends the game files along with the caches.
 Leave it ticked the first time (about **1.7 GB**). Only the files the Vita
 needs go over: the `Support`, `Uninstall` and `#JIMBO` folders and other
 files the port never opens are left out. Game files that are already on
-the Vita at the right size are skipped. The converted data is skipped too
+the Vita at the right size are skipped. The caches are skipped too
 when it hasn't changed since the last send to that Vita (or memory card)
 and is still there: the Prep Tool keeps a list of what it sent,
 `sent_<where>.txt`, in its output folder. Adding the World Expansion later
@@ -106,8 +102,7 @@ and the **`cache`** folder from the output folder into
 
 ### Checking it worked
 
-Start the game. It goes straight to the title screen; there is no world
-conversion step.
+Start the game. It goes straight to the title screen.
 
 ## Importing a PC save
 
@@ -157,11 +152,11 @@ tool only checks them and copies them over. You can also copy them by hand
    found by themselves. Leave a box empty to skip that city. The line under
    the boxes shows each city's state: *not set*, *ready to send*, *files
    differ* or *folder not right*.
-2. **Convert** (or **Check game files**) checks the other games' files too.
-3. **Send to Vita** / **Copy to memory card** take the cities' files along
-   while **World Expansion too** is ticked (about 1.8 GB for both; files
-   already there are skipped).
-4. In the game, pick **Quick Race → Free Run**. The game finds the cities by
+2. **Send to Vita** / **Copy to memory card** check the cities' files and
+   take them along while **World Expansion too** is ticked (about 1.8 GB for
+   both; files already there are skipped). **Check game files** checks them
+   on their own.
+3. In the game, pick **Quick Race → Free Run**. The game finds the cities by
    itself. The first trip into each city takes a few minutes longer while it
    prepares it.
 

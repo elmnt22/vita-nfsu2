@@ -191,9 +191,9 @@ gets your PC copy of the game ready for the Vita:
 - **Checks your game files.** Every file the Vita needs is compared with the
   original game (size and checksum), so a missing, damaged or modded file
   shows up on the PC instead of as a crash on the Vita.
-- **Prebuilds the small caches** the game would otherwise make on first use
-  (each track's start, the cars' parts lists, the shop screens), with the
-  port's own code. This takes a few seconds.
+- **Prebuilds a few small caches** while it sends (each track's start, the
+  cars' parts lists, the shop screens). This takes a second; without the
+  tool the game makes them itself on first use.
 - **Puts it on the Vita** over Wi-Fi (FTP) or USB. Only the files the Vita
   needs go over (no `Support`, `Uninstall` or other unused files). Files
   already there are skipped: the tool remembers what it sent to each Vita or
@@ -203,9 +203,10 @@ gets your PC copy of the game ready for the Vita:
   converting; the tool just checks and copies those games' files.
 - **Imports a PC save** (see [below](#bringing-over-a-pc-save)).
 
-Use the Prep Tool from the **same release** as your VPK. If the data format
-changes, the Vita ignores cache files from an older tool and converts the
-data itself.
+The Prep Tool is optional: copying the game folders by hand works the same
+(see [step 2](#2-copy-the-game-data)). Use it from the **same release** as
+your VPK. If a cache format changes, the Vita ignores cache files from an
+older tool and makes them itself.
 
 **Quick start:**
 
@@ -216,12 +217,8 @@ Run **NFSU2VitaPrep.exe**. The window follows the steps from top to bottom:
    the game folder (the one with `TRACKS` in it). **Check Game Files** checks
    it on its own; the line beside it tells you whether it's ready.
 2. **Optional: World Expansion.** Leave it empty if you only want Bayview.
-3. **Convert.** It checks your game files first, then prebuilds the small
-   caches (about 25 MB, a few seconds). Nothing in the world needs
-   converting any more. The result goes to a folder called `NFSU2 Vita Prep`.
-   **Done!** shows beside the progress bar when it has finished.
-4. **Put It on Your Vita.** Leave **Game files too** ticked the first time
-   (about 1.7 GB), then either:
+3. **Put It on Your Vita.** Leave **Game files too** ticked the first time
+   (about 1.7 GB). Sending checks your game files first. Then either:
    - **Over Wi-Fi:** start an FTP server on the Vita on port **1337** (in
      VitaShell press **SELECT**, or use vitacompanion), type the IP address
      the Vita shows and click **Send to Vita**.
@@ -229,10 +226,8 @@ Run **NFSU2VitaPrep.exe**. The window follows the steps from top to bottom:
      and connect the Vita. Click **Copy to Memory Card...** and pick the
      memory card's drive.
 
-   **Open Output Folder** shows the converted data and the logs.
-
-If it worked, the game goes straight to the title screen without the
-"OPTIMIZING WORLD DATA" screen.
+   **Done!** shows beside the progress bar when it has finished. **Open
+   Output Folder** shows the caches, imported saves and logs.
 
 The full guide, with the command line options and troubleshooting, is in
 **[docs/PREP_TOOL.md](docs/PREP_TOOL.md)**.
@@ -314,11 +309,10 @@ one of the two ways below; both end with the same files in the same place.
    `TRACKS` in it). Installed copies are found by themselves. Leave a box
    empty to skip that city. Each city shows **Ready to send** when its files
    are there.
-2. **Convert** (or **Check Game Files**) also checks those games' files
-   against the originals.
-3. **Send to Vita** or **Copy to Memory Card...** with **World Expansion
-   too** ticked. It copies the same files as Option A into the same
-   folders, and skips files already there.
+2. **Send to Vita** or **Copy to Memory Card...** with **World Expansion
+   too** ticked. It checks those games' files against the originals, then
+   copies the same files as Option A into the same folders, and skips files
+   already there. (**Check Game Files** runs the check on its own.)
 
 #### Then, on the Vita
 
@@ -426,7 +420,7 @@ supported targets are the three scripts above.
 | `src/` | Game code: engine, world streaming, rendering, physics (`n2sim`), AI, career, front end (FEng), HUD, shops, audio, speech, movies, profiles |
 | `vita/` | Vita platform layer (an SDL subset on vitaGL / SceCtrl / SceAudio), boot settings menu, build script, LiveArea assets, vendored vitaGL |
 | `sim/` | Windows simulator of the Vita build, plus self-tests in `sim/test/` |
-| `converter/` | NFSU2 Vita Prep Tool: game file check, PC-side world conversion, cache builders, PC save import, FTP / USB send |
+| `converter/` | NFSU2 Vita Prep Tool: game file check, cache builders, PC save import, FTP / USB send |
 | `tools/` | Asset dump/audit tools, LiveArea and loading-screen art helpers |
 | `docs/` | Player guide for the Prep Tool, file format notes, developer guide |
 | `third_party/` | Dear ImGui (desktop debug UI) |

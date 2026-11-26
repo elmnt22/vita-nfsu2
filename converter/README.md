@@ -54,20 +54,20 @@ World detail is set to low, as the Vita's default.
 
 1. Run `NFSU2VitaPrep.exe` (one file, nothing to install). It finds the NFSU2
    install from the registry; otherwise Browse to the folder with `TRACKS`.
-2. Convert.
-3. Send to Vita: the Vita's FTP server on port 1337 (VitaShell: SELECT, or
-   vitacompanion). Or copy the `cache` folder from "Open output folder" into
-   `ux0:data/NFSU2/` by hand.
+2. Send to Vita: the Vita's FTP server on port 1337 (VitaShell: SELECT, or
+   vitacompanion), or Copy to Memory Card. Sending checks the game files and
+   makes the small caches first (11-25: there is no Convert button any
+   more; `send_thread` runs `convert_all` with `g_job.chain`).
 
-Command line: `--check GAME`, `--cli GAME OUT` (check + convert, log in
-`OUT/convert_log.txt`), `--send IP OUT [GAME|- [MW|- [CARBON|-]]]`,
+Command line: `--check GAME`, `--cli GAME OUT` (check + prepare the caches,
+log in `OUT/convert_log.txt`; `--send`/`--copy` with GAME do this first too), `--send IP OUT [GAME|- [MW|- [CARBON|-]]]`,
 `--copy DEST OUT [GAME|- [MW|- [CARBON|-]]]`.
 
 World Expansion (`conv_xp.c`, merged from the separate Expansion Prep Tool
 11-19): optional Most Wanted / Carbon folders (`--cli GAME OUT [MW|- [CARBON|-]]`).
 Since 11-25 nothing is converted: the game streams both cities from the
 original files (`src/rstream.c`) and prepares the rest on the first trip
-(`src/xpcity.c`). Convert checks the files against `xp_manifest.inc`
+(`src/xpcity.c`). Send checks the files against `xp_manifest.inc`
 (`tools/gen_xp_manifest.py`); Send copies them as they are to
 `ux0:data/NFSU2/expansion/<mw|carbon>/` (gameplay.bin and the minimap, the
 stream, then the companion `.BUN` last: with both `.BUN` files there the game
