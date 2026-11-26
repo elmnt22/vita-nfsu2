@@ -43,7 +43,7 @@ const float *xpcity_race_route(const char *track, int event_id, int *n_out);
 extern int g_xpcity_pick;
 int xpcity_outdated(int pick);           /* V3: translated for an older build, no raw files (the Prep Tool has to send it again) */
 int xpcity_installed(int pick);          /* translated or raw files there (Bayview: 1) */
-int xpcity_enabled(void);              /* ux0:data/NFSU2/expansion/enable.txt (the switch; the cities need it and their files) */
+int xpcity_enabled(void);              /* a city's raw files in ux0:data/NFSU2/expansion/<mw|carbon>, or the old Prep Tool switch (enable.txt) */
 const char *xpcity_track(int pick);      /* its stream name (STREAML2RA ...), Bayview NULL */
 /* race barriers (MW BARRIER_SPLINE groups): the city's per-event lists
    (TRACKS/ROUTES<region>/barriers.txt) for the scenery selection (world_scenery.h hook,

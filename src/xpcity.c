@@ -1,13 +1,13 @@
-/* xpcity.c -- the expansion cities' one-time translation on the console.
+/* xpcity.c -- the expansion cities on the console, from the games' raw files.
  *
- * Rockport (Most Wanted 2005) and Palmont (Carbon) are read as UG2 tracks
- * STREAML2RA / STREAML5RA once their world stream is translated into UG2's
- * format (xpconv.c). The NFSU2 Expansion Prep Tool does that on a PC and sends
- * the result with its marker (TRACKS/<stream>.xp). Without the tool the player
- * copies the game's raw files to ux0:data/NFSU2/expansion/<mw|carbon>/TRACKS
- * and the first boot into the city translates them here, behind a progress
- * screen (slower, same output); the boot's tile conversion then builds the
- * rest exactly as it does for a Bayview track. */
+ * Rockport (Most Wanted 2005) and Palmont (Carbon): the player copies the games'
+ * raw files to ux0:data/NFSU2/expansion/<mw|carbon>/ (TRACKS/ + GLOBAL/) and
+ * nothing else -- no PC tool (11-25). The retail streamer (rstream.c) draws the
+ * raw stream, each section translated as it loads; the first boot into the city
+ * makes the small files (companion, collision, map, roads, races, props) here,
+ * on the game's loading screen. The old way stays readable: a city translated
+ * into UG2's format (xpconv.c) by the Expansion Prep Tool, with its marker
+ * (TRACKS/<stream>.xp) and tiles, is still used when its raw files are not there. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -39,7 +39,8 @@ static void city_screen_done(void)
 }
 
 #define XP_RAW_ROOT "ux0:data/NFSU2/expansion"
-#define XP_SWITCH   XP_RAW_ROOT "/enable.txt"   /* the switch: the cities need it AND their files */
+#define XP_SWITCH   XP_RAW_ROOT "/enable.txt"   /* the switch (Settings ticked on, or the old Prep Tool) */
+#define XP_OFF      XP_RAW_ROOT "/off.txt"      /* Settings ticked off: dropped-in raw files stay hidden */
 #define XP_CACHE    "ux0:data/NFSU2/cache"
 
 static const struct { const char *bun, *companion, *dir, *name; int game; } k_city[] = {
@@ -501,6 +502,7 @@ keep:
     return out;
 }
 
+static void files_notice(int c);   /* the file check (below) */
 static int g_failed[NCITY];   /* XF3: a translation that failed this session */
 static int g_known[NCITY], g_ok[NCITY];   /* xpcity_installed: the files do not change while the game runs */
 /* ---- the retail streamer's way (11-24): no translated stream, no tiles ----
@@ -604,6 +606,7 @@ static int lean_prepare(int c, const char *troot)
     }
     if (g_failed[c]) { vita_mark("xpcity: %s failed to prepare this session; not again until a restart", k_city[c].name); return 0; }
     vita_mark("xpcity: preparing %s for the retail streamer from %s (%lld bytes)", k_city[c].name, raw, raw_size);
+    files_notice(c);
     remove(mark);
     snprintf(p, sizeof p, XP_CACHE "/%s.XPL.idx", k_city[c].bun); remove(p);
     g_prep_city = k_city[c].name;
@@ -664,6 +667,7 @@ int xpcity_prepare(const char *troot, const char *track) {
     }
     if (g_failed[c]) { vita_mark("xpcity: %s failed to translate this session; not again until a restart", k_city[c].name); return 0; }
     vita_mark("xpcity: translating %s from %s (%lld bytes)", k_city[c].name, raw, raw_size);
+    files_notice(c);
     remove(mark);
     /* everything built from an older translation goes with it */
     char p[256];
@@ -713,16 +717,90 @@ int xpcity_prepare(const char *troot, const char *track) {
 
 /* the Free Run world picker (shop.c): 0 Bayview, 1 Rockport, 2 Palmont */
 int g_xpcity_pick;
-/* the switch (as the World Expansion's beyond/enable.txt): the cities need it AND their files */
+/* raw files dropped in for city c: its stream + companion in expansion/<mw|carbon>/TRACKS */
+static int raw_present(int c)
+{
+    char a[256], b[256];
+    snprintf(a, sizeof a, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
+    snprintf(b, sizeof b, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
+    return xp_file_size(a) > 0 && xp_file_size(b) > 0;
+}
+/* on: the switch (expansion/enable.txt: Settings, or the old Prep Tool), or (11-25, no PC
+   tool) a city's raw files dropped in -- the player copies them and nothing else --
+   unless Settings ticked the World Expansion off (expansion/off.txt) */
 int xpcity_enabled(void)
 {
     static int known, on;
     if (!known) {
-        on = xp_file_size(XP_SWITCH) >= 0;
+        int sw = xp_file_size(XP_SWITCH) >= 0, raw = 0;
+        for (int c = 0; c < NCITY; c++) raw |= raw_present(c) << c;
+        on = sw || (raw && xp_file_size(XP_OFF) < 0);
         known = 1;
-        printf("xpcity: %s\n", on ? "enable.txt found -- Rockport / Palmont on where installed" : "off (no " XP_SWITCH ")");
+        printf("xpcity: %s%s%s\n", !on ? (raw ? "off (ticked off in Settings: " XP_OFF ")" : "off (no raw files in " XP_RAW_ROOT ", no enable.txt)")
+                                       : sw ? "enable.txt found" : "raw files found",
+               raw & 1 ? " -- Rockport files in" : "", raw & 2 ? " -- Palmont files in" : "");
     }
     return on;
+}
+
+/* ---- the file check (was the Prep Tool's): the files each city reads, as in the
+   games the expansion was made with (attributes.bin: never read here). Every size is checked; the small files' CRC32
+   too (~5 MB); the streams by size only (reading 0.5-1.2 GB just for this would add
+   a minute to the first boot). A different file is logged and shown on the loading
+   screen, then the prep goes on (a different release may still work). */
+static const struct { int city; const char *rel; long long size; unsigned crc; int opt; } k_files[] = {
+    { 0, "TRACKS/STREAML2RA.BUN", 532663556LL, 0xbd947661u, 0 },
+    { 0, "TRACKS/L2RA.BUN", 1413824LL, 0x75079449u, 0 },
+    { 0, "TRACKS/L2RA/MINI_MAP.BIN", 221492LL, 0x93886852u, 1 },
+    { 0, "GLOBAL/gameplay.bin", 2105216LL, 0xc5153d5au, 1 },
+    { 1, "TRACKS/STREAML5RA.BUN", 1238368256LL, 0x964f0bedu, 0 },
+    { 1, "TRACKS/L5RA.BUN", 1068712LL, 0xf1d4c3ceu, 0 },
+    { 1, "GLOBAL/gameplay.bin", 1638336LL, 0x5f351271u, 1 },
+};
+static unsigned file_crc(const char *p)
+{
+    FILE *f = fopen(p, "rb"); if (!f) return 0;
+    static unsigned char buf[64 << 10]; static unsigned tab[256];
+    if (!tab[1]) for (unsigned i = 0; i < 256; i++) {   /* the zip CRC-32, as the Prep Tool's */
+        unsigned k = i; for (int b = 0; b < 8; b++) k = k & 1 ? 0xedb88320u ^ (k >> 1) : k >> 1; tab[i] = k; }
+    unsigned c = 0xffffffffu; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) for (size_t i = 0; i < n; i++) c = tab[(c ^ buf[i]) & 0xff] ^ (c >> 8);
+    fclose(f);
+    return c ^ 0xffffffffu;
+}
+/* 0 all match; else the number of missing/different files, the first in why */
+static int files_check(int c, char *why, size_t n)
+{
+    int bad = 0; why[0] = 0;
+    for (int i = 0; i < (int)(sizeof k_files / sizeof *k_files); i++) {
+        if (k_files[i].city != c) continue;
+        char p[300]; snprintf(p, sizeof p, XP_RAW_ROOT "/%s/%s", k_city[c].dir, k_files[i].rel);
+        long long sz = xp_file_size(p);
+        const char *w = sz < 0 ? "missing" : sz != k_files[i].size ? "a different size"
+                      : k_files[i].size < (64LL << 20) && file_crc(p) != k_files[i].crc ? "different" : NULL;
+        if (!w) continue;
+        vita_mark("xpcity: %s file check: %s is %s%s", k_city[c].name, k_files[i].rel, w,
+                  sz < 0 && k_files[i].opt ? " (optional: that part is left out)" : "");
+        if (!bad++) {
+            const char *nm = strrchr(k_files[i].rel, '/');
+            snprintf(why, n, "%s IS %s", nm ? nm + 1 : k_files[i].rel, w);
+            for (char *s = why; *s; s++) if (*s >= 'a' && *s <= 'z') *s -= 32;
+        }
+    }
+    if (!bad) vita_mark("xpcity: %s file check: all files match", k_city[c].name);
+    return bad;
+}
+/* shown once per city on its first prep: a few seconds, then the prep goes on */
+static void files_notice(int c)
+{
+    char why[96];
+    if (!files_check(c, why, sizeof why) || !xpcity_screen) return;
+    char t[64]; snprintf(t, sizeof t, "PREPARING %s", k_city[c].name);
+    Uint32 t0 = SDL_GetTicks();
+    while (SDL_GetTicks() - t0 < 4000) {
+        city_screen(t, why, "NOT THE EXPECTED GAME VERSION -- TRYING ANYWAY");
+        SDL_Delay(100);
+    }
 }
 /* 1 usable (translated, or raw files to translate), 2 translated but too old for this
    build and no raw files to translate again (V3: "run the Prep Tool again"), 0 none */

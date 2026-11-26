@@ -8300,8 +8300,8 @@ static void crib_trip(Shop *s, int city) {
 static int xp_outdated_msg(Shop *s, int city) {
     if (!xpcity_outdated(city)) return 0;
     static char t[200];
-    snprintf(t, sizeof t, "%s needs updating. Run the Prep Tool again and send the files to your Vita.",
-             city == 1 ? "Rockport" : "Palmont");
+    snprintf(t, sizeof t, "%s needs updating. Copy the %s files to ux0:data/NFSU2/expansion/%s on your Vita.",
+             city == 1 ? "Rockport" : "Palmont", city == 1 ? "NFS Most Wanted" : "NFS Carbon", city == 1 ? "mw" : "carbon");
     dialog_text(s, DLG_AUTO, 1, t, DA_NONE, 0, 0);
     return 1;
 }

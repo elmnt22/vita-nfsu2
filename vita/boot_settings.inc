@@ -24,9 +24,11 @@
      Full detail fulldetail.txt  present = the original road reflection rate,
                              traffic count and particle rate; off by default
                              (the Vita's lighter mix for 30 fps downtown)
-     World Expansion  expansion/enable.txt  present = Rockport (from NFS Most
-                             Wanted) and Palmont (from NFS Carbon) in Free Run,
-                             where the Prep Tool installed them; off by default
+     World Expansion  Rockport (from NFS Most Wanted) and Palmont (from NFS
+                             Carbon) in Free Run: on when their raw files are in
+                             ux0:data/NFSU2/expansion (11-25, no PC tool) or
+                             expansion/enable.txt is there; ticked off =
+                             expansion/off.txt (raw files kept, cities hidden)
      Save logs as ZIP        packs the last (or all kept) run folders of
                              ux0:data/NFSU2/logs into ux0:data/NFSU2/
                              NFSU2_logs_<time>.zip for bug reports; local only
@@ -67,6 +69,7 @@ enum { STG_UP = 1, STG_DOWN = 2, STG_LEFT = 4, STG_RIGHT = 8, STG_CROSS = 16, ST
 #define BS_FULL   "ux0:data/NFSU2/fulldetail.txt"   /* = main.c full_detail() */
 #define BS_CACHE  "ux0:data/NFSU2/cache"
 #define BS_XP     "ux0:data/NFSU2/expansion/enable.txt"   /* = xpcity.c XP_SWITCH */
+#define BS_XPOFF  "ux0:data/NFSU2/expansion/off.txt"      /* = xpcity.c XP_OFF */
 
 /* one rasterised glyph: w x h coverage, left = pen to bitmap's left edge,
    top = baseline to bitmap's top edge (up positive), adv = pen advance */
@@ -521,7 +524,7 @@ static const char *const k_bs_help[I_N] = {
     "Earn PS Vita trophies. Needs the NoTrpDrm plugin.",
     "Original reflections, traffic and particles. Lower frame rate.",
     "",
-    "Drive Rockport and Palmont in Free Run. Needs the Prep Tool.",
+    "Drive Rockport and Palmont in Free Run.",
     "Clear converted data and shaders. Your saves are kept.",
     "Start the game with these settings." };
 /* layout in 720x408 units: the title bar, the rows full width (scrolled when
@@ -617,10 +620,10 @@ static void bs_draw(const BsUi *u)
                       : u->sel == I_RESET && u->confirm ? "Select again to delete caches. Saves are kept."
                       : u->sel == I_EXPORT && u->xstatus[0] ? u->xstatus
                       : u->sel == I_XP && !u->xp_city[0] && !u->xp_city[1]
-                        ? "Not installed: add NFS Most Wanted / Carbon with the PC Prep Tool."
+                        ? "Not installed: copy the NFS Most Wanted / Carbon files to ux0:data/NFSU2/expansion."
                       : u->sel == I_XP && u->xp && !(u->xp_city[0] && u->xp_city[1])
-                        ? (u->xp_city[0] ? "Rockport is ready. Add NFS Carbon in the Prep Tool for Palmont."
-                                         : "Palmont is ready. Add NFS Most Wanted in the Prep Tool for Rockport.")
+                        ? (u->xp_city[0] ? "Rockport is ready. Copy the NFS Carbon files for Palmont."
+                                         : "Palmont is ready. Copy the NFS Most Wanted files for Rockport.")
                       : k_bs_help[u->sel];
         float dy = ry0 + vis * rh + 12 * S;
         bs_text(fs, d, (W - bs_text_w(fs, d)) * 0.5f, dy, white);
@@ -754,13 +757,14 @@ static void boot_settings_run(void) {
     u.rscam = bs_exists(BS_RSCAM);
     u.novr = bs_exists(BS_NOVR);
     u.trophies = bs_exists(BS_TRP); u.full = bs_exists(BS_FULL); u.frac = -1.0f;
-    u.xp = bs_exists(BS_XP);
-    /* installed = translated by the Prep Tool (.xp marker beside the world), or
-       the raw files the Vita translates itself on the first drive (xpcity.c city_ok) */
-    u.xp_city[0] = bs_exists("ux0:data/NFSU2/TRACKS/STREAML2RA.xp") ||
-                   bs_exists("ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN");
-    u.xp_city[1] = bs_exists("ux0:data/NFSU2/TRACKS/STREAML5RA.xp") ||
-                   bs_exists("ux0:data/NFSU2/expansion/carbon/TRACKS/STREAML5RA.BUN");
+    /* installed = the raw files the Vita streams (dropped in, 11-25), or a city the old
+       Prep Tool translated (.xp marker beside the world) -- xpcity.c city_ok */
+    int raw0 = bs_exists("ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN");
+    int raw1 = bs_exists("ux0:data/NFSU2/expansion/carbon/TRACKS/STREAML5RA.BUN");
+    u.xp_city[0] = raw0 || bs_exists("ux0:data/NFSU2/TRACKS/STREAML2RA.xp");
+    u.xp_city[1] = raw1 || bs_exists("ux0:data/NFSU2/TRACKS/STREAML5RA.xp");
+    /* on: the switch, or raw files dropped in and not ticked off (= xpcity_enabled) */
+    u.xp = bs_exists(BS_XP) || ((raw0 || raw1) && !bs_exists(BS_XPOFF));
     int quit = 0;
     unsigned prev = bs_pad();   /* the L+R that opened the screen is not a press */
     vita_mark("settings: opened (logs %s, frame rate %s, fast travel %s)", u.logs ? "on" : "off",
@@ -818,7 +822,9 @@ static void boot_settings_run(void) {
             case I_NOVR:   bs_toggle(&u.novr, BS_NOVR, 1); u.status[0] = 0; break;
             case I_TROPHY: bs_toggle(&u.trophies, BS_TRP, 1); u.status[0] = 0; break;
             case I_FULL:   bs_toggle(&u.full, BS_FULL, 1); u.status[0] = 0; break;
-            case I_XP:     bs_toggle(&u.xp, BS_XP, 1); u.status[0] = 0; break;
+            case I_XP:     bs_toggle(&u.xp, BS_XP, 1); u.status[0] = 0;
+                           if (u.xp) bs_remove(BS_XPOFF); else bs_touch(BS_XPOFF);   /* off beats dropped-in files */
+                           break;
             case I_EXPORT:
                 if (!cross) { u.export_all = !u.export_all; u.xstatus[0] = 0; break; }
                 u.xstatus[0] = 0; u.busy = "Saving logs..."; u.frac = 0.0f;
