@@ -260,14 +260,22 @@ static long pin_tpk(int fd, long off, uint32_t size, long cur, int *nstub) {
 }
 
 static int g_pin_strip_req;   /* (defined below) */
-/* One pass over the top-level chunk list into g_pb / g_ps. */
-static long pin_build(int fd, long flen, int *nstub) {
+/* One pass over the top-level chunk list into g_pb / g_ps. top: that list's headers
+   already read (xp_lean, the city's first preparation), or NULL. */
+static long pin_build(int fd, long flen, int *nstub, const XpTop *top, int ntop) {
     long off = 0, cur = 0;
     unsigned char h[8];
+    int ti = 0;
     *nstub = 0;
     while (off + 8 <= flen) {
-        if (!pin_pread(fd, off, h, 8)) return -1;
-        uint32_t cid = pin_u32(h), cs = pin_u32(h + 4);
+        uint32_t cid, cs;
+        if (top) {
+            if (ti >= ntop || top[ti].off != off) return -1;
+            cid = top[ti].id; cs = top[ti].size; ti++;
+        } else {
+            if (!pin_pread(fd, off, h, 8)) return -1;
+            cid = pin_u32(h); cs = pin_u32(h + 4);
+        }
         if ((unsigned long)cs > (unsigned long)(flen - off - 8)) return -1;   /* no signed wrap / zero-step loop */
         long next = off + 8 + (long)cs;
         if (g_pin_strip_req && (cid == 0x80134000u || cid == 0x80034100u || cid == 0x80034130u || cid == 0x3b801u)) {
@@ -429,7 +437,14 @@ unsigned char *res_bundle(const char *path, long *len) {
     }
     int nstub = 0;
     Uint32 b0 = SDL_GetTicks();
-    long size = flen > 0 ? pin_build(fd, flen, &nstub) : -1;
+    const XpTop *top = NULL;
+    int ntop = xp_lean_top(path, flen, &top);
+    long size = flen > 0 ? pin_build(fd, flen, &nstub, ntop >= 0 ? top : NULL, ntop) : -1;
+    if (size < 0 && ntop >= 0) {   /* (the list not of this file after all: the walk) */
+        free(g_pb); free(g_ps); g_pb = NULL; g_pbcap = 0; g_ps = NULL; g_pscap = 0;
+        ntop = -1; size = pin_build(fd, flen, &nstub, NULL, 0);
+    }
+    xp_lean_top_drop();
     close(fd);
     unsigned char *out = size > 0 ? (unsigned char *)realloc(g_pb, (size_t)size) : NULL;   /* to its size */
     if (!out) free(g_pb);
@@ -437,7 +452,8 @@ unsigned char *res_bundle(const char *path, long *len) {
     g_pb = NULL; g_pbcap = 0; g_ps = NULL; g_pscap = 0;
     if (!out) { free(stub); return NULL; }
     if (!nstub) { free(stub); stub = NULL; }
-    printf("bundle copy built in one pass: %u ms\n", (unsigned)(SDL_GetTicks() - b0));
+    printf("bundle copy built in one pass: %u ms%s\n", (unsigned)(SDL_GetTicks() - b0),
+           ntop >= 0 ? " (chunk list from the lean pass)" : "");
     snprintf(g_pin.path, sizeof g_pin.path, "%s", path);
     g_pin.data = out; g_pin.len = size; g_pin.stub = stub; g_pin.nstub = nstub;
     g_pin_flen = flen; g_pin_gen++;

@@ -38,6 +38,15 @@ int xp_convert(const char *in_path, const char *out_path, int game,
 int xp_section(const unsigned char *in, size_t n, int game, unsigned char **out, size_t *outn);
 size_t xp_tpk_header_carbon(const unsigned char *p, size_t n, unsigned char *out);   /* resource.c pin: Carbon TPK v8 header -> UG2 (0 = not Carbon) */
 int xp_lean(const char *in_path, const char *out_path, int game, XpProgress progress, void *ud, XpStats *stats);
+/* where the last xp_lean of in_path found the stream's CARP chunks (0x3b801, top
+   level, file order: header offsets + sizes), so the race events' barrier walls read
+   only those; -1 = no such list this session (walk the stream instead) */
+int xp_lean_carp(const char *in_path, const long long **off, const unsigned **size);
+/* and every top-level chunk header of it (file order), when it walked the whole file
+   of that length; -1 = none. xp_lean_top_drop frees the list. */
+typedef struct { long long off; unsigned id, size; } XpTop;
+int xp_lean_top(const char *in_path, long long len, const XpTop **t);
+void xp_lean_top_drop(void);
 /* The marker next to a translated stream (STREAMxxx.xp): "xpconv VERSION GAME SOURCE_SIZE".
    xp_marker_ok: 1 when it is there and matches this translator + source (source_size < 0:
    any source, for a city sent from the PC tool without its raw files). */

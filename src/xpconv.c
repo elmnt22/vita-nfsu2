@@ -909,9 +909,53 @@ int xp_section(const uint8_t *in, size_t n, int game, uint8_t **out, size_t *out
 /* The lean file (STREAMxxx.XPL) for a city the retail streamer draws from its raw
    stream: only the collision packs (the CARP packs translated, as xp_convert) and
    the generated night lamp flares (0x80135100), read from the raw stream once. */
+static struct { char path[512]; long long *off; unsigned *sz; int n, cap, ok; } g_carp;
+int xp_lean_carp(const char *in_path, const long long **off, const unsigned **size)
+{
+    if (!g_carp.ok || !in_path || strcmp(in_path, g_carp.path)) return -1;
+    *off = g_carp.off; *size = g_carp.sz;
+    return g_carp.n;
+}
+/* every top-level chunk header the last xp_lean read (resource.c's pin build: the same
+   walk, not done twice) */
+static struct { char path[512]; long long len; XpTop *t; int n, cap, ok; } g_top;
+int xp_lean_top(const char *in_path, long long len, const XpTop **t)
+{
+    if (!g_top.ok || !in_path || strcmp(in_path, g_top.path) || len != g_top.len) return -1;
+    *t = g_top.t;
+    return g_top.n;
+}
+void xp_lean_top_drop(void) { free(g_top.t); memset(&g_top, 0, sizeof g_top); }
+static int top_note(long long at, unsigned id, unsigned sz)
+{
+    if (g_top.n == g_top.cap) {
+        int cap = g_top.cap ? g_top.cap * 2 : 4096;
+        XpTop *n = realloc(g_top.t, (size_t)cap * sizeof *n); if (!n) return 0;
+        g_top.t = n; g_top.cap = cap;
+    }
+    g_top.t[g_top.n].off = at; g_top.t[g_top.n].id = id; g_top.t[g_top.n].size = sz; g_top.n++;
+    return 1;
+}
+static int carp_note(long long at, unsigned sz)
+{
+    if (g_carp.n == g_carp.cap) {
+        int cap = g_carp.cap ? g_carp.cap * 2 : 512;
+        long long *o = realloc(g_carp.off, (size_t)cap * sizeof *o); if (!o) return 0;
+        g_carp.off = o;
+        unsigned *s = realloc(g_carp.sz, (size_t)cap * sizeof *s); if (!s) return 0;
+        g_carp.sz = s; g_carp.cap = cap;
+    }
+    g_carp.off[g_carp.n] = at; g_carp.sz[g_carp.n] = sz; g_carp.n++;
+    return 1;
+}
+
 int xp_lean(const char *in_path, const char *out_path, int game, XpProgress progress, void *ud, XpStats *out_stats)
 {
     xp_setup(game);
+    g_carp.ok = 0; g_carp.n = 0;
+    int carp_ok = strlen(in_path) < sizeof g_carp.path;
+    g_top.ok = 0; g_top.n = 0;
+    int top_ok = carp_ok;
     memset(&st, 0, sizeof st); g_oom = 0;
     FILE *f = xp_fopen(in_path, "rb"); if (!f) return XP_ERR_OPEN_IN;
     FILE *w = xp_fopen(out_path, "wb"); if (!w) { fclose(f); return XP_ERR_OPEN_OUT; }
@@ -935,6 +979,8 @@ int xp_lean(const char *in_path, const char *out_path, int game, XpProgress prog
         uint32_t id = rd32(h), sz = rd32(h + 4);
         if (in_at + 8 + (long long)sz > total) { rc = XP_ERR_FORMAT; break; }
         int want_carp = id == 0x3b801, want_lamps = id == 0x80034100 && g_relight;
+        if (want_carp && carp_ok && !carp_note(in_at, sz)) carp_ok = 0;
+        if (top_ok && !top_note(in_at, id, sz)) top_ok = 0;
         if (want_carp || want_lamps) {
             if (8 + (size_t)sz > chunk_cap) {
                 uint8_t *nc = realloc(chunk, 8 + (size_t)sz); if (!nc) { rc = XP_ERR_MEMORY; break; }
@@ -961,6 +1007,11 @@ int xp_lean(const char *in_path, const char *out_path, int game, XpProgress prog
     free(o.p); free(chunk); fclose(f);
     if (fclose(w) && rc == XP_OK) rc = XP_ERR_WRITE;
     if (rc != XP_OK) remove(out_path);
+    else {
+        if (carp_ok) { strcpy(g_carp.path, in_path); g_carp.ok = 1; }
+        if (top_ok && in_at == total) { strcpy(g_top.path, in_path); g_top.len = total; g_top.ok = 1; }
+    }
+    if (!g_top.ok) xp_lean_top_drop();
     if (out_stats) *out_stats = st;
     return rc;
 }

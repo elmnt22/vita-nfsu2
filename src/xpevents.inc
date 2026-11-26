@@ -574,7 +574,18 @@ static int bar_walls(const char *stream, Bars *B)
     struct { long o, e; } st[32]; int sp = 0, ok = art && gen && len > 0;
     long o = 0, e = len;
     uint8_t *buf = NULL; size_t bcap = 0;
-    while (ok) {
+    /* 11-26: the lean pass just found them (all top level in MW's and Carbon's
+       streams): ~460 reads, not a ~27k-header walk (21 s on the Vita) */
+    const long long *co; const unsigned *cz;
+    int nc = xp_lean_carp(stream, &co, &cz);
+    for (int i = 0; ok && i < nc; i++) {
+        uint32_t s = cz[i];
+        if (co[i] + 8 + (long long)s > (long long)len) { ok = 0; break; }
+        if (s > bcap) { uint8_t *nb = realloc(buf, s); if (!nb) { ok = 0; break; } buf = nb; bcap = s; }
+        if (fseek(f, (long)co[i] + 8, SEEK_SET) || fread(buf, 1, s, f) != s) { ok = 0; break; }
+        if (!carp_walls(buf, s, B, art, gen, ++g)) ok = 0;
+    }
+    while (ok && nc < 0) {   /* no list (events made again on their own): walk the stream */
         if (o + 8 > e) { if (!sp) break; sp--; o = st[sp].o; e = st[sp].e; continue; }
         uint8_t hd[8];
         if (fseek(f, o, SEEK_SET) || fread(hd, 1, 8, f) != 8) break;
@@ -591,6 +602,7 @@ static int bar_walls(const char *stream, Bars *B)
             e = o + 8 + (long)s; o += 8;
         } else o += 8 + (long)s;
     }
+    if (nc >= 0) printf("xp_events: barrier walls from the lean pass's %d CARP chunks\n", nc);
     free(buf); free(art); free(gen); fclose(f);
     if (ok) qsort(B->s, (size_t)B->ns, sizeof *B->s, bseg_cmp);
     return ok;
@@ -1067,7 +1079,7 @@ static int paths_bin(const DPolys *S, int ev_id, int closed, Buf *part, uint8_t 
 #define PT_ROUTE (0x800u | 0x1000u | 0x40000u | (0x3Fu << 19))
 #define EV_SEC_FLAGS 0x7FF141u
 #define EV_HALF_W 5.0
-static int routes_bin(const DPolys *S, int closed, FILE *f)
+static int routes_bin(const DPolys *S, int closed, uint8_t **out, size_t *outn)   /* its file's bytes (malloc'd) */
 {
     int n = S->n, nlk = 0;
     double lap = 0;
@@ -1136,17 +1148,37 @@ static int routes_bin(const DPolys *S, int closed, FILE *f)
             for (int q = 0; q < 4; q++) pu16(r + 0x18 + 2 * q, 0xffffu);
         }
     }
-    if (ok && fwrite(b.b, 1, b.n, f) != b.n) ok = 0;
-    free(b.b); free(lk);
+    if (ok) { *out = b.b; *outn = b.n; } else free(b.b);
+    free(lk);
     for (int s = 0; s < n; s++) free(pr[s]);
     free(pr);
     return ok;
 }
 
 /* ---- the whole set ---- */
-typedef struct { int id, type, closed, mode, len; size_t partlen; uint8_t *part; char start[96]; char *bars; float *pl; int npl; float tlim; char gates[1024]; char name[64]; float *mr; int nmr; } EvMeta;   /* pl: the route, x y every ~15 m */
-/* each kept event's Paths file: its part, then every kept record (0x3414c) -- one open, two writes
-   (11-24: was a reopen + a write per record, ~24k small writes on the Vita's card) */
+typedef struct { int id, type, closed, mode, len; size_t partlen; uint8_t *part; char start[96]; char *bars; float *pl; int npl; float tlim; char gates[1024]; char name[64]; float *mr; int nmr; uint8_t *rt; size_t rtlen; } EvMeta;   /* pl: the route, x y every ~15 m */
+/* each kept event's two files: Routes<id>F.bin, and Paths<id>.bin = its part, then every
+   kept record (0x3414c). 11-26: written after the event loop by several threads at once
+   (one file ~60 ms on the Vita's card, mostly the open/close: 280 of them were ~14 s) */
+typedef struct { const char *dir; const EvMeta *m; int nm; const uint8_t *t; size_t tn; volatile int next, fail; } EvWrite;
+static void ev_write(void *arg, int wi)
+{
+    EvWrite *J = arg; (void)wi;
+    for (;;) {
+        int k = __sync_fetch_and_add(&J->next, 1);
+        if (k >= 2 * J->nm || J->fail) break;
+        const EvMeta *m = &J->m[k >> 1];
+        char p[600];
+        if (k & 1) snprintf(p, sizeof p, "%s/Paths%d.bin", J->dir, m->id);
+        else snprintf(p, sizeof p, "%s/Routes%dF.bin", J->dir, m->id);
+        FILE *f = xp_fopen(p, "wb");
+        int ok = f != NULL;
+        if (f && (k & 1)) ok = fwrite(m->part, 1, m->partlen, f) == m->partlen && fwrite(J->t, 1, J->tn, f) == J->tn;
+        else if (f) ok = fwrite(m->rt, 1, m->rtlen, f) == m->rtlen;
+        if (f && fclose(f)) ok = 0;
+        if (!ok) J->fail = 1;
+    }
+}
 static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t *recs, const unsigned char *keep)
 {
     int nk = 0; for (int i = 0; i < nm; i++) nk += keep[i];
@@ -1154,16 +1186,12 @@ static int write_allrec(const char *dir, const EvMeta *m, int nm, const uint8_t 
     uint8_t *t = malloc(tn); if (!t) return 0;
     pu32(t, 0x3414C); pu32(t + 4, 0x110 * (uint32_t)nk);
     for (int j = 0, w = 0; j < nm; j++) if (keep[j]) memcpy(t + 8 + 0x110 * (size_t)w++, recs + 0x110 * (size_t)j, 0x110);
-    for (int i = 0; i < nm; i++) {
-        if (!keep[i]) continue;
-        char p[600]; snprintf(p, sizeof p, "%s/Paths%d.bin", dir, m[i].id);
-        FILE *f = xp_fopen(p, "wb"); if (!f) { free(t); return 0; }
-        int ok = fwrite(m[i].part, 1, m[i].partlen, f) == m[i].partlen && fwrite(t, 1, tn, f) == tn;
-        if (fclose(f)) ok = 0;
-        if (!ok) { free(t); return 0; }
-    }
+    for (int i = 0; i < nm; i++) if (!keep[i]) { free(t); return 0; }   /* (the callers compact first) */
+    EvWrite J = { dir, m, nm, t, tn, 0, 0 };
+    int nw = xp_parallel && xp_workers > 1 ? (xp_workers > 8 ? 8 : xp_workers) : 1;
+    if (nw > 1) xp_parallel(ev_write, &J, nw); else ev_write(&J, 0);
     free(t);
-    return 1;
+    return !J.fail;
 }
 /* ---- Carbon's minimap route (11-19) ----
    Carbon keeps no route for its minimap: at race start (NFSC FUN_00642470) it
@@ -1188,8 +1216,36 @@ typedef struct {
     double *g; int *from; int *heap, nheap, *hpos; unsigned *stamp, tag;
     unsigned char *mark;
 } Mr;
+static uint8_t *read_all(const char *path, size_t *len);
+/* 11-26: a small file (a companion BUN, ~1 MB) is walked in memory: one read, not a
+   seek + read per chunk header on the Vita's card */
+static uint8_t *read_nested_mem(const uint8_t *b, size_t n, uint32_t want, size_t *len)
+{
+    struct { size_t o, e; } st[32]; int sp = 0;
+    size_t o = 0, e = n;
+    *len = 0;
+    for (;;) {
+        if (o + 8 > e) { if (!sp) break; sp--; o = st[sp].o; e = st[sp].e; continue; }
+        uint32_t id = u32le(b + o), s = u32le(b + o + 4);
+        if ((unsigned long long)o + 8 + s > (unsigned long long)e) { if (!sp) break; sp--; o = st[sp].o; e = st[sp].e; continue; }
+        if (id == want) {
+            uint8_t *out = malloc(s ? s : 1);
+            if (out) { memcpy(out, b + o + 8, s); *len = s; }
+            return out;
+        }
+        if ((id & 0x80000000u) && sp < 32) { st[sp].o = o + 8 + (size_t)s; st[sp].e = e; sp++; e = o + 8 + (size_t)s; o += 8; }
+        else o += 8 + (size_t)s;
+    }
+    return NULL;
+}
 static uint8_t *read_nested(const char *path, uint32_t want, size_t *len)
 {
+    if (xp_file_size(path) > 0 && xp_file_size(path) <= (16 << 20)) {
+        size_t n = 0; uint8_t *b = read_all(path, &n);
+        if (!b) { *len = 0; return NULL; }
+        uint8_t *out = read_nested_mem(b, n, want, len);
+        free(b); return out;
+    }
     FILE *f = xp_fopen(path, "rb"); if (!f) return NULL;
     fseek(f, 0, SEEK_END); long e = ftell(f), o = 0;
     struct { long o, e; } st[32]; int sp = 0;
@@ -1586,7 +1642,7 @@ static void ev_chains(void *arg, int wi)
 int xp_events(const char *gameplay_bin, const char *raw_companion, const char *raw_stream,
               const char *out_dir, int game, const char *city, int first_id, XpEventStats *st)
 {
-    unsigned T[12] = {0}, tw = 0, tb = 0, tp = 0, tpb = 0, tq;
+    unsigned T[13] = {0}, tw = 0, tb = 0, tp = 0, tpb = 0, tq;
     ChainRes *res = NULL; EvWorker *ew = NULL; int nw = 0;
     BarLs BL = {0}; uint8_t *tbl = NULL;
     T[0] = ev_now(); xp_frac = 0.0f;
@@ -1625,6 +1681,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     st->barrier_segs = B.ns;
     rc = XP_ERR_MEMORY;
     if (game == XP_GAME_CARBON && !mr_init(&mr, &rn, raw_companion, &mr_bars)) goto done;
+    T[11] = ev_now();
     rc = XP_ERR_MEMORY;
     {
         int np = 0; for (int i = 0; i < g.n; i++) np += g.l[i].pts.n;
@@ -1653,6 +1710,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (!C.dist || !C.prev || !C.touched || !C.W || !stamp || !seen || !mark || !meta || !recs) goto done;
     for (size_t i = 0; i < (size_t)g.n * maxwp; i++) { C.dist[i] = 1e18; C.prev[i] = -1; }
     qsort(R, (size_t)nr, sizeof *R, race_cmp);
+    T[12] = ev_now();
     if (!barl_make(&BL, R, nr, &B, &g, &grid, stamp, &tag, seen, &seentag)) goto done;
     T[5] = ev_now(); xp_frac = 0.19f;
     {   /* every race's chain: worker 0 uses the buffers above, the others their own */
@@ -1709,11 +1767,8 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
         m->part = malloc(part.n ? part.n : 1);   /* 11-24: its Paths file written once, with the records (write_allrec) */
         if (!m->part) { free(ch); goto done; }
         memcpy(m->part, part.b, part.n);
-        snprintf(p, sizeof p, "%s/Routes%dF.bin", out_dir, ev);
-        FILE *f = xp_fopen(p, "wb");
-        int okw = f != NULL;
-        if (f) { okw = routes_bin(&S, closed, f); if (fclose(f)) okw = 0; }
-        if (!okw) { free(ch); rc = XP_ERR_WRITE; goto done; }
+        (void)p;
+        if (!routes_bin(&S, closed, &m->rt, &m->rtlen)) { free(ch); rc = XP_ERR_MEMORY; goto done; }   /* written with its Paths file (write_allrec) */
         tw += ev_now() - tq;
         if (game == XP_GAME_CARBON && !mr_race(&mr, r, &m->mr, &m->nmr, &mr_fail)) { free(ch); rc = XP_ERR_MEMORY; goto done; }
         snprintf(m->name, sizeof m->name, "%s", r->name); m->id = ev; m->type = r->type; m->closed = r->closed; m->mode = r->mode; m->tlim = r->tlim; memcpy(m->gates, r->gates, sizeof m->gates); m->len = (int)pyround(L); m->partlen = part.n;
@@ -1774,9 +1829,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
             memcpy(fb2, meta[i].part, meta[i].partlen);
             RacePath *rp = racepath_parse(fb2, (long)(meta[i].partlen + tn), meta[i].id, 0);
             if (rp) { racepath_free(rp); continue; }
-            keep[i] = 0; bad++;
-            char p[600]; snprintf(p, sizeof p, "%s/Paths%d.bin", out_dir, meta[i].id); remove(p);
-            snprintf(p, sizeof p, "%s/Routes%dF.bin", out_dir, meta[i].id); remove(p);
+            keep[i] = 0; bad++;   /* (its files: not written) */
         }
         free(tbl); tbl = NULL;
     }
@@ -1785,7 +1838,7 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     if (bad) {
         /* the records shrink to the events kept */
         int w = 0;
-        for (int i = 0; i < nm; i++) if (keep[i]) { if (w != i) { memmove(recs + 0x110 * (size_t)w, recs + 0x110 * (size_t)i, 0x110); free(meta[w].bars); free(meta[w].pl); free(meta[w].mr); free(meta[w].part); meta[w] = meta[i]; meta[i].bars = NULL; meta[i].pl = NULL; meta[i].mr = NULL; meta[i].part = NULL; } w++; }
+        for (int i = 0; i < nm; i++) if (keep[i]) { if (w != i) { memmove(recs + 0x110 * (size_t)w, recs + 0x110 * (size_t)i, 0x110); free(meta[w].bars); free(meta[w].pl); free(meta[w].mr); free(meta[w].part); free(meta[w].rt); meta[w] = meta[i]; meta[i].bars = NULL; meta[i].pl = NULL; meta[i].mr = NULL; meta[i].part = NULL; meta[i].rt = NULL; } w++; }
         nm = w; memset(keep, 1, (size_t)(nm ? nm : 1));
     }
     rc = XP_ERR_WRITE;
@@ -1864,13 +1917,13 @@ int xp_events(const char *gameplay_bin, const char *raw_companion, const char *r
     }
     T[9] = ev_now(); xp_frac = 1.0f;
     if (xp_ticks)
-        printf("xp_events: steps (ms): races %u, road net + graph %u, barrier names %u, barrier walls %u, setup %u, "
+        printf("xp_events: steps (ms): races %u, road net + graph %u, barrier names %u, barrier walls %u, setup %u (minimap routes %u, barrier lanes %u), "
                "chains %u (%d cores), events %u (lanes %u, paths %u, files %u, barriers %u), records %u, route check %u, the rest %u\n",
-               T[1] - T[0], T[2] - T[1], T[3] - T[2], T[4] - T[3], T[5] - T[4],
+               T[1] - T[0], T[2] - T[1], T[3] - T[2], T[4] - T[3], T[5] - T[4], T[11] - T[4], T[5] - T[12],
                T[10] - T[5], nw, T[6] - T[10], tp, tpb, tw, tb, T[7] - T[6], T[8] - T[7], T[9] - T[8]);
 done:
     (void)nrecs;
-    if (meta) for (int i = 0; i < nr; i++) { free(meta[i].bars); free(meta[i].pl); free(meta[i].mr); free(meta[i].part); }
+    if (meta) for (int i = 0; i < nr; i++) { free(meta[i].bars); free(meta[i].pl); free(meta[i].mr); free(meta[i].part); free(meta[i].rt); }
     barl_free(&BL); free(tbl);
     if (mr.rn) mr_free(&mr);
     free(meta); free(recs); free(keep); free(mark); free(stamp); free(seen);
