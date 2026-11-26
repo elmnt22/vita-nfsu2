@@ -25844,7 +25844,21 @@ int main(int argc, char **argv) {
                 }
             }
             static float lost[3];
-            if (g_ride.contact_mask == 0xf) {
+            /* GitHub #45 (Street X garage): a car through a hole in the floor that lands on a
+               layer under it has contact again, so the 10 m air rule never fires. Under the
+               floor = the drawn ground near the height it last stood on (within 2 m) is 2 m
+               or more over the car at its spot, for a second; a bridge deck overhead is
+               further from that height, a ramp down is the ground under the car itself. */
+            static int under_run;
+            int under = 0;
+            if (have_good) {
+                float fz = good[0][2];
+                if (world_ground_at(&scene, carpos[0], carpos[1], good[0][2], &fz) != WSURF_NONE &&
+                    fabsf(fz - good[0][2]) < 2.0f && carpos[2] < fz - 2.0f) under = 1;
+            }
+            under_run = under ? under_run + 1 : 0;
+            if (under) ground_run = 0;   /* the layer under the floor is not a good pose */
+            if (g_ride.contact_mask == 0xf && !under) {
                 air_run = 0;
                 if (++ground_run >= 30) {   /* keep the last two, 0.5 s apart */
                     ground_run = 0;
@@ -25874,7 +25888,8 @@ int main(int argc, char **argv) {
                            carpos[0], carpos[1], good[0][2] - carpos[2]);
                 }
             }
-            if (have_good && air_run > 90 && carpos[2] < good[0][2] - 10.0f) {
+            if (have_good && ((air_run > 90 && carpos[2] < good[0][2] - 10.0f) || under_run > 60)) {
+                if (under_run > 60) { printf("fell through world: under the floor (z %.1f, stood at %.1f)\n", carpos[2], good[0][2]); if (!air_run) memcpy(lost, carpos, sizeof lost); }
                 const float *r = good[have_good - 1];
                 float gz_ref = r[2], gz_top = r[2];
                 int cat_ref = world_ground_at(&scene, lost[0], lost[1], lost[2], &gz_ref);
@@ -25906,7 +25921,7 @@ int main(int argc, char **argv) {
                 vel[0] = vel[1] = 0.0f; speed = 0.0f;
                 g_ride_ready = 0;
                 world.city.race.havep = 0;   /* the jump back crosses no gate */
-                air_run = ground_run = 0; have_good = 0;
+                air_run = ground_run = under_run = 0; have_good = 0;
             }
         }
         /* The Reset action (binding 0x83aa60, Select): Player::HandleReset
