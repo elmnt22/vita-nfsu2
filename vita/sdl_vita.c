@@ -1308,6 +1308,21 @@ static volatile uint32_t gx_wait_us[GXW_N];
 extern int vita_gfx_mode;
 static void gx_delta(GxSnap *s, double *busy, double *idle, double *lat, unsigned *scenes,
                      double wait[GXW_N], double split[2]);
+/* per-pass split of the non-display scenes (render.c tags each pass, vita_gx_tag):
+   GPU busy and the CPU's sceGxmEndScene block, by the tag the scene began with */
+enum { GXT_MAIN, GXT_POST, GXT_DOF, GXT_N };
+typedef struct { uint32_t busy[GXT_N], endw[GXT_N], n[GXT_N]; } GxTagSnap;
+static volatile uint32_t gx_busy_t[GXT_N], gx_endw_t[GXT_N], gx_n_t[GXT_N];
+static volatile int gx_tag_req, gx_tag_cur;
+static volatile unsigned gx_dof_submitted;
+void vita_gx_tag(int t) { gx_tag_req = t >= 0 && t < GXT_N ? t : 0; }
+static void gx_tag_delta(GxTagSnap *s, double busy[GXT_N], double endw[GXT_N], unsigned n[GXT_N]) {
+    for (int i = 0; i < GXT_N; i++) {
+        uint32_t b = gx_busy_t[i], e = gx_endw_t[i], k = gx_n_t[i];
+        busy[i] = (b - s->busy[i]) / 1000.0; endw[i] = (e - s->endw[i]) / 1000.0; n[i] = k - s->n[i];
+        s->busy[i] = b; s->endw[i] = e; s->n[i] = k;
+    }
+}
 float vita_audio_pct;   /* mixer share of a core, refreshed every lap report */
 static void lap_report(unsigned frames) {
     char line[512];
@@ -1329,6 +1344,11 @@ static void lap_report(unsigned frames) {
                busy / frames, sp[0] / frames, sp[1] / frames, idle / frames, (double)n / frames, lat, wt[GXW_END] / frames,
                wt[GXW_BEGIN] / frames, wt[GXW_QUEUE] / frames, wt[GXW_NOTIFY] / frames,
                wt[GXW_FINISH] / frames, wt[GXW_SWAP] / frames);
+        static GxTagSnap ts; double tb[GXT_N], te[GXT_N]; unsigned tn[GXT_N];
+        gx_tag_delta(&ts, tb, te, tn);
+        printf("gx by pass ms/frame: main %.1f post %.1f dof %.1f (scenes %.1f/%.1f/%.1f) | endscene wait: main %.1f post %.1f dof %.1f\n",
+               tb[0] / frames, tb[1] / frames, tb[2] / frames, (double)tn[0] / frames, (double)tn[1] / frames,
+               (double)tn[2] / frames, te[0] / frames, te[1] / frames, te[2] / frames);
     }
     {   extern float audio_cost_pct(void);
         vita_audio_pct = audio_cost_pct();
@@ -1347,7 +1367,7 @@ static void lap_report(unsigned frames) {
    busy from max(submit, previous scene done) to its own done time; the rest of
    the wall time is GPU idle. The other wraps time how long the CPU blocks in
    each call. Counters are 32-bit microseconds and only ever differenced. */
-typedef struct { volatile uint32_t *addr; uint32_t value, t_submit, display; } GxScene;
+typedef struct { volatile uint32_t *addr; uint32_t value, t_submit, display, tag; } GxScene;
 #define GX_RING 64
 static GxScene gx_ring[GX_RING];
 static volatile unsigned gx_head, gx_tail;
@@ -1365,6 +1385,7 @@ static int gx_watch(SceSize args, void *argp) {
         uint32_t start = (int32_t)(s.t_submit - prev_done) > 0 ? s.t_submit : prev_done;
         gx_busy_us += done - start;
         gx_busy_s[s.display] += done - start;
+        if (!s.display) { gx_busy_t[s.tag] += done - start; gx_n_t[s.tag]++; }
         gx_lat_us += done - s.t_submit;
         gx_scenes++;
         prev_done = done;
@@ -1480,16 +1501,22 @@ static void vita_probe_frame(void) {
 /* perf.csv columns, one row per frame (see pf_open in main.c). */
 const char *vita_gx_header(void) {
     return ",gx_busy,gx_idle,gx_scenes,gx_latency,w_endscene,w_beginscene,w_queue,"
-           "w_notifywait,w_finish,w_swap_other,gx_3d,gx_display,gfx_mode";
+           "w_notifywait,w_finish,w_swap_other,gx_3d,gx_display,gfx_mode,"
+           "gx_main,gx_post,gx_dof,w_end_main,w_end_post,w_end_dof,dof";
 }
 void vita_gx_row(FILE *f) {
     static GxSnap snap;
     double busy, idle, lat, w[GXW_N], sp[2]; unsigned n;
     gx_delta(&snap, &busy, &idle, &lat, &n, w, sp);
-    if (!gx_on) { fprintf(f, ",,,,,,,,,,,,%d", vita_gfx_mode); return; }
+    static GxTagSnap ts; double tb[GXT_N], te[GXT_N]; unsigned tn[GXT_N];
+    gx_tag_delta(&ts, tb, te, tn);
+    if (!gx_on) { fprintf(f, ",,,,,,,,,,,,%d,,,,,,,", vita_gfx_mode); return; }
     fprintf(f, ",%.3f,%.3f,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d", busy, idle, n, lat,
             w[GXW_END], w[GXW_BEGIN], w[GXW_QUEUE], w[GXW_NOTIFY], w[GXW_FINISH], w[GXW_SWAP],
             sp[0], sp[1], vita_gfx_mode);
+    /* dof: DOF passes were submitted since the last row (their scenes, not yet all done) */
+    static unsigned dof_sub; unsigned ds = gx_dof_submitted; int dof = ds != dof_sub; dof_sub = ds;
+    fprintf(f, ",%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d", tb[0], tb[1], tb[2], te[0], te[1], te[2], dof);
 }
 
 #define GX_TIMED(slot, call) \
@@ -1499,11 +1526,13 @@ void vita_gx_row(FILE *f) {
 
 int __real_sceGxmEndScene(SceGxmContext *, const SceGxmNotification *, const SceGxmNotification *);
 __attribute__((used)) int __wrap_sceGxmEndScene(SceGxmContext *c, const SceGxmNotification *v, const SceGxmNotification *f) {
+    const int tag = gx_tag_cur;
     GX_TIMED(GXW_END, __real_sceGxmEndScene(c, v, f))
+    if (gx_on && !gx_in_swap) { gx_endw_t[tag] += sceKernelGetProcessTimeLow() - t0; if (tag == GXT_DOF) gx_dof_submitted++; }
     if (gx_on && f && f->address) {
         unsigned h = gx_head;
         if (h - gx_tail < GX_RING) {   /* full: drop it, the next scene's done time still bounds it */
-            gx_ring[h % GX_RING] = (GxScene){ f->address, f->value, sceKernelGetProcessTimeLow(), gx_in_swap ? 1u : 0u };
+            gx_ring[h % GX_RING] = (GxScene){ f->address, f->value, sceKernelGetProcessTimeLow(), gx_in_swap ? 1u : 0u, (uint32_t)tag };
             __sync_synchronize();
             gx_head = h + 1;
         }
@@ -1516,6 +1545,7 @@ int __real_sceGxmBeginScene(SceGxmContext *, unsigned int, const SceGxmRenderTar
 __attribute__((used)) int __wrap_sceGxmBeginScene(SceGxmContext *c, unsigned int fl, const SceGxmRenderTarget *rt,
                             const SceGxmValidRegion *vr, SceGxmSyncObject *vs, SceGxmSyncObject *fs,
                             const SceGxmColorSurface *cs, const SceGxmDepthStencilSurface *ds) {
+    gx_tag_cur = gx_tag_req;   /* the pass this scene draws (its EndScene comes later) */
     GX_TIMED(GXW_BEGIN, __real_sceGxmBeginScene(c, fl, rt, vr, vs, fs, cs, ds))
     return r;
 }

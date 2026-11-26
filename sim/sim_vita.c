@@ -303,6 +303,7 @@ void vita_gx_start(void) {}
 unsigned vita_gx_busy_total(void) { return 0; }   /* no GPU watcher: the adaptive view distance sees headroom */
 const char *vita_gx_header(void) { return ""; }
 void vita_gx_row(FILE *f) { (void)f; }
+void vita_gx_tag(int t) { (void)t; }
 void vita_fast_clocks(void) {}
 int vita_probe_skip;
 float vita_audio_pct;

@@ -3057,7 +3057,9 @@ static const char *SPEED_FS =
 static struct {
     int state;                 /* 0 untried, 1 ready, -1 unavailable */
     int w, h, cur;             /* half-res size; G[cur] is the latest glow */
-    GLuint fbo[4], tex[4];     /* A, B, G0, G1 */
+    GLuint fbo[6], tex[6];     /* A, B, G0, G1, then C, D: the depth of field's own pair
+                                  (made at its first use, bloom_dof_targets) */
+    int dof_rt;                /* C/D: 0 untried, 1 made, -1 failed (DOF uses A/B) */
     GLuint ob, blur, glow, obblur, glow2;   /* obblur+glow2: the fused chain */
     GLint blur_step, glow_step, obblur_step, glow2_step;
     struct { GLuint p; GLint vt, bloom, lift, flash, lbh, dof, speed; } fin[2];   /* plain, depth of field */
@@ -3211,10 +3213,8 @@ static void bloom_levels(float *ofs, float *sub, float *add) {
     *sub = (float)0xB0 / 255.0f;
 }
 
-static int bloom_setup(int sw, int sh) {
-    g_bloom.state = -1;
-    g_bloom.w = sw / 2; g_bloom.h = sh / 2;
-    for (int i = 0; i < 4; i++) {
+static int bloom_target(int i) {
+    {
         glGenTextures(1, &g_bloom.tex[i]);
         glBindTexture(GL_TEXTURE_2D, g_bloom.tex[i]);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_bloom.w, g_bloom.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -3232,6 +3232,26 @@ static int bloom_setup(int sw, int sh) {
         }
         glViewport(0, 0, g_bloom.w, g_bloom.h);
         glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);   /* G starts dark */
+    }
+    return 1;
+}
+/* The depth of field's blur in its own two half-res targets: on A/B (the bloom's)
+   A took 4 scenes a frame and B 3, and each vitaGL FBO render target is made for
+   one scene a frame -- the later uses waited ~22 ms in sceGxmEndScene for the
+   whole main scene (INTRO_NIS_RESEARCH.md; every DOF intro camera at 20 fps).
+   +2 x 360x204 RGBA, made at the first DOF frame. */
+static int bloom_dof_targets(void) {
+    if (!g_bloom.dof_rt) {
+        g_bloom.dof_rt = bloom_target(4) && bloom_target(5) ? 1 : -1;
+        printf("depth of field: own blur targets %s\n", g_bloom.dof_rt > 0 ? "made" : "unavailable (shares the bloom's)");
+    }
+    return g_bloom.dof_rt > 0;
+}
+static int bloom_setup(int sw, int sh) {
+    g_bloom.state = -1;
+    g_bloom.w = sw / 2; g_bloom.h = sh / 2;
+    for (int i = 0; i < 4; i++) {
+        if (!bloom_target(i)) return 0;
     }
     g_bloom.ob = bloom_program(BLOOM_OB_FS, "overbright");
     g_bloom.blur = bloom_program(BLOOM_BLUR_FS, "blur");
@@ -3337,7 +3357,20 @@ static void bloom_pass(int target, GLuint prog, GLuint tex0, GpuMesh *quad) {
 
 /* Runs the chain from g_scene.tex and leaves the composited frame in the
    default framebuffer at screen size. 0 = not available (caller blits). */
+#ifdef __vita__
+extern void vita_gx_tag(int t);   /* sdl_vita.c: 0 main, 1 post, 2 depth of field (the GPU split) */
+#define GX_TAG(t) vita_gx_tag(t)
+#else
+#define GX_TAG(t) ((void)0)
+#endif
+static int bloom_composite_(GpuMesh *quad, int sw, int sh);
 static int bloom_composite(GpuMesh *quad, int sw, int sh) {
+    GX_TAG(1);
+    int r = bloom_composite_(quad, sw, sh);
+    GX_TAG(0);
+    return r;
+}
+static int bloom_composite_(GpuMesh *quad, int sw, int sh) {
     if (!g_bloom.state && !bloom_setup(g_scene.w, g_scene.h)) return 0;
     if (g_bloom.state != 1 || !quad) return 0;
     enum { A, B };
@@ -3410,27 +3443,30 @@ composite:;  /* screen = treatment(dof(scene)) + G */
        box + H + V from the full-res frame, then H + V; A and B are free
        once the glow is updated */
     int dof = g_dof.frame && g_dof.on && g_bloom.fin[1].p;
+    const int DA = dof && bloom_dof_targets() ? 4 : A, DB = DA == 4 ? 5 : B;   /* C, D */
+    if (dof) GX_TAG(2);
     if (dof && g_bloom.sblur) {   /* the same blur as separable non-dependent passes */
         glUseProgram(g_bloom.sblur);
         glUniform2f(g_bloom.sblur_step, tx, 0.0f);
-        bloom_pass(B, g_bloom.sblur, g_scene.tex, quad);          /* box + H */
+        bloom_pass(DB, g_bloom.sblur, g_scene.tex, quad);          /* box + H */
         glUniform2f(g_bloom.sblur_step, 0.0f, ty);
-        bloom_pass(A, g_bloom.sblur, g_bloom.tex[B], quad);       /* V */
+        bloom_pass(DA, g_bloom.sblur, g_bloom.tex[DB], quad);      /* V */
         glUniform2f(g_bloom.sblur_step, tx, 0.0f);
-        bloom_pass(B, g_bloom.sblur, g_bloom.tex[A], quad);       /* H */
+        bloom_pass(DB, g_bloom.sblur, g_bloom.tex[DA], quad);      /* H */
         glUniform2f(g_bloom.sblur_step, 0.0f, ty);
-        bloom_pass(A, g_bloom.sblur, g_bloom.tex[B], quad);       /* V */
+        bloom_pass(DA, g_bloom.sblur, g_bloom.tex[DB], quad);      /* V */
     } else if (dof) {
         glUseProgram(g_bloom.dofblur);
         glUniform2f(g_bloom.dofblur_step, tx, ty);
-        bloom_pass(B, g_bloom.dofblur, g_scene.tex, quad);
-        bloom_pass(A, g_bloom.dofblur, g_bloom.tex[B], quad);
+        bloom_pass(DB, g_bloom.dofblur, g_scene.tex, quad);
+        bloom_pass(DA, g_bloom.dofblur, g_bloom.tex[DB], quad);
     }
     /* speed blur (0x5cc460): B = the frame's 4 taps at o, A = B's at 4o,
        blended over the frame by the strength cut to a byte (ftol, render
        state 0xc1); skipped below 1/255. Half res here (A and B are free once
        the glow is updated; not alongside the DOF, which holds A -- the NIS
        intros that use it stand still). */
+    GX_TAG(1);
     float speed = 0.0f;
     if (!dof && g_speed.on > 0 && g_speed.k >= 1.0f / 255.0f && g_bloom.speed) {
         const float *o = g_speed.o;
@@ -3454,7 +3490,7 @@ composite:;  /* screen = treatment(dof(scene)) + G */
         if (speed > 0.0f) { glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[A]); }
         if (f) {
             glUniform3f(g_bloom.fin[f].dof, g_dof.F, g_dof.O1, g_dof.O2);
-            glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[A]);
+            glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[DA]);
         }
     }
     glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, g_bloom.tex[next]);
