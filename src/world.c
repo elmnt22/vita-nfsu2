@@ -338,6 +338,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
             long ln = 0; unsigned char *lb = xpcity_lamps(troot, regs[r], &ln);
             if (lb && ln > 8) world_region_hook(lb, ln, r + 1, nreg);
         }
+        VMARK("  region hook + lamps done");   /* 11-26: the first entry's ~11 s here, split */
 #ifdef __vita__
         /* The pinned bundle never changes, so its light list (a whole-bundle
            scan plus an O(n^2) de-duplication) is built once and copied. */
@@ -381,8 +382,10 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
             }
 #endif
         }
+        VMARK("  lights done (%d)", w->neighborhood.nlights);
         g->tpk = n2_tpk_open(g->data, g->len);
         world_texanim_scan(g->data, g->len);
+        VMARK("  texture list + anims done");
         long size_on_disk = g->len;
 #ifdef __vita__
         if (g->pinned) size_on_disk = res_bundle_file_len();   /* compact copy is smaller */
@@ -451,6 +454,7 @@ static int world_neighborhood_load_facade(World *w, const char *troot,
 #endif
         if (!w->neighborhood.have_grass)
             w->neighborhood.have_grass = n2_load_texture(g->data, g->len, "TRN_GRASSC", &w->neighborhood.grass);
+        VMARK("  meshes + grass done");
         if (!instance_world) {
             printf("region %-12s: %3ld MB, %5d meshes, %d tex keys\n",
                    regs[r], g->len >> 20, g->mesh1 - g->mesh0, ntk);
@@ -709,7 +713,9 @@ static int world_lean_scene(N2Scene *sc, const char *troot, const char *track, f
     snprintf(sp, sizeof sp, "%s/STREAM%s.BUN", troot, stem);
     snprintf(tp, sizeof tp, "%s/%s.BUN", troot, stem);
     xpcity_coll_path(troot, b, sp, sizeof sp);   /* Rockport streamed: its lean file's collision */
+    VMARK("  lean: collision load start");
     WColl *wc = wcoll_shared(sp, tp);
+    VMARK("  lean: collision loaded");
     if (!wc) { printf("lean resident: no collision for %s\n", track); return 0; }
     WLean *L = (WLean *)calloc(1, sizeof *L);
     if (!L) { wcoll_free(wc); return 0; }

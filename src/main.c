@@ -176,11 +176,13 @@ static Uint32 g_race_ask_ms;   /* when the race start began (log) */
    between their steps (here, and LOAD_PUMP in the loaders) keeps its bar and
    circles moving, so a long load never looks like a freeze (player reports
    11-16: the career start sat on one frame for ~10 s on the Vita). */
+static unsigned g_ls_pump_n, g_ls_pump_ms;   /* 11-26: what the loading frames cost a load */
 static void ls_pump(void) {
     Uint32 now = SDL_GetTicks();
     Shop *fe = g_boot_fe ? g_boot_fe : g_ls_fe;
     if (!fe || !g_ls_drawn || now - g_ls_drawn < 40 || SDL_ThreadID() != g_ls_tid) return;
     fe_frame(fe);
+    g_ls_pump_n++; g_ls_pump_ms += SDL_GetTicks() - now;
 #ifdef OPENUG2_SIM_PRE_H
     {   /* test aid (simulator): OPENUG2_LS_SHOT=1 shoots ls_<n> on each load's third loading frame */
         static Uint32 prev; static int n, f;
@@ -21809,8 +21811,11 @@ int main(int argc, char **argv) {
             if (!rstream_active()) rstream_stop();   /* a park nobody resumed: freed */
             hud_free(&sw_ls);
             kit_globalb_release();
-            vita_mark("track switch: %s ready in %u ms, %d meshes, %d events, spawn (%.0f, %.0f, %.1f)",
-                      trackname, SDL_GetTicks() - sw_t0, nm, nsprint, carpos[0], carpos[1], carpos[2]);
+            vita_mark("track switch: %s ready in %u ms, %d meshes, %d events, spawn (%.0f, %.0f, %.1f); "
+                      "%u loading frames from inside loads took %u ms",
+                      trackname, SDL_GetTicks() - sw_t0, nm, nsprint, carpos[0], carpos[1], carpos[2],
+                      g_ls_pump_n, g_ls_pump_ms);
+            g_ls_pump_n = g_ls_pump_ms = 0;
             vita_heap_report("switch: after");
         }
 #endif
