@@ -208,6 +208,8 @@ static struct {
     char troot[512], stream[640], comp[640];
     int active;
     char stem[48];             /* L4RA, L2RA, L5RA */
+    unsigned char booboo[2048]; int nbooboo;   /* PrecullerBooBooScript.hoo: 128x128 cells of 32 m
+                                  (4096 m wrap) where precull is off (rs_booboo_load) */
     int xp;                    /* XP_GAME_MW: a raw MW stream (sections translated as read, xp_section) */
     RsSec *sec; int nsec;
     short secof[RS_NUM];       /* number -> g.sec index, -1 */
@@ -1436,6 +1438,35 @@ void rstream_set_event(int event) {
            event, g_wg_career_stage, g.sel_on ? "selected" : "unfiltered", (int)g.sel.count);
 }
 
+/* TRACKS/PrecullerBooBooScript.hoo next to the stream (UG2 0x5e9a30's bitmap 0x8832c0,
+   MW loader 0x728a30): "BOOBOO: <track> <section> SET|CLR Pos = x, y, z ..." lines of
+   this track set / clear the cell of (x, y); Carbon ships none (empty) */
+static void rs_booboo_load(void) {
+    memset(g.booboo, 0, sizeof g.booboo); g.nbooboo = 0;
+    char pth[700]; snprintf(pth, sizeof pth, "%s", g.stream);
+    char *sl = strrchr(pth, '/'); char *bs = strrchr(pth, '\\'); if (bs > sl) sl = bs;
+    if (!sl) return;
+    snprintf(sl + 1, sizeof pth - (size_t)(sl + 1 - pth), "PrecullerBooBooScript.hoo");
+    long n = 0; unsigned char *f = n2_read_file(pth, &n);
+    if (!f) return;
+    char *t = (char *)malloc((size_t)n + 1);
+    if (!t) { free(f); return; }
+    memcpy(t, f, (size_t)n); t[n] = 0; free(f);
+    for (char *ln = t; ln && *ln; ) {
+        char *nx = strchr(ln, '\n'); if (nx) *nx++ = 0;
+        char trk[32], sec[32], op[8]; float x, y;
+        if (sscanf(ln, " BOOBOO: %31s %31s %7s Pos = %f , %f", trk, sec, op, &x, &y) == 5 &&
+            !strcmp(trk, g.stem)) {
+            const int b = (((int)y >> 5) & 127) * 128 + (((int)x >> 5) & 127);
+            if (!strcmp(op, "SET")) { if (!(g.booboo[b >> 3] >> (b & 7) & 1)) g.nbooboo++; g.booboo[b >> 3] |= (unsigned char)(1 << (b & 7)); }
+            else if (!strcmp(op, "CLR")) { if (g.booboo[b >> 3] >> (b & 7) & 1) g.nbooboo--; g.booboo[b >> 3] &= (unsigned char)~(1 << (b & 7)); }
+        }
+        ln = nx;
+    }
+    free(t);
+    printf("rstream: precull off in %d cells (%s)\n", g.nbooboo, pth);
+}
+
 int rstream_start(const char *track_root, const char *trackname) {
     if (!rstream_track_ok(trackname)) { rstream_stop(); return 0; }
     char stream[640];
@@ -1467,6 +1498,7 @@ int rstream_start(const char *track_root, const char *trackname) {
     char *dot = strstr(stem, ".BUN"); if (dot) *dot = 0;
     snprintf(g.comp, sizeof g.comp, "%s/%s.BUN", track_root, stem);
     snprintf(g.stem, sizeof g.stem, "%s", stem);
+    rs_booboo_load();
     Uint32 t0 = SDL_GetTicks();
     for (int i = 0; i < RS_NUM; i++) g.secof[i] = -1;
     long clen = 0;
@@ -1887,9 +1919,20 @@ int rstream_draw(const RsDrawCtx *c) {
     if (aux && c->pix > 0.0f) K.H *= c->pix;
     float ll = sqrtf(c->look[0]*c->look[0] + c->look[1]*c->look[1] + c->look[2]*c->look[2]);
     for (int i = 0; i < 3; i++) K.dir[i] = ll > 1e-6f ? c->look[i] / ll : 0.0f;
-    /* precull mode 3: only at camera speed >= 17.88 m/s */
+    /* precull: UG2 mode 3, only at camera speed >= 17.88 m/s; MW and Carbon mode 1, every
+       speed (MW 0x903160 / NFSC 0xa72c28 = 1). Off in a boo-boo cell, in a scene camera
+       (the disable counter) and, for MW/Carbon, in the aux views (their view-id exclusion) */
     float sp = sqrtf(g.vel[0]*g.vel[0] + g.vel[1]*g.vel[1] + g.vel[2]*g.vel[2]);
-    K.cell = sp >= 17.88f || g_rs_precull_always ? ((((int)c->cam[1] >> 5) & 31) * 32 + (((int)c->cam[0] >> 5) & 31)) : -1;
+    {
+        const int cx = (int)c->cam[0], cy = (int)c->cam[1];
+        const int bb = ((cy >> 5) & 127) * 128 + ((cx >> 5) & 127);
+        /* sim A/B: OPENUG2_RS_NOPRECULL=1 off; =<ms> off from that many ms after boot */
+        static long nopc = -2; if (nopc == -2) { const char *e = getenv("OPENUG2_RS_NOPRECULL"); nopc = e ? atol(e) : -1; }
+        const int off = nopc >= 0 && (long)SDL_GetTicks() >= nopc;
+        const int on = (g.xp ? !aux : (sp >= 17.88f || g_rs_precull_always)) && !c->nis && !off &&
+                       !(g.booboo[bb >> 3] >> (bb & 7) & 1);
+        K.cell = on ? ((cy >> 5) & 31) * 32 + ((cx >> 5) & 31) : -1;
+    }
     /* a player view (0x02) + forward track direction [guess 0x08]. 0x10 ("always")
        is left out: the port decides group members by its own selection above,
        as the tile build does (world_scenery.h) */

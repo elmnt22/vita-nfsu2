@@ -294,13 +294,14 @@ one of the two ways below; both end with the same files in the same place.
 
    | City | From your PC install | To the Vita |
    |---|---|---|
-   | Rockport | `TRACKS\STREAML2RA.BUN`, `TRACKS\L2RA.BUN`, `TRACKS\L2RA\MINI_MAP.BIN`, `GLOBAL\gameplay.bin` (Most Wanted) | `ux0:data/NFSU2/expansion/mw/` |
+   | Rockport | `TRACKS\STREAML2RA.BUN`, `TRACKS\L2RA.BUN`, `TRACKS\L2RA\MINI_MAP.BIN`, `TRACKS\PrecullerBooBooScript.hoo`, `GLOBAL\gameplay.bin` (Most Wanted) | `ux0:data/NFSU2/expansion/mw/` |
    | Palmont | `TRACKS\STREAML5RA.BUN`, `TRACKS\L5RA.BUN`, `GLOBAL\gameplay.bin` (Carbon) | `ux0:data/NFSU2/expansion/carbon/` |
 
    For example, Rockport's stream ends up at
    `ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN`. The two `.BUN` files
    of a city are required. Without Rockport's `MINI_MAP.BIN` it has no
-   minimap, and without `gameplay.bin` a city has no race events.
+   minimap, without `PrecullerBooBooScript.hoo` a few spots may lose
+   scenery for a moment, and without `gameplay.bin` a city has no race events.
 
 #### Option B: with the Prep Tool
 

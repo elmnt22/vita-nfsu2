@@ -763,6 +763,7 @@ static const struct { int city; const char *rel; long long size; unsigned crc; i
     { 0, "TRACKS/STREAML2RA.BUN", 532663556LL, 0xbd947661u, 0 },
     { 0, "TRACKS/L2RA.BUN", 1413824LL, 0x75079449u, 0 },
     { 0, "TRACKS/L2RA/MINI_MAP.BIN", 221492LL, 0x93886852u, 1 },
+    { 0, "TRACKS/PrecullerBooBooScript.hoo", 13575LL, 0x00b78729u, 1 },   /* precull fixes (rstream.c) */
     { 0, "GLOBAL/gameplay.bin", 2105216LL, 0xc5153d5au, 1 },
     { 1, "TRACKS/STREAML5RA.BUN", 1238368256LL, 0x964f0bedu, 0 },
     { 1, "TRACKS/L5RA.BUN", 1068712LL, 0xf1d4c3ceu, 0 },

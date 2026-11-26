@@ -836,15 +836,22 @@ static void walk(Buf *o, const uint8_t *p, size_t n)
 }
 static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const uint8_t *raw)
 {
+    if (g_secmode && (g_game == XP_GAME_CARBON || g_game == XP_GAME_MW) && id == 0x34107 && sz % 0x80 == 0) {
+        /* MW/Carbon precull rows: UG2's grid exactly (32 m cells, 32x32, LSB first, set =
+           culled; MW 0x729120 / NFSC 0x79fa60), only the id differs -> UG2's 0x34106.
+           No filler in front: rs_records takes an exact multiple as is */
+        size_t at = o->n; put(o, raw, 8 + sz);
+        if (!g_oom) { uint32_t u = 0x34106; memcpy(o->p + at, &u, 4); }
+        return;
+    }
     if (g_secmode && g_game == XP_GAME_CARBON && (id == 0x34104 || id == 0x34105 || id == 0x34106 || id == 0x34107)) {
-        /* Carbon: 0x34105 its tree (conv_tree_carbon); its precull grid is unknown (left out) */
+        /* Carbon: 0x34105 its tree (conv_tree_carbon); 0x34106 = override pairs (not used) */
         if (id == 0x34105) conv_tree_carbon(o, d, sz);
         return;
     }
     if (g_secmode && g_game == XP_GAME_MW && (id == 0x34104 || id == 0x34105 || id == 0x34106 || id == 0x34107)) {
         /* MW scenery: 0x34105 = the tree nodes (UG2's 0x34104 layout, 0x24 B), 0x34107 its
-           precull rows (0x80 B, but MW's cell grid is not known: left out, as no precull),
-           0x34106 s16 pairs (not used) */
+           precull rows (above), 0x34106 s16 override pairs (not used) */
         if (id != 0x34105) return;
         size_t at = o->n; put(o, raw, 8 + sz);
         if (!g_oom) { uint32_t u = 0x34104; memcpy(o->p + at, &u, 4); }

@@ -2,6 +2,7 @@
     { 1, "TRACKS/STREAML2RA.BUN", 532663556LL, 0xbd947661u },
     { 1, "TRACKS/L2RA.BUN", 1413824LL, 0x75079449u },
     { 1, "TRACKS/L2RA/MINI_MAP.BIN", 221492LL, 0x93886852u },
+    { 1, "TRACKS/PrecullerBooBooScript.hoo", 13575LL, 0x00b78729u },
     { 1, "GLOBAL/attributes.bin", 689728LL, 0xca3ac558u },
     { 1, "GLOBAL/gameplay.bin", 2105216LL, 0xc5153d5au },
     { 2, "TRACKS/STREAML5RA.BUN", 1238368256LL, 0x964f0bedu },

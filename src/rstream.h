@@ -48,6 +48,7 @@ typedef struct {
        >= minh, pixel sizes scaled by pix, at most max_draws draws; no stats */
     int aux, max_draws;
     float reach, minz, minh, pix;
+    int nis;                    /* a scene (NIS) camera: no precull (retail's disable counter) */
 } RsDrawCtx;
 
 /* main thread, once per frame before drawing: zones, wanted list, uploads */

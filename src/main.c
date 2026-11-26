@@ -28699,6 +28699,7 @@ int main(int argc, char **argv) {
                 rc.rp = &rp; rc.MVP = MVP; rc.cam = cam; rc.look = look;
                 rc.hfov43 = 2.0f * atanf(tanf(0.5f * cam_fovy) / 0.75f);
                 rc.planes = (const float (*)[4])world_planes; rc.refl_ready = g_refl_ready;
+                rc.nis = g_career_nis_on || (g_rt.active && g_rt.nis && race_state == 0);
                 g_dbg.drawn += rstream_draw(&rc);
                 lasttex = (GLuint)-1; lastmode = -1;
             }
