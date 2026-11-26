@@ -13971,6 +13971,18 @@ static int car_stock_turbo(const char *folder) {
     int i = player_car_index(folder);
     return i >= 0 && g_stock_turbo[i];
 }
+/* The turbo as fitted: the same max-above-zero test (0x457b00) on the car's
+   tuned record, whose +0x224 curve the turbo package (perfparts cat 4) moves
+   from the stock curve toward its target -- a bought turbo shows the gauge
+   (GitHub #46). The stock test until the player's simulation exists. */
+static int car_turbo_fitted(const char *folder) {
+    if (!g_n2) return car_stock_turbo(folder);
+    float m = 0.0f;
+    for (int k = 0; k < 9; k++) { float v = n2sim_param(g_n2, 0x224 + 4 * k); if (v > m) m = v; }
+    static int said = -1;
+    if (said != (m > 0.0f)) { said = m > 0.0f; printf("turbo gauge: %s (%s, max boost %.3f)\n", said ? "on" : "off", folder, (double)m); }
+    return m > 0.0f;
+}
 #endif
 
 #ifdef __vita__
@@ -24417,7 +24429,7 @@ int main(int argc, char **argv) {
            end). Closed throttle pulls vacuum; on throttle the turbo builds
            pressure with rpm and lags behind it (spools up slowly, vents
            fast). Display + audio only: the power curve is unchanged. */
-        g_turbo_fitted = car_stock_turbo(carname);
+        g_turbo_fitted = car_turbo_fitted(carname);
         {
             float tgt = -0.70f, thr = rp_up() ? g_n2s.throttle : throttle;   /* the replay: the recorded pedal */
             if ((race_state == 1 || rp_up()) && thr > 0.05f) {
@@ -31607,7 +31619,7 @@ int main(int argc, char **argv) {
             /* garage NITROUS / TURBO rows, per car (stock: turbo on the
                factory-turbo cars only); the dial reads simulated pressure */
             hs.have_nos = (unsigned char)(g_n2_nos_level > 0);   /* the shop package */
-            hs.have_turbo = (unsigned char)car_stock_turbo(carname);
+            hs.have_turbo = (unsigned char)car_turbo_fitted(carname);
 #endif
             if (hud_fitted_set) {     /* developer override, display only */
                 hs.have_nos = (unsigned char)hud_fitted_nos;
