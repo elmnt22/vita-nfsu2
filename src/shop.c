@@ -569,7 +569,7 @@ static const char *group_name(int g) {   /* as in the part hash "<CAR>_KITnn_<NA
 
 /* ------------------------------------------------------------------ data */
 
-typedef struct { uint32_t key; GLuint tex; int w, h; unsigned char additive; long off; } ShopTex;   /* off: its pixels in the cache, not read yet */
+typedef struct { uint32_t key; GLuint tex; int w, h; unsigned char additive, tries; long off; } ShopTex;   /* off: its pixels in the cache, not read yet; tries: failed reads so far */
 typedef struct { GLuint tex; int aw, ah, ok; FengFont f; } ShopFont;
 
 typedef struct {
@@ -1877,7 +1877,13 @@ static GLuint upload_rgba(int w, int h, const unsigned char *px) {
     if (!id) return 0;
     glBindTexture(GL_TEXTURE_2D, id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    while (glGetError() != GL_NO_ERROR) {}
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    if (glGetError() != GL_NO_ERROR) {   /* GitHub #45: no GPU memory (just after a city reload) -> a texture
+                                            with no storage drew white / noise; none, so it is tried again */
+        glDeleteTextures(1, &id);
+        return 0;
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1890,7 +1896,6 @@ static GLuint upload_rgba(int w, int h, const unsigned char *px) {
 static GLuint tex_load(Shop *s, ShopTex *t) {
     if (t->tex || !t->off) return t->tex;
     long off = t->off;
-    t->off = 0;                                   /* once, as the read at the open was */
     if (!s->texf) s->texf = fopen(SHOP_CACHE, "rb");
     size_t n = (size_t)t->w * t->h * 4;
     unsigned char *px = s->texf ? (unsigned char *)malloc(n ? n : 1) : NULL;
@@ -1898,9 +1903,13 @@ static GLuint tex_load(Shop *s, ShopTex *t) {
         GLint bound = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
         t->tex = upload_rgba(t->w, t->h, px);
         glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
-        s->tex_read++; s->tex_read_kb += (long)(n >> 10);
+        if (t->tex) { s->tex_read++; s->tex_read_kb += (long)(n >> 10); }
     }
     free(px);
+    /* read once; a failed read or upload (memory tight while a city streams in
+       after a fast travel) is tried again on the next draws, then given up */
+    if (t->tex || ++t->tries >= 120) t->off = 0;
+    if (!t->tex && !t->off) printf("shop: texture %08x (%dx%d) not loaded\n", (unsigned)t->key, t->w, t->h);
     return t->tex;
 }
 
@@ -1915,8 +1924,9 @@ static GLuint res_tex(const Shop *s, int p, int r) {
     int i = s->res_ti[p][r];
     if (t || i < 0 || i >= s->ntex) return t;
     Shop *w = (Shop *)s;
-    w->res_ti[p][r] = -1;
-    return w->res_tex[p][r] = tex_load(w, &w->tex[i]);
+    GLuint got = tex_load(w, &w->tex[i]);
+    if (got || !w->tex[i].off) w->res_ti[p][r] = -1;   /* loaded or given up; else tried again next draw */
+    return w->res_tex[p][r] = got;
 }
 
 /* Loading_Controller's logo UG_load_logo.tga (drawn 384x48) in the Ultimate
