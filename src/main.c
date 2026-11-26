@@ -161,6 +161,7 @@ static void fe_frame(Shop *fe) {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     shop_draw(fe, NULL, NULL, W, H);
     SDL_GL_SwapWindow(NULL);
+    rstream_pump(12);   /* the streamer's textures while the load runs (its worker waits on them) */
     if (prog >= 0) glUseProgram((GLuint)prog);
     if (abuf >= 0) glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf);
     if (ebuf >= 0) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)ebuf);

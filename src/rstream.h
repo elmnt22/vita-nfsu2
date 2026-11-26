@@ -59,6 +59,8 @@ int  rstream_area_ready(int *left);
 /* 1 from a fresh start until its first area is in (20 s at most): the
    loading screen stays over the world meanwhile */
 int  rstream_cold(void);
+/* main thread, from a loading-screen frame: decoded textures up for about ms */
+void rstream_pump(int ms);
 /* a jump (fast travel, a replay's exit): cold again until the new area is in */
 void rstream_rewarm(void);
 /* while the car stands at a start (loading screen held): also want the zone 100 m

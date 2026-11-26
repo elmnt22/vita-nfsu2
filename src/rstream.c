@@ -245,6 +245,7 @@ static struct {
     /* stats */
     long st_draws, st_inst, st_frames, st_cull[8], st_tex_up, st_sec_up, st_unload;
     long st_binst, st_bruns, st_bpieces;
+    long st_pump_up;           /* textures uploaded by the loading screen (rstream_pump) */
     /* decoded pixels waiting for the main thread's upload (state 2) */
     volatile long dec_bytes; volatile int ndec; long dec_peak; long st_dec_wait_ms;
     long tex_gpu;              /* uploaded texture bytes (decoded size: DXT exact, RGB(A) close) */
@@ -1647,6 +1648,16 @@ void rstream_update(const float cam[3]) {
    the start area in): every wanted section on the GPU and no texture still
    queued or decoded -- 1 also when not streaming or outside every zone */
 int rstream_cold(void) { return g.active && g.cold; }
+/* the loading screen's frames (main.c fe_frame): the decoded textures up while a race
+   or career start loads -- rstream_update is not called then, so the worker sat at
+   RS_DEC_CAP (hwlog90: X0's 846 textures took 22 s, 15.4 s of it waiting) */
+void rstream_pump(int ms) {
+    if (!g.active || !g.ndec) return;
+    Uint64 f = SDL_GetPerformanceFrequency();
+    long n0 = g.st_tex_up;
+    rs_tex_upload(SDL_GetPerformanceCounter() + f * (Uint64)ms / 1000);
+    g.st_pump_up += g.st_tex_up - n0;
+}
 void rstream_ahead(float dx, float dy) {
     float l = sqrtf(dx * dx + dy * dy);
     if (l < 1e-3f) { g.ahead_on = 0; return; }
@@ -2152,8 +2163,8 @@ int rstream_draw(const RsDrawCtx *c) {
                g.st_cull[7] / F, g.st_cull[6] / F, g.st_cull[0] / F, g.st_cull[1] / F, g.st_cull[2] / F, g.st_cull[3] / F, g.st_cull[4] / F, g.st_cull[5] / F, g_st_mtxsw / F, g_st_texsw / F, g_st_ident / F,
                nwant, nact, nbuilt, nq, nmiss, g.st_unload, gpu / 1024, ntex, g.st_tex_up, g.tex_gpu / 1024);
         g.st_draws = g.st_inst = g.st_frames = 0; memset(g.st_cull, 0, sizeof g.st_cull);
-        printf("rstream: decoded backlog %ld KB now, %ld KB peak, worker waited %ld ms\n",
-               g.dec_bytes / 1024, g.dec_peak / 1024, g.st_dec_wait_ms);
+        printf("rstream: decoded backlog %ld KB now, %ld KB peak, worker waited %ld ms, %ld uploads from loading frames\n",
+               g.dec_bytes / 1024, g.dec_peak / 1024, g.st_dec_wait_ms, g.st_pump_up);
         g.st_draw_ms = g.st_upd_ms = g.st_up_ms = cull_ms = 0; g.st_tex_up = 0; g_st_mtxsw = g_st_texsw = g_st_ident = 0;
     }
     return draws;
@@ -2175,5 +2186,6 @@ int rstream_draw(const RsDrawCtx *c) { (void)c; return 0; }
 int rstream_area_ready(int *left) { if (left) *left = 0; return 1; }
 void rstream_ahead(float dx, float dy) { (void)dx; (void)dy; }
 int rstream_cold(void) { return 0; }
+void rstream_pump(int ms) { (void)ms; }
 void rstream_rewarm(void) {}
 #endif
