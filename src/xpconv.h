@@ -36,6 +36,7 @@ int xp_convert(const char *in_path, const char *out_path, int game,
    flares -> the small STREAMxxx.XPL the game reads in place of a translated stream. */
 #define XP_LEAN_VERSION 1
 int xp_section(const unsigned char *in, size_t n, int game, unsigned char **out, size_t *outn);
+size_t xp_tpk_header_carbon(const unsigned char *p, size_t n, unsigned char *out);   /* resource.c pin: Carbon TPK v8 header -> UG2 (0 = not Carbon) */
 int xp_lean(const char *in_path, const char *out_path, int game, XpProgress progress, void *ud, XpStats *stats);
 /* The marker next to a translated stream (STREAMxxx.xp): "xpconv VERSION GAME SOURCE_SIZE".
    xp_marker_ok: 1 when it is there and matches this translator + source (source_size < 0:

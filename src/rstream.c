@@ -38,6 +38,8 @@
 #include "world_scenery.h"
 #include "xpcity.h"
 #include "xpconv.h"
+#include "world_tiles.h"
+#include <strings.h>
 #include "SDL.h"
 #include <math.h>
 #include <stdio.h>
@@ -204,6 +206,7 @@ typedef struct {
 static struct {
     char troot[512], stream[640], comp[640];
     int active;
+    char stem[48];             /* L4RA, L2RA, L5RA */
     int xp;                    /* XP_GAME_MW: a raw MW stream (sections translated as read, xp_section) */
     RsSec *sec; int nsec;
     short secof[RS_NUM];       /* number -> g.sec index, -1 */
@@ -293,7 +296,13 @@ static int rs_comp_visit(const unsigned char *d, uint32_t tag, long beg, long en
             int num = rd16(p + q + 8), np = rd16(p + q + 0xa);
             if (np < 0 || np > 1024 || q + 0x24 + 8L * np > len) break;   /* MW: up to 260 points */
             int L = num / 100, n = num % 100;
-            if (L >= 1 && L <= 20 && n >= 1 && n < (g.lod_offset ? g.lod_offset : 20) && g.nbnd < cap) {
+            if (g.nbnd == cap) {   /* Palmont: ~640 (512 dropped its northern zones: nothing drawn there) */
+                RsBound *nb = (RsBound *)realloc(g.bnd, (size_t)cap * 2 * sizeof *g.bnd);
+                if (!nb) break;
+                memset(nb + cap, 0, (size_t)cap * sizeof *nb);
+                g.bnd = nb; cap *= 2;
+            }
+            if (L >= 1 && L <= 20 && n >= 1 && n < (g.lod_offset ? g.lod_offset : 20)) {
                 RsBound *b = &g.bnd[g.nbnd];
                 b->number = num; b->npts = np;
                 b->lo[0] = rdf(p + q + 0xc); b->lo[1] = rdf(p + q + 0x10);
@@ -506,7 +515,7 @@ static int rs_page_room(RsSec *s, int nv) {
    never draws it (rs_hash_valid): it is the sky pass's. The tile build kept
    it in its track-wide tile; here it is kept aside at the build and placed
    once on the main thread (rstream_sky). */
-#define RS_SKYMAX 4
+#define RS_SKYMAX 8
 typedef struct { uint32_t solid, texkey; int nv, ni; float *v; unsigned char *col; uint16_t *ix; } RsSkySrc;
 static RsSkySrc g_skysrc[RS_SKYMAX]; static int g_nskysrc;   /* worker writes under g_mx */
 static N2Batch g_skyb[RS_SKYMAX]; static int g_nskyb, g_sky_slot[RS_SKYMAX];
@@ -589,6 +598,35 @@ static void rs_sky_free(int sources) {
     memset(g_skysrc, 0, sizeof g_skysrc); g_nskysrc = 0;
 }
 
+/* Palmont's sea (PAN_Ocean_Xenon, one placement, a plain move): cut open where the city's
+   streets lie below it (world_tiles.c wt_sea_mask, the tile build's rule). Its placement
+   is in the same section's scenery. */
+static void rs_sea_cut(RsBuild *B, N2Scene *sc) {
+    int want = 0;
+    for (int i = 0; i < sc->count; i++) want |= !strcasecmp(sc->meshes[i].sname, "PAN_OCEAN_XENON");
+    if (!want) return;
+    N2Leaf L[16]; int ni = 0, nn = 0; N2Leaf I[16];
+    n2_find_leaves(B->d, 0, B->dlen, 0x34102u, L, &ni, 16);
+    n2_find_leaves(B->d, 0, B->dlen, 0x34103u, I, &nn, 16);
+    float ox = 0, oy = 0; int found = 0;
+    for (int a = 0; a < ni && a < nn && !found; a++) {   /* each scenery pack: its infos, its instances */
+        const unsigned char *ip = B->d + L[a].off; int is = (int)L[a].size, ipad = n2_skip_filler(ip, is);
+        const unsigned char *np = B->d + I[a].off; int ns = (int)I[a].size, npad = n2_skip_filler(np, ns);
+        int ninfo = (is - ipad) / 0x44, ninst = (ns - npad) / 0x40;
+        for (int k = 0; k < ninst && !found; k++) {
+            const unsigned char *r = np + npad + k * 0x40;
+            int inf = (uint16_t)rd16(r + 24);
+            if (inf >= ninfo) continue;
+            char nm[25]; memcpy(nm, ip + ipad + inf * 0x44, 24); nm[24] = 0;
+            if (strcasecmp(nm, "PAN_OCEAN_XENON")) continue;
+            ox = rdf(r + 32); oy = rdf(r + 36); found = 1;
+        }
+    }
+    if (!found) { printf("rstream: sea model without its placement in %s: not cut\n", B->s->name); return; }
+    char trk[64]; snprintf(trk, sizeof trk, "STREAM%s", g.stem);
+    for (int i = 0; i < sc->count; i++)
+        if (!strcasecmp(sc->meshes[i].sname, "PAN_OCEAN_XENON")) world_tiles_sea_cut_placed(&sc->meshes[i], trk, ox, oy);
+}
 static void rs_build_solid(RsBuild *B, long beg, long end) {
     RsSec *s = B->s;
     N2Leaf h[2]; int nh = 0;
@@ -600,6 +638,30 @@ static void rs_build_solid(RsBuild *B, long beg, long end) {
     hp += pad;
     N2Scene sc; memset(&sc, 0, sizeof sc);
     winst_solid_meshes(B->d, beg, end, g.keys, g.nkeys, &sc);
+    if (g.xp == XP_GAME_CARBON) rs_sea_cut(B, &sc);
+    /* Palmont's backdrops, the tile build's rules (it draws neither):
+       - PAN_* (the T8x/T9x panoramas, PAN_MUDriftA_Trn08 spans 12 km) and TRN_PANO_*:
+         backdrop unless it measures as a ground sheet (the seas) -- world_instance.c,
+         n2_walk_meshes; its vista tier is off;
+       - SKYDOME_Xenon (Z0, solid ed85ba82): the high-detail dome. The sky pass takes the
+         sky from SKYDOME (be43edbb) as the tile build does; the name rule (nfsu2.h: an
+         uppercase run "SKYDOME" or "SKY_") misses "SKYDOME_Xenon", so it drew as ordinary
+         scenery -- a flat fog-coloured slab over the canyons, 11-25 */
+    if (g.xp == XP_GAME_CARBON && sc.count) {
+        const char *nm0 = sc.meshes[0].sname;
+        int drop = !strncasecmp(nm0, "SKYDOME", 7);
+        for (int i = 0; i < sc.count && drop; i++) drop = sc.meshes[i].cat != N2_SKY;   /* not the sky's own source */
+        if (!drop && (!strncasecmp(nm0, "PAN", 3) || !strncasecmp(nm0, "TRN_PANO", 8))) {
+            float mtx[16]; N2Geom geo;
+            n2_obj_matrix(B->d, beg, end, mtx);   /* identity when it has none */
+            drop = !(n2_obj_geom(B->d, beg, end, mtx, &geo) && n2_is_ground_sheet(&geo));
+        }
+        if (drop) {
+            static int logn;   /* the worker only */
+            if (logn++ < 4) printf("rstream: backdrop %s in %s left out (the tile build's rule)%c", nm0, s->name, 10);
+            winst_solid_free(&sc); memset(&sc, 0, sizeof sc);
+        }
+    }
     if (s->nsol == B->nsol_cap) {
         int c = B->nsol_cap ? B->nsol_cap * 2 : 256;
         RsSolid *n = (RsSolid *)realloc(s->sol, (size_t)c * sizeof *n);
@@ -1330,6 +1392,8 @@ N2Batch *rstream_sky(int profile, int *count) {
             if (go) g_tex[slot].state = 5;
             rs_unlock(&g_mx);
             if (go) rs_tex_decode(slot);   /* once: the upload below (or the next frame's) binds it */
+            printf("rstream:   sky batch %d: solid %08x texture %08x -> %08x, %d vertices, %d indices, z %.0f..%.0f""\n",
+                   g_nskyb, k->solid, k->texkey, b->texkey, k->nv, k->ni, b->bbox_min[2], b->bbox_max[2]);
             g_sky_slot[g_nskyb++] = slot;
         }
         glBindBuffer(GL_ARRAY_BUFFER, 0); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -1344,8 +1408,14 @@ N2Batch *rstream_sky(int profile, int *count) {
         n += g_skyb[i].tex != 0;
     }
     if (!n) { rs_tex_upload(SDL_GetPerformanceCounter() + SDL_GetPerformanceFrequency() / 500); return NULL; }
-    *count = g_nskyb;
-    return g_skyb;
+    /* only the pieces with a texture, in order: Palmont's SKYDOME carries five, three of them
+       (95a0861e afa7d64f ff91ce2b) Carbon's own sky in its GLOBALB, not on the card -- drawn
+       untextured they blacked out the night dome (LOC4's pair) over the whole sky */
+    static N2Batch out[RS_SKYMAX];
+    int k = 0;
+    for (int i = 0; i < g_nskyb; i++) if (g_skyb[i].tex) out[k++] = g_skyb[i];
+    *count = k;
+    return out;
 }
 
 /* the scenery set (resident_args.scenery_event: -1 free roam, > 0 a race's
@@ -1394,6 +1464,7 @@ int rstream_start(const char *track_root, const char *trackname) {
     char stem[64]; snprintf(stem, sizeof stem, "%s", b + 6);
     char *dot = strstr(stem, ".BUN"); if (dot) *dot = 0;
     snprintf(g.comp, sizeof g.comp, "%s/%s.BUN", track_root, stem);
+    snprintf(g.stem, sizeof g.stem, "%s", stem);
     Uint32 t0 = SDL_GetTicks();
     for (int i = 0; i < RS_NUM; i++) g.secof[i] = -1;
     long clen = 0;

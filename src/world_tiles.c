@@ -2715,6 +2715,19 @@ static int wt_sea_cut(N2Mesh *m, const WtSea *s) {
     return 1;
 }
 
+/* the retail streamer's sea (rstream.c rs_build_solid): its model in model space, placed by a
+   plain move -- the mask moved into model space instead (the pieces share one vertex pool).
+   The streamer's worker only (the tile build is off then). */
+int world_tiles_sea_cut_placed(N2Mesh *m, const char *track, float ox, float oy) {
+    const WtSea *s0 = wt_sea_mask(track);
+    if (!s0 || !m->verts) return 0;
+    WtSea s = *s0; s.x0 -= ox; s.y0 -= oy;
+    long c0 = g_wt_sea_cut;
+    int ok = wt_sea_cut(m, &s);
+    printf("rstream: sea cut open over dry land: %ld of its triangles cut, %d after\n", g_wt_sea_cut - c0, m->nidx / 3);
+    return ok;
+}
+
 /* Buildings arriving at the edge: which tiles gave objects to the last
    assembly, so this one can mark the ones that are new (N2Mesh.fade_in; main
    fades them in instead of popping). A first build, or one that is mostly new

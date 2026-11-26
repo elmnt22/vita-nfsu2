@@ -78,6 +78,9 @@ void world_tiles_preload(const char *track, float x, float y);
 void world_tiles_migrate_start(void);
 void world_tiles_drop_old_versions(void);   /* older WTILE_VERSION sets, once the current one is complete */
 void world_tiles_drop_track(const char *track);   /* a streamer track: its tiles + compact copy off the card */
+/* the retail streamer (rstream.c): Palmont's sea sheet cut open by the city's sea mask, as the
+   tile build does; the model is placed at (ox, oy) by a plain move. 1 = cut */
+int world_tiles_sea_cut_placed(N2Mesh *m, const char *track, float ox, float oy);
 /* Boot: pack every track's loose tile files on the calling thread, progress
  * in p (cells = tiles copied + files removed); needed = any loose file left;
  * track = the one being packed now (for the screen). */

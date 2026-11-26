@@ -181,7 +181,7 @@ static void make_events(int c, const char *troot)
     snprintf(rawc, sizeof rawc, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
     snprintf(raws, sizeof raws, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
     if (xp_file_size(gp) <= 0 || xp_file_size(rawc) <= 0 || xp_file_size(raws) <= 0) {
-        if (have) vita_mark("xpcity: %s race events are an older set (no raw files to make them again; the Prep Tool sends new ones)", k_city[c].name);
+        if (have) vita_mark("xpcity: %s race events are an older set (no raw files to make them again: copy them to expansion/)", k_city[c].name);
         else vita_mark("xpcity: no race events for %s (no raw gameplay.bin / %s / %s)", k_city[c].name, k_city[c].companion, k_city[c].bun);
         return;
     }
@@ -196,7 +196,7 @@ static void make_events(int c, const char *troot)
                        k_city[c].game == XP_GAME_CARBON ? 7601 : 7301, &st);
     if (rc != XP_OK) remove(ev);
     else { beyond_events_reload(); g_bar_region[0] = 0; }   /* XF2: the new set (and barriers), not none until a restart */
-    vita_mark("xpcity: race events %s: %s in %.1f s (%ld MW races -> %ld events: %ld circuits %ld sprints %ld drags, %ld skipped, "
+    vita_mark("xpcity: race events %s: %s in %.1f s (%ld races -> %ld events: %ld circuits %ld sprints %ld drags, %ld skipped, "
               "%ld dropped; barriers %ld on %ld off)", dir, rc == XP_OK ? "made" : "FAILED", (SDL_GetTicks() - t0) / 1000.0,
               st.races, st.events, st.circuits, st.sprints, st.drags, st.skipped, st.dropped, st.barriers_on, st.barriers_off);
 }
@@ -518,7 +518,7 @@ static int lean_city(int c)
         char a[256], b[256];
         snprintf(a, sizeof a, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].bun);
         snprintf(b, sizeof b, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
-        g_lean_on[c] = k_city[c].game == XP_GAME_MW && xpcity_enabled() && rstream_enabled() &&
+        g_lean_on[c] = xpcity_enabled() && rstream_enabled() &&
                        xp_file_size(a) > 0 && xp_file_size(b) > 0;
         g_lean_known[c] = 1;
         printf("xpcity: %s %s%c", k_city[c].name, g_lean_on[c] ? "streams from its raw files (retail streamer, no tiles)"
@@ -817,7 +817,7 @@ static int city_ok(int c)
     snprintf(b, sizeof b, XP_RAW_ROOT "/%s/TRACKS/%s.BUN", k_city[c].dir, k_city[c].companion);
     if (xp_file_size(a) > 0 && xp_file_size(b) > 0) return 1;   /* raw: translated on the way in */
     if (have && xp_file_size(m) > 0) {
-        printf("xpcity: %s is translated for an older build (%s); the Prep Tool has to send it again%c", k_city[c].name, m, 10);
+        printf("xpcity: %s is translated for an older build (%s); its raw files are needed%c", k_city[c].name, m, 10);
         return 2;
     }
     return 0;

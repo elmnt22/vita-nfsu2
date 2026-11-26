@@ -260,9 +260,18 @@ static void conv_insts_carbon(Buf *o, const uint8_t *d, size_t sz)
     size_t c = open_chunk(o, 0x34103); align_fill(o, 0x10);
     for (size_t i = 0; i < n; i++) {
         const uint8_t *r = d + f + i * 0x60;
+        uint32_t fl; memcpy(&fl, r + 0xc, 4);
+        /* the retail streamer (xp_section): Carbon's low-detail twins (0x40000: PAN_Ocean_CG
+           beside PAN_Ocean_Xenon) are left out, as the tile build leaves them; no tree or
+           precull refers to an instance by number there */
+        if (g_secmode && (fl & 0x40000)) continue;
         uint8_t u[0x40]; memset(u, 0, sizeof u);
         memcpy(u, r, 12); memcpy(u + 12, r + 0x10, 12);    /* bbox */
         memcpy(u + 24, r + 0x54, 2);                       /* scenery info number */
+        /* not in the player's view (0x2, as MW's and UG2's): the reflection-only placements
+           (REFBLOCKER black blocks, ReflectionBarrier, _REFLECTIONS, sign copies; 418 in
+           Palmont). Not 0x8: race barriers carry it, and UG2's 0x08 culls them */
+        if (g_secmode) u[26] = (uint8_t)(fl & 0x02);
         int32_t pc = (int16_t)(r[0x1c] | r[0x1d] << 8); memcpy(u + 28, &pc, 4);
         memcpy(u + 32, r + 0x20, 12);                      /* position */
         for (int k = 0; k < 9; k++) {                      /* rotation: s16, 0x2000 = 1 */
@@ -662,36 +671,82 @@ static void lamp_pack(Buf *o, const uint8_t *d, size_t n)
    material, not the texture: its DXT3 textures are all cut-outs (railings, chain-link,
    foliage, panoramas) and so are its DXT5 ORG_ (plant) ones; other DXT5 alpha is not. */
 static long g_tpk_tex, g_tpk_alpha;
+/* one Carbon row at d (0x58 bytes, a length byte, the name; L = d[0x58]) -> a UG2 row.
+   No statics: the retail streamer's pin (resource.c) calls it on another thread. 1 = has alpha */
+static int tpk_row_carbon(const uint8_t *d, uint8_t r[0x7c])
+{
+    const uint8_t *C = d + 0xc;
+    size_t L = d[0x58];
+    memset(r, 0, 0x7c);
+    uint8_t *N = r + 12;
+    const char *nm = (const char *)d + 0x59;
+    size_t k = 0;
+    if (!(nm[0] >= 'A' && nm[0] <= 'Z')) N[k++] = 'X';   /* the loader finds a row by its capital */
+    for (size_t j = 0; j < L && nm[j] && k < 23; j++) N[k++] = (uint8_t)nm[j];
+    memcpy(N + 0x18, C, 4);            /* key */
+    memcpy(N + 0x1c, C + 4, 4);        /* class */
+    memcpy(N + 0x24, C + 8, 4);        /* pixel offset */
+    memcpy(N + 0x2c, C + 0x10, 4);     /* size (whole mip chain) */
+    memcpy(N + 0x38, C + 0x1c, 4);     /* w, h */
+    N[0x3e] = C[0x22];
+    int au = C[0x29], ab = C[0x2a];
+    if (au == 4 || au == 6) { N[0x45] = 5; N[0x49] = 1; N[0x4b] = 1; }
+    else if (au == 5 || au == 7) { N[0x45] = 6; N[0x49] = 2; N[0x4a] = ab == 2 ? 2 : 1; }
+    else if (C[0x22] == 0x24 || (C[0x22] == 0x26 && L > 4 && !memcmp(nm, "ORG_", 4))) { N[0x45] = 5; N[0x49] = 1; N[0x4b] = 1; }
+    else N[0x4b] = 1;
+    if (ab == 2) N[0x4a] = 2;
+    return N[0x49] || N[0x4a];
+}
 static void tpk_rows_carbon(Buf *o, const uint8_t *d, size_t n)
 {
     size_t c = open_chunk(o, 0x33310004);
     for (size_t q = 0; q + 0x59 <= n; ) {
-        const uint8_t *C = d + q + 0xc;
         size_t L = d[q + 0x58];
         if (q + 0x59 + L > n) { st.bad++; break; }
-        uint8_t r[0x7c]; memset(r, 0, sizeof r);
-        uint8_t *N = r + 12;
-        const char *nm = (const char *)d + q + 0x59;
-        size_t k = 0;
-        if (!(nm[0] >= 'A' && nm[0] <= 'Z')) N[k++] = 'X';   /* the loader finds a row by its capital */
-        for (size_t j = 0; j < L && nm[j] && k < 23; j++) N[k++] = (uint8_t)nm[j];
-        memcpy(N + 0x18, C, 4);            /* key */
-        memcpy(N + 0x1c, C + 4, 4);        /* class */
-        memcpy(N + 0x24, C + 8, 4);        /* pixel offset */
-        memcpy(N + 0x2c, C + 0x10, 4);     /* size (whole mip chain) */
-        memcpy(N + 0x38, C + 0x1c, 4);     /* w, h */
-        N[0x3e] = C[0x22];
-        int au = C[0x29], ab = C[0x2a];
-        if (au == 4 || au == 6) { N[0x45] = 5; N[0x49] = 1; N[0x4b] = 1; }
-        else if (au == 5 || au == 7) { N[0x45] = 6; N[0x49] = 2; N[0x4a] = ab == 2 ? 2 : 1; }
-        else if (C[0x22] == 0x24 || (C[0x22] == 0x26 && L > 4 && !memcmp(nm, "ORG_", 4))) { N[0x45] = 5; N[0x49] = 1; N[0x4b] = 1; }
-        else N[0x4b] = 1;
-        if (ab == 2) N[0x4a] = 2;
-        if (N[0x49] || N[0x4a]) g_tpk_alpha++;
+        uint8_t r[0x7c];
+        if (tpk_row_carbon(d + q, r)) g_tpk_alpha++;
         put(o, r, sizeof r); g_tpk_tex++;
         q += 0x59 + L;
     }
     close_chunk(o, c);
+}
+/* A raw texture pack's header body (the children of 0xb3310000): Carbon's (version 8 in
+   0x33310001) in the UG2 layout, as conv_tpk_carbon -- the retail streamer pins Palmont's
+   raw stream (resource.c pin_tpk). Returns the translated body's size (out NULL = the size
+   only), or 0 when it is not a Carbon header (copy it as it is). Thread-safe. */
+size_t xp_tpk_header_carbon(const unsigned char *p, size_t n, unsigned char *out)
+{
+    int carbon = 0;
+    for (size_t r = 0; r + 12 <= n; ) {
+        uint32_t cid = rd32(p + r), cn = rd32(p + r + 4);
+        if (r + 8 + cn > n) return 0;
+        if (cid == 0x33310001) { carbon = rd32(p + r + 8) == 8; break; }
+        r += 8 + cn;
+    }
+    if (!carbon) return 0;
+    size_t w = 0;
+    for (size_t r = 0; r + 8 <= n; ) {
+        uint32_t cid = rd32(p + r), cn = rd32(p + r + 4);
+        if (r + 8 + cn > n) return 0;
+        if (cid == 0x33310004) {
+            size_t h = w, rows = 0;
+            w += 8;
+            for (size_t q = 0; q + 0x59 <= cn; ) {
+                const uint8_t *d = p + r + 8 + q;
+                size_t L = d[0x58];
+                if (q + 0x59 + L > cn) break;
+                if (out) tpk_row_carbon(d, out + w);
+                w += 0x7c; rows++;
+                q += 0x59 + L;
+            }
+            if (out) { uint32_t a = 0x33310004, b = (uint32_t)(rows * 0x7c); memcpy(out + h, &a, 4); memcpy(out + h + 4, &b, 4); }
+        } else if (cid != 0x33310005) {   /* Carbon's per-texture FourCCs go */
+            if (out) memcpy(out + w, p + r, 8 + cn);
+            w += 8 + cn;
+        }
+        r += 8 + cn;
+    }
+    return w;
 }
 static void conv_tpk_carbon(Buf *o, const uint8_t *d, size_t sz)
 {
@@ -737,6 +792,8 @@ static void walk(Buf *o, const uint8_t *p, size_t n)
 }
 static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const uint8_t *raw)
 {
+    if (g_secmode && g_game == XP_GAME_CARBON && (id == 0x34104 || id == 0x34105 || id == 0x34106 || id == 0x34107))
+        return;   /* Carbon: its tree nodes are 0x30 B (not translated yet: every instance is tested), its precull grid unknown */
     if (g_secmode && g_game == XP_GAME_MW && (id == 0x34104 || id == 0x34105 || id == 0x34106 || id == 0x34107)) {
         /* MW scenery: 0x34105 = the tree nodes (UG2's 0x34104 layout, 0x24 B), 0x34107 its
            precull rows (0x80 B, but MW's cell grid is not known: left out, as no precull),

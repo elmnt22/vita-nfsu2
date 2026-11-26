@@ -14,6 +14,7 @@
 #endif
 
 #include "resource.h"
+#include "xpconv.h"   /* xp_tpk_header_carbon (the pin of a raw Carbon stream) */
 
 void (*g_load_pump)(void);   /* resource.h: the loading screen's frame pump */
 
@@ -174,7 +175,23 @@ static long pin_tpk(int fd, long off, uint32_t size, unsigned char *out, long cu
         if (!pin_pread(fd, o, h, 8)) return -1;
         uint32_t cid = pin_u32(h), cs = pin_u32(h + 4);
         if ((unsigned long)cs > (unsigned long)(end - o - 8)) return -1;   /* runs past its parent (audit 11-17) */
-        if (cid != 0xb3320000u) {                 /* copied verbatim */
+        if (cid == 0xb3310000u && cs <= (4u << 20)) {   /* the header: a Carbon one (Palmont's raw stream) translated */
+            unsigned char *hb = (unsigned char *)malloc(cs ? cs : 1);
+            if (!hb) return -1;
+            if (!pin_pread(fd, o + 8, hb, (long)cs)) { free(hb); return -1; }
+            size_t tn = xp_tpk_header_carbon(hb, cs, NULL);
+            if (tn) {
+                if (out) {
+                    xp_tpk_header_carbon(hb, cs, out + cur + w + 8);
+                    pin_w32(out + cur + w, cid); pin_w32(out + cur + w + 4, (uint32_t)tn);
+                }
+                w += 8 + (long)tn;
+            } else {
+                if (out) { pin_w32(out + cur + w, cid); pin_w32(out + cur + w + 4, cs); memcpy(out + cur + w + 8, hb, cs); }
+                w += 8 + (long)cs;
+            }
+            free(hb);
+        } else if (cid != 0xb3320000u) {                 /* copied verbatim */
             if (out && !pin_pread(fd, o, out + cur + w, 8 + (long)cs)) return -1;
             w += 8 + (long)cs;
         } else {
