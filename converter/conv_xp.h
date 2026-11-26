@@ -27,11 +27,14 @@ void xpp_set_dir(int c, const char *dir);      /* "" = leave the city out */
 int  xpp_any_dir(void);
 int  xpp_dir_fix(int c, char *dir);            /* 1 = holds the city's TRACKS (dir trimmed to the game folder) */
 int  xpp_dir_detect(int c, char *out, size_t cap);   /* from the installer's registry entry */
-int  xpp_city_done(int c);                     /* converted and ready to send */
+int  xpp_city_done(int c);                     /* its files there: ready to send */
+void xpp_vita_stream(int c, char *out, size_t cap);   /* the stream's path on the Vita */
+long long xpp_stream_size(int c);              /* the stream's size (the manifest's) */
 /* 1 = every file of the picked games matches, 0 = some don't, -1 = no game picked */
 int  xpp_check(volatile long long *bytes, volatile long long *total, char *msg, size_t cap);
-/* converts every picked city not done yet; 1 = ok. ask_on_bad: ask (owner's message
-   box) before going on with files that don't match */
+/* checks the picked cities' files (nothing is converted: the game streams them as they
+   are); 1 = a city is ready to send. ask_on_bad: ask (owner's message box) before going
+   on with files that don't match */
 int  xpp_convert(XppJob *job, int ask_on_bad, HWND owner);
 /* adds each ready city's files (local path, Vita path) in send order; add returns 1
    when it took the file (it exists). Returns how many were taken. */

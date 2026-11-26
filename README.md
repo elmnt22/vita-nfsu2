@@ -110,7 +110,7 @@ Disclosure: Whilst I know a bit of programming and coding, I used AI to help acc
   have it yet, extract it with **ShaRKBR33D**.
 - About **1.7 GB** free on the memory card for the game data, plus about
   **330 MB** for the converted world cache.
-- For the World Expansion only: about **2.7 GB** more, and your own PC copy
+- For the World Expansion only: about **1.8 GB** more, and your own PC copy
   of **Need for Speed Most Wanted (2005)** and/or **Need for Speed Carbon**
   (see [World Expansion](#world-expansion-rockport-and-palmont)).
 - For trophies only: the **[NoTrpDrm](https://github.com/Yoti/psv_notrpdrm)**
@@ -202,8 +202,9 @@ gets your PC copy of the game ready for the Vita:
   needs go over (no `Support`, `Uninstall` or other unused files). Files
   already there are skipped: the tool remembers what it sent to each Vita or
   memory card, so sending again later only sends what changed.
-- **Converts the World Expansion cities** from your Most Wanted and/or Carbon
-  install (see [below](#world-expansion-rockport-and-palmont)).
+- **Sends the World Expansion cities** from your Most Wanted and/or Carbon
+  install (see [below](#world-expansion-rockport-and-palmont)). They need no
+  converting; the tool just checks and copies those games' files.
 - **Imports a PC save** (see [below](#bringing-over-a-pc-save)).
 
 Use the Prep Tool from the **same release** as your VPK. If the data format
@@ -283,57 +284,46 @@ Carbon's pursuit knockout events.
 - Your own PC copy of **Need for Speed Most Wanted (2005)** for Rockport
   and/or **Need for Speed Carbon** for Palmont. One is enough: the other
   city is simply left out. **No data from those games is included** in this
-  repository or the VPK; the Prep Tool converts your own copy on your PC.
-- About **2.7 GB** more on the memory card for both cities.
-- The **Prep Tool** from the same release as your VPK.
+  repository or the VPK; you copy the files from your own install.
+- About **1.8 GB** more on the memory card for both cities (the game files
+  themselves; nothing is converted).
 
 ### Setting it up
 
-1. In the Prep Tool, under **Optional: World Expansion**, pick your Most
-   Wanted and/or Carbon folder (the one with `TRACKS` in it). Installed
-   copies are found by themselves. Leave a box empty to skip that city. The
-   labels under the boxes show each city's state (**Found**, **Ready to
-   send**, **Not set** or **Folder not right**).
-2. Click **Convert**. After the Underground 2 tracks it checks those games'
-   files and converts each city. This takes longer than the Underground 2
-   tracks alone.
-3. Send or copy as usual with **World Expansion too** ticked. If this tool
-   already sent the Underground 2 data, only the new cities go over.
-4. On the Vita, open [Settings](#settings) and tick **Rockport and Palmont**
-   under **World Expansion**. The right side shows which cities are on the
-   memory card.
-5. In the game, pick **Quick Race → Free Run**. It asks which city you want.
-
-Turning the switch off hides the cities again. Your Underground 2 career is
-untouched either way.
-
-### Without the Prep Tool
-
-The Vita can translate a city itself from the game's raw files. It's slower
-(the first trip into each city shows a progress screen) and has had less
-testing than the Prep Tool. Copy these files from your PC install to the
-memory card, keeping the folders:
+No PC tool is needed: the game streams both cities straight from the
+original files. Copy these files from your PC install to the memory card,
+keeping the folders:
 
 | City | From your PC install | To the Vita |
 |---|---|---|
 | Rockport | `TRACKS\STREAML2RA.BUN`, `TRACKS\L2RA.BUN`, `TRACKS\L2RA\MINI_MAP.BIN`, `GLOBAL\gameplay.bin` (Most Wanted) | `ux0:data/NFSU2/expansion/mw/` |
-| Palmont | `TRACKS\STREAML5RA.BUN`, `TRACKS\L5RA.BUN`, `TRACKS\L5RA\MINI_MAP.BIN`, `GLOBAL\gameplay.bin` (Carbon) | `ux0:data/NFSU2/expansion/carbon/` |
+| Palmont | `TRACKS\STREAML5RA.BUN`, `TRACKS\L5RA.BUN`, `GLOBAL\gameplay.bin` (Carbon) | `ux0:data/NFSU2/expansion/carbon/` |
 
 For example, Rockport's stream ends up at
-`ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN`. The two `.BUN` files are
-required. Without `MINI_MAP.BIN` the city has no minimap, and without
-`gameplay.bin` it has no race events. Then turn on the switch in
-[Settings](#settings) as in step 4 above. Leave the raw files there: when a
-later release changes the cities' format, the Vita translates them again
-from those files.
+`ux0:data/NFSU2/expansion/mw/TRACKS/STREAML2RA.BUN`. The two `.BUN` files of
+a city are required. Without Rockport's `MINI_MAP.BIN` it has no minimap,
+and without `gameplay.bin` a city has no race events.
+
+That's all. The game finds the files by itself and turns the World
+Expansion on. In the game, pick **Quick Race → Free Run**; it asks which
+city you want. The first trip into each city takes a few minutes longer
+while the game prepares its roads, collision and events (shown in % on the
+loading screen); later trips load normally.
+
+To hide the cities again, untick **Rockport and Palmont** under **World
+Expansion** in [Settings](#settings). Your Underground 2 career is untouched
+either way.
+
+Older releases converted the cities with the Prep Tool. That is no longer
+needed: the converted city files from it are deleted on the first boot to
+free the space, and the raw files above are used instead.
 
 ### Good to know
 
 - The World Expansion is **new and has had little hardware testing**. Some
   busy spots can drop below 30 FPS. Logs from either city are very welcome
   (see [Reporting problems](#reporting-problems)).
-- If the cities' data format changes in a later release, convert them again
-  with that release's Prep Tool.
+- Leave the raw files in place: they are the city data the game plays from.
 
 ---
 
@@ -350,7 +340,7 @@ game starts. A small menu opens before the game loads:
 | **Ignore Visual Rating** | Off by default. On: in the career, DVD covers unlock without needing their star rating, so the Visual Rating no longer holds up a stage (`novisrating.txt`). The cover still pays by your rating. |
 | **Trophies** | Off by default. On: trophies are reported to the system (`trophies.txt`; needs the NoTrpDrm plugin). Off, progress is still saved in your profile and is reported when you turn them on. |
 | **Full detail** | Off by default: the lighter mix for a steady 30 FPS downtown (road reflection redrawn every second frame, fewer traffic cars, half the particle rate). On: the original rates (`fulldetail.txt`). |
-| **World Expansion: Rockport and Palmont** | Off by default. On: Free Run offers Rockport and Palmont (`expansion/enable.txt`). The right side shows which cities are on the memory card; send them with the [Prep Tool](#world-expansion-rockport-and-palmont) first. |
+| **World Expansion: Rockport and Palmont** | On by itself once a city's files are on the memory card ([World Expansion](#world-expansion-rockport-and-palmont)): Free Run offers Rockport and Palmont. Off hides them again (`expansion/off.txt`). The right side shows which cities are on the memory card. |
 | **Reset caches** | Deletes `ux0:data/NFSU2/cache`: the converted world data, shaders and shop lists. Your profiles and options are kept. On the next boot the game converts the world again, or you can send it again from the Prep Tool. |
 
 **Start Game** (or START) saves the settings and restarts the game.

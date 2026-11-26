@@ -16,14 +16,16 @@
  *   NFSU2VitaPrep.exe                          the window
  *   NFSU2VitaPrep.exe --check GAME             check the game files (report on stderr)
  *  - optionally, the World Expansion (conv_xp.c): Rockport from Need for Speed
- *    Most Wanted (2005) and Palmont from Carbon, translated and converted here
- *    and sent with the rest; the player switches it on in the Vita's Settings.
+ *    Most Wanted (2005) and Palmont from Carbon: their files checked and sent
+ *    with the rest, as they are (the game streams them; nothing converted).
  *
  *   NFSU2VitaPrep.exe --cli GAME OUT [MW|- [CARBON|-]]
  *                                              check + convert without the window
- *                                              (+ the World Expansion from MW / CARBON)
- *   NFSU2VitaPrep.exe --send IP OUT [GAME]     send OUT's cache (+ GAME's files) to the Vita
- *   NFSU2VitaPrep.exe --copy DEST OUT [GAME]   the same into DEST (ux0's root, or any folder)
+ *                                              (+ checks the World Expansion in MW / CARBON)
+ *   NFSU2VitaPrep.exe --send IP OUT [GAME|- [MW|- [CARBON|-]]]
+ *                                              send OUT's cache (+ GAME's, MW's, CARBON's files) to the Vita
+ *   NFSU2VitaPrep.exe --copy DEST OUT [GAME|- [MW|- [CARBON|-]]]
+ *                                              the same into DEST (ux0's root, or any folder)
  *   NFSU2VitaPrep.exe --import-save SAVE GAME OUT
  *                                         a PC save (%LOCALAPPDATA%\NFS Underground 2\
  *                                         <NAME>\<NAME>) into OUT\profiles\<NAME>\<NAME>
@@ -481,7 +483,7 @@ static int xp_add(void *ud, const char *local, const char *remote) {
     SendFile *s = &a->f[a->n++];
     snprintf(s->local, sizeof s->local, "%s", local);
     snprintf(s->remote, sizeof s->remote, "%s", remote);
-    s->game = 0;   /* always sent: a new translation can keep a file's size */
+    s->game = 1;   /* the other games' own files: skipped when already there at that size */
     return 1;
 }
 static int send_list(SendFile *f, int cap, const char *game) {
@@ -725,8 +727,8 @@ static int put_file(HINTERNET c, const SendFile *f, char *buf, DWORD bufsz) {
     return ok;
 }
 
-/* ---- V1 / V2 (11-22): what the Vita has -- each city's translation marker (TRACKS/<stream>.xp,
-   the game's own test: xp_marker_text_ok) and Bayview's tile indexes at this WTILE_VERSION ---- */
+/* ---- V1 / V2 (11-22): what the Vita has -- each city's raw stream (expansion/<game>/TRACKS,
+   11-25; an older release's translated city is VC_OLD) and Bayview's tile indexes ---- */
 static int vita_read_text(HINTERNET c, const char *remote, char *buf, int cap) {   /* -1: not there */
     buf[0] = 0;
     int n = 0;
@@ -749,9 +751,10 @@ typedef struct { int city[XPP_NCITY]; int tiles; } VitaState;   /* tiles: Bayvie
 static void vita_state(HINTERNET c, VitaState *v) {
     char t[128], r[256];
     for (int k = 0; k < XPP_NCITY; k++) {
-        snprintf(r, sizeof r, VITA_DATA "/TRACKS/%s.xp", xpp_bun(k));
-        int ok = vita_read_text(c, r, t, sizeof t) < 0 ? -1 : xp_marker_text_ok(t, xpp_city_game(k), -1);
-        v->city[k] = ok < 0 ? VC_NONE : ok ? VC_OK : VC_OLD;
+        xpp_vita_stream(k, r, sizeof r);
+        if (remote_size(c, r) == xpp_stream_size(k)) { v->city[k] = VC_OK; continue; }
+        snprintf(r, sizeof r, VITA_DATA "/TRACKS/%s.xp", xpp_bun(k));   /* an older release's converted city */
+        v->city[k] = vita_read_text(c, r, t, sizeof t) < 0 ? VC_NONE : VC_OLD;
     }
     remote_dirs_reset();   /* the listings from before the send are stale */
     v->tiles = 0;
@@ -775,11 +778,11 @@ static void vita_report(const VitaState *was, const VitaState *now, char *msg, s
         if (now->city[k] == VC_OK && was->city[k] == VC_OLD)
             snprintf(msg + n, cap - n, "\n\n%s on your Vita was out of date and has been updated.", xpp_city_name(k));
         else if (now->city[k] == VC_OLD && xpp_city_done(k) && !g_send.xp)
-            snprintf(msg + n, cap - n, "\n\n%s on your Vita is out of date. Tick \"World Expansion files\" and send again.",
-                     xpp_city_name(k));
+            snprintf(msg + n, cap - n, "\n\n%s on your Vita is from an older release. Tick \"World Expansion too\" and "
+                     "send again: the game now plays it from %s's own files.", xpp_city_name(k), xpp_game_name(k));
         else if (now->city[k] == VC_OLD)
-            snprintf(msg + n, cap - n, "\n\n%s on your Vita is out of date: this version of the game no longer loads it. "
-                     "Pick the %s folder, press Convert, then send again.", xpp_city_name(k), xpp_game_name(k));
+            snprintf(msg + n, cap - n, "\n\n%s on your Vita is from an older release: this version plays it from %s's "
+                     "own files. Pick the %s folder, then send again.", xpp_city_name(k), xpp_game_name(k), xpp_game_name(k));
     }
     printf("prep: %s\n", l);
 }
@@ -866,9 +869,8 @@ static void send_all(void) {
                          track_done(0) ? " -- it skips \"Optimizing world data\"" : "",
                          g_kept_profiles ? "\n\nYour profile already on the Vita was kept (not replaced by the "
                                            "PC import). To replace it, import the PC save again, then send." : "",
-                         g_send.xp_sent ? "\n\nTo drive Rockport and Palmont: on the game's LiveArea screen press "
-                                          "Settings (or hold L+R while it starts), tick \"Rockport and Palmont\" "
-                                          "under World Expansion, then pick the city in Free Run." : "");
+                         g_send.xp_sent ? "\n\nTo drive Rockport and Palmont: pick the city in Free Run. The first "
+                                          "trip into each city takes a few minutes longer while the game prepares it." : "");
         if (ok) { vita_state(c, &vnow); vita_report(&vwas, &vnow, g_send.msg, sizeof g_send.msg); }
     } else snprintf(g_send.msg, sizeof g_send.msg, "Nothing to send yet: convert first, or tick \"Game files too\".");
     if (c) InternetCloseHandle(c);
@@ -1036,10 +1038,9 @@ static void xp_status_update(void) {
     char dir[MAX_PATH];
     for (int c = 0; c < XPP_NCITY; c++) {
         GetWindowTextA(g_xp_ed[c], dir, sizeof dir);
-        if (xpp_city_done(c)) g_city_st[c] = 2;
-        else if (!dir[0]) g_city_st[c] = 0;
-        else if (xpp_dir_fix(c, dir)) g_city_st[c] = 1;
-        else g_city_st[c] = 3;
+        if (!dir[0]) { xpp_set_dir(c, ""); g_city_st[c] = 0; }
+        else if (xpp_dir_fix(c, dir)) { xpp_set_dir(c, dir); g_city_st[c] = xpp_city_done(c) ? 2 : 1; }
+        else { xpp_set_dir(c, ""); g_city_st[c] = 3; }
     }
     inval(CL, CY(1) + 118, CR - CL, 30);
 }
@@ -1092,7 +1093,7 @@ static void ui_initial_status(void) {
             int done = xpp_city_done(c);
             if (!done && !d[0]) continue;
             size_t k = strlen(m);
-            snprintf(m + k, sizeof m - k, " %s %s.", xpp_city_name(c), done ? "ready" : "not converted yet");
+            snprintf(m + k, sizeof m - k, " %s %s.", xpp_city_name(c), done ? "ready to send" : "files not right");
         }
         set_status(m);
         SendMessageA(g_bar, PBM_SETPOS, n == NTRACKS ? 1000 : 0, 0);
@@ -1470,7 +1471,7 @@ static void paint_all(HDC dc, int cw, int chh) {
     {
         int x = CL, y = CY(1) + 122;
         for (int c = 0; c < XPP_NCITY; c++) {
-            static const wchar_t *st[4] = { L"Not set", L"Found — press Convert", L"Ready to send", L"Folder not right" };
+            static const wchar_t *st[4] = { L"Not set", L"Found — files differ", L"Ready to send", L"Folder not right" };
             wchar_t s[80]; swprintf(s, 80, L"%hs: %ls", xpp_city_name(c), st[g_city_st[c]]);
             int k = g_city_st[c];
             int w = text_w(dc, g_font, s) * 96 / g_dpi + 44;
@@ -1688,13 +1689,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
         if (!strcmp(__argv[1], "--send")) snprintf(g_send.ip, sizeof g_send.ip, "%s", __argv[2]);
         else { snprintf(g_send.dest, sizeof g_send.dest, "%s", __argv[2]); dest_fix(g_send.dest); }
         snprintf(g_out, sizeof g_out, "%s", __argv[3]);
-        if (__argc >= 5) {
+        for (int c = 0; c < XPP_NCITY && 5 + c < __argc; c++) {   /* MW, CARBON ("-" = none): their files go too */
+            char d[MAX_PATH]; snprintf(d, sizeof d, "%s", __argv[5 + c]);
+            if (!strcmp(d, "-")) continue;
+            if (!xpp_dir_fix(c, d)) { fprintf(stderr, "no %s folder at %s\n", xpp_game_name(c), __argv[5 + c]); return 2; }
+            xpp_set_dir(c, d);
+        }
+        if (__argc >= 5 && strcmp(__argv[4], "-")) {
             snprintf(g_send.game, sizeof g_send.game, "%s", __argv[4]);
             if (!game_dir_fix(g_send.game, sizeof g_send.game)) { fprintf(stderr, "no NFSU2 game folder at %s\n", __argv[4]); return 2; }
         }
         conv_set_folders("", g_out);
         xpp_set_out(g_out);
-        g_send.xp = 1;   /* the World Expansion cities converted in OUT, if any */
+        g_send.xp = 1;   /* the World Expansion: the picked games' files */
         send_all();
         fprintf(stderr, "%s\n", g_send.msg);
         return g_send.ok ? 0 : 1;

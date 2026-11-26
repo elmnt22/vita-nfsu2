@@ -82,6 +82,10 @@ int xpcity_is_city(const char *track) { (void)track; return 0; }
 const char *xpcity_map(const char *track) { (void)track; return NULL; }   /* world_tiles' sea mask: never reached (no city) */
 int xpcity_installed(int pick) { return pick == 0; }
 int xpcity_outdated(int pick) { (void)pick; return 0; }
+int xpcity_lean(const char *track) { (void)track; return 0; }
+int xpcity_stream_path(const char *track, char *out, size_t n) { (void)track; (void)out; (void)n; return 0; }
+int xpcity_coll_path(const char *troot, const char *track, char *out, size_t n) { (void)troot; (void)track; (void)out; (void)n; return 0; }
+unsigned char *xpcity_lamps(const char *troot, const char *track, long *len) { (void)troot; (void)track; if (len) *len = 0; return NULL; }
 /* rstream.c / smokeable.c are not linked: the tool converts with tiles (lean tracks skip the tile build) */
 struct N2Scene;
 int rstream_track_ok(const char *t) { (void)t; return 0; }

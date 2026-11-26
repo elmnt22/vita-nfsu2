@@ -59,17 +59,19 @@ World detail is set to low, as the Vita's default.
    `ux0:data/NFSU2/` by hand.
 
 Command line: `--check GAME`, `--cli GAME OUT` (check + convert, log in
-`OUT/convert_log.txt`), `--send IP OUT [GAME]`, `--copy DEST OUT [GAME]`.
+`OUT/convert_log.txt`), `--send IP OUT [GAME|- [MW|- [CARBON|-]]]`,
+`--copy DEST OUT [GAME|- [MW|- [CARBON|-]]]`.
 
 World Expansion (`conv_xp.c`, merged from the separate Expansion Prep Tool
 11-19): optional Most Wanted / Carbon folders (`--cli GAME OUT [MW|- [CARBON|-]]`).
-It checks them against `xp_manifest.inc` (`tools/gen_xp_manifest.py`),
-translates each city with `src/xpconv.c` / `xproads.c` into `OUT/stage/TRACKS`,
-runs the same world conversion plus the skyline on it, and adds the files to
-the send list (stream, companion, caches, minimap, road net, props, events,
-then the `.xp` marker and the tile index last). It does not send
-`expansion/enable.txt`: the player switches the cities on in the Vita's
-Settings.
+Since 11-25 nothing is converted: the game streams both cities from the
+original files (`src/rstream.c`) and prepares the rest on the first trip
+(`src/xpcity.c`). Convert checks the files against `xp_manifest.inc`
+(`tools/gen_xp_manifest.py`); Send copies them as they are to
+`ux0:data/NFSU2/expansion/<mw|carbon>/` (gameplay.bin and the minimap, the
+stream, then the companion `.BUN` last: with both `.BUN` files there the game
+takes the city), skipping files already there at the same size. The game
+turns the expansion on when it finds them.
 
 When sending, the Vita's old `.idx` files are deleted first and each track's
 index goes up last, so a cut-off transfer reads as "not converted" (the Vita
