@@ -70,6 +70,7 @@ void savenote_cancel(void) {}
 void skyline_texavg_note(uint32_t key, const struct N2Tex *t) { (void)key; (void)t; }
 void vita_copy_push(void *dst, const void *src, unsigned n) { memcpy(dst, src, n); }
 int vita_copy_idle(void) { return 1; }
+void vita_gx_tag(int t) { (void)t; }   /* render.c GPU pass tags (Vita only) */
 unsigned vita_copy_mark(void) { return 0; }
 int vita_copy_passed(unsigned mark) { (void)mark; return 1; }
 void vita_copy_wait(void) {}
