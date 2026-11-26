@@ -182,6 +182,10 @@ static int n2_mod_attach(const char *root,const unsigned char *data,long len,
         if(mirror && part.meshes[i].inst!=side[k]+1)continue;
         N2Mesh *src=part.meshes+i,*dst=car->meshes+car->count++;
         *dst=*src;dst->inst=0;dst->car_source=0;dst->famkey=0;dst->car_part=(unsigned char)(slot+1);
+        /* GLOBALB 0x34608 maps the SPOILER slot (0xc) onto the trunk whatever the
+           mesh's name: a library spoiler ("SPOILER_STYLE..", no "_SPOILER") rides
+           the opening trunk like the car's own (GitHub #46) */
+        if(slot==N2_PART_SPOILER)dst->car_anim=2;
         dst->verts=(float *)malloc((size_t)src->nverts*(src->authored_normals?8:5)*sizeof(float));
         dst->idx=(uint16_t *)malloc((size_t)src->nidx*sizeof(uint16_t));dst->vcol=NULL;
         if(!dst->verts || !dst->idx){n2_free_scene(&part);return 0;}
