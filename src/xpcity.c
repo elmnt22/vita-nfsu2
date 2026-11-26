@@ -591,12 +591,23 @@ static int lean_prepare(int c, const char *troot)
         FILE *k = fopen("ux0:data/NFSU2/keeptiles.txt", "rb");
         if (k) fclose(k);
         else {
+            long long freed = 0, n;
             snprintf(p, sizeof p, "%s/%s.BUN", troot, k_city[c].bun);
-            if (xp_file_size(p) > 0) { remove(p); vita_mark("xpcity: old translated stream %s deleted", p); }
+            if ((n = xp_file_size(p)) > 0 && remove(p) == 0) { freed += n; vita_mark("xpcity: old translated stream %s deleted", p); }
             snprintf(p, sizeof p, "%s/%s.xp", troot, k_city[c].bun); remove(p);
             snprintf(p, sizeof p, XP_CACHE "/%s.BUN.idx", k_city[c].bun); remove(p);
             skyline_forget(k_city[c].bun);
-            world_tiles_drop_track(k_city[c].bun);
+            freed += world_tiles_drop_track(k_city[c].bun);
+            if (freed >= (1 << 20)) {   /* says so on the loading screen, once (main.c old_data_notice) */
+                char l2[96], l3[96];
+                snprintf(l2, sizeof l2, "OLD %s DATA DELETED", k_city[c].name);
+                snprintf(l3, sizeof l3, "%lld MB FREED", freed >> 20);
+                vita_mark("xpcity: %s", l3);
+                for (Uint32 t0 = SDL_GetTicks(); xpcity_screen && SDL_GetTicks() - t0 < 3000;) {
+                    city_screen("CLEANING UP", l2, l3);
+                    SDL_Delay(33);
+                }
+            }
         }
     }
     if (xp_file_size(outc) > 0 && xp_file_size(lean) > 0 && lean_marker_ok(mark, raw_size)) {

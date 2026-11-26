@@ -77,7 +77,8 @@ void world_tiles_preload(const char *track, float x, float y);
    assembly starts it, calling it earlier is harmless. */
 void world_tiles_migrate_start(void);
 void world_tiles_drop_old_versions(void);   /* older WTILE_VERSION sets, once the current one is complete */
-void world_tiles_drop_track(const char *track);   /* a streamer track: its tiles + compact copy off the card */
+/* a streamer track: its tiles + compact copy off the card; the bytes freed */
+long long world_tiles_drop_track(const char *track);
 /* the retail streamer (rstream.c): Palmont's sea sheet cut open by the city's sea mask, as the
    tile build does; the model is placed at (ox, oy) by a plain move. 1 = cut */
 int world_tiles_sea_cut_placed(N2Mesh *m, const char *track, float ox, float oy);

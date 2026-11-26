@@ -222,6 +222,18 @@ static void xp_ls_screen_done(void) {
     Shop *fe = g_boot_fe ? g_boot_fe : g_ls_fe;
     if (fe) shop_loading_text(fe, NULL, NULL);   /* back to "LOADING" */
 }
+/* the boot that deletes an older release's converted world data says so on the
+   loading screen for 3 s (once: the files are gone after it) */
+static void old_data_notice(long long freed) {
+    printf("old converted world data deleted: %lld MB freed\n", freed >> 20);
+    if (!(g_boot_fe ? g_boot_fe : g_ls_fe) || freed < (1 << 20)) return;
+    char l3[96]; snprintf(l3, sizeof l3, "%lld MB FREED", freed >> 20);
+    for (Uint32 t0 = SDL_GetTicks(); SDL_GetTicks() - t0 < 3000;) {
+        xp_ls_screen("CLEANING UP", "UNUSED OLD DATA DELETED", l3);
+        SDL_Delay(33);
+    }
+    xp_ls_screen_done();
+}
 static int g_boot_window;   /* the boot opened the window (early, for a city's first-boot steps) */
 /* the boot world load, off the main thread so the loading screen animates */
 static struct { World *w; const char *root, *track; const WLoadOptions *opt; int world2, nm; volatile int done; } g_wl;
@@ -17314,10 +17326,11 @@ int main(int argc, char **argv) {
                 { "STREAML4RC", "DRIFT VENUES" }, { "STREAML4RD", "DRAG STRIPS 2" },
                 { "STREAML4RF", "STREET X TRACKS" }, { "STREAML4RG", "URL TRACKS" } };
             const char *conv[8], *conv_name[8]; int nconv = 0, boot_listed = 0, tiles_relaunch = 0;
+            long long old_freed = 0;
             for (int q = 0; q < (int)(sizeof k_tile_tracks / sizeof *k_tile_tracks); q++) {
                 if (!strcmp(k_tile_tracks[q][0], trackname)) boot_listed = 1;
                 if (world_lean_track(k_tile_tracks[q][0])) {   /* the retail streamer draws it from the game data */
-                    world_tiles_drop_track(k_tile_tracks[q][0]);
+                    old_freed += world_tiles_drop_track(k_tile_tracks[q][0]);
                     continue;
                 }
                 char bp[1024]; snprintf(bp, sizeof bp, "%s/%s.BUN", troot, k_tile_tracks[q][0]);
@@ -17327,6 +17340,7 @@ int main(int argc, char **argv) {
                 if (world_tiles_ready(k_tile_tracks[q][0])) continue;
                 conv[nconv] = k_tile_tracks[q][0]; conv_name[nconv++] = k_tile_tracks[q][1];
             }
+            if (old_freed > 0) old_data_notice(old_freed);
             if (!boot_listed && !world_lean_track(trackname) && !world_tiles_ready(trackname)) {
                 conv[nconv] = trackname; conv_name[nconv++] = "THIS TRACK";
             }

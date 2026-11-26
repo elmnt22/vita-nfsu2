@@ -2254,11 +2254,19 @@ static int wt_drop_old_thread(void *arg) {
 /* A track the retail streamer draws needs no tiles and no compact bundle
    copy: its tile packs, skyline bins and <track>.BUN.compact go (the .strip
    and .idx stay: the streamer's pinned bundle). Main thread, at boot. */
-void world_tiles_drop_track(const char *track) {
+static long long wt_fsize(const char *p) {
+    FILE *f = fopen(p, "rb");
+    if (!f) return -1;
+    long long n = fseek(f, 0, SEEK_END) == 0 ? (long long)ftell(f) : 0;
+    fclose(f);
+    return n;
+}
+long long world_tiles_drop_track(const char *track) {
     {   /* keeptiles.txt: leave them (a test build next to a tiles build on one card) */
         FILE *k = fopen("ux0:data/NFSU2/keeptiles.txt", "rb");
-        if (k) { fclose(k); printf("tiles: %s cache kept (keeptiles.txt)\n", track); return; }
+        if (k) { fclose(k); printf("tiles: %s cache kept (keeptiles.txt)\n", track); return 0; }
     }
+    long long freed = 0;
     size_t tl = strlen(track);
     char names[32][96]; int nn = 0;
     DIR *d = opendir(WTILE_DIR);
@@ -2274,12 +2282,14 @@ void world_tiles_drop_track(const char *track) {
     int del = 0;
     for (int i = 0; i < nn; i++) {
         char p[256]; snprintf(p, sizeof p, "%s/%s", WTILE_DIR, names[i]);
-        if (wt_remove(p)) { del++; printf("tiles: removed %s (the streamer draws %s)\n", names[i], track); }
+        long long n = wt_fsize(p);
+        if (wt_remove(p)) { del++; if (n > 0) freed += n; printf("tiles: removed %s (the streamer draws %s)\n", names[i], track); }
     }
     char c[256]; snprintf(c, sizeof c, "ux0:data/NFSU2/cache/%s.BUN.compact", track);
-    FILE *f = fopen(c, "rb");
-    if (f) { fclose(f); if (wt_remove(c)) { del++; printf("tiles: removed %s.BUN.compact (the streamer draws %s)\n", track, track); } }
-    if (del) printf("tiles: %d old cache file(s) of %s removed\n", del, track);
+    long long n = wt_fsize(c);
+    if (n >= 0 && wt_remove(c)) { del++; freed += n; printf("tiles: removed %s.BUN.compact (the streamer draws %s)\n", track, track); }
+    if (del) printf("tiles: %d old cache file(s) of %s removed (%lld MB)\n", del, track, freed >> 20);
+    return freed;
 }
 void world_tiles_drop_old_versions(void) {
 #if defined(__vita__) && !defined(OPENUG2_SIM_PRE_H)
