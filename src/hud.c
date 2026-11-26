@@ -2408,9 +2408,12 @@ static void fe_button_at(Hud *h, const HudDC *dc, int i, int b, float lineh,
 
 /* An FEng string in the game's own bitmap font, anchored and justified as
  * authored (Sj), at the object's scale. */
-static void fe_text_at(Hud *h, const HudDC *dc, int i, const char *txt,
-                       float x, float y, float sc, const float *rgba) {
+/* angle: the object's rotation (radians, clockwise on screen), about its
+   placed point -- the tuning graph's vertical "Torque ( unit )" */
+static void fe_text_at_r(Hud *h, const HudDC *dc, int i, const char *txt,
+                         float x, float y, float sc, const float *rgba, float angle) {
     const FengObj *o = &h->pk->obj[i];
+    const float px = x, py = y, ca = cosf(angle), sa = sinf(angle);
     if (!txt || !*txt || o->res < 0 || o->res >= h->pk->nres) return;
     int fi = h->font_of[o->res];
     if (fi < 0 || !h->font[fi].ok) return;
@@ -2467,15 +2470,25 @@ static void fe_text_at(Hud *h, const HudDC *dc, int i, const char *txt,
             float x0 = x + g->xo * sc, y0 = y + g->yo * sc;
             float x1 = x0 + g->w * sc, y1 = y0 + g->h * sc;
             float ax, ay, bx, by;
-            fe_ndc(dc->asp, pin, x0, y0, &ax, &ay);
-            fe_ndc(dc->asp, pin, x1, y1, &bx, &by);
             float u0 = (float)g->u / F->aw, v0 = (float)g->v / F->ah;
             float u1 = (float)(g->u + g->w) / F->aw, v1 = (float)(g->v + g->h) / F->ah;
             float *q = v + nq * 20;
-            put_vert(q,      ax, ay, u0, v0);
-            put_vert(q + 5,  bx, ay, u1, v0);
-            put_vert(q + 10, bx, by, u1, v1);
-            put_vert(q + 15, ax, by, u0, v1);
+            if (angle != 0.0f) {
+                const float cx[4] = { x0, x1, x1, x0 }, cy[4] = { y0, y0, y1, y1 };
+                const float cu[4] = { u0, u1, u1, u0 }, cv[4] = { v0, v0, v1, v1 };
+                for (int k = 0; k < 4; k++) {
+                    float dx = cx[k] - px, dy = cy[k] - py;
+                    fe_ndc(dc->asp, pin, px + dx * ca - dy * sa, py + dx * sa + dy * ca, &ax, &ay);
+                    put_vert(q + 5 * k, ax, ay, cu[k], cv[k]);
+                }
+            } else {
+                fe_ndc(dc->asp, pin, x0, y0, &ax, &ay);
+                fe_ndc(dc->asp, pin, x1, y1, &bx, &by);
+                put_vert(q,      ax, ay, u0, v0);
+                put_vert(q + 5,  bx, ay, u1, v0);
+                put_vert(q + 10, bx, by, u1, v1);
+                put_vert(q + 15, ax, by, u0, v1);
+            }
             nq++;
             /* a wrapping screen's long message: the full batch out, the rest after it */
             if (nq == HUD_QMAX && h->dw && h->dw->wrap) { hud_batch(h, dc, F->tex, v, nq, rgba); nq = 0; }
@@ -2483,6 +2496,10 @@ static void fe_text_at(Hud *h, const HudDC *dc, int i, const char *txt,
         x += g->adv * sc;
     }
     hud_batch(h, dc, F->tex, v, nq, rgba);
+}
+static void fe_text_at(Hud *h, const HudDC *dc, int i, const char *txt,
+                       float x, float y, float sc, const float *rgba) {
+    fe_text_at_r(h, dc, i, txt, x, y, sc, rgba, 0.0f);
 }
 
 static void fe_text(Hud *h, const HudDC *dc, int i, const char *txt,
@@ -3521,7 +3538,7 @@ static void fe_anim_draw(Hud *h, const HudDC *dc, int i) {
     feng_anim_place(&w->anim, i, &pl);
     if (pl.hidden || pl.rgba[3] <= 0.0f) return;
     if (o->type == FENG_STRING) {
-        fe_text_at(h, dc, i, w->has_txt[i] ? w->txt[i] : o->text, pl.x, pl.y, pl.sx, pl.rgba);
+        fe_text_at_r(h, dc, i, w->has_txt[i] ? w->txt[i] : o->text, pl.x, pl.y, pl.sx, pl.rgba, pl.angle);
         return;
     }
     int res = w->res_ov[i] ? w->res_ov[i] - 1 : o->res;

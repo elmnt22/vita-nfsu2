@@ -488,7 +488,8 @@ static struct {
     /* screens */
     const char *root;
     int scr, sel, cat, row, top, pt;
-    Hud *h, *dlg;
+    int quiet;              /* open_master as a backdrop: no category speech */
+    Hud *h, *dlg, *under;   /* under: TuningGraphMenu keeps UI_PerformanceTuning_Master drawn beneath it */
     int dlg_kind, dsel, quit_save;
     int types[16], ntypes;
     /* dyno */
@@ -555,7 +556,7 @@ void tun_commit(uint8_t (*car_tune)[TUNE_BYTES])
     memcpy(g_tt.db, g_tt.stored, sizeof g_tt.db);
     printf("tuning: CommitCustomTuningsToFEDatabase\n");
 }
-void tun_close_screens(void) { hud_free(&g_tt.h); hud_free(&g_tt.dlg); g_tt.scr = SCR_NONE; }
+void tun_close_screens(void) { hud_free(&g_tt.h); hud_free(&g_tt.dlg); hud_free(&g_tt.under); g_tt.scr = SCR_NONE; }
 void tun_end(void) { tun_close_screens(); g_tt.active = 0; g_tt.setting = -1; }
 void tun_test_event(int *event, int *qr_type, int *laps)
 {
@@ -666,7 +667,7 @@ static void open_master(void)
     if (g_tt.setting >= 0) hud_screen_label_h(g_tt.h, 0x95ad096bu, k_set[g_tt.setting].header);
     g_tt.scr = SCR_MASTER; g_tt.sel = g_tt.cat >= 0 && g_tt.cat < 7 && cat_avail(g_tt.cat) ? g_tt.cat : first < 0 ? 0 : first;
     strip_title();
-    cat_speech(g_tt.sel);
+    if (!g_tt.quiet) cat_speech(g_tt.sel);
     hud_screen_script_all(g_tt.h, "FadeIn");
     printf("tuning: UI_PerformanceTuning_Master (%d icons)\n", got);
 }
@@ -794,53 +795,103 @@ static int slider_step(int t, int i, int dir)
     return 1;
 }
 
-/* ---- the torque graph (TuningGraphMenu / TorqueGraph) ---- */
+/* ---- the torque graph (TuningGraphMenu / TorqueGraph) ----
+   TorqueGraph::Setup (PC 0x550580): the y axis is the type's total display
+   range at point 0 (GetTotalRangeMinMax 0x5b09a0), out to 50s -- min
+   (int)min/50*50 (>= 0), max ((int)max/50+1)*50 -- labelled by TORQUE_DATA_1..6
+   ("%$d", min + k * (max - min) / 5); the title 0xcb9a2c64 "Torque ( unit )".
+   Bars (AddPoint 0x549e50, drawn by 0x531040): point i (1-based names)
+   GRAPHBAR_i = the value (0x5b3e40), _B_i = the tuneable min (0x5b2ba0),
+   _C_i = the max (0x5b2bd0); columns from x -292 + 65 every 455 / 9, the
+   floor at y -49 + 213, (v - min) / (max - min) x 241 high, PULLPOINT_i
+   centred on top of the value bar. Axes 0x549fd0: RPM_DATA_k at k x 1000 rpm
+   over the redline (<= 9000) x 455 x 0.9, past it hidden. The selected point
+   runs "Highlight", the one left "UnHighlight" (0x522d70 / 0x522dd0). */
+#define TG_X0     (-227.0f)
+#define TG_COL    (455.0f / 9.0f)
+#define TG_FLOOR  164.0f
+#define TG_H      241.0f
+static void tg_axis(const Spec *s, int t, float *amn, float *amx)
+{
+    float lo = 0, hi = 0;
+    total_range(s, t, &lo, &hi);
+    float mn = (float)((int)lo / 50) * 50.0f, mx = (float)((int)hi / 50 + 1) * 50.0f;
+    *amn = mn < 0.0f ? 0.0f : mn; *amx = mx;
+}
 static void graph_refresh(void)
 {
     Hud *h = g_tt.h;
     if (!h) return;
     Spec s; tun_spec(&s);
     int t = g_tt.cat == 4 ? 23 : 24;
-    float r0 = rf(s.P, 0x1f0), r1 = rf(s.P, 0x1f8);
+    float amn, amx; tg_axis(&s, t, &amn, &amx);
+    float span = amx - amn > 0.0f ? amx - amn : 1.0f;
     for (int i = 0; i < 9; i++) {
         float lo = 0, hi = 0, v = remap(&s, t, real_value(&s, t, i), 1);
         tune_range(&s, t, &lo, &hi, i, 1);
-        float rpm = (r1 - r0) * (float)i * 0.125f + r0, x = -231.0f + rpm * 0.0504f;   /* x axis 0..9 x1000 rpm */
+        float left = TG_X0 + TG_COL * (float)i;
         struct { uint32_t o; float val; } bars[3] = { { 0xa11a9316u + i, v }, { 0x520c0557u + i, lo }, { 0x520c0998u + i, hi } };
+        float top = TG_FLOOR;
         for (int b = 0; b < 3; b++) {
             int o = hud_screen_find_h(h, bars[b].o);
-            float ht = fmax2(1.0f, fminf(bars[b].val, 500.0f) / 500.0f * 239.0f);
-            hud_screen_obj_pos(h, o, x, 158.0f - ht * 0.5f);
-            hud_screen_obj_size(h, o, b ? 30.0f : 22.0f, ht);
+            float ht = (bars[b].val - amn) / span * TG_H;
+            ht = ht < 1.0f ? 1.0f : ht > TG_H ? TG_H : ht;
+            hud_screen_obj_pos(h, o, left + 48.22f * 0.5f, TG_FLOOR - ht * 0.5f);
+            hud_screen_obj_size(h, o, 48.22f, ht);
+            if (!b) top = TG_FLOOR - ht;
         }
         int c = hud_screen_find_h(h, 0x57d3f016u + i);
-        float ht = fmax2(1.0f, fminf(v, 500.0f) / 500.0f * 239.0f);
-        hud_screen_obj_pos(h, c, x, 158.0f - ht);
-        hud_screen_obj_hide(h, c, i != g_tt.pt);
+        hud_screen_obj_pos(h, c, left + TG_COL * 0.5f, top);
+        hud_screen_obj_hide(h, c, 0);
     }
-    for (uint32_t k = 0; k < 10; k++) {   /* the rpm labels under the axis */
+    float red = rf(g_tt.work + PO, 0x1f8);   /* the live record (0x5b5350(1)), as the dyno run */
+    int maxr = (int)red > 9000 ? 9000 : (int)red < 1 ? 1 : (int)red;
+    for (uint32_t k = 0; k < 10; k++) {   /* RPM_DATA_k */
         int o = hud_screen_find_h(h, 0x70f8df36u + k);
-        hud_screen_obj_pos(h, o, -231.0f + 50.4f * (float)k, 170.0f);
+        float x = (float)(k * 1000) / (float)maxr * (455.0f * 0.9f);
+        hud_screen_obj_hide(h, o, x > 455.0f * 0.9f);
+        hud_screen_obj_pos(h, o, TG_X0 + x, TG_FLOOR + 6.0f);
+    }
+    {   char num[24]; int base = (int)amn, step = (int)((amx - amn) / 5.0f);
+        for (uint32_t k = 0; k < 6; k++) {   /* TORQUE_DATA_1..6 */
+            int v = base + (int)k * step;
+            if (v >= 1000) snprintf(num, sizeof num, "%d,%03d", v / 1000, v % 1000); else snprintf(num, sizeof num, "%d", v);
+            hud_screen_text_h(h, 0x796555c8u + k, num);
+        }
     }
     for (uint32_t k = 0; k < 10; k++) { hud_screen_hide_h(h, 0x10da171eu + k, 1); hud_screen_hide_h(h, 0x2498423du + k, 1); }
     hud_screen_hide_h(h, 0x938d3cc8u, 1); hud_screen_hide_h(h, 0xb7a08a0du, 1);
     hud_screen_hide_h(h, 0x938cb067u, 1); hud_screen_hide_h(h, 0xc46cf606u, 1);
     char txt[96];
-    snprintf(txt, sizeof txt, "%s (%s)", hud_screen_string(h, name_hash(t)), hud_screen_string(h, unit_hash(&s, t)));
-    hud_screen_text_h(h, 0x42adb44cu, txt);
+    snprintf(txt, sizeof txt, "%s ( %s )", hud_screen_string(h, 0x03cb927eu), hud_screen_string(h, unit_hash(&s, t)));
+    hud_screen_text_h(h, 0xcb9a2c64u, txt);
+    hud_screen_hide_h(h, 0xcb9a2c64u, 0);
 }
+static void graph_select(int prev)
+{
+    if (!g_tt.h) return;
+    if (prev >= 0 && prev != g_tt.pt) hud_screen_obj_script(g_tt.h, hud_screen_find_h(g_tt.h, 0x57d3f016u + (uint32_t)prev), "UnHighlight");
+    hud_screen_obj_script(g_tt.h, hud_screen_find_h(g_tt.h, 0x57d3f016u + (uint32_t)g_tt.pt), "Highlight");
+}
+/* TuningGraphMenu is a child screen: UI_PerformanceTuning_Master stays drawn
+   beneath it (its title, the category strip at the chosen icon) */
+static void open_master(void);
 static void open_graph(int cat)
 {
-    if (!open_pkg("UI_PerformanceTuning_Graph.fng")) return;
-    g_tt.scr = SCR_GRAPH; g_tt.pt = 4;
+    g_tt.quiet = 1; open_master(); g_tt.quiet = 0;
+    Hud *m = g_tt.h; g_tt.h = NULL;
+    if (!open_pkg("UI_PerformanceTuning_Graph.fng")) { hud_free(&m); return; }
+    g_tt.under = m;
+    g_tt.scr = SCR_GRAPH; g_tt.pt = 0;   /* the first point added is the current one */
     for (uint32_t k = 0; k < 12; k++) hud_screen_hide_h(g_tt.h, 0x3409d780u + k, 1);
     for (uint32_t k = 0; k < 3; k++) hud_screen_hide_h(g_tt.h, 0xb544c7b0u + k, 1);
     hud_screen_label_h(g_tt.h, 0xd69c9b64u, 0xb672f15au);   /* "Maximum" */
-    hud_screen_label_h(g_tt.h, 0x6b6d137cu, 0x0000c3e5u);   /* GUESS: the legend's min line */
+    hud_screen_label_h(g_tt.h, 0x6b6d137cu, 0xb6bd9c95u);   /* "Minimum" */
     (void)cat;
     graph_refresh();
     hud_screen_script_all(g_tt.h, "FadeIn");
-    printf("tuning: UI_PerformanceTuning_Graph (%s)\n", g_tt.cat == 4 ? "ECU" : "Turbo");
+    graph_select(-1);
+    printf("tuning: UI_PerformanceTuning_Graph (%s) over the Master%c", g_tt.cat == 4 ? "ECU" : "Turbo", 10);
 }
 /* ---- nitrous (NOSGraph) ---- */
 static void nos_refresh(void)
@@ -1301,8 +1352,8 @@ int tun_key(int key)
         break;
     case SCR_GRAPH: {
         int t = g_tt.cat == 4 ? 23 : 24;
-        if (key == TT_K_LEFT && g_tt.pt > 0) { g_tt.pt--; graph_refresh(); audio_fe_play(FE_SND_LEFT); }
-        else if (key == TT_K_RIGHT && g_tt.pt < 8) { g_tt.pt++; graph_refresh(); audio_fe_play(FE_SND_RIGHT); }
+        if (key == TT_K_LEFT && g_tt.pt > 0) { g_tt.pt--; graph_refresh(); graph_select(g_tt.pt + 1); audio_fe_play(FE_SND_LEFT); }
+        else if (key == TT_K_RIGHT && g_tt.pt < 8) { g_tt.pt++; graph_refresh(); graph_select(g_tt.pt - 1); audio_fe_play(FE_SND_RIGHT); }
         else if (key == TT_K_UP || key == TT_K_DOWN) {
             if (slider_step(t, g_tt.pt, key == TT_K_UP ? 1 : -1)) { audio_fe_play(key == TT_K_UP ? FE_SND_UP : FE_SND_DOWN); graph_refresh(); }
         } else if (key == TT_K_RESET) { for (int k = 0; k < 9; k++) g_tt.temp[tidx(t, k)] = 100; graph_refresh(); }
@@ -1344,6 +1395,7 @@ void tun_tick(float dt)
 }
 void tun_draw(const RProg *rp, GpuMesh *quad, int W, int H, int dms)
 {
+    if (g_tt.under) hud_screen_draw(g_tt.under, rp, quad, W, H, dms);
     if (g_tt.h) hud_screen_draw(g_tt.h, rp, quad, W, H, dms);
     if (g_tt.h && g_tt.scr == SCR_CHART) chart_draw(rp, quad, W, H);
     if (g_tt.dlg) hud_screen_draw(g_tt.dlg, rp, quad, W, H, dms);
