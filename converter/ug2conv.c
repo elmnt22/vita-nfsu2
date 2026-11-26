@@ -68,9 +68,9 @@ int conv_shop(void);
    default since 11-24) -- no tiles, no compact copy; only its stripped
    bundle + start are made here (the game would make them on first use) */
 static const struct { const char *bun, *name; int lean; } k_tracks[] = {
-    { "STREAML4RA", "The City", 1 },        { "STREAML4RB", "Drag Strips 1", 0 },
-    { "STREAML4RC", "Drift Venues", 0 },    { "STREAML4RD", "Drag Strips 2", 0 },
-    { "STREAML4RF", "Street X Tracks", 0 }, { "STREAML4RG", "URL Tracks", 0 } };
+    { "STREAML4RA", "The City", 1 },        { "STREAML4RB", "Drag Strips 1", 1 },
+    { "STREAML4RC", "Drift Venues", 1 },    { "STREAML4RD", "Drag Strips 2", 1 },
+    { "STREAML4RF", "Street X Tracks", 1 }, { "STREAML4RG", "URL Tracks", 1 } };
 #define NTRACKS ((int)(sizeof k_tracks / sizeof *k_tracks))
 #define TRACKS_ROOT "ux0:data/NFSU2/TRACKS"   /* the game folder's TRACKS (conv_platform.c) */
 #define VITA_CACHE  "ux0:/data/NFSU2/cache"   /* on the Vita, as its FTP servers name it */

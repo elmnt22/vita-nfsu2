@@ -6,14 +6,12 @@ Underground 2 ready for the Vita:
 - **Checks your game files** against the original game, so missing,
   damaged or modded files show up on your PC instead of as a crash on the
   Vita.
-- **Converts the world data.** On its first boot the Vita build converts
-  the game's world data into a format it can stream quickly (the
-  **"OPTIMIZING WORLD DATA"** screen). On the console that takes
-  **15–20+ minutes**. The Prep Tool does the same work on your PC in about
-  **1½ minutes**, with the port's own conversion code, so its output is the
-  same as what the Vita would make itself.
+- **Prebuilds a few small caches** (each track's start, the cars' parts
+  lists, the shop screens) in a few seconds. The game streams every track
+  straight from the game files, so there is no world conversion any more;
+  without the tool the game makes these caches itself on first use.
 - **Puts everything on the Vita** over Wi-Fi or USB: only the game files
-  the Vita needs, plus the converted data.
+  the Vita needs, plus those caches.
 - **Imports a PC career save.**
 
 ## Download
@@ -49,22 +47,17 @@ and the v1.2 patch didn't change the data files, so this is only a note.
 
 ## 3. Convert
 
-Click **Convert**. The five event track sets are converted:
-
-- Drag Strips 1 and 2
-- Drift Venues
-- Street X Tracks
-- URL Tracks
-
-The City itself needs no conversion any more: the game streams it straight
-from the game files, the way the original does. The tool only prepares its
-small start-up file. When the game starts, it deletes the old converted city
-files from your Vita (they are no longer used).
+Click **Convert**. It checks your game files, then prepares each track's
+small start-up file: the City, Drag Strips 1 and 2, Drift Venues, Street X
+Tracks and URL Tracks. Nothing is converted any more: the game streams every
+track straight from the game files, the way the original does. When the
+game starts, it deletes old converted track files from your Vita (they are
+no longer used).
 
 It also prebuilds the cars' parts lists and the shop screens, which the
 Vita would otherwise build the first time you open them.
 
-The result (about **330 MB**) goes to a folder called
+The result (about **25 MB**) goes to a folder called
 **`NFSU2 Vita Prep`** next to the tool, or in your Documents folder if
 that's not writable. **Open output folder** shows it.
 
@@ -100,10 +93,8 @@ to copy to the Vita later.
 3. In the Prep Tool, type the IP address the Vita shows and click
    **Send to Vita**.
 
-Everything goes to `ux0:data/NFSU2`. The Vita's old track index files are
-deleted first, and each track's index is sent last. If the transfer is cut
-off, the Vita sees that track as "not converted" and converts it itself, so
-you never end up with a half-copied track. Send again to finish: files
+Everything goes to `ux0:data/NFSU2`. If the transfer is cut off, send
+again to finish: files
 already sent are skipped.
 
 ### By hand
@@ -111,12 +102,12 @@ already sent are skipped.
 Copy the game folders (see the [README](../README.md#2-copy-the-game-data))
 and the **`cache`** folder from the output folder into
 **`ux0:data/NFSU2/`**, so you get for example
-`ux0:data/NFSU2/cache/tiles/STREAML4RG_v7.idx`.
+`ux0:data/NFSU2/cache/L4RG.focus`.
 
 ### Checking it worked
 
-Start the game. If the conversion was picked up, it goes straight to the
-title screen without the "OPTIMIZING WORLD DATA" screen.
+Start the game. It goes straight to the title screen; there is no world
+conversion step.
 
 ## Importing a PC save
 

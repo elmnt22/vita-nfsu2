@@ -97,9 +97,8 @@ Disclosure: Whilst I know a bit of programming and coding, I used AI to help acc
 - **Need for Speed Underground 2 for PC, patched to v1.2.** The port only
   reads the data folders, but it is built and tested against v1.2
   (`SPEED2.EXE` dated Feb 9 2005).
-- A Windows 10/11 PC for the **NFSU2 Vita Prep Tool** (optional, but
-  recommended: it checks your game files, puts them on the Vita, and saves
-  15–20+ minutes on the first boot).
+- Optionally, a Windows 10/11 PC for the **NFSU2 Vita Prep Tool**: it checks
+  your game files and puts them on the Vita. You can also copy them yourself.
 
 ### On the Vita side
 
@@ -108,8 +107,8 @@ Disclosure: Whilst I know a bit of programming and coding, I used AI to help acc
 - **`libshacccg.suprx`** extracted to `ur0:data/libshacccg.suprx`. The
   renderer compiles its shaders on the console and needs it. If you don't
   have it yet, extract it with **ShaRKBR33D**.
-- About **1.7 GB** free on the memory card for the game data, plus about
-  **330 MB** for the converted world cache.
+- About **1.7 GB** free on the memory card for the game data, plus a few
+  dozen MB the game adds for its own caches.
 - For the World Expansion only: about **1.8 GB** more, and your own PC copy
   of **Need for Speed Most Wanted (2005)** and/or **Need for Speed Carbon**
   (see [World Expansion](#world-expansion-rockport-and-palmont)).
@@ -131,7 +130,7 @@ page to your Vita and install it with VitaShell. It shows up as
 
 The easiest way is the **[NFSU2 Vita Prep Tool](#nfsu2-vita-prep-tool-pc)**:
 it checks your game files, then sends only the ones the Vita needs over
-Wi-Fi or copies them over USB, along with the converted world data (step 3).
+Wi-Fi or copies them over USB.
 Files already on the Vita are skipped, so sending again later is quick.
 
 To copy by hand instead, copy these folders from your PC install (usually
@@ -164,21 +163,18 @@ The layout on the memory card:
 ux0:data/NFSU2/
 ├── CARS/  CREDITS/  FRONTEND/  GLOBAL/  LANGUAGES/  MOVIES/
 ├── NIS/   SDATA/    SOUND/     SUBTITLES/  TRACKS/  memcard/   <- copied from the PC game
-├── cache/      <- converted world data, shaders, shop lists (made by the game or the Prep Tool)
+├── cache/      <- shaders, track starts, parts and shop lists (made by the game or the Prep Tool)
 ├── profiles/   <- your saves
 └── logs/        <- logs: latest/ is the current run, plus the last 5 runs by start time
 ```
 
-### 3. Convert the world data (recommended)
+### 3. Nothing to convert
 
-On its first boot the game converts the world data into a format the Vita
-can stream quickly. This is the **"OPTIMIZING WORLD DATA"** screen, and on
-the console it takes **15–20+ minutes**. The **NFSU2 Vita Prep Tool** does
-the same job on your PC in about **2 minutes** and puts the result on the
-Vita with the game files. See [NFSU2 Vita Prep Tool](#nfsu2-vita-prep-tool-pc) below.
-
-You can skip this step. The Vita then converts the data itself on the first
-boot.
+The game streams every track straight from the original game files: the
+city, the drag strips, the drift venues, Street X and URL. There is no
+world conversion step any more. The small caches it needs (each track's
+start, the cars' parts lists, the shop screens) are made the first time
+they're needed.
 
 ### 4. Play
 
@@ -195,9 +191,9 @@ gets your PC copy of the game ready for the Vita:
 - **Checks your game files.** Every file the Vita needs is compared with the
   original game (size and checksum), so a missing, damaged or modded file
   shows up on the PC instead of as a crash on the Vita.
-- **Converts the world data** with the port's own code, so the result is
-  identical to what the Vita would make. It also prebuilds the cars' parts
-  lists and the shop screens.
+- **Prebuilds the small caches** the game would otherwise make on first use
+  (each track's start, the cars' parts lists, the shop screens), with the
+  port's own code. This takes a few seconds.
 - **Puts it on the Vita** over Wi-Fi (FTP) or USB. Only the files the Vita
   needs go over (no `Support`, `Uninstall` or other unused files). Files
   already there are skipped: the tool remembers what it sent to each Vita or
@@ -220,9 +216,9 @@ Run **NFSU2VitaPrep.exe**. The window follows the steps from top to bottom:
    the game folder (the one with `TRACKS` in it). **Check Game Files** checks
    it on its own; the line beside it tells you whether it's ready.
 2. **Optional: World Expansion.** Leave it empty if you only want Bayview.
-3. **Convert.** It checks your game files first, then converts all six
-   track sets (the City, both Drag Strips, Drift, Street X and URL). The
-   result is about 330 MB and goes to a folder called `NFSU2 Vita Prep`.
+3. **Convert.** It checks your game files first, then prebuilds the small
+   caches (about 25 MB, a few seconds). Nothing in the world needs
+   converting any more. The result goes to a folder called `NFSU2 Vita Prep`.
    **Done!** shows beside the progress bar when it has finished.
 4. **Put It on Your Vita.** Leave **Game files too** ticked the first time
    (about 1.7 GB), then either:
@@ -363,7 +359,7 @@ game starts. A small menu opens before the game loads:
 | **Trophies** | Off by default. On: trophies are reported to the system (`trophies.txt`; needs the NoTrpDrm plugin). Off, progress is still saved in your profile and is reported when you turn them on. |
 | **Full detail** | Off by default: the lighter mix for a steady 30 FPS downtown (road reflection redrawn every second frame, fewer traffic cars, half the particle rate). On: the original rates (`fulldetail.txt`). |
 | **World Expansion: Rockport and Palmont** | On by itself once a city's files are on the memory card ([World Expansion](#world-expansion-rockport-and-palmont)): Free Run offers Rockport and Palmont. Off hides them again (`expansion/off.txt`). The right side shows which cities are on the memory card. |
-| **Reset caches** | Deletes `ux0:data/NFSU2/cache`: the converted world data, shaders and shop lists. Your profiles and options are kept. On the next boot the game converts the world again, or you can send it again from the Prep Tool. |
+| **Reset caches** | Deletes `ux0:data/NFSU2/cache`: shaders, track starts, parts and shop lists. Your profiles and options are kept. The game makes them again when it needs them. |
 
 **Start Game** (or START) saves the settings and restarts the game.
 

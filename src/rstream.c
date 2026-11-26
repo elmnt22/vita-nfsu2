@@ -82,8 +82,9 @@ static const char *rs_base(const char *t) {
 int rstream_track_ok(const char *trackname) {
     if (!trackname || !rstream_enabled()) return 0;
     const char *b = rs_base(trackname);
-    /* the base city, and Rockport from its raw MW files (11-24, xpcity_lean) */
-    return !strncmp(b, "STREAML4RA", 10) || xpcity_lean(b);
+    /* every UG2 track set (the city; 11-25 the drag strips L4RB/L4RD, drift venues L4RC,
+       Street X L4RF, URL L4RG), and the expansion cities from their raw files (xpcity_lean) */
+    return (!strncmp(b, "STREAML4R", 9) && b[9] >= 'A' && b[9] <= 'G') || xpcity_lean(b);
 }
 
 /* ---------------------------------------------------------------- helpers */

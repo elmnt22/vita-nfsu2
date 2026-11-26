@@ -1,9 +1,10 @@
 # NFSU2 Vita Prep Tool (developer notes) (Windows)
 
 Was UG2Converter (renamed 2026-11-12). Checks the player's game files,
-does the Vita's one-time "OPTIMIZING WORLD DATA" boot step on a PC (about
-2 minutes for all six tracks instead of 15-20+ on the console), and puts
-the game files + cache on the Vita over FTP or into a folder (USB).
+prebuilds the small first-use caches, and puts the game files + cache on
+the Vita over FTP or into a folder (USB). Since 11-25 every track set is
+streamed from the game data (all `lean` in k_tracks), so no world tiles are
+built here any more; the tile path below is only used with the streamer off.
 
 ## Game files: the check and what is sent
 
