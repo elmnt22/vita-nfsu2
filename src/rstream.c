@@ -237,6 +237,7 @@ static struct {
     /* streaming position */
     float pos[3], vel[3]; Uint32 t_pos; int have_pos;
     int zone, pzone;
+    float ahead[2], ahead_org[2]; int ahead_on, ahead_org_set;   /* rstream_ahead: the car's heading while it stands at a start */
     /* worker */
     SDL_Thread *thr; int quit;
     /* stats */
@@ -1295,7 +1296,7 @@ void rstream_park_for(const char *next_track) {
     free(g.tpk.blk); memset(&g.tpk, 0, sizeof g.tpk);
     g.pin = NULL; g.pinlen = 0;   /* borrowed: the caller unpins it next */
     int ntex = 0; for (int i = 0; i < RS_TEXCAP; i++) ntex += g_tex[i].state == 3;
-    g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0;
+    g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0; g.ahead_on = 0;
     g_parked = 1;
     printf("rstream: parked for the reload (%d library sections, %d textures, %ld KB kept)\n",
            keep, ntex, g.tex_gpu / 1024);
@@ -1318,7 +1319,7 @@ void rstream_stop(void) {
     rs_free_tables();
     rs_sky_free(1);
     rs_prop_free();
-    g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0;
+    g.active = 0; g.quit = 0; g.have_pos = 0; g.zone = g.pzone = 0; g.ahead_on = 0;
     printf("rstream: stopped\n");
 }
 int rstream_active(void) { return g.active; }
@@ -1541,7 +1542,19 @@ void rstream_update(const float cam[3]) {
     int zone = rs_find_zone(cam[0], cam[1]);
     float sp = sqrtf(g.vel[0] * g.vel[0] + g.vel[1] * g.vel[1]);
     int pz = zone;
-    if (sp > 1.0f) {
+    if (g.ahead_on && !g.ahead_org_set) { g.ahead_org[0] = cam[0]; g.ahead_org[1] = cam[1]; g.ahead_org_set = 1; }
+    /* 30 m on: the speed prediction takes over (not the speed itself: the gate's car
+       position to the first frame's eye reads as a jump of several metres) */
+    if (g.ahead_on && hypotf(cam[0] - g.ahead_org[0], cam[1] - g.ahead_org[1]) > 30.0f) g.ahead_on = 0;
+    if (g.ahead_on && zone) {
+        /* standing at a start: the zone 100 m along the car's heading too (the
+           prediction's own reach), so pulling away finds it in (hwpal_1125: Palmont's
+           next sections, up to 4.6 MB / 1.4 s each, arrived after the first seconds) */
+        int z = rs_find_zone(cam[0] + g.ahead[0] * 100.0f, cam[1] + g.ahead[1] * 100.0f);
+        if (z) pz = z;
+        if (z != g.pzone) { static int logn; if (logn++ < 8) printf("rstream: start ahead (%.2f %.2f): zone %d, ahead %d%c", g.ahead[0], g.ahead[1], zone, z, 10); }
+        rs_find_zone(cam[0], cam[1]);
+    } else if (sp > 1.0f) {
         float t = 1.5f; if (sp * t > 100.0f) t = 100.0f / sp;
         int z = rs_find_zone(cam[0] + g.vel[0] * t, cam[1] + g.vel[1] * t);
         if (z) pz = z;
@@ -1602,6 +1615,11 @@ void rstream_update(const float cam[3]) {
    the start area in): every wanted section on the GPU and no texture still
    queued or decoded -- 1 also when not streaming or outside every zone */
 int rstream_cold(void) { return g.active && g.cold; }
+void rstream_ahead(float dx, float dy) {
+    float l = sqrtf(dx * dx + dy * dy);
+    if (l < 1e-3f) { g.ahead_on = 0; return; }
+    g.ahead[0] = dx / l; g.ahead[1] = dy / l; g.ahead_on = 1; g.ahead_org_set = 0;
+}
 void rstream_rewarm(void) { if (g.active) { g.cold = 1; g.cold_t0 = 0; } }
 
 int rstream_area_ready(int *left) {
@@ -2112,6 +2130,7 @@ void rstream_park_for(const char *t) { (void)t; }
 void rstream_update(const float cam[3]) { (void)cam; }
 int rstream_draw(const RsDrawCtx *c) { (void)c; return 0; }
 int rstream_area_ready(int *left) { if (left) *left = 0; return 1; }
+void rstream_ahead(float dx, float dy) { (void)dx; (void)dy; }
 int rstream_cold(void) { return 0; }
 void rstream_rewarm(void) {}
 #endif

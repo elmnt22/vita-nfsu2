@@ -254,17 +254,28 @@ static int g_game;
 static int g_secmode;
 /* Carbon instance (0x60 B): +0 bmin, +0xc flags, +0x10 bmax, +0x1c s16 preculler, +0x20 position,
    +0x2c float 3x3 (scale included), +0x50 key, +0x54 scenery info number */
+/* Carbon instance number -> translated number (-1 = left out), for its scenery tree */
+static int *g_cbmap; static size_t g_cbmapn, g_cbmapcap;
 static void conv_insts_carbon(Buf *o, const uint8_t *d, size_t sz)
 {
     size_t f = skip_fill(d, sz); size_t n = (sz - f) / 0x60;
     size_t c = open_chunk(o, 0x34103); align_fill(o, 0x10);
+    g_cbmapn = 0;
+    if (n > g_cbmapcap) {
+        int *m = realloc(g_cbmap, n * sizeof *m);
+        if (m) { g_cbmap = m; g_cbmapcap = n; }
+    }
+    int keep = n <= g_cbmapcap, out = 0;
     for (size_t i = 0; i < n; i++) {
         const uint8_t *r = d + f + i * 0x60;
         uint32_t fl; memcpy(&fl, r + 0xc, 4);
         /* the retail streamer (xp_section): Carbon's low-detail twins (0x40000: PAN_Ocean_CG
-           beside PAN_Ocean_Xenon) are left out, as the tile build leaves them; no tree or
-           precull refers to an instance by number there */
-        if (g_secmode && (fl & 0x40000)) continue;
+           beside PAN_Ocean_Xenon) are left out, as the tile build leaves them; the tree
+           (conv_tree_carbon) is renumbered past them */
+        int skip = g_secmode && (fl & 0x40000);
+        if (keep) g_cbmap[i] = skip ? -1 : out;
+        if (skip) continue;
+        out++;
         uint8_t u[0x40]; memset(u, 0, sizeof u);
         memcpy(u, r, 12); memcpy(u + 12, r + 0x10, 12);    /* bbox */
         memcpy(u + 24, r + 0x54, 2);                       /* scenery info number */
@@ -282,6 +293,39 @@ static void conv_insts_carbon(Buf *o, const uint8_t *d, size_t sz)
         put(o, u, sizeof u); st.insts++;
     }
     close_chunk(o, c);
+    if (keep) g_cbmapn = n;
+}
+/* Carbon's scenery tree (0x34105, 0x30 B nodes: box lo +0, child count u32 +0xc, box hi
+   +0x10, up to 5 s16 children +0x1c; >= 0 instance, < 0 node -c, as UG2's) -> UG2's
+   0x34104 (0x24 B: lo, hi, s16 count +0x18, children +0x1a). Without it every instance
+   of a section is tested each frame (11-25 HW: 4.6 ms a frame, 13 ms spikes). Instances
+   are renumbered past the left-out ones; with no instance map the tree is left out
+   (rs_tree_cull then tests every instance, as before). */
+static void conv_tree_carbon(Buf *o, const uint8_t *d, size_t sz)
+{
+    if (!g_cbmapn) return;
+    size_t f = skip_fill(d, sz); size_t n = (sz - f) / 0x30;
+    if (!n) return;
+    size_t c = open_chunk(o, 0x34104); align_fill(o, 0x10);
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t *r = d + f + i * 0x30;
+        uint8_t u[0x24]; memset(u, 0, sizeof u);
+        memcpy(u, r, 12); memcpy(u + 12, r + 0x10, 12);
+        uint32_t cn; memcpy(&cn, r + 0xc, 4); if (cn > 5) cn = 5;
+        int16_t k = 0;
+        for (uint32_t j = 0; j < cn; j++) {
+            int16_t ch; memcpy(&ch, r + 0x1c + 2 * j, 2);
+            if (ch >= 0) {
+                if ((size_t)ch >= g_cbmapn || g_cbmap[ch] < 0) continue;
+                ch = (int16_t)g_cbmap[ch];
+            } else if ((size_t)-ch >= n) continue;
+            memcpy(u + 0x1a + 2 * k, &ch, 2); k++;
+        }
+        memcpy(u + 0x18, &k, 2);
+        put(o, u, sizeof u);
+    }
+    close_chunk(o, c);
+    g_cbmapn = 0;
 }
 static void conv_insts(Buf *o, const uint8_t *d, size_t sz)
 {
@@ -792,8 +836,11 @@ static void walk(Buf *o, const uint8_t *p, size_t n)
 }
 static void conv_chunk(Buf *o, uint32_t id, const uint8_t *d, size_t sz, const uint8_t *raw)
 {
-    if (g_secmode && g_game == XP_GAME_CARBON && (id == 0x34104 || id == 0x34105 || id == 0x34106 || id == 0x34107))
-        return;   /* Carbon: its tree nodes are 0x30 B (not translated yet: every instance is tested), its precull grid unknown */
+    if (g_secmode && g_game == XP_GAME_CARBON && (id == 0x34104 || id == 0x34105 || id == 0x34106 || id == 0x34107)) {
+        /* Carbon: 0x34105 its tree (conv_tree_carbon); its precull grid is unknown (left out) */
+        if (id == 0x34105) conv_tree_carbon(o, d, sz);
+        return;
+    }
     if (g_secmode && g_game == XP_GAME_MW && (id == 0x34104 || id == 0x34105 || id == 0x34106 || id == 0x34107)) {
         /* MW scenery: 0x34105 = the tree nodes (UG2's 0x34104 layout, 0x24 B), 0x34107 its
            precull rows (0x80 B, but MW's cell grid is not known: left out, as no precull),

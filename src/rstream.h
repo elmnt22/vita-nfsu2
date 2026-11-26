@@ -60,6 +60,9 @@ int  rstream_area_ready(int *left);
 int  rstream_cold(void);
 /* a jump (fast travel, a replay's exit): cold again until the new area is in */
 void rstream_rewarm(void);
+/* while the car stands at a start (loading screen held): also want the zone 100 m
+   along (dx, dy); ends by itself once the car moves */
+void rstream_ahead(float dx, float dy);
 /* main view scenery; returns draws issued. Leaves uMVP = MVP, uModel = I,
    alpha test off, blend off, depth write on. */
 int  rstream_draw(const RsDrawCtx *c);

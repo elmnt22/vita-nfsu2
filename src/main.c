@@ -21781,6 +21781,7 @@ int main(int argc, char **argv) {
                    frame (hwlog87: the car stood ~5 s in an empty world while X0 built) */
                 Uint32 p0 = SDL_GetTicks(), pf = 0; int left = 0, ok;
                 rstream_set_event(resident_args.scenery_event);
+                rstream_ahead(cosf(heading), sinf(heading));   /* and the road ahead of the car */
                 for (;;) {
                     rstream_update(carpos);
                     if ((ok = rstream_area_ready(&left)) || SDL_GetTicks() - p0 > 20000) break;
@@ -28678,6 +28679,7 @@ int main(int argc, char **argv) {
             if (g_dbg.show_track && passmode == 0 && !g_showroom &&
                 rstream_start(resident_args.track_root, resident_args.trackname)) {
                 rstream_set_event(resident_args.scenery_event);
+                if (rstream_cold()) rstream_ahead(cosf(heading), sinf(heading));   /* held start: the road ahead too */
                 rstream_update(cam);
                 RsDrawCtx rc; memset(&rc, 0, sizeof rc);
                 rc.rp = &rp; rc.MVP = MVP; rc.cam = cam; rc.look = look;
