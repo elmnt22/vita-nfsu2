@@ -15,6 +15,7 @@
 
 #include "resource.h"
 #include "xpconv.h"   /* xp_tpk_header_carbon (the pin of a raw Carbon stream) */
+#include <SDL.h>   /* SDL_GetTicks (the bundle copy log) */
 
 void (*g_load_pump)(void);   /* resource.h: the loading screen's frame pump */
 
@@ -163,14 +164,38 @@ static void pin_w32(unsigned char *p, uint32_t v) {
     p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
 }
 
+/* The copy is built in one pass into a growing buffer (11-26: it was a size pass
+   and a copy pass, each ~21k small seek+reads over Palmont's 1.2 GB stream, ~44 s
+   on the Vita together). Same bytes as before. */
+static unsigned char *g_pb; static long g_pbcap;
+static ResPixStub *g_ps; static int g_pscap;
+static int pin_room(long need) {
+    if (need <= g_pbcap) return 1;
+    long cap = g_pbcap ? g_pbcap : (1L << 20);
+    while (cap < need) cap *= 2;
+    unsigned char *n = (unsigned char *)realloc(g_pb, (size_t)cap);
+    if (!n) return 0;
+    g_pb = n; g_pbcap = cap;
+    return 1;
+}
+static int pin_stub_room(int need) {
+    if (need <= g_pscap) return 1;
+    int cap = g_pscap ? g_pscap * 2 : 1024;
+    while (cap < need) cap *= 2;
+    ResPixStub *n = (ResPixStub *)realloc(g_ps, (size_t)cap * sizeof *n);
+    if (!n) return 0;
+    g_ps = n; g_pscap = cap;
+    return 1;
+}
+
 /* Copy one TPK container (0xb3300000) at file offset `off` (header
- * included) into out+cur, emptying its 0x33320002 pixel payload. Returns the
- * bytes written, or -1. `out` NULL = size only (stubs still counted). */
-static long pin_tpk(int fd, long off, uint32_t size, unsigned char *out, long cur,
-                    ResPixStub *stub, int *nstub) {
+ * included) into g_pb+cur, emptying its 0x33320002 pixel payload (a stub
+ * keeps where it is in the file). Returns the bytes written, or -1. */
+static long pin_tpk(int fd, long off, uint32_t size, long cur, int *nstub) {
     long end = off + 8 + (long)size, o = off + 8, w = 8;
     long outer_hdr = cur;
     unsigned char h[8];
+    if (!pin_room(cur + 8)) return -1;
     while (o + 8 <= end) {
         if (!pin_pread(fd, o, h, 8)) return -1;
         uint32_t cid = pin_u32(h), cs = pin_u32(h + 4);
@@ -181,57 +206,62 @@ static long pin_tpk(int fd, long off, uint32_t size, unsigned char *out, long cu
             if (!pin_pread(fd, o + 8, hb, (long)cs)) { free(hb); return -1; }
             size_t tn = xp_tpk_header_carbon(hb, cs, NULL);
             if (tn) {
-                if (out) {
-                    xp_tpk_header_carbon(hb, cs, out + cur + w + 8);
-                    pin_w32(out + cur + w, cid); pin_w32(out + cur + w + 4, (uint32_t)tn);
-                }
+                if (!pin_room(cur + w + 8 + (long)tn)) { free(hb); return -1; }
+                xp_tpk_header_carbon(hb, cs, g_pb + cur + w + 8);
+                pin_w32(g_pb + cur + w, cid); pin_w32(g_pb + cur + w + 4, (uint32_t)tn);
                 w += 8 + (long)tn;
             } else {
-                if (out) { pin_w32(out + cur + w, cid); pin_w32(out + cur + w + 4, cs); memcpy(out + cur + w + 8, hb, cs); }
+                if (!pin_room(cur + w + 8 + (long)cs)) { free(hb); return -1; }
+                pin_w32(g_pb + cur + w, cid); pin_w32(g_pb + cur + w + 4, cs); memcpy(g_pb + cur + w + 8, hb, cs);
                 w += 8 + (long)cs;
             }
             free(hb);
         } else if (cid != 0xb3320000u) {                 /* copied verbatim */
-            if (out && !pin_pread(fd, o, out + cur + w, 8 + (long)cs)) return -1;
+            if (!pin_room(cur + w + 8 + (long)cs) || !pin_pread(fd, o, g_pb + cur + w, 8 + (long)cs)) return -1;
             w += 8 + (long)cs;
         } else {
             long inner_hdr = cur + w, iw = 8, q = o + 8, qe = o + 8 + (long)cs;
+            if (!pin_room(inner_hdr + 8)) return -1;
+            /* each block's header read together with the 256 bytes after it (a pixel
+               block's 0x11 filler run; a small block whole): one read, not two */
+            unsigned char g[8 + 256];
             while (q + 8 <= qe) {
-                unsigned char g[8];
-                if (!pin_pread(fd, q, g, 8)) return -1;
+                long gn = qe - q < (long)sizeof g ? qe - q : (long)sizeof g;
+                if (!pin_pread(fd, q, g, gn)) return -1;
                 uint32_t gid = pin_u32(g), gs = pin_u32(g + 4);
                 if ((unsigned long)gs > (unsigned long)(qe - q - 8)) return -1;
                 if (gid == 0x33320002u) {
-                    if (out) { pin_w32(out + inner_hdr + iw, gid); pin_w32(out + inner_hdr + iw + 4, 0); }
-                    if (stub) {
-                        /* payload starts after a run of 0x11 filler bytes */
-                        unsigned char head[256]; long hn = gs < 256 ? (long)gs : 256, skip = 0;
-                        if (hn > 0 && pin_pread(fd, q + 8, head, hn))
-                            while (skip < hn && head[skip] == 0x11) skip++;
-                        skip = n2_tpk_pixel_skip(skip);   /* 0x80-aligned payload */
-                        stub[*nstub].coff = inner_hdr + iw;
-                        stub[*nstub].foff = q + 8 + skip; stub[*nstub].flen = (long)gs - skip;
-                    }
+                    if (!pin_room(inner_hdr + iw + 8) || !pin_stub_room(*nstub + 1)) return -1;
+                    pin_w32(g_pb + inner_hdr + iw, gid); pin_w32(g_pb + inner_hdr + iw + 4, 0);
+                    /* payload starts after a run of 0x11 filler bytes */
+                    long hn = gs < 256 ? (long)gs : 256, skip = 0;
+                    while (skip < hn && g[8 + skip] == 0x11) skip++;
+                    skip = n2_tpk_pixel_skip(skip);   /* 0x80-aligned payload */
+                    g_ps[*nstub].coff = inner_hdr + iw;
+                    g_ps[*nstub].foff = q + 8 + skip; g_ps[*nstub].flen = (long)gs - skip;
                     (*nstub)++;
                     iw += 8;
                 } else {
-                    if (out && !pin_pread(fd, q, out + inner_hdr + iw, 8 + (long)gs)) return -1;
+                    if (!pin_room(inner_hdr + iw + 8 + (long)gs)) return -1;
+                    long have = gn - 8 < (long)gs ? gn - 8 : (long)gs;
+                    memcpy(g_pb + inner_hdr + iw, g, (size_t)(8 + have));
+                    if (have < (long)gs && !pin_pread(fd, q + 8 + have, g_pb + inner_hdr + iw + 8 + have, (long)gs - have)) return -1;
                     iw += 8 + (long)gs;
                 }
                 q += 8 + (long)gs;
             }
-            if (out) { pin_w32(out + inner_hdr, cid); pin_w32(out + inner_hdr + 4, (uint32_t)(iw - 8)); }
+            pin_w32(g_pb + inner_hdr, cid); pin_w32(g_pb + inner_hdr + 4, (uint32_t)(iw - 8));
             w += iw;
         }
         o += 8 + (long)cs;
     }
-    if (out) { pin_w32(out + outer_hdr, 0xb3300000u); pin_w32(out + outer_hdr + 4, (uint32_t)(w - 8)); }
+    pin_w32(g_pb + outer_hdr, 0xb3300000u); pin_w32(g_pb + outer_hdr + 4, (uint32_t)(w - 8));
     return w;
 }
 
 static int g_pin_strip_req;   /* (defined below) */
-/* Two passes over the top-level chunk list: size, then copy. */
-static long pin_build(int fd, long flen, unsigned char *out, ResPixStub *stub, int *nstub) {
+/* One pass over the top-level chunk list into g_pb / g_ps. */
+static long pin_build(int fd, long flen, int *nstub) {
     long off = 0, cur = 0;
     unsigned char h[8];
     *nstub = 0;
@@ -248,23 +278,25 @@ static long pin_build(int fd, long flen, unsigned char *out, ResPixStub *stub, i
             /* padding: shrink to the size that keeps the next chunk at its
                original offset modulo 128 */
             long pad = ((next - cur - 8) % 128 + 128) % 128;
-            if (out) { pin_w32(out + cur, 0); pin_w32(out + cur + 4, (uint32_t)pad);
-                       memset(out + cur + 8, 0, (size_t)pad); }
+            if (!pin_room(cur + 8 + pad)) return -1;
+            pin_w32(g_pb + cur, 0); pin_w32(g_pb + cur + 4, (uint32_t)pad);
+            memset(g_pb + cur + 8, 0, (size_t)pad);
             cur += 8 + pad;
         } else if (cid == 0xb3300000u) {
-            long w = pin_tpk(fd, off, cs, out, cur, stub, nstub);
+            long w = pin_tpk(fd, off, cs, cur, nstub);
             if (w < 0) return -1;
             cur += w;
             /* realign whatever follows with an explicit padding chunk */
             long mis = ((next - cur) % 128 + 128) % 128;
             if (mis) {
                 long pad = ((mis - 8) % 128 + 128) % 128;
-                if (out) { pin_w32(out + cur, 0); pin_w32(out + cur + 4, (uint32_t)pad);
-                           memset(out + cur + 8, 0, (size_t)pad); }
+                if (!pin_room(cur + 8 + pad)) return -1;
+                pin_w32(g_pb + cur, 0); pin_w32(g_pb + cur + 4, (uint32_t)pad);
+                memset(g_pb + cur + 8, 0, (size_t)pad);
                 cur += 8 + pad;
             }
         } else {
-            if (out && !pin_pread(fd, off, out + cur, 8 + (long)cs)) return -1;
+            if (!pin_room(cur + 8 + (long)cs) || !pin_pread(fd, off, g_pb + cur, 8 + (long)cs)) return -1;
             cur += 8 + (long)cs;
         }
         off = next;
@@ -396,15 +428,16 @@ unsigned char *res_bundle(const char *path, long *len) {
         *len = g_pin.len; return g_pin.data;
     }
     int nstub = 0;
-    long size = flen > 0 ? pin_build(fd, flen, NULL, NULL, &nstub) : -1;
-    unsigned char *out = size > 0 ? (unsigned char *)malloc((size_t)size) : NULL;
-    ResPixStub *stub = nstub ? (ResPixStub *)malloc((size_t)nstub * sizeof *stub) : NULL;
-    int n2 = 0;
-    if (!out || (nstub && !stub) || pin_build(fd, flen, out, stub, &n2) != size || n2 != nstub) {
-        close(fd); free(out); free(stub);
-        return NULL;
-    }
+    Uint32 b0 = SDL_GetTicks();
+    long size = flen > 0 ? pin_build(fd, flen, &nstub) : -1;
     close(fd);
+    unsigned char *out = size > 0 ? (unsigned char *)realloc(g_pb, (size_t)size) : NULL;   /* to its size */
+    if (!out) free(g_pb);
+    ResPixStub *stub = g_ps;
+    g_pb = NULL; g_pbcap = 0; g_ps = NULL; g_pscap = 0;
+    if (!out) { free(stub); return NULL; }
+    if (!nstub) { free(stub); stub = NULL; }
+    printf("bundle copy built in one pass: %u ms\n", (unsigned)(SDL_GetTicks() - b0));
     snprintf(g_pin.path, sizeof g_pin.path, "%s", path);
     g_pin.data = out; g_pin.len = size; g_pin.stub = stub; g_pin.nstub = nstub;
     g_pin_flen = flen; g_pin_gen++;
