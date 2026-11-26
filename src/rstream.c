@@ -471,6 +471,12 @@ done:
             printf("rstream texdump %08x: src %d ok %d %dx%d dxt %p fmt %d rgb %p (mean %ld) bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
                    e->key, src, ok, t.w, t.h, (void *)t.dxt, t.dxtfmt, (void *)t.rgb, n ? sum / n : -1,
                    L1[0], L1[1], L1[2], L1[3], L1[4], L1[5], L1[6], L1[7]);
+            if (t.rgb) {   /* and the pixels: ux0:data/NFSU2/texdump.raw = w*h RGB, then w*h alpha (if any) */
+                FILE *df = fopen("ux0:data/NFSU2/texdump.raw", "wb");
+                if (df) { fwrite(t.rgb, 3, (size_t)t.w * t.h, df); if (t.alpha) fwrite(t.alpha, 1, (size_t)t.w * t.h, df); fclose(df); }
+                printf("rstream texdump %08x: order %d usage %d blend %d wz %d alpha %p afmt %d prehalved %d\n",
+                       e->key, t.order, t.usage, t.blend, t.wz, (void *)t.alpha, t.afmt, t.prehalved);
+            }
         }
     }
 #endif
@@ -722,6 +728,21 @@ static void rs_build_solid(RsBuild *B, long beg, long end) {
         RsMesh *rm = &s->mesh[s->nmesh++]; memset(rm, 0, sizeof *rm);
         for (int c = 0; c < 3; c++) { rm->lo[c] = 1e30f; rm->hi[c] = -1e30f; }
         int vb = p->nv;
+#ifdef OPENUG2_SIM_PRE_H
+        {   /* test aid (simulator): OPENUG2_RS_KEYV=<texkey hex> logs that key's meshes' vertices (pos, uv, colour) */
+            static uint32_t vk = 1; static int vn;
+            if (vk == 1) { const char *e = getenv("OPENUG2_RS_KEYV"); vk = e ? (uint32_t)strtoul(e, NULL, 16) : 0; }
+            if (vk && m->texkey == vk && m->nidx >= 200 && vn++ < 2) {
+                printf("rstream keyv %08x: %d verts, %d indices, vcol %p, exact %d\n", vk, m->nverts, m->nidx, (void *)m->vcol, m->mat_exact);
+                for (int t = 0; t < m->nidx && t < 300; t++) {
+                    int v = m->idx[t]; if (v < 0 || v >= m->nverts) continue;
+                    const float *q = m->verts + v * 5; const unsigned char *cc = m->vcol ? m->vcol + v * 4 : NULL;
+                    printf("  v%d %.2f %.2f %.2f uv %.3f %.3f col %d %d %d %d\n", v, q[0], q[1], q[2], q[3], q[4],
+                           cc ? cc[0] : -1, cc ? cc[1] : -1, cc ? cc[2] : -1, cc ? cc[3] : -1);
+                }
+            }
+        }
+#endif
         for (int v = 0; v < m->nverts; v++) {
             if (remap[v] < 0) continue;
             BatchedVertex *o = &p->v[vb + remap[v]]; const float *q = m->verts + v * 5;
@@ -1915,6 +1936,30 @@ static unsigned char rs_mesh_mode(const RsMesh *m) {
     if (m->b.texkey && world_texture_lookup(m->b.texkey, &md) && m->mat_exact) return md;
     return N2_DRAW_OPAQUE;
 }
+/* the texture's own mode, whether or not the mesh's material matched it */
+static unsigned char rs_mesh_texmode(const RsMesh *m) {
+    if (m->tex >= 0 && g_tex[m->tex].state == 3) return g_tex[m->tex].mode;
+    unsigned char md = 0;
+    if (m->b.texkey && world_texture_lookup(m->b.texkey, &md)) return md;
+    return N2_DRAW_OPAQUE;
+}
+/* deferred class of a mesh: -1 opaque now, 0 reflect, 1 cutout, 2 blend/add, 3 glow.
+   The glow pass (emitter state) only takes a "glow" mesh whose texture blends
+   (its own mode: a neon with an inexact material still glows):
+   retail has no glow class -- world.fx draws each mesh by its texture's mode --
+   and an opaque one (Observatory monument base, 2ccdad16) drew as a full-bright
+   additive slab (#45). */
+static int rs_mesh_class(const RsDrawCtx *c, const RsMesh *m, unsigned char md) {
+#ifdef OPENUG2_SIM_PRE_H
+    if (m->glow) {   /* test aid: list each glow-named texture once, with its mode */
+        static uint32_t seen[256]; static int ns;
+        int k = 0; while (k < ns && seen[k] != m->b.texkey) k++;
+        if (k == ns && ns < 256) { seen[ns++] = m->b.texkey; printf("rstream glow tex %08x mode %d exact %d texmode %d%s\n", (unsigned)m->b.texkey, md, m->mat_exact, m->tex >= 0 ? (int)g_tex[m->tex].mode : -1, rs_mesh_texmode(m) >= N2_DRAW_BLEND ? "" : " (drawn as world)"); }
+    }
+#endif
+    return m->glow && rs_mesh_texmode(m) >= N2_DRAW_BLEND ? 3 : md == N2_DRAW_BLEND || md == N2_DRAW_ADD ? 2
+         : md == N2_DRAW_CUTOUT ? 1 : m->reflect && c->refl_ready ? 0 : -1;
+}
 
 int rstream_draw(const RsDrawCtx *c) {
     if (!g.active) return 0;
@@ -1974,7 +2019,7 @@ int rstream_draw(const RsDrawCtx *c) {
             RsMesh *m = &so->sec->mesh[so->m0 + k];
             if (!m->b.vbo || !rs_mesh_visible(c, R, m)) continue;
             unsigned char md = rs_mesh_mode(m);
-            int q = m->glow ? 3 : md == N2_DRAW_BLEND || md == N2_DRAW_ADD ? 2 : md == N2_DRAW_CUTOUT ? 1 : m->reflect && c->refl_ready ? 0 : -1;
+            int q = rs_mesh_class(c, m, md);
             if (aux && (q == 1 || draws >= c->max_draws)) continue;
 #ifdef OPENUG2_SIM_PRE_H
             {   /* test aid (simulator): OPENUG2_RS_HIDEQ=<q> hides a class (-1 opaque, 0 reflect, 1 cutout, 2 blend, 3 glow) */
@@ -1989,14 +2034,6 @@ int rstream_draw(const RsDrawCtx *c) {
                 }
             }
 #endif
-            if (q >= 0) {
-                if (g_ndef[q] < RS_MAXDEF) {
-                    RsDef *d = &g_def[q][g_ndef[q]++]; d->m = m; d->vbo = m->b.vbo; d->ibo = m->b.ibo;
-                    d->ioff = m->b.ioff; d->count = m->b.index_count; d->mtx = R->mtx;
-                    d->row = q == 2 && m->tex >= 0 ? g_tex[m->tex].order : 0;
-                }
-                continue;
-            }
 #ifdef OPENUG2_SIM_PRE_H
             {   /* test aid (simulator): OPENUG2_RS_KEY=<texkey hex> logs (once) and hides those meshes */
                 static uint32_t dk = 1; static int dn;
@@ -2014,6 +2051,14 @@ int rstream_draw(const RsDrawCtx *c) {
                 }
             }
 #endif
+            if (q >= 0) {
+                if (g_ndef[q] < RS_MAXDEF) {
+                    RsDef *d = &g_def[q][g_ndef[q]++]; d->m = m; d->vbo = m->b.vbo; d->ibo = m->b.ibo;
+                    d->ioff = m->b.ioff; d->count = m->b.index_count; d->mtx = R->mtx;
+                    d->row = q == 2 && m->tex >= 0 ? g_tex[m->tex].order : 0;
+                }
+                continue;
+            }
             rs_set_mtx(c, R->mtx);
             rs_bind_tex(c, m, &m->b);
             draw_batch(&m->b); draws++; g_st_ident += R->mtx < 0;
@@ -2035,7 +2080,7 @@ int rstream_draw(const RsDrawCtx *c) {
                 const RsMesh *m = run->src; const RsPage *bp = &sc->sec->bpage[run->page];
                 if (bp->vbo) {
                     unsigned char md = rs_mesh_mode(m);
-                    int cq = m->glow ? 3 : md == N2_DRAW_BLEND || md == N2_DRAW_ADD ? 2 : md == N2_DRAW_CUTOUT ? 1 : m->reflect && c->refl_ready ? 0 : -1;
+                    int cq = rs_mesh_class(c, m, md);
                     if (aux && (cq == 1 || draws >= c->max_draws)) cq = -9;
 #ifdef OPENUG2_SIM_PRE_H
                     static int hq = -9; if (hq == -9) { const char *e = getenv("OPENUG2_RS_HIDEQ"); hq = e && *e ? atoi(e) : -5; }
@@ -2090,16 +2135,23 @@ int rstream_draw(const RsDrawCtx *c) {
     if (g_ndef[2]) {
         glEnable(GL_BLEND); glDepthMask(GL_FALSE);
         glUniform1f(c->rp->uTextureAlpha, 1.0f);
+        float bfog[3]; glGetUniformfv(c->rp->prog, c->rp->uFogColor, bfog);
         int lastadd = -1;
         for (int row = 0; row < 16; row++)
             for (int q = 0; q < g_ndef[2]; q++) {
                 const RsDef *d = &g_def[2][q];
                 if (d->row != row) continue;
                 int add = rs_mesh_mode(d->m) == N2_DRAW_ADD;
-                if (add != lastadd) { glBlendFunc(GL_SRC_ALPHA, add ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA); lastadd = add; }
+                if (add != lastadd) {   /* additive fogs toward black (it fades out), as the glows do: fog RGB
+                                           added on top turned lamp light cones into solid grey wedges (#45) */
+                    glBlendFunc(GL_SRC_ALPHA, add ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+                    if (add) glUniform3f(c->rp->uFogColor, 0, 0, 0); else glUniform3fv(c->rp->uFogColor, 1, bfog);
+                    lastadd = add;
+                }
                 N2Batch b; rs_def_batch(d, &b);
                 rs_set_mtx(c, d->mtx); rs_bind_tex(c, d->m, &b); draw_batch(&b); draws++;
             }
+        glUniform3fv(c->rp->uFogColor, 1, bfog);
         glUniform1f(c->rp->uTextureAlpha, 0.0f);
         glDepthMask(GL_TRUE); glDisable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -2117,6 +2169,11 @@ int rstream_draw(const RsDrawCtx *c) {
             GLuint t = b.tex;
             glUniform1f(c->rp->uUnlit, t ? 0 : 1); glUniform1f(c->rp->uEmissiveTex, t ? 1 : 0);
             glUniform3f(c->rp->uColor, 1, t ? 1 : .85f, t ? 1 : .5f);
+#ifdef OPENUG2_SIM_PRE_H
+            {   extern int g_sim_probe;   /* test aid: the probe frame lists the glow draws */
+                if (g_sim_probe) printf("rstream glow draw: texkey %08x count %u mode %d mtx %d tex %u\n", (unsigned)d->m->b.texkey, d->count, rs_mesh_mode(d->m), d->mtx, (unsigned)t);
+            }
+#endif
             draw_batch(&b); draws++;
         }
         glUniform3fv(c->rp->uFogColor, 1, fog);

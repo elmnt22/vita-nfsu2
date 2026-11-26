@@ -596,6 +596,30 @@ void sim_probe_draw(int count) {
         glGetIntegerv(GL_ACTIVE_TEXTURE, &unit); glActiveTexture(GL_TEXTURE0);
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex); glActiveTexture((GLenum)unit);
         printf("probe: draw %d count %d prog %d tex %d texkey %08x -> %d %d %d %d\n", g_probe_n, count, prog, tex, (unsigned)g_sim_probe_tag, px[0], px[1], px[2], px[3]);
+        {   /* OPENUG2_PROBE_TEXKEY=<hex>: save the texture bound for that key's draw (desktop GL read-back) */
+            const char *e = getenv("OPENUG2_PROBE_TEXKEY");
+            if (e && (uint32_t)strtoul(e, NULL, 16) == g_sim_probe_tag && tex) {
+                typedef void (APIENTRY *GetTexImg)(GLenum, GLint, GLenum, GLenum, void *);
+                typedef void (APIENTRY *GetTexLvl)(GLenum, GLint, GLenum, GLint *);
+                GetTexImg gti = (GetTexImg)SDL_GL_GetProcAddress("glGetTexImage");
+                GetTexLvl gtl = (GetTexLvl)SDL_GL_GetProcAddress("glGetTexLevelParameteriv");
+                GLint w = 0, h = 0;
+                glActiveTexture(GL_TEXTURE0);
+                if (gtl) { gtl(GL_TEXTURE_2D, 0, 0x1000 /* GL_TEXTURE_WIDTH */, &w); gtl(GL_TEXTURE_2D, 0, 0x1001, &h); }
+                if (gti && w > 0 && h > 0 && w <= 2048 && h <= 2048) {
+                    unsigned char *pix = (unsigned char *)malloc((size_t)w * h * 4), *rgb = (unsigned char *)malloc((size_t)w * h * 3);
+                    if (pix && rgb) {
+                        gti(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+                        long sa = 0, sr = 0;
+                        for (long i = 0; i < (long)w * h; i++) { rgb[i*3] = pix[i*4]; rgb[i*3+1] = pix[i*4+1]; rgb[i*3+2] = pix[i*4+2]; sr += pix[i*4]; sa += pix[i*4+3]; }
+                        char b[512]; write_png(sim_path("ux0:data/NFSU2/probetex.png", b, sizeof b), w, h, rgb);
+                        printf("probe:   bound texture %dx%d mean r %ld a %ld -> probetex.png\n", w, h, sr / ((long)w * h), sa / ((long)w * h));
+                    }
+                    free(pix); free(rgb);
+                } else printf("probe:   bound texture read-back unavailable (%p %p %dx%d)\n", (void *)gti, (void *)gtl, w, h);
+                glActiveTexture((GLenum)unit);
+            }
+        }
         g_sim_probe_tag = 0;
         memcpy(g_probe_last, px, 4);
         static const char *names[] = { "uVColor", "uUseTex", "uDecal", "uColor", "uAlpha", "uCDiffMin",
@@ -607,6 +631,29 @@ void sim_probe_draw(int count) {
             glGetUniformfv((GLuint)prog, l, v);
             printf("probe:   %s = %.3f %.3f %.3f %.3f\n", names[k], v[0], v[1], v[2], v[3]);
         }
+        {   /* the caller (vu_glDrawElements is inline): name it from the PDB */
+            static int syminit;
+            if (!syminit) { SymInitialize(GetCurrentProcess(), NULL, TRUE); syminit = 1; }
+            void *ra[6]; USHORT nf = RtlCaptureStackBackTrace(1, 6, ra, NULL);
+            printf("probe:   from");
+            for (USHORT k = 0; k < nf && k < 4; k++) {
+                char sb[sizeof(SYMBOL_INFO) + 128]; SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+                memset(sb, 0, sizeof sb); si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 127;
+                IMAGEHLP_LINE64 li; DWORD dsp = 0; memset(&li, 0, sizeof li); li.SizeOfStruct = sizeof li;
+                if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)ra[k], NULL, si)) {
+                    if (SymGetLineFromAddr64(GetCurrentProcess(), (DWORD64)(uintptr_t)ra[k], &dsp, &li))
+                        printf(" %s:%lu", si->Name, (unsigned long)li.LineNumber);
+                    else printf(" %s", si->Name);
+                } else printf(" %p", ra[k]);
+            }
+            printf("\n");
+        }
+        {   GLint nu = 0; glGetProgramiv((GLuint)prog, GL_ACTIVE_UNIFORMS, &nu);
+            printf("probe:   uniforms:");
+            for (GLint k = 0; k < nu && k < 40; k++) { char nm[64]; GLsizei ln = 0; GLint sz; GLenum ty;
+                glGetActiveUniform((GLuint)prog, (GLuint)k, sizeof nm, &ln, &sz, &ty, nm); printf(" %s", nm); }
+            GLint sf = 0, df = 0; glGetIntegerv(GL_BLEND_SRC_RGB, &sf); glGetIntegerv(GL_BLEND_DST_RGB, &df);
+            printf(" | blend src %x dst %x\n", sf, df); }
         GLint en = 0; glGetVertexAttribiv(3, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en);
         GLint cull = glIsEnabled(GL_CULL_FACE), blend = glIsEnabled(GL_BLEND);
         printf("probe:   attr3 %d cull %d blend %d\n", en, cull, blend);
