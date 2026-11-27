@@ -8,6 +8,11 @@ The goal is to play like the real game. Menus, HUD, sounds, handling, camera
 and controls are rebuilt 1:1 from the shipped game data and from reverse
 engineering of the PC executable (`SPEED2.EXE` v1.2). Nothing is redesigned.
 
+**New in v0.3.0: nothing to convert.** The game streams Bayview, every race
+track and both World Expansion cities straight from the original game files,
+like the PC game does: just copy the game folders over. Less pop-in, fewer
+dropped frames, faster loading.
+
 **New in v0.2.0: the World Expansion.** If you also own Need for Speed Most
 Wanted (2005) or Need for Speed Carbon for PC, you can take your Underground 2
 car to **Rockport** and **Palmont** at night, with traffic and about 300 race
